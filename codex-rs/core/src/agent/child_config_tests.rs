@@ -40,7 +40,7 @@ async fn start_prepared_child(
         .unwrap()
         .spawn_child_thread(
             StartThreadOptions {
-                history_mode: Some(codex_protocol::ThreadHistoryMode::Legacy),
+                history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
                 session_source: Some(source),
                 ..StartThreadOptions::new(config)
             },
@@ -975,7 +975,7 @@ async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenan
         .await;
     let ready = environments.primary().expect("actual local executor");
     let mut owner = ready.config().clone();
-    owner.permission_profile = codex_protocol::PermissionProfileSnapshot::legacy(
+    owner.permission_profile = codex_protocol::models::PermissionProfileSnapshot::legacy(
         codex_protocol::models::PermissionProfile::Disabled,
     );
     let mut selection = ready.selection();
@@ -992,7 +992,11 @@ async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenan
         })
         .await
         .unwrap();
-    let _current_turn = fixture.parent.session.new_default_turn().await;
+    let _current_turn = fixture
+        .parent
+        .session
+        .new_turn_with_default_settings("authority-runtime-update".into(), Default::default())
+        .await;
     let actual = fixture
         .parent
         .session
@@ -1305,7 +1309,11 @@ async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_displ
         })
         .await
         .unwrap();
-    let _current_turn = fixture.parent.session.new_default_turn().await;
+    let _current_turn = fixture
+        .parent
+        .session
+        .new_turn_with_default_settings("authority-runtime-update".into(), Default::default())
+        .await;
     let updated = fixture
         .parent
         .session
@@ -1337,7 +1345,7 @@ async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_displ
         .err()
         .expect("changed executor authority must revoke prepared proof");
     assert!(
-        error.to_string().contains("parent authority changed"),
+        error.to_string().contains("environment authority changed"),
         "{error}"
     );
     assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
