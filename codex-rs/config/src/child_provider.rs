@@ -13,6 +13,7 @@ use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::merge_configured_model_providers;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -33,6 +34,8 @@ pub struct ChildProviderPolicy {
     project_roots: Vec<PathBuf>,
     catalog_boundaries: BTreeMap<String, PathBuf>,
     protected_catalog_roots: Vec<PathBuf>,
+    file_system_policy: FileSystemSandboxPolicy,
+    cwd: AbsolutePathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -144,11 +147,13 @@ impl ChildProviderPolicy {
     /// through a provider definition, a provider default, or a built-in endpoint override.
     /// `protected_catalog_roots` must be actual read-only carveouts from the finalized
     /// host filesystem policy for this cwd, never merely trusted config directories.
+    /// Pass that same finalized policy: narrower write grants can reopen a carveout.
     pub fn from_config_layers(
         stack: &ConfigLayerStack,
         cwd: &AbsolutePathBuf,
         workspace_roots: &[AbsolutePathBuf],
         protected_catalog_roots: &[AbsolutePathBuf],
+        file_system_policy: &FileSystemSandboxPolicy,
     ) -> std::io::Result<Self> {
         let mut project_roots = vec![cwd.to_path_buf()];
         project_roots.extend(workspace_roots.iter().map(|root| root.to_path_buf()));
@@ -165,11 +170,13 @@ impl ChildProviderPolicy {
                     canonical_source_path(file).is_some_and(|file| {
                         !project_roots.iter().any(|root| {
                             root.canonicalize().is_ok_and(|root| file.starts_with(root))
-                        }) || protected_catalog_roots.iter().any(|root| {
-                            root.as_path()
-                                .canonicalize()
-                                .is_ok_and(|root| file.starts_with(root))
-                        })
+                        }) || (!file_system_policy
+                            .can_write_local_path_with_cwd(&file, cwd.as_path())
+                            && protected_catalog_roots.iter().any(|root| {
+                                root.as_path()
+                                    .canonicalize()
+                                    .is_ok_and(|root| file.starts_with(root))
+                            }))
                     })
                 })
         };
@@ -309,6 +316,8 @@ impl ChildProviderPolicy {
             unsafe_host_provider_ids,
             project_roots,
             catalog_boundaries,
+            file_system_policy: file_system_policy.clone(),
+            cwd: cwd.clone(),
             protected_catalog_roots: protected_catalog_roots
                 .iter()
                 .map(|root| root.to_path_buf())
@@ -508,12 +517,15 @@ impl ChildProviderPolicy {
             .catalog_boundaries
             .get(provider_id)
             .and_then(|boundary| boundary.canonicalize().ok());
-        let protected_boundary = boundary.as_ref().is_some_and(|boundary| {
-            self.protected_catalog_roots.iter().any(|root| {
-                root.canonicalize()
-                    .is_ok_and(|root| boundary.starts_with(root))
-            })
-        });
+        let protected_boundary = !self
+            .file_system_policy
+            .can_write_local_path_with_cwd(&canonical, self.cwd.as_path())
+            && boundary.as_ref().is_some_and(|boundary| {
+                self.protected_catalog_roots.iter().any(|root| {
+                    root.canonicalize()
+                        .is_ok_and(|root| boundary.starts_with(root))
+                })
+            });
         // An incidental ancestor repository does not turn a declaring host directory
         // into project configuration. Active workspace roots are stricter: the host
         // directory must have an actual read-only permission carveout. Repositories

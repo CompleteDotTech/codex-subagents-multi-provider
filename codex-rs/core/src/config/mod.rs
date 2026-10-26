@@ -4388,6 +4388,7 @@ impl Config {
                 &resolved_cwd,
                 &child_provider_scope_roots,
                 &protected_catalog_roots,
+                &effective_file_system_sandbox_policy,
             )?;
         let effective_permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
             effective_permission_profile.enforcement(),

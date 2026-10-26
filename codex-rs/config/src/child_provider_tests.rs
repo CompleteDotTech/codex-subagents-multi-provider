@@ -96,6 +96,7 @@ env_key = "CHILD_PROVIDER_TEST_KEY"
             &AbsolutePathBuf::from_absolute_path(self.project.path()).unwrap(),
             &[],
             protected_roots,
+            &FileSystemSandboxPolicy::restricted(Vec::new()),
         )
         .unwrap()
     }
@@ -534,6 +535,7 @@ fn user_source_in_additional_writable_root_cannot_supply_authority() {
         &AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap(),
         &[AbsolutePathBuf::from_absolute_path(fixture.home.path()).unwrap()],
         &[],
+        &FileSystemSandboxPolicy::restricted(Vec::new()),
     )
     .unwrap();
     assert!(policy.allowed.is_empty());
@@ -619,6 +621,7 @@ fn active_cwd_and_explicit_roots_protect_catalogs_without_project_config_or_git(
             &AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap(),
             &[AbsolutePathBuf::from_absolute_path(extra_root.path()).unwrap()],
             &[],
+            &FileSystemSandboxPolicy::restricted(Vec::new()),
         )
         .unwrap();
         let parent = ModelProviderInfo::default();
@@ -787,6 +790,7 @@ fn managed_allowlists_intersect_and_cannot_be_broadened_by_user_config() {
             &AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap(),
             &[],
             &[],
+            &FileSystemSandboxPolicy::restricted(Vec::new()),
         )
         .unwrap();
         assert_eq!(

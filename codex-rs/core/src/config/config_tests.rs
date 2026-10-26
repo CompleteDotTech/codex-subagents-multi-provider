@@ -3509,6 +3509,115 @@ model_catalog_url = "https://attacker.invalid/models"
 }
 
 #[tokio::test]
+async fn child_provider_authority_and_catalog_reject_nested_write_regrants() -> std::io::Result<()>
+{
+    for writable_source in [true, false] {
+        let temp = TempDir::new()?;
+        let workspace = temp.path().join("workspace");
+        let host = workspace.join("host");
+        let reopened = host.join("reopened");
+        std::fs::create_dir_all(&reopened)?;
+        let codex_home = if writable_source { &reopened } else { &host };
+        let catalog = reopened.join("catalog.json");
+        std::fs::write(&catalog, "{}")?;
+        let catalog_default = if writable_source {
+            String::new()
+        } else {
+            format!(
+                "model_catalog_json = '{}'",
+                catalog.to_string_lossy().replace('\\', "/")
+            )
+        };
+        let text = format!(
+            r#"
+default_permissions = "dev"
+[permissions.dev]
+extends = ":workspace"
+[permissions.dev.filesystem]
+"{host}" = "read"
+"{reopened}" = "write"
+[agents]
+allowed_model_providers = ["zai"]
+default_subagent_model_provider = "zai"
+[agents.provider_defaults.zai]
+model = "target-model"
+{catalog_default}
+[model_providers.zai]
+name = "Configured provider"
+base_url = "https://provider.invalid/v1"
+model_catalog_url = "https://provider.invalid/models"
+[model_providers.zai.auth]
+command = "MUST_NOT_EXECUTE"
+"#,
+            host = host.to_string_lossy().replace('\\', "/"),
+            reopened = reopened.to_string_lossy().replace('\\', "/")
+        );
+        let config_file = codex_home.join("config.toml");
+        std::fs::write(&config_file, &text)?;
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        let stack = ConfigLayerStack::new(
+            vec![ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: config_file.abs(),
+                    profile: None,
+                },
+                value.clone(),
+            )],
+            Default::default(),
+            Default::default(),
+        )?;
+        let config = Config::load_config_with_layer_stack(
+            LOCAL_FS.as_ref(),
+            value.try_into().unwrap(),
+            ConfigOverrides {
+                cwd: Some(workspace.clone()),
+                ..Default::default()
+            },
+            codex_home.abs(),
+            stack,
+        )
+        .await?;
+        let policy = config.permissions.file_system_sandbox_policy();
+        assert_eq!(
+            policy.can_write_local_path_with_cwd(&config_file, &workspace),
+            writable_source
+        );
+        assert!(policy.can_write_local_path_with_cwd(&catalog, &workspace));
+        if writable_source {
+            assert_eq!(config.child_provider_policy.default_provider(), None);
+            assert_eq!(
+                config
+                    .child_provider_policy
+                    .authorize("zai", None)
+                    .unwrap_err()
+                    .code,
+                "child_provider_untrusted_source"
+            );
+        } else {
+            assert_eq!(config.child_provider_policy.default_provider(), Some("zai"));
+            let parent = ModelProviderInfo::default();
+            let result = config.child_provider_policy.resolve(
+                codex_config::child_provider::ChildProviderRequest {
+                    explicit_provider: Some("zai"),
+                    role_provider: None,
+                    parent_provider_id: "openai",
+                    parent_provider: &parent,
+                    parent_model: "parent-model",
+                    authorization_origin: None,
+                    explicit_model: None,
+                    role_model: None,
+                    default_subagent_model: None,
+                    full_history: false,
+                    host_owned: false,
+                },
+            );
+            assert_eq!(result.unwrap_err().code, "child_provider_untrusted_source");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn explicit_builtin_workspace_profile_ignores_legacy_workspace_write_settings()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
