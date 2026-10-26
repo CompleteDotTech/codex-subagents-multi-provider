@@ -32,6 +32,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+#[path = "client_responses_compatibility.rs"]
+pub(crate) mod responses_compatibility;
 #[path = "client_tool_metadata.rs"]
 mod tool_metadata;
 
@@ -990,6 +992,13 @@ impl ModelClient {
         include_internal: bool,
     ) -> Result<ResponsesApiRequest> {
         self.validate_catalog_metadata(model_info)?;
+        self.validate_responses_compatibility(prompt, model_info, service_tier.as_deref())?;
+        let stateless = self.stateless_responses();
+        if stateless && model_info.use_responses_lite {
+            return Err(responses_compatibility::unsupported(
+                "Responses Lite requires full Responses support",
+            ));
+        }
         let mut input = prompt.get_formatted_input_for_request(model_info);
         if !self.reasoning_effort_override_enabled(model_info) {
             // Unsupported models and disabled overrides must also accept saved history.
@@ -1008,7 +1017,7 @@ impl ModelClient {
                 }
             });
         }
-        let is_openai = self.state.provider.info().is_openai();
+        let is_openai = !stateless && self.state.provider.info().is_openai();
         // These prompt-only items are rebuilt on every request. Hash their visible payloads
         // within the thread so retries and resumed sessions preserve their identity.
         let prefix_namespace = Uuid::new_v5(
@@ -1016,7 +1025,14 @@ impl ModelClient {
             self.state.thread_id.to_string().as_bytes(),
         );
         let mut prefix = Vec::new();
-        let tools = if model_info.use_responses_lite {
+        let tools = if stateless {
+            Some(
+                Arc::<serde_json::value::RawValue>::from(serde_json::value::to_raw_value(
+                    &responses_compatibility::function_tools(&prompt.tools)?,
+                )?)
+                .into(),
+            )
+        } else if model_info.use_responses_lite {
             if !prompt.tools.is_empty() {
                 let tools = create_tools_json_for_responses_lite(&prompt.tools)?;
                 prefix.push(ResponseItem::AdditionalTools {
@@ -1043,6 +1059,9 @@ impl ModelClient {
             prefix.push(instructions);
         }
         input.splice(0..0, prefix);
+        if stateless {
+            input = responses_compatibility::portable_history(input)?;
+        }
         if !model_info.use_responses_lite {
             // Only RLite accepts per-content attribution until the Responses API schema expands.
             for item in &mut input {
@@ -1069,14 +1088,22 @@ impl ModelClient {
                 }
             }
         }
-        let reasoning = self.build_reasoning(model_info, effort, summary);
+        let mut reasoning = self.build_reasoning(model_info, effort, summary);
+        if stateless {
+            reasoning.summary = None;
+            reasoning.context = None;
+        }
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
             && reasoning.summary.is_some())
         .then_some(StreamOptions {
             reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
         });
-        let mut include = vec!["reasoning.encrypted_content".to_string()];
+        let mut include = if stateless {
+            Vec::new()
+        } else {
+            vec!["reasoning.encrypted_content".to_string()]
+        };
         if self.state.output_token_replay_enabled && is_openai {
             include.push("output.encrypted_content".to_string());
         }
@@ -1112,16 +1139,20 @@ impl ModelClient {
             input,
             tools,
             tool_choice: "auto".to_string(),
-            parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+            parallel_tool_calls: !stateless
+                && prompt.parallel_tool_calls
+                && !model_info.use_responses_lite,
             reasoning: Some(reasoning),
             store: false,
             stream: true,
             stream_options,
             include,
-            service_tier,
-            prompt_cache_key: self.prompt_cache_key(responses_metadata),
-            text,
-            client_metadata: Some(client_metadata),
+            service_tier: if stateless { None } else { service_tier },
+            prompt_cache_key: (!stateless)
+                .then(|| self.prompt_cache_key(responses_metadata))
+                .flatten(),
+            text: if stateless { None } else { text },
+            client_metadata: (!stateless).then_some(client_metadata),
             access_programs: None,
         };
         Ok(request)
@@ -1134,6 +1165,46 @@ impl ModelClient {
             return Err(CodexErr::InvalidRequest(
                 "child_provider_model_unavailable: authoritative provider catalog metadata is unavailable".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn stateless_responses(&self) -> bool {
+        self.state.provider.capabilities().responses
+            == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
+    }
+
+    fn validate_responses_compatibility(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        service_tier: Option<&str>,
+    ) -> Result<()> {
+        if self.stateless_responses() {
+            if prompt.cyber_access_program.is_some() {
+                return Err(responses_compatibility::unsupported(
+                    "access programs require full Responses support",
+                ));
+            }
+            if service_tier.is_some_and(|tier| tier != "default") {
+                return Err(responses_compatibility::unsupported(
+                    "service tiers require full Responses support",
+                ));
+            }
+            if model_info.use_responses_lite {
+                return Err(responses_compatibility::unsupported(
+                    "Responses Lite requires full Responses support",
+                ));
+            }
+            responses_compatibility::function_tools(&prompt.tools)?;
+            responses_compatibility::portable_history(
+                prompt.get_formatted_input_for_request(model_info),
+            )?;
+            if prompt.output_schema.is_some() {
+                return Err(responses_compatibility::unsupported(
+                    "structured output requires full Responses support",
+                ));
+            }
         }
         Ok(())
     }
@@ -1153,7 +1224,8 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.info().supports_websockets
+        if self.stateless_responses()
+            || !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
             return false;
@@ -1822,6 +1894,11 @@ impl ResponsesHttpExecutor<'_> {
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
         self.client.validate_catalog_metadata(model_info)?;
+        self.client.validate_responses_compatibility(
+            prompt,
+            model_info,
+            service_tier.as_deref(),
+        )?;
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
             .as_ref()
@@ -2353,6 +2430,11 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
         self.client.validate_catalog_metadata(model_info)?;
+        self.client.validate_responses_compatibility(
+            prompt,
+            model_info,
+            service_tier.as_deref(),
+        )?;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -2416,6 +2498,11 @@ impl ModelClientSession {
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
         self.client.validate_catalog_metadata(model_info)?;
+        self.client.validate_responses_compatibility(
+            prompt,
+            model_info,
+            service_tier.as_deref(),
+        )?;
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -2626,6 +2713,21 @@ where
                     usage_metadata,
                     end_turn,
                 }) => {
+                    if end_turn == Some(false)
+                        && provider.capabilities().responses
+                            == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
+                    {
+                        let error = ApiError::ResponseIncomplete(Box::new(
+                            codex_protocol::error::ResponseIncompleteError {
+                                reason: "interrupted".to_string(),
+                                response_id: Some(response_id),
+                                token_usage,
+                            },
+                        ));
+                        let error = provider.map_api_error(error);
+                        let _ = tx_event.send(Err(error)).await;
+                        return;
+                    }
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(usage, ttft_ms);

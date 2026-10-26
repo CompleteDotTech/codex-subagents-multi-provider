@@ -637,6 +637,119 @@ async fn authoritative_catalog_fallback_is_rejected_before_auth_helpers_or_trans
     Ok(())
 }
 
+#[tokio::test]
+async fn stateless_unsupported_history_and_tools_fail_before_auth_or_transport()
+-> anyhow::Result<()> {
+    use codex_model_provider_info::ModelProviderCapabilities;
+    use codex_model_provider_info::ResponsesCompatibility;
+    for prompt in [
+        Prompt {
+            input: vec![serde_json::from_value(
+                json!({"type":"compaction","encrypted_content":"foreign"}),
+            )?],
+            ..Default::default()
+        },
+        Prompt {
+            output_schema: Some(json!({"type":"object"})),
+            ..Default::default()
+        },
+        Prompt {
+            tools: Arc::from(vec![ToolSpec::WebSearch {
+                external_web_access: None,
+                indexed_web_access: None,
+                filters: None,
+                user_location: None,
+                search_context_size: None,
+                search_content_types: None,
+            }]),
+            ..Default::default()
+        },
+    ] {
+        let home = TempDir::new()?;
+        let server = MockServer::start().await;
+        let info = ModelProviderInfo {
+            name: "generic-stateless".into(),
+            base_url: Some(format!("{}/v1", server.uri())),
+            supports_websockets: true,
+            capabilities: Some(ModelProviderCapabilities {
+                responses: Some(ResponsesCompatibility::StatelessFunctions),
+                ..Default::default()
+            }),
+            auth: Some(codex_protocol::config_types::ModelProviderAuthInfo {
+                command: if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
+                args: if cfg!(windows) {
+                    vec!["/D", "/C", "echo invoked>marker&echo fixture-token"]
+                } else {
+                    vec!["-c", "printf invoked > marker; printf fixture-token"]
+                }
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                timeout_ms: std::num::NonZeroU64::new(5000).unwrap(),
+                refresh_interval_ms: 60000,
+                cwd: home.path().try_into().unwrap(),
+            }),
+            ..Default::default()
+        };
+        let mut client = test_model_client(SessionSource::Cli);
+        Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(info, None);
+        let mut model = test_model_info();
+        model.use_responses_lite = false;
+        let metadata = test_responses_metadata_for_client(
+            &client,
+            None,
+            format!("{}:0", client.state.thread_id),
+            None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+        let telemetry = test_session_telemetry();
+        assert!(!client.responses_websocket_enabled());
+        let mut session = client.new_session();
+        session
+            .preconnect_websocket(&model, None, &telemetry, &metadata)
+            .await?;
+        let prewarm = session
+            .prewarm_websocket(
+                &prompt,
+                &model,
+                &telemetry,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+            )
+            .await;
+        assert!(
+            prewarm
+                .unwrap_err()
+                .to_string()
+                .contains("provider_responses_unsupported")
+        );
+        let stream = session
+            .stream(
+                &prompt,
+                &model,
+                &telemetry,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+                &InferenceTraceContext::disabled(),
+            )
+            .await;
+        assert!(
+            stream
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("provider_responses_unsupported")
+        );
+        assert!(!home.path().join("marker").exists());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    Ok(())
+}
+
 fn output_with_tool_result_metadata(metadata: ToolResultMetadata) -> ResponseItem {
     let mut call = ExecutedToolCall::new("test_tool".to_string(), json!({ "query": "keep" }));
     call.set_tool_result_sources(ToolResultSources::new(vec![ToolResultSource {

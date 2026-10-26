@@ -62,6 +62,7 @@ mod bedrock_multi_agent;
 mod bedrock_service_tier;
 mod catalog_permission_messages;
 mod child_provider_auth;
+mod child_provider_responses;
 mod cli_stream;
 mod client;
 mod client_websockets;

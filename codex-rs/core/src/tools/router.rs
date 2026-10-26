@@ -366,6 +366,50 @@ impl ToolRouter {
         source: ToolCallSource,
         call_state: Option<Arc<ToolCallState>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        let mut call = call;
+        if step_context.turn.provider.capabilities().responses
+            == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
+        {
+            // Only the exact registered runtime can interpret a flattened wire
+            // name. No model-provided name can create a new handler or grant.
+            let candidates: Vec<_> = self
+                .registry
+                .entries()
+                .filter(|registered| {
+                    let name = registered.runtime.tool_name();
+                    crate::client::responses_compatibility::wire_tool_name(
+                        name.namespace.as_deref(),
+                        &name.name,
+                    ) == call.tool_name.name
+                })
+                .collect();
+            if candidates.len() != 1
+                || call
+                    .tool_name
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|namespace| {
+                        namespace != codex_protocol::DEFAULT_FUNCTION_NAMESPACE
+                    })
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "unsupported or ambiguous function tool name".to_string(),
+                ));
+            }
+            let registered = candidates[0];
+            call.tool_name = registered.runtime.tool_name();
+            let ToolPayload::Function { arguments } = &call.payload else {
+                return Err(FunctionCallError::RespondToModel(
+                    "this provider must use function tool calls".to_string(),
+                ));
+            };
+            if matches!(&*registered.spec(), ToolSpec::Freeform(_)) {
+                call.payload = ToolPayload::Custom {
+                    input: crate::client::responses_compatibility::decode_freeform(arguments)
+                        .map_err(FunctionCallError::RespondToModel)?,
+                };
+            }
+        }
         let ToolCall {
             tool_name,
             call_id,
