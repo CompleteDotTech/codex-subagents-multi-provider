@@ -498,7 +498,7 @@ async fn provider_catalog_tiers_are_enforced_on_actual_http_requests() -> anyhow
         provider.supports_websockets = false;
         let mut client = test_model_client(SessionSource::Cli);
         let state = Arc::get_mut(&mut client.state).unwrap();
-        state.provider = create_model_provider(provider, None);
+        state.provider = create_model_provider(provider, /*auth_manager*/ None);
         state.model_provider_id = provider_id.into();
         let mut info = test_model_info();
         if advertised {
@@ -511,9 +511,9 @@ async fn provider_catalog_tiers_are_enforced_on_actual_http_requests() -> anyhow
         }
         let metadata = test_responses_metadata_for_client(
             &client,
-            None,
+            /*turn_id*/ None,
             format!("{}:0", client.state.thread_id),
-            None,
+            /*parent_thread_id*/ None,
             TestCodexResponsesRequestKind::Turn,
         );
         let mut session = client.new_session();
@@ -522,7 +522,7 @@ async fn provider_catalog_tiers_are_enforced_on_actual_http_requests() -> anyhow
                 &Prompt::default(),
                 &info,
                 &test_session_telemetry(),
-                None,
+                /*effort*/ None,
                 codex_protocol::config_types::ReasoningSummary::None,
                 Some(requested.into()),
                 &metadata,
@@ -571,21 +571,22 @@ async fn authoritative_catalog_fallback_is_rejected_before_auth_helpers_or_trans
             cwd: home.path().try_into().unwrap(),
         });
         let mut client = test_model_client(SessionSource::Cli);
-        Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(info, None);
+        Arc::get_mut(&mut client.state).unwrap().provider =
+            create_model_provider(info, /*auth_manager*/ None);
         let mut model = test_model_info();
         model.used_fallback_model_metadata = true;
         let metadata = test_responses_metadata_for_client(
             &client,
-            None,
+            /*turn_id*/ None,
             format!("{}:0", client.state.thread_id),
-            None,
+            /*parent_thread_id*/ None,
             TestCodexResponsesRequestKind::Turn,
         );
         let telemetry = test_session_telemetry();
         let prompt = Prompt::default();
         let mut session = client.new_session();
         let error = session
-            .preconnect_websocket(&model, None, &telemetry, &metadata)
+            .preconnect_websocket(&model, /*service_tier*/ None, &telemetry, &metadata)
             .await
             .err()
             .expect("invalid catalog must fail preconnect");
@@ -599,9 +600,9 @@ async fn authoritative_catalog_fallback_is_rejected_before_auth_helpers_or_trans
                 &prompt,
                 &model,
                 &telemetry,
-                None,
+                /*effort*/ None,
                 codex_protocol::config_types::ReasoningSummary::None,
-                None,
+                /*service_tier*/ None,
                 &metadata,
             )
             .await
@@ -617,9 +618,9 @@ async fn authoritative_catalog_fallback_is_rejected_before_auth_helpers_or_trans
                 &prompt,
                 &model,
                 &telemetry,
-                None,
+                /*effort*/ None,
                 codex_protocol::config_types::ReasoningSummary::None,
-                None,
+                /*service_tier*/ None,
                 &metadata,
                 &InferenceTraceContext::disabled(),
             )
@@ -703,30 +704,31 @@ async fn stateless_unsupported_history_and_tools_fail_before_auth_or_transport()
             ..Default::default()
         };
         let mut client = test_model_client(SessionSource::Cli);
-        Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(info, None);
+        Arc::get_mut(&mut client.state).unwrap().provider =
+            create_model_provider(info, /*auth_manager*/ None);
         let mut model = test_model_info();
         model.use_responses_lite = false;
         let metadata = test_responses_metadata_for_client(
             &client,
-            None,
+            /*turn_id*/ None,
             format!("{}:0", client.state.thread_id),
-            None,
+            /*parent_thread_id*/ None,
             TestCodexResponsesRequestKind::Turn,
         );
         let telemetry = test_session_telemetry();
         assert!(!client.responses_websocket_enabled());
         let mut session = client.new_session();
         session
-            .preconnect_websocket(&model, None, &telemetry, &metadata)
+            .preconnect_websocket(&model, /*service_tier*/ None, &telemetry, &metadata)
             .await?;
         let prewarm = session
             .prewarm_websocket(
                 &prompt,
                 &model,
                 &telemetry,
-                None,
+                /*effort*/ None,
                 codex_protocol::config_types::ReasoningSummary::None,
-                None,
+                /*service_tier*/ None,
                 &metadata,
             )
             .await;
@@ -741,9 +743,9 @@ async fn stateless_unsupported_history_and_tools_fail_before_auth_or_transport()
                 &prompt,
                 &model,
                 &telemetry,
-                None,
+                /*effort*/ None,
                 codex_protocol::config_types::ReasoningSummary::None,
-                None,
+                /*service_tier*/ None,
                 &metadata,
                 &InferenceTraceContext::disabled(),
             )

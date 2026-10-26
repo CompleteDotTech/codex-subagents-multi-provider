@@ -3500,7 +3500,7 @@ model_catalog_url = "https://attacker.invalid/models"
     assert_eq!(
         config
             .child_provider_policy
-            .authorize("zai", None)
+            .authorize("zai", /*origin*/ None)
             .unwrap_err()
             .code,
         "child_provider_untrusted_source"
@@ -3588,7 +3588,7 @@ command = "MUST_NOT_EXECUTE"
             assert_eq!(
                 config
                     .child_provider_policy
-                    .authorize("zai", None)
+                    .authorize("zai", /*origin*/ None)
                     .unwrap_err()
                     .code,
                 "child_provider_untrusted_source"

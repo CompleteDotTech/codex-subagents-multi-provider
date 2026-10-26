@@ -144,7 +144,7 @@ async fn configured_stateless_providers_complete_real_patch_tool_round_trips_and
             ],
         )
         .await;
-        let mut builder = compatible(name, format!("{}/v1", server.uri()), 0);
+        let mut builder = compatible(name, format!("{}/v1", server.uri()), /*retries*/ 0);
         let test = builder.build_with_auto_env(&server).await?;
         assert!(turn(&test, "apply the requested patch").await?.is_none());
         assert_eq!(
@@ -240,7 +240,7 @@ async fn malformed_streams_exhaust_retries_on_the_selected_provider_without_succ
                 .expect(2)
                 .mount(&server)
                 .await;
-            let mut builder = compatible(name, format!("{}/v1", server.uri()), 1);
+            let mut builder = compatible(name, format!("{}/v1", server.uri()), /*retries*/ 1);
             let test = builder.build_with_auto_env(&server).await?;
             assert!(turn(&test, "fail incomplete response").await?.is_some());
             assert_eq!(server.received_requests().await.unwrap().len(), 2);
@@ -277,7 +277,11 @@ async fn malformed_freeform_wrappers_and_invalid_patches_use_original_validation
             ],
         )
         .await;
-        let mut builder = compatible("configured-validation", format!("{}/v1", server.uri()), 0);
+        let mut builder = compatible(
+            "configured-validation",
+            format!("{}/v1", server.uri()),
+            /*retries*/ 0,
+        );
         let test = builder.build_with_auto_env(&server).await?;
         assert!(
             turn(&test, "reject the invalid tool arguments")
@@ -323,7 +327,11 @@ async fn structured_http_200_quota_and_interrupted_streams_fail_the_turn() -> an
             .respond_with(ResponseTemplate::new(200).set_body_raw(body, content_type))
             .mount(&server)
             .await;
-        let mut builder = compatible("configured-errors", format!("{}/v1", server.uri()), 0);
+        let mut builder = compatible(
+            "configured-errors",
+            format!("{}/v1", server.uri()),
+            /*retries*/ 0,
+        );
         let test = builder.build_with_auto_env(&server).await?;
         let error = turn(&test, "report a failure").await?.expect("failed turn");
         if quota {
@@ -353,7 +361,11 @@ async fn cancellation_stops_the_selected_request_without_tool_execution() -> any
         )
         .mount(&server)
         .await;
-    let mut builder = compatible("configured-cancel", format!("{}/v1", server.uri()), 0);
+    let mut builder = compatible(
+        "configured-cancel",
+        format!("{}/v1", server.uri()),
+        /*retries*/ 0,
+    );
     let test = builder.build_with_auto_env(&server).await?;
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {

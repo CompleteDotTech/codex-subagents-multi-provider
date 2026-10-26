@@ -203,7 +203,7 @@ fn rotating_helper() -> anyhow::Result<(tempfile::TempDir, ModelProviderAuthInfo
 
 fn static_models() -> Arc<StaticModelsManager> {
     Arc::new(StaticModelsManager::new(
-        None,
+        /*auth_manager*/ None,
         codex_models_manager::bundled_models_response().unwrap(),
     ))
 }
@@ -550,9 +550,9 @@ async fn websocket_child_reconnect_keeps_parent_and_local_connections_isolated()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let http_fixture = start_mock_server().await;
-    let parent_server = auth_socket_fixture(false).await?;
-    let local_server = auth_socket_fixture(false).await?;
-    let child_server = auth_socket_fixture(true).await?;
+    let parent_server = auth_socket_fixture(/*reject_first_generation*/ false).await?;
+    let local_server = auth_socket_fixture(/*reject_first_generation*/ false).await?;
+    let child_server = auth_socket_fixture(/*reject_first_generation*/ true).await?;
     let (helper_home, auth) = rotating_helper()?;
     let host = shared_host();
     let manager = AuthManager::from_auth_for_testing(host.auth.clone());
