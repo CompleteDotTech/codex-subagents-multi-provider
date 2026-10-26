@@ -79,15 +79,22 @@ async fn auth_socket_fixture(reject_first_generation: bool) -> anyhow::Result<Au
             let rejected = rejected.clone();
             clients.spawn(async move {
                 let mut handshake = None;
-                let socket = tokio_tungstenite::accept_hdr_async(
+                // Match the production client's negotiated compression, as the
+                // shared websocket fixtures do.
+                let mut websocket_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+                websocket_config.extensions.permessage_deflate = Some(
+                    tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig::default(),
+                );
+                let socket = tokio_tungstenite::accept_hdr_async_with_config(
                     stream,
                     |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                      response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                         handshake = Some((request.uri().to_string(), request.headers().clone()));
                         Ok(response)
                     },
+                    Some(websocket_config),
                 ).await;
-                let Ok(mut socket) = socket else { return };
+                let mut socket = socket.expect("synthetic websocket handshake must succeed");
                 let (path, headers) = handshake.unwrap();
                 let index = {
                     let mut log = log.lock().unwrap();
@@ -98,12 +105,15 @@ async fn auth_socket_fixture(reject_first_generation: bool) -> anyhow::Result<Au
                 while let Some(Ok(message)) = socket.next().await {
                     let Message::Text(payload) = message else { continue };
                     let request: Value = serde_json::from_str(&payload).unwrap();
+                    if request["type"] == "response.interrupt" {
+                        continue;
+                    }
+                    assert_eq!(request["type"], "response.create");
                     let request_index = {
                         let mut log = log.lock().unwrap();
                         log[index].requests.push(request.clone());
                         log[index].requests.len() - 1
                     };
-                    assert_eq!(request["type"], "response.create");
                     let generation = request["generate"] != false;
                     if generation && reject_first_generation
                         && rejected.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
