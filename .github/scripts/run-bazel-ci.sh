@@ -543,7 +543,7 @@ set -e
 if [[ ${bazel_status:-0} -ne 0 ]]; then
   # Observe the failed build outputs before any diagnostic Bazel info call.
   if [[ "${RUNNER_OS:-}" == Windows && "${GITHUB_ACTIONS:-}" == true && "${GITHUB_REPOSITORY:-}" == CompleteDotTech/codex-subagents-multi-provider && -n "${CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR:-}" ]]; then
-    python "$(dirname "${BASH_SOURCE[0]}")/capture-windows-workspace-provenance.py" "${bazel_run_args[@]:1}" || echo "Workspace provenance capture failed; original Bazel failure retained." >&2
+    python "$(dirname "${BASH_SOURCE[0]}")/capture-windows-workspace-provenance.py" "${bazel_run_args[@]}" || echo "Workspace provenance capture failed; original Bazel failure retained." >&2
   fi
   if [[ $print_failed_bazel_action_summary -eq 1 ]]; then
     print_bazel_action_failure_summary "$bazel_console_log"

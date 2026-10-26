@@ -16,6 +16,20 @@ from run_bazel_with_buildbuddy import bazel_command
 FORK = "CompleteDotTech/codex-subagents-multi-provider"
 
 
+def failure_category(stderr):
+    # Return fixed categories only: messages may embed remote credentials.
+    text = stderr.lower()
+    for marker, category in (
+        (b"unrecognized option", "unknown_option"),
+        (b"config value", "config_expansion"),
+        (b"starlark", "starlark_options"),
+        (b"unrecognized arguments", "unrecognized_arguments"),
+    ):
+        if marker in text:
+            return category
+    return "other"
+
+
 def capture_file(source, destination, limit):
     if not source.is_file():
         return {"present": False}
@@ -88,12 +102,26 @@ def main():
         "path": str(receipt),
         **capture_file(receipt, destination / "built.json", 1024 * 1024),
     }
+    report["tracked_working_files"] = {}
+    for name, source in (
+        ("workspace.bazelrc", root / ".bazelrc"),
+        ("workspace-status.cmd", root / "scripts" / "workspace-status.cmd"),
+    ):
+        report["tracked_working_files"][name] = capture_file(
+            source, destination / name, 65536
+        )
     # Canonicalize the original build flags without starting another build. The
     # helper applies the same startup/remote defaults. Never persist raw output:
     # unrelated effective flags can contain remote authentication headers.
     args = sys.argv[1:]
-    code, stdout, _ = command(
-        bazel_command("canonicalize-flags", "--for_command=build", "--", *args), root
+    original_command = args[0] if args else "unavailable"
+    if original_command not in ("test", "build"):
+        raise ValueError("Expected the original build or test command")
+    code, stdout, stderr = command(
+        bazel_command(
+            "canonicalize-flags", f"--for_command={original_command}", "--", *args[1:]
+        ),
+        root,
     )
     allowed = (
         "--workspace_status_command=",
@@ -110,7 +138,9 @@ def main():
     report["effective_flags"] = {
         "exit": code,
         "flags": effective,
-        "method": "canonicalize-flags --for_command=build with original build flags",
+        "original_command": original_command,
+        "failure_category": failure_category(stderr) if code != 0 else None,
+        "method": "canonicalize-flags with original command and flags",
     }
     selected = [
         line.partition("=")[2]
@@ -122,22 +152,27 @@ def main():
         "replay_is_separate_observation": True,
     }
     # Replay only the repository's known producer, never arbitrary effective code.
-    # cmd /d avoids host AutoRun; this does not claim to reproduce Bazel's launcher.
-    if selected and selected[-1].replace("\\", "/") in (
-        "./scripts/workspace-status.cmd",
-        "scripts/workspace-status.cmd",
-    ):
-        argv = [
-            os.environ.get("COMSPEC", "cmd.exe"),
-            "/d",
-            "/c",
-            "scripts\\workspace-status.cmd",
-        ]
-        code, stdout, stderr = command(argv, root)
-        report["status_producer"].update({"replay_argv": argv, "exit": code})
-        for name, data in (("stdout", stdout), ("stderr", stderr)):
-            if len(data) <= 65536:
-                (destination / f"status-producer-{name}.bin").write_bytes(data)
+    # Match official Bazel 9.2 CommandBuilder's Windows argv for this known
+    # candidate, even when canonicalization failed. This remains a new replay;
+    # it does not establish which command the failed build actually executed.
+    argv = [
+        "CMD.EXE",
+        "/S",
+        "/E:ON",
+        "/V:ON",
+        "/D",
+        "/C",
+        "scripts\\workspace-status.cmd",
+    ]
+    code, stdout, stderr = command(argv, root)
+    report["status_producer"].update({"replay_argv": argv, "exit": code})
+    for name, data in (("stdout", stdout), ("stderr", stderr)):
+        report["status_producer"][name] = {
+            "size": len(data),
+            "captured": len(data) <= 65536,
+        }
+        if len(data) <= 65536:
+            (destination / f"status-producer-{name}.bin").write_bytes(data)
     (destination / "observation.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
