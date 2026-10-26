@@ -1,0 +1,3 @@
+# Preserve upstream formatting conventions for the licensed vendor snapshot.
+edition = "2021"
+imports_granularity = "Preserve"
