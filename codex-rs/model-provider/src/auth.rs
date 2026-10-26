@@ -238,9 +238,8 @@ pub(crate) fn auth_manager_for_provider(
 ) -> Option<Arc<AuthManager>> {
     match provider.auth.clone() {
         Some(config) => Some(AuthManager::external_bearer_only(config)),
-        None
-            if provider.is_amazon_bedrock()
-                || crate::provider::provider_uses_first_party_auth_path(provider) =>
+        None if provider.is_amazon_bedrock()
+            || crate::provider::provider_uses_first_party_auth_path(provider) =>
         {
             auth_manager
         }
