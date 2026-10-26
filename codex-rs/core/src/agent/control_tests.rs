@@ -193,6 +193,15 @@ impl LocalAgentControl {
         let config = self
             .prepare_spawn_fixture(&config, &source, options.fork_mode.is_some())
             .await?;
+        let mut source = source;
+        if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) = &mut source
+        {
+            *agent_role = config
+                .prepared_child_authorization
+                .as_ref()
+                .and_then(|authorization| authorization.role_name())
+                .map(str::to_owned);
+        }
         let caller = source
             .parent_thread_id()
             .expect("child fixture has a parent");

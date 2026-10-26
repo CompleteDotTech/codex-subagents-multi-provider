@@ -162,10 +162,10 @@ mod tests {
     use crate::runtime::test_support::test_thread_metadata;
     use codex_utils_absolute_path::test_support::PathExt;
 
-    async fn runtime() -> (tempfile::TempDir, Arc<StateRuntime>) {
-        let home = tempfile::tempdir().unwrap();
+    async fn runtime() -> (std::path::PathBuf, Arc<StateRuntime>) {
+        let home = crate::runtime::test_support::unique_temp_dir();
         let runtime = StateRuntime::init(
-            SqliteConfig::new_for_testing(home.path().abs()),
+            SqliteConfig::new_for_testing(home.as_path().abs()),
             "test".into(),
         )
         .await
@@ -274,8 +274,11 @@ mod tests {
      {
         let (home, runtime) = runtime().await;
         let epoch = root_epoch();
-        let metadata =
-            test_thread_metadata(home.path(), epoch.thread_id, home.path().to_path_buf());
+        let metadata = test_thread_metadata(
+            home.as_path(),
+            epoch.thread_id,
+            home.as_path().to_path_buf(),
+        );
         runtime.upsert_thread(&metadata).await.unwrap();
         assert!(
             runtime
