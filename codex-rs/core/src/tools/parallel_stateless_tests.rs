@@ -274,7 +274,8 @@ async fn advertised_plain_alias_dispatches_without_hidden_shadow_and_keeps_runti
                 .unwrap();
             assert!(
                 matches!(&result.item, codex_protocol::models::ResponseItem::FunctionCallOutput { output, .. }
-                if matches!(&output.body, codex_protocol::models::FunctionCallOutputBody::Text(text) if text == "terminal native result"))
+                if matches!(&output.body, codex_protocol::models::FunctionCallOutputBody::Text(text) if text == "terminal native result")),
+                "unexpected output for exposure={exposure:?} finishes={finishes}: {:?}", result.item
             );
             assert_eq!(visible.executions.load(Ordering::SeqCst), 1);
             assert_eq!(hidden.executions.load(Ordering::SeqCst), 0);
