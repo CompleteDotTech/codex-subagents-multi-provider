@@ -6,6 +6,7 @@ codex_rust_crate(
     name = "aws-config",
     crate_name = "aws_config",
     crate_edition = "2021",
+    compile_data = ["src/profile/location_of_profile_files.md"],
     crate_features = [
         "default-https-client",
         "rt-tokio",
@@ -14,4 +15,5 @@ codex_rust_crate(
         "credentials-login",
     ],
     test_data_extra = glob(["test-data/**"]),
+    unit_test_working_directory_marker = ":Cargo.toml",
 )
