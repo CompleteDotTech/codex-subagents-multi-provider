@@ -347,6 +347,42 @@ impl<'call> ToolExecutor<ExtensionToolCall<'call>> for TestNamespaceExtensionToo
 
 struct DeferredExtensionTool;
 
+#[tokio::test]
+async fn stateless_provider_exposes_deferred_handlers_without_server_tool_search() {
+    for name in ["configured-capability-a", "configured-capability-b"] {
+        for model_search in [false, true] {
+            let plan = probe_with(
+                |turn| {
+                    update_turn_settings_for_test(turn, |settings| {
+                        let model = Arc::make_mut(&mut settings.model_info);
+                        model.supports_search_tool = model_search;
+                        model.tool_mode = Some(ToolMode::Direct);
+                    });
+                    turn.provider = create_model_provider(
+                        ModelProviderInfo {
+                            name: name.into(),
+                            capabilities: Some(codex_model_provider_info::ModelProviderCapabilities {
+                                responses: Some(codex_model_provider_info::ResponsesCompatibility::StatelessFunctions),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        None,
+                    );
+                },
+                ToolPlanInputs {
+                    extension_tool_executors: vec![Arc::new(DeferredExtensionTool)],
+                    ..ToolPlanInputs::default()
+                },
+            ).await;
+            plan.assert_visible_lacks(&["tool_search"]);
+            plan.assert_visible_contains(&["extension_echo"]);
+            plan.assert_registered_contains(&["extension_echo"]);
+            assert_eq!(plan.exposure("extension_echo"), ToolExposure::Direct);
+        }
+    }
+}
+
 impl<'call> ToolExecutor<ExtensionToolCall<'call>> for DeferredExtensionTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("extension_echo")

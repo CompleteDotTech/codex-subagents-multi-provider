@@ -2910,6 +2910,14 @@
             }
           ],
           "description": "Remote context-compaction protocol; omission preserves provider defaults."
+        },
+        "responses": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResponsesCompatibility"
+            }
+          ],
+          "description": "Responses request/history dialect. This cannot grant tool or filesystem authority."
         }
       },
       "type": "object"
@@ -4302,6 +4310,25 @@
         "url"
       ],
       "type": "object"
+    },
+    "ResponsesCompatibility": {
+      "description": "Wire compatibility for Responses endpoints, independent of provider or model names.",
+      "oneOf": [
+        {
+          "description": "Full Responses protocol, preserving the existing OpenAI-compatible behavior.",
+          "enum": [
+            "full"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Stateless HTTP requests with portable history and function tools only.",
+          "enum": [
+            "stateless_functions"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ResumeCwdMode": {
       "description": "Working directory to use when resuming or forking a session.",

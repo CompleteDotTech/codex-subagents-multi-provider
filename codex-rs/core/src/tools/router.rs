@@ -253,6 +253,91 @@ impl ToolRouter {
         self.registry.registered_tool(tool_name)
     }
 
+    /// Resolve only an existing registered runtime, never a model-defined handler.
+    pub(crate) fn resolve_wire_tool(
+        &self,
+        wire_name: &ToolName,
+    ) -> Result<(&RegisteredTool, bool), FunctionCallError> {
+        // Resolve the advertised identity before touching the runtime registry.
+        // A hidden/nested runtime may share the flattened alias of a visible
+        // plain tool, but must neither shadow it nor gain direct admission.
+        let mut candidates = self
+            .model_visible_specs
+            .iter()
+            .flat_map(|spec| match spec {
+                ToolSpec::Function(tool) => vec![ToolName::plain(tool.name.clone())],
+                ToolSpec::Freeform(tool) => vec![ToolName::plain(tool.name.clone())],
+                ToolSpec::Namespace(namespace) => namespace
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        let name = match tool {
+                            ResponsesApiNamespaceTool::Function(tool) => &tool.name,
+                            ResponsesApiNamespaceTool::Custom(tool) => &tool.name,
+                        };
+                        ToolName::namespaced(namespace.name.clone(), name.clone())
+                    })
+                    .collect(),
+                ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => Vec::new(),
+            })
+            .filter(|name| {
+                crate::client::responses_compatibility::wire_tool_name(
+                    name.namespace.as_deref(),
+                    &name.name,
+                ) == wire_name.name
+            });
+        let name = candidates.next().ok_or_else(|| {
+            FunctionCallError::RespondToModel("unsupported function tool name".to_string())
+        })?;
+        if candidates.next().is_some()
+            || wire_name
+                .namespace
+                .as_deref()
+                .is_some_and(|namespace| namespace != codex_protocol::DEFAULT_FUNCTION_NAMESPACE)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "unsupported or ambiguous function tool name".to_string(),
+            ));
+        }
+        let registered = self.registry.registered_tool(&name).ok_or_else(|| {
+            FunctionCallError::RespondToModel("unsupported function tool name".to_string())
+        })?;
+        let spec = registered.spec();
+        let freeform = match &*spec {
+            ToolSpec::Freeform(_) => true,
+            ToolSpec::Namespace(namespace) => namespace.name == name.namespace.as_deref().unwrap_or(codex_protocol::DEFAULT_FUNCTION_NAMESPACE)
+                && namespace.tools.iter().any(|tool| matches!(tool, ResponsesApiNamespaceTool::Custom(tool) if tool.name == name.name)),
+            _ => false,
+        };
+        Ok((registered, freeform))
+    }
+
+    /// Normalize external wire calls before recording, readiness or scheduling.
+    /// Native Code Mode/plaintext calls already carry canonical names and payloads.
+    pub(crate) fn normalize_wire_call(
+        &self,
+        mut call: ToolCall,
+        source: &ToolCallSource,
+        stateless: bool,
+    ) -> Result<ToolCall, FunctionCallError> {
+        if matches!(source, ToolCallSource::Direct) && stateless {
+            let (registered, freeform) = self.resolve_wire_tool(&call.tool_name)?;
+            call.tool_name = registered.runtime.tool_name();
+            let ToolPayload::Function { arguments } = &call.payload else {
+                return Err(FunctionCallError::RespondToModel(
+                    "this provider must use function tool calls".to_string(),
+                ));
+            };
+            if freeform {
+                call.payload = ToolPayload::Custom {
+                    input: crate::client::responses_compatibility::decode_freeform(arguments)
+                        .map_err(FunctionCallError::RespondToModel)?,
+                };
+            }
+        }
+        Ok(call)
+    }
+
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
         match item {

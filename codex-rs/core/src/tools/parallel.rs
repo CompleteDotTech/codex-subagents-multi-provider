@@ -69,6 +69,22 @@ impl ToolCallRuntime {
         &self,
         tool_name: &codex_tools::ToolName,
     ) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
+        if self.stateless_responses() {
+            let (registered, freeform) = self
+                .step_context
+                .tool_router
+                .resolve_wire_tool(tool_name)
+                .ok()?;
+            if freeform {
+                // The wire deltas are JSON wrapper fragments, not raw grammar
+                // input. Final decoding/validation still runs before execution.
+                return None;
+            }
+            return self
+                .step_context
+                .tool_router
+                .create_diff_consumer(&registered.runtime.tool_name());
+        }
         self.step_context
             .tool_router
             .create_diff_consumer(tool_name)
@@ -80,20 +96,35 @@ impl ToolCallRuntime {
         call: ToolCall,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ResponseItemEnvelope, CodexErr>> {
-        let error_call = call.clone();
         let source = call.direct_source();
+        let wire_call = call.clone();
+        let call = match self.step_context.tool_router.normalize_wire_call(
+            call,
+            &source,
+            self.stateless_responses(),
+        ) {
+            Ok(call) => call,
+            Err(error) => {
+                return Either::Left(std::future::ready(Ok(ResponseItemEnvelope::new(
+                    Self::failure_response(wire_call, error).into(),
+                ))));
+            }
+        };
+        let error_call = call.clone();
+        let bridged_freeform = matches!(wire_call.payload, ToolPayload::Function { .. })
+            && matches!(call.payload, ToolPayload::Custom { .. });
         let recorder = self.session.services.executed_tool_calls.clone();
         let recorded_call = recorder.prepare_direct_call(&call, &source, &self.step_context);
         let step_context = Arc::clone(&self.step_context);
         let call_state = Arc::new(ToolCallState::default());
-        let future = self.handle_tool_call_with_source(
+        let future = self.handle_canonical_tool_call_with_source(
             step_context,
             call,
             source,
             cancellation_token,
             Arc::clone(&call_state),
         );
-        async move {
+        Either::Right(async move {
             let result = future.await;
             let mut recorded_call =
                 recorded_call.filter(|(_, recording)| recording.strong_count() > 0);
@@ -117,13 +148,57 @@ impl ToolCallRuntime {
                     .get_or_insert_default()
                     .delivered_assistant_message = Some(text.clone());
             }
+            if bridged_freeform
+                && let codex_protocol::models::ResponseItem::CustomToolCallOutput {
+                    call_id,
+                    output,
+                    ..
+                } = response.item
+            {
+                // Stored incoming history retains the external function call.
+                // Match that call's output dialect after the native handler has
+                // completed, including its validation/cancellation failures.
+                response.item = ResponseInputItem::FunctionCallOutput { call_id, output }.into();
+            }
             recorder.attach_direct_call_to_output(&mut response.item, recorded_call);
             Ok(response)
-        }
+        })
     }
 
     #[instrument(level = "trace", skip_all)]
     pub(crate) fn handle_tool_call_with_source(
+        self,
+        step_context: Arc<StepContext>,
+        call: ToolCall,
+        source: ToolCallSource,
+        cancellation_token: CancellationToken,
+        call_state: Arc<ToolCallState>,
+    ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
+        let stateless = step_context.turn.provider.capabilities().responses
+            == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions;
+        let call = match step_context
+            .tool_router
+            .normalize_wire_call(call, &source, stateless)
+        {
+            Ok(call) => call,
+            Err(error) => return Either::Left(std::future::ready(Err(error))),
+        };
+        Either::Right(self.handle_canonical_tool_call_with_source(
+            step_context,
+            call,
+            source,
+            cancellation_token,
+            call_state,
+        ))
+    }
+
+    fn stateless_responses(&self) -> bool {
+        self.step_context.turn.provider.capabilities().responses
+            == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    fn handle_canonical_tool_call_with_source(
         self,
         step_context: Arc<StepContext>,
         call: ToolCall,
@@ -884,3 +959,7 @@ mod tests {
 #[cfg(test)]
 #[path = "parallel_observation_tests.rs"]
 mod observation_tests;
+
+#[cfg(test)]
+#[path = "parallel_stateless_tests.rs"]
+mod stateless_tests;
