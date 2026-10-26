@@ -5,6 +5,8 @@
 use super::OAuthSessionManager;
 use super::RefreshPolicy;
 use super::login;
+use sha2::Digest;
+use sha2::Sha256;
 use std::fmt;
 use std::io;
 
@@ -12,6 +14,37 @@ use std::io;
 pub struct OAuthRequestCredentials {
     pub access_token: String,
     pub authorization_id: Option<String>,
+}
+
+impl OAuthRequestCredentials {
+    /// Opaque scope for the exact credential pair used by a request. Token
+    /// rotation invalidates derived caches, including grants without an ID.
+    pub fn cache_identity(&self, credential_id: &str) -> String {
+        credential_cache_identity(
+            credential_id,
+            &self.access_token,
+            self.authorization_id.as_deref(),
+        )
+    }
+}
+
+pub(super) fn credential_cache_identity(
+    credential_id: &str,
+    token: &str,
+    authorization_id: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update([u8::from(authorization_id.is_some())]);
+    for field in [
+        "oauth-derived-cache-v1",
+        credential_id,
+        token,
+        authorization_id.unwrap_or_default(),
+    ] {
+        digest.update((field.len() as u64).to_le_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 impl fmt::Debug for OAuthRequestCredentials {

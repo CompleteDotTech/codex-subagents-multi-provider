@@ -17,6 +17,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -42,6 +43,16 @@ const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 /// manager owns refresh policy, cache behavior, and catalog merging; it calls
 /// this endpoint only when it decides a remote refresh should happen.
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
+    /// Observe externally replaceable credential state before serving derived
+    /// metadata. Ordinary providers retain the cheap existing identity path.
+    fn reconcile_identity(&self) -> ModelsEndpointFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Synchronous metadata readers cannot perform the required store observation.
+    fn requires_identity_reconciliation(&self) -> bool {
+        false
+    }
     /// Opaque identity of the current provider and credentials, without resolving auth.
     ///
     /// Must distinguish provider routing and authenticated principals within the
@@ -71,7 +82,7 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
         &'a self,
         client_version: &'a str,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>>;
+    ) -> ModelsEndpointFuture<'a, Result<ModelsEndpointResponse, ModelsEndpointError>>;
 }
 
 /// Catalog and validation metadata captured using the credentials for one request.
@@ -82,6 +93,33 @@ pub struct ModelsEndpointResponse {
     /// Identity of the credentials actually used to fetch this catalog.
     /// Successful responses must always identify their provider and authentication scope.
     pub identity: String,
+}
+
+/// Failure scoped to the credentials actually resolved for one attempted request.
+#[derive(Debug)]
+pub struct ModelsEndpointError {
+    pub error: codex_protocol::error::CodexErr,
+    /// None means authentication failed before an attempted identity was established.
+    pub identity: Option<String>,
+}
+impl From<codex_protocol::error::CodexErr> for ModelsEndpointError {
+    fn from(error: codex_protocol::error::CodexErr) -> Self {
+        Self {
+            error,
+            identity: None,
+        }
+    }
+}
+impl std::ops::Deref for ModelsEndpointError {
+    type Target = codex_protocol::error::CodexErr;
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+impl fmt::Display for ModelsEndpointError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
 }
 
 pub type ModelsEndpointFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -289,6 +327,7 @@ impl CatalogSource {
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
     remote_models: RwLock<ModelsCacheEntry>,
+    rejected_identities: std::sync::RwLock<HashSet<String>>,
     cache: Option<Arc<dyn ModelsCache>>,
     endpoint_client: SharedModelsEndpointClient,
     catalog_source: CatalogSource,
@@ -312,7 +351,7 @@ impl OpenAiModelsManager {
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         Self::new_with_optional_cache(
-            Some(Arc::new(FileModelsCache::new(
+            Some(Arc::new(FileModelsCache::partitioned(
                 cache_path,
                 DEFAULT_MODEL_CACHE_TTL,
             ))),
@@ -354,6 +393,7 @@ impl OpenAiModelsManager {
                 identity: endpoint_client.identity(),
                 models: load_remote_models_from_file().unwrap_or_default(),
             }),
+            rejected_identities: std::sync::RwLock::new(HashSet::new()),
             cache,
             api_key_model_discovery_enabled: AtomicBool::new(false),
             endpoint_client,
@@ -405,6 +445,7 @@ impl ModelsManager for OpenAiModelsManager {
     ) -> ModelsManagerFuture<'_, ()> {
         Box::pin(async move {
             let refresh = async {
+                self.endpoint_client.reconcile_identity().await;
                 // Resolve lazy command credentials before comparing catalog identities.
                 if !self.should_refresh_models().await {
                     return Ok(());
@@ -431,12 +472,16 @@ impl ModelsManager for OpenAiModelsManager {
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move {
+            self.endpoint_client.reconcile_identity().await;
             let entry = self.remote_models.read().await;
             self.models_for_entry(&entry).into_owned()
         })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+        if self.endpoint_client.requires_identity_reconciliation() {
+            return Ok(Vec::new());
+        }
         let entry = self.remote_models.try_read()?;
         Ok(self.models_for_entry(&entry).into_owned())
     }
@@ -452,6 +497,7 @@ impl ModelsManager for OpenAiModelsManager {
         config: &'a ModelsManagerConfig,
     ) -> ModelsManagerFuture<'a, ModelInfo> {
         Box::pin(async move {
+            self.endpoint_client.reconcile_identity().await;
             let remote = {
                 let entry = self.remote_models.read().await;
                 let models = self.models_for_entry(&entry);
@@ -485,8 +531,28 @@ impl ModelsManager for OpenAiModelsManager {
 }
 
 impl OpenAiModelsManager {
+    // Rejections survive account switches even if persistent invalidation failed.
+    fn identity_rejected(&self, identity: &str) -> bool {
+        self.rejected_identities
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(identity)
+    }
+
     /// Selects the catalog available under the current provider and auth identity.
     fn models_for_entry<'a>(&self, entry: &'a ModelsCacheEntry) -> Cow<'a, [ModelInfo]> {
+        if entry
+            .identity
+            .as_ref()
+            .is_some_and(|identity| self.identity_rejected(identity))
+        {
+            return Cow::Borrowed(&[]);
+        }
+        if self.endpoint_client.requires_identity_reconciliation()
+            && self.endpoint_client.identity().is_none()
+        {
+            return Cow::Borrowed(&[]);
+        }
         if !self.api_key_discovery_disabled()
             && entry.identity.is_some()
             && entry.identity == self.endpoint_client.identity()
@@ -515,6 +581,7 @@ impl OpenAiModelsManager {
 
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
         let refresh_guard = self.catalog_source.refresh_lock().await;
+        self.endpoint_client.reconcile_identity().await;
         let (identity, current_etag) = {
             let entry = self.remote_models.read().await;
             (entry.identity.clone(), entry.etag.clone())
@@ -548,6 +615,7 @@ impl OpenAiModelsManager {
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
         let _refresh_guard = self.catalog_source.refresh_lock().await;
+        self.endpoint_client.reconcile_identity().await;
         // API-key discovery must be enabled and supported before reusing a remote catalog.
         // Otherwise even a matching cache from an earlier run would bypass bundled-only behavior.
         // Command-auth providers retain their existing discovery behavior.
@@ -583,7 +651,6 @@ impl OpenAiModelsManager {
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
         let client_version = crate::client_version_to_whole();
-        let request_identity = self.endpoint_client.identity();
         let ModelsEndpointResponse {
             models,
             etag,
@@ -594,7 +661,10 @@ impl OpenAiModelsManager {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
+            Err(ModelsEndpointError {
+                error,
+                identity: request_identity,
+            }) => {
                 // A failed fetch is not an authoritative empty catalog. Keep the last
                 // successful snapshot (and its original freshness) unless access was
                 // explicitly rejected. Provider/auth identity checks still govern reuse.
@@ -608,22 +678,27 @@ impl OpenAiModelsManager {
                 );
 
                 if is_provider_catalog && (access_denied || credentials_rejected) {
+                    if let Some(identity) = request_identity.as_ref() {
+                        self.rejected_identities
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(identity.clone());
+                    }
+                    self.endpoint_client.reconcile_identity().await;
                     {
                         let mut current = self.remote_models.write().await;
-                        if request_identity != self.endpoint_client.identity() {
-                            return Err(error);
+                        if request_identity.is_some() && current.identity == request_identity {
+                            current.fetched_at = DateTime::<Utc>::MIN_UTC;
+                            current.models.clear();
+                            current.etag = None;
                         }
-                        // Keep this failure in memory even if persistent invalidation fails.
-                        current.fetched_at = DateTime::<Utc>::MIN_UTC;
-                        current.models.clear();
-                        current.etag = None;
-                        current.identity.clone_from(&request_identity);
                     }
                     if let Some(identity) = request_identity
                         && let Some(cache) = self.cache.as_ref()
                     {
                         let invalidation = async {
-                            if let Some(mut entry) = cache.load(&client_version).await?
+                            if let Some(mut entry) =
+                                cache.load_scoped(&client_version, &identity).await?
                                 && entry.identity.as_deref() == Some(&identity)
                                 && entry.client_version.as_deref() == Some(&client_version)
                             {
@@ -643,6 +718,11 @@ impl OpenAiModelsManager {
                 return Err(error);
             }
         };
+        self.rejected_identities
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&identity);
+        self.endpoint_client.reconcile_identity().await;
         if Some(&identity) != self.endpoint_client.identity().as_ref() {
             return Ok(());
         }
@@ -688,12 +768,19 @@ impl OpenAiModelsManager {
         self.endpoint_client.uses_codex_backend().await
             || self.endpoint_client.has_command_auth()
             || self.supports_api_key_discovery()
+            || matches!(&self.catalog_source, CatalogSource::ExplicitProvider(_))
     }
 
     /// Publish only while the request identity still matches, including after async storage.
     async fn apply_remote_models(&self, mut entry: ModelsCacheEntry) -> bool {
+        self.endpoint_client.reconcile_identity().await;
         let mut current = self.remote_models.write().await;
-        if entry.identity != self.endpoint_client.identity() {
+        if entry.identity != self.endpoint_client.identity()
+            || entry
+                .identity
+                .as_ref()
+                .is_some_and(|identity| self.identity_rejected(identity))
+        {
             return false;
         }
         let remote_only = entry
@@ -728,6 +815,7 @@ impl OpenAiModelsManager {
         let Some(cache) = self.cache.as_ref() else {
             return false;
         };
+        self.endpoint_client.reconcile_identity().await;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::client_version_to_whole();
@@ -735,6 +823,9 @@ impl OpenAiModelsManager {
         let Some(identity) = self.endpoint_client.identity() else {
             return false;
         };
+        if self.identity_rejected(&identity) {
+            return false;
+        }
         {
             let current = self.remote_models.read().await;
             // An access rejection must not be replaced by stale cache data if invalidation failed.
@@ -744,7 +835,7 @@ impl OpenAiModelsManager {
                 return false;
             }
         }
-        let cache_entry = match cache.load(&client_version).await {
+        let cache_entry = match cache.load_scoped(&client_version, &identity).await {
             Ok(Some(cache_entry)) => cache_entry,
             Ok(None) => {
                 info!("models cache: no usable cache entry");

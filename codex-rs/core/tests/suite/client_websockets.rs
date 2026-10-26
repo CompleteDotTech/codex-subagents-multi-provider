@@ -1303,6 +1303,82 @@ async fn responses_websocket_prewarm_reuses_advisory_model_and_tier_routing_hint
     server.shutdown().await;
 }
 
+#[test_case::test_case("custom", false, "flex", None; "custom unsupported flex")]
+#[test_case::test_case("custom", true, "flex", Some("flex"); "custom advertised flex")]
+#[test_case::test_case("openai", false, "flex", Some("flex"); "openai implicit flex")]
+#[test_case::test_case("custom", false, "default", None; "custom default sentinel")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_provider_catalog_tiers_apply_to_handshake_and_warmup(
+    provider_id: &str,
+    advertised: bool,
+    requested: &str,
+    expected: Option<&str>,
+) {
+    skip_if_no_network!();
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-1"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+    // A custom ID can have the same display name/endpoint behavior as OpenAI;
+    // only its selected catalog can authorize its request tier.
+    let provider = ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    let harness = websocket_harness_with_provider_id_options_and_auth(
+        provider,
+        provider_id,
+        false,
+        false,
+        &[],
+        Some(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+    )
+    .await;
+    let mut model_info = harness.model_info.clone();
+    model_info.service_tiers.clear();
+    if advertised {
+        model_info.service_tiers.push(ModelServiceTier {
+            id: "flex".into(),
+            name: "Flex".into(),
+            description: "fixture".into(),
+        });
+    }
+    let mut session = harness.client.new_session();
+    let metadata = prewarm_metadata(&harness, None);
+    session
+        .preconnect_websocket(
+            &model_info,
+            Some(requested.into()),
+            &harness.session_telemetry,
+            &metadata,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .single_handshake()
+            .header(X_CODEX_ROUTING_HINT_HEADER),
+        Some(expected.map_or_else(
+            || format!("model={MODEL}"),
+            |tier| format!("model={MODEL};tier={tier}")
+        ))
+    );
+    session
+        .prewarm_websocket(
+            &prompt_with_input(vec![message_item("hello")]),
+            &model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            Some(requested.into()),
+            &metadata,
+        )
+        .await
+        .unwrap();
+    let connection = server.single_connection();
+    assert_eq!(connection.len(), 1);
+    assert_eq!(connection[0].body_json()["service_tier"].as_str(), expected);
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websockets() {
     skip_if_no_network!();
@@ -2803,8 +2879,33 @@ async fn websocket_harness_with_provider_options_and_auth(
     enabled_features: &[Feature],
     auth: Option<CodexAuth>,
 ) -> WebsocketTestHarness {
+    let provider_id = if provider.is_openai() {
+        "openai"
+    } else {
+        "websocket-test"
+    };
+    websocket_harness_with_provider_id_options_and_auth(
+        provider,
+        provider_id,
+        runtime_metrics_enabled,
+        concurrent_reasoning_summaries_enabled,
+        enabled_features,
+        auth,
+    )
+    .await
+}
+
+async fn websocket_harness_with_provider_id_options_and_auth(
+    provider: ModelProviderInfo,
+    provider_id: &str,
+    runtime_metrics_enabled: bool,
+    concurrent_reasoning_summaries_enabled: bool,
+    enabled_features: &[Feature],
+    auth: Option<CodexAuth>,
+) -> WebsocketTestHarness {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
+    config.model_provider_id = provider_id.to_owned();
     config.model = Some(MODEL.to_string());
     if runtime_metrics_enabled {
         config
@@ -2865,6 +2966,7 @@ async fn websocket_harness_with_provider_options_and_auth(
         client_auth_manager,
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
+        config.model_provider_id.clone(),
         provider.clone(),
         SessionSource::Exec,
         "test_originator".to_string(),

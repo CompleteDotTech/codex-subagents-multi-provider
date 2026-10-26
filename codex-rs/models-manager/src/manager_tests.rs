@@ -229,14 +229,18 @@ impl TestModelsEndpoint {
             .expect("observed proxy policy lock should not be poisoned")
     }
 
-    async fn list_models(&self) -> CoreResult<ModelsEndpointResponse> {
+    async fn list_models(&self) -> Result<ModelsEndpointResponse, ModelsEndpointError> {
         self.fetch_count.fetch_add(1, Ordering::SeqCst);
         let models = self
             .responses
             .lock()
             .expect("responses lock should not be poisoned")
             .pop_front()
-            .unwrap_or_else(|| Ok(Vec::new()))?;
+            .unwrap_or_else(|| Ok(Vec::new()))
+            .map_err(|error| ModelsEndpointError {
+                error,
+                identity: self.identity(),
+            })?;
         Ok(ModelsEndpointResponse {
             models,
             etag: self.etag.clone(),
@@ -298,7 +302,7 @@ impl ModelsEndpointClient for TestModelsEndpoint {
         &'a self,
         _client_version: &'a str,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+    ) -> ModelsEndpointFuture<'a, Result<ModelsEndpointResponse, ModelsEndpointError>> {
         Box::pin(async move {
             *self
                 .observed_proxy_policy
@@ -336,9 +340,10 @@ where
     F: FnOnce(&mut ModelsCacheEntry),
 {
     let client_version = crate::client_version_to_whole();
-    let cache = FileModelsCache::new(codex_home.join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
+    let cache =
+        FileModelsCache::partitioned(codex_home.join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
     let mut entry = cache
-        .load(&client_version)
+        .load_scoped(&client_version, "test-provider")
         .await
         .expect("cache load succeeds")
         .expect("cache entry exists");
@@ -1605,7 +1610,7 @@ impl TestAuthAwareModelsEndpoint {
         }
     }
 
-    async fn list_models(&self) -> CoreResult<ModelsEndpointResponse> {
+    async fn list_models(&self) -> Result<ModelsEndpointResponse, ModelsEndpointError> {
         self.fetch_count.fetch_add(1, Ordering::SeqCst);
         let models = self
             .responses
@@ -1645,7 +1650,7 @@ impl ModelsEndpointClient for TestAuthAwareModelsEndpoint {
         &'a self,
         _client_version: &'a str,
         _http_client_factory: HttpClientFactory,
-    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+    ) -> ModelsEndpointFuture<'a, Result<ModelsEndpointResponse, ModelsEndpointError>> {
         Box::pin(TestAuthAwareModelsEndpoint::list_models(self))
     }
 }
