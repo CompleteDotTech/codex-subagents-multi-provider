@@ -143,6 +143,12 @@ async fn high_stdio_descriptors_use_compatible_fallback() -> anyhow::Result<()> 
             ])
             .env("CODEX_TEST_HIGH_STDIO_FDS", "1")
             .output()?;
+        let stderr = &output.stderr[..output.stderr.len().min(8 * 1024)];
+        eprintln!(
+            "high-fd isolated child status={} stderr (at most 8192 bytes):\n{}",
+            output.status,
+            String::from_utf8_lossy(stderr)
+        );
         assert!(output.status.success(), "{output:?}");
         return Ok(());
     }

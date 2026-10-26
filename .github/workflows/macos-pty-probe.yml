@@ -1,0 +1,93 @@
+name: macOS native PTY diagnostic probe
+
+on:
+  push:
+    branches: [task/53-macos-high-fd]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-pty:
+    if: github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Identify native architecture and record read-only host context
+        id: native
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/macos-pty-probe"
+          case "$(uname -m)" in
+            x86_64) target=x86_64-apple-darwin ;;
+            arm64) target=aarch64-apple-darwin ;;
+            *) echo "Unsupported native macOS architecture" >&2; exit 1 ;;
+          esac
+          echo "target=${target}" >> "${GITHUB_OUTPUT}"
+          {
+            printf 'source_sha=%s\ntarget=%s\n' "${GITHUB_SHA}" "${target}"
+            uname -a
+            /usr/sbin/sysctl kern.maxfiles kern.maxfilesperproc || true
+            launchctl limit maxfiles || true
+          } 2>&1 | tee "${RUNNER_TEMP}/macos-pty-probe/host-context.txt"
+
+      - name: Prepare Bazel CI
+        id: prepare_bazel
+        uses: ./.github/actions/prepare-bazel-ci
+        with:
+          target: ${{ steps.native.outputs.target }}
+          cache-scope: macos-pty-probe
+
+      - name: Run the full native PTY unit suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.github/scripts/run-bazel-ci.sh \
+            --print-failed-action-summary \
+            --print-failed-test-logs \
+            -- \
+            test \
+            --test_output=all \
+            --test_arg=--nocapture \
+            --build_metadata=COMMIT_SHA="${GITHUB_SHA}" \
+            -- \
+            //codex-rs/utils/pty:pty-unit-tests \
+            2>&1 | tee "${RUNNER_TEMP}/macos-pty-probe/console.log"
+
+      - name: Collect PTY logs and native binary identity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/macos-pty-probe"
+          mkdir -p "${evidence}"
+          printf 'source_sha=%s\n' "${GITHUB_SHA}" > "${evidence}/source.txt"
+          testlogs=bazel-testlogs/codex-rs/utils/pty/pty-unit-tests
+          for name in test.log test.xml; do
+            if [[ -f "${testlogs}/${name}" ]]; then
+              cp "${testlogs}/${name}" "${evidence}/${name}"
+            fi
+          done
+          {
+            for name in pty-unit-tests pty-unit-tests-bin; do
+              binary="bazel-bin/codex-rs/utils/pty/${name}"
+              if [[ -f "${binary}" ]]; then
+                file -L "${binary}"
+                shasum -a 256 "${binary}"
+              fi
+            done
+          } > "${evidence}/binary-identity.txt" 2>&1
+
+      - name: Upload PTY probe evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: macos-pty-probe-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-pty-probe
+          if-no-files-found: error
