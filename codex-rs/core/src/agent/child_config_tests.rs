@@ -145,7 +145,7 @@ request_max_retries = 0
             let path = host.path().join("config.toml");
             let mut contents = std::fs::read_to_string(&path).unwrap();
             contents.push_str(&format!(
-                "\n[features.guardianv2]\nreview_threshold={threshold}\n"
+                "\n[features.guardianv2]\nenabled=true\nreview_threshold={threshold}\n"
             ));
             std::fs::write(path, contents).unwrap();
         }
@@ -1508,6 +1508,7 @@ async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
         "type":"message","role":"user","content":[{"type":"input_text","text":"persist typed Guardian ceiling"}]
     })).unwrap()]).await.unwrap();
     let actual = child.session.get_config().await;
+    assert!(actual.features.enabled(Feature::GuardianV2));
     assert_eq!(
         actual.config_layer_stack.effective_config()["features"]["guardianv2"]["review_threshold"]
             .as_float(),
@@ -1554,6 +1555,15 @@ async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
             .effective_config()["features"]["guardianv2"]["review_threshold"]
             .as_float(),
         Some(0.75)
+    );
+    assert!(
+        fixture
+            .parent
+            .session
+            .get_config()
+            .await
+            .features
+            .enabled(Feature::GuardianV2)
     );
     let runtime = &fixture.parent.session.services.local_agent_runtime;
     let error = runtime
