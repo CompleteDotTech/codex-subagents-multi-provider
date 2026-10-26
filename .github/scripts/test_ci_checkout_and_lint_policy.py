@@ -39,6 +39,9 @@ class CheckoutAndLintPolicyTest(unittest.TestCase):
                     self.assertIn("if: runner.os == 'Windows'", before_checkout)
                     self.assertIn("shell: pwsh", before_checkout)
                     self.assertIn(
+                        "working-directory: ${{ runner.temp }}", before_checkout
+                    )
+                    self.assertIn(
                         "run: git config --global core.longpaths true", before_checkout
                     )
 
