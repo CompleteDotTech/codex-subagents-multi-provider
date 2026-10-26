@@ -723,6 +723,8 @@ async fn native_runtime_cwd_and_write_scope_revoke_host_file_authority() -> Resu
                     Some(codex_protocol::models::PermissionProfile::Disabled);
             }
             fixture.test.codex.update_thread_settings(overrides).await?;
+            // Source trust must fail before attempting even a catalog read.
+            std::fs::remove_file(fixture.home.path().join("catalog.json"))?;
             scripted_spawn(&fixture.root, version, "scope_rejection",
                 json!({"message":"source became writable/project-owned", "model_provider":"blocked"})).await;
             // blocked owns an executable helper, providing a direct before-I/O marker.
@@ -883,5 +885,62 @@ async fn public_resumed_child_history_cannot_be_reclassified_by_source_labels() 
     fixture.turn("delegate after forged attempts").await?;
     assert_eq!(fixture.children(1).await?.len(), 1);
     fixture.assert_provider_headers().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_provider_does_not_replace_an_incompatible_role_model_or_fall_back() -> Result<()>
+{
+    for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
+        let fixture = Fixture::with_host_setup(version, None, |config| {
+            std::fs::write(
+                config.codex_home.join("role.toml"),
+                "model_provider='b'\nmodel='role-only-b'\n",
+            )
+            .unwrap();
+        })
+        .await?;
+        scripted_spawn(
+            &fixture.root,
+            version,
+            "role_model_rejection",
+            json!({"message":"incompatible role model", "agent_type":"provider_role",
+                "model_provider":"a", "model":"shared"}),
+        )
+        .await;
+        fixture
+            .turn("select provider A while retaining role model precedence")
+            .await?;
+        assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
+        assert!(
+            fixture
+                .a
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .b
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty()
+        );
+        assert!(!fixture.home.path().join("helper-marker").exists());
+        assert!(
+            fixture
+                .root
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .iter()
+                .filter(|request| request.method.as_str() == "POST")
+                .any(|request| body(request)
+                    .to_string()
+                    .contains("child_provider_model_unavailable"))
+        );
+    }
     Ok(())
 }

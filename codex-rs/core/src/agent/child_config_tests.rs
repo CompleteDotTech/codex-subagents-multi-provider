@@ -964,6 +964,8 @@ async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenan
     let filesystem = runtime.permissions.file_system_sandbox_policy();
     let host_config = fixture._host.path().join("config.toml");
     let host_catalog = fixture._host.path().join("zai.json");
+    assert!(filesystem.can_write_local_path_with_cwd(&host_config, runtime.cwd.as_path()));
+    assert!(filesystem.can_write_local_path_with_cwd(&host_catalog, runtime.cwd.as_path()));
     assert!(
         error
             .as_ref()

@@ -54,6 +54,23 @@ env_key = "CHILD_PROVIDER_TEST_KEY"
         required: Option<&str>,
         protected_roots: &[AbsolutePathBuf],
     ) -> ChildProviderPolicy {
+        self.policy_with_runtime_filesystem(
+            project,
+            session,
+            required,
+            protected_roots,
+            &FileSystemSandboxPolicy::restricted(Vec::new()),
+        )
+    }
+
+    fn policy_with_runtime_filesystem(
+        &self,
+        project: &str,
+        session: &str,
+        required: Option<&str>,
+        protected_roots: &[AbsolutePathBuf],
+        filesystem: &FileSystemSandboxPolicy,
+    ) -> ChildProviderPolicy {
         let user = resolve_relative_paths_in_config_toml(
             toml::from_str(&self.user).unwrap(),
             self.home.path(),
@@ -96,7 +113,7 @@ env_key = "CHILD_PROVIDER_TEST_KEY"
             &AbsolutePathBuf::from_absolute_path(self.project.path()).unwrap(),
             &[],
             protected_roots,
-            &FileSystemSandboxPolicy::restricted(Vec::new()),
+            filesystem,
         )
         .unwrap()
     }
@@ -870,5 +887,103 @@ fn native_guidance_filters_authority_managed_constraints_and_definition_shadowin
         !policy
             .selectable_provider_ids(None, "openai")
             .contains(&"openai".to_owned())
+    );
+}
+
+#[test]
+fn unrestricted_filesystem_rejects_file_authority_outside_all_workspace_roots() {
+    let fixture = Fixture::new();
+    let cwd = AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap();
+    let filesystem = FileSystemSandboxPolicy::unrestricted();
+    assert!(
+        filesystem
+            .get_writable_roots_with_cwd(cwd.as_path())
+            .is_empty()
+    );
+    assert!(
+        filesystem
+            .can_write_local_path_with_cwd(&fixture.home.path().join("config.toml"), cwd.as_path())
+    );
+    let policy = fixture.policy_with_runtime_filesystem("", "", None, &[], &filesystem);
+    let parent = ModelProviderInfo::default();
+    let mut input = request(&parent);
+    input.explicit_provider = Some("zai");
+    assert_eq!(
+        policy.resolve(input).unwrap_err().code,
+        "child_provider_untrusted_source"
+    );
+    assert!(
+        !policy
+            .selectable_provider_ids(None, "openai")
+            .contains(&"zai".into())
+    );
+}
+
+#[test]
+fn non_file_managed_authority_cannot_promote_a_writable_local_catalog() {
+    let fixture = Fixture::new();
+    let cwd = AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap();
+    let config = resolve_relative_paths_in_config_toml(
+        toml::from_str(&fixture.user).unwrap(),
+        fixture.home.path(),
+    )
+    .unwrap();
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::Mdm {
+                domain: "child-provider-test".into(),
+                key: "managed".into(),
+            },
+            config,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .unwrap();
+    let filesystem = FileSystemSandboxPolicy::unrestricted();
+    let policy =
+        ChildProviderPolicy::from_config_layers(&stack, &cwd, &[], &[], &filesystem).unwrap();
+    // The delivered MDM definition is still trusted; its writable file payload is not.
+    assert!(policy.authorize("zai", None).is_ok());
+    let parent = ModelProviderInfo::default();
+    let mut input = request(&parent);
+    input.explicit_provider = Some("zai");
+    let error = policy.resolve(input).unwrap_err();
+    assert_eq!(error.code, "child_provider_untrusted_source");
+    assert!(error.to_string().contains("catalog is writable"));
+}
+
+#[test]
+fn reopened_read_only_carveout_cannot_retain_file_authority_or_root_exemption() {
+    let mut fixture = Fixture::new();
+    fixture.home = tempfile::tempdir_in(fixture.project.path()).unwrap();
+    std::fs::write(fixture.home.path().join("catalog.json"), "{}").unwrap();
+    let protected = [AbsolutePathBuf::from_absolute_path(fixture.home.path()).unwrap()];
+    let readonly = fixture.policy_with_runtime_filesystem(
+        "",
+        "",
+        None,
+        &protected,
+        &FileSystemSandboxPolicy::restricted(Vec::new()),
+    );
+    let original = readonly.providers["zai"].clone();
+    let mut input = request(&original);
+    input.explicit_provider = Some("zai");
+    assert!(readonly.resolve(input).is_ok());
+    // A stale list of old carveouts is insufficient once the actual runtime
+    // grants write access. Even the original provider's origin cannot bypass it.
+    let reopened = fixture.policy_with_runtime_filesystem(
+        "",
+        "",
+        None,
+        &protected,
+        &FileSystemSandboxPolicy::unrestricted(),
+    );
+    let mut input = request(&original);
+    input.parent_provider_id = "zai";
+    input.authorization_origin = Some(origin("zai"));
+    assert_eq!(
+        reopened.resolve(input).unwrap_err().code,
+        "child_provider_untrusted_source"
     );
 }

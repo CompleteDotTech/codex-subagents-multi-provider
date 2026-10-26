@@ -192,11 +192,13 @@ impl ChildProviderPolicy {
             is_host_source(source)
                 && source_file(source).is_none_or(|file| {
                     canonical_source_path(file).is_some_and(|file| {
-                        !project_roots.iter().any(|root| {
-                            root.canonicalize().is_ok_and(|root| file.starts_with(root))
-                        }) || (!file_system_policy
-                            .can_write_local_path_with_cwd(&file, cwd.as_path())
-                            && protected_catalog_roots.iter().any(|root| {
+                        // Full-disk write access has no finite writable-root list.
+                        // The live policy's path decision is authoritative even
+                        // when this host file is outside every active workspace.
+                        !file_system_policy.can_write_local_path_with_cwd(&file, cwd.as_path())
+                            && (!project_roots.iter().any(|root| {
+                                root.canonicalize().is_ok_and(|root| file.starts_with(root))
+                            }) || protected_catalog_roots.iter().any(|root| {
                                 root.as_path()
                                     .canonicalize()
                                     .is_ok_and(|root| file.starts_with(root))
@@ -535,6 +537,18 @@ impl ChildProviderPolicy {
                 "child_provider_model_unavailable",
                 provider_id,
                 "configured catalog is not a file",
+            ));
+        }
+        // In unrestricted profiles get_writable_roots_with_cwd is empty;
+        // writable local data still cannot supply privileged model metadata.
+        if self
+            .file_system_policy
+            .can_write_local_path_with_cwd(&canonical, self.cwd.as_path())
+        {
+            return Err(error(
+                "child_provider_untrusted_source",
+                provider_id,
+                "configured catalog is writable under the current filesystem policy",
             ));
         }
         let boundary = self
