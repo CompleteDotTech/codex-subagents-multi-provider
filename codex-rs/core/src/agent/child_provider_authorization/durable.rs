@@ -1,5 +1,6 @@
 //! Protected host-store effective ceiling; provider origins remain separate.
 use super::*;
+use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::openai_models::ModelInfo;
 use codex_thread_store::NativeAuthorityEpoch;
