@@ -1412,6 +1412,184 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
 }
 
 #[tokio::test]
+async fn sqlite_less_warm_reload_uses_only_the_actual_retained_target_model() {
+    let fixture = Fixture::new().await;
+    let config = fixture
+        .prepared(&fixture.resolved("zai").await, None, None)
+        .await
+        .unwrap()
+        .config;
+    let child = fixture.start_native_child(config).await;
+    child.ensure_rollout_materialized().await;
+    child.session.flush_rollout().await.unwrap();
+    let stored = child.read_thread(true, true).await.unwrap();
+    assert!(
+        stored.model.is_none(),
+        "SQLite-less legacy metadata does not claim a selected model"
+    );
+    assert_eq!(child.thread_settings_snapshot().await.model, "shared");
+    child.shutdown_and_wait().await.unwrap();
+    fixture
+        .manager
+        .remove_thread(&child.session.thread_id)
+        .await
+        .unwrap();
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    let turn = fixture
+        .parent
+        .session
+        .new_turn_with_default_settings("warm-model-proof".into(), Default::default())
+        .await;
+    let mut candidate = build_agent_resume_config(&turn).unwrap();
+    candidate.model_provider_id = stored.model_provider;
+    candidate.model = Some("forged-saved-model".into());
+    let history = codex_history::InitialHistory::Resumed(codex_history::ResumedHistory {
+        history_revision: None,
+        conversation_id: child.session.thread_id,
+        history: Arc::new(stored.history.unwrap().items),
+        rollout_path: stored.rollout_path,
+    });
+    let epoch = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+        &fixture.parent.session,
+        &fixture.parent.session_source,
+    )
+    .await;
+    let mut selections = None;
+    let rejected = crate::agent::child_provider_authorization::ChildResumePermit::prepare(
+        runtime,
+        fixture.parent.clone(),
+        epoch,
+        &mut candidate,
+        &history,
+        &child.session_source,
+        Some(fixture.parent.session.thread_id),
+        &stored.permission_profile,
+        stored.approval_mode,
+        MultiAgentVersion::V1,
+        &mut selections,
+        None,
+    )
+    .await;
+    let error = rejected
+        .err()
+        .expect("raw saved model cannot replace actual target selection");
+    assert!(
+        error
+            .to_string()
+            .contains("saved model differs from its retained actual selection"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.manager.list_thread_ids().await,
+        vec![fixture.parent.session.thread_id]
+    );
+    runtime
+        .control(fixture.parent.session.session_id())
+        .resume_agent_from_rollout(
+            fixture.config.clone(),
+            child.session.thread_id,
+            child.session_source.clone(),
+        )
+        .await
+        .expect("real same-host target model remains reloadable without SQLite");
+    let resumed = fixture
+        .manager
+        .get_thread(child.session.thread_id)
+        .await
+        .unwrap();
+    assert_eq!(resumed.thread_settings_snapshot().await.model, "shared");
+    assert_eq!(
+        resumed.thread_settings_snapshot().await.model_provider_id,
+        "zai"
+    );
+    let root_step = StepContext::for_test(fixture.parent.session.new_default_turn().await);
+    fixture
+        .parent
+        .session
+        .record_context_updates_and_set_reference_context_item(&root_step)
+        .await
+        .unwrap();
+    fixture.parent.ensure_rollout_materialized().await;
+    fixture.parent.session.flush_rollout().await.unwrap();
+    let root_context = runtime
+        .upgrade()
+        .unwrap()
+        .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
+            thread_id: fixture.parent.session.thread_id,
+            include_archived: true,
+        })
+        .await
+        .unwrap();
+    let root_path = fixture.parent.rollout_path();
+    fixture
+        .manager
+        .shutdown_all_threads_bounded(std::time::Duration::from_secs(5))
+        .await;
+    let cold_manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("parent-only"),
+        fixture.config.model_provider.clone(),
+        fixture._host.path().to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let cold_root = cold_manager
+        .start_thread(StartThreadOptions {
+            initial_history: codex_history::InitialHistory::Resumed(
+                codex_history::ResumedHistory {
+                    conversation_id: fixture.parent.session.thread_id,
+                    history: Arc::new(root_context.items),
+                    history_revision: root_context.revision,
+                    rollout_path: root_path,
+                },
+            ),
+            ..StartThreadOptions::new(fixture.config.clone())
+        })
+        .await
+        .unwrap()
+        .thread;
+    assert_eq!(
+        cold_root.session.session_id(),
+        fixture.parent.session.session_id()
+    );
+    let cold_runtime = &cold_root.session.services.local_agent_runtime;
+    let cold_turn = cold_root
+        .session
+        .new_turn_with_default_settings("cold-model-no-proof".into(), Default::default())
+        .await;
+    let mut cold_candidate = build_agent_resume_config(&cold_turn).unwrap();
+    cold_candidate.model_provider_id = "zai".into();
+    cold_candidate.model = Some("forged-saved-model".into());
+    let cold_epoch = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+        &cold_root.session,
+        &cold_root.session_source,
+    )
+    .await;
+    let mut selections = None;
+    let rejected = crate::agent::child_provider_authorization::ChildResumePermit::prepare(
+        cold_runtime,
+        cold_root.clone(),
+        cold_epoch,
+        &mut cold_candidate,
+        &history,
+        &child.session_source,
+        Some(cold_root.session.thread_id),
+        &stored.permission_profile,
+        stored.approval_mode,
+        MultiAgentVersion::V1,
+        &mut selections,
+        None,
+    )
+    .await;
+    let error = rejected
+        .err()
+        .expect("raw model with no same-host ceiling cannot create cold authority");
+    assert!(error.to_string().contains("authority"), "{error}");
+    assert_eq!(
+        cold_manager.list_thread_ids().await,
+        vec![cold_root.session.thread_id]
+    );
+}
+
+#[tokio::test]
 async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
     let fixture = Fixture::new().await;
     let catalog_path = fixture._host.path().join("zai.json");

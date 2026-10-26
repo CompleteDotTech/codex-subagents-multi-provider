@@ -592,6 +592,17 @@ impl ChildResumePermit {
                     "saved runtime differs from retained host ownership",
                 ));
             }
+            // SQLite-less legacy metadata omits selected-model fields. Only the
+            // authenticated same-runtime target snapshot may fill that absence.
+            match config.model.as_deref() {
+                Some(model) if model != ceiling.settings.model => {
+                    return Err(invalid(
+                        "saved model differs from its retained actual selection",
+                    ));
+                }
+                None => config.model = Some(ceiling.settings.model.clone()),
+                Some(_) => {}
+            }
             if ceiling.settings.approval_policy != current.settings.approval_policy
                 || ceiling.settings.approvals_reviewer != current.settings.approvals_reviewer
             {
