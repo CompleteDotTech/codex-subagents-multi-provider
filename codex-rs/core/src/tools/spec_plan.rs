@@ -384,6 +384,15 @@ pub(crate) fn finalize_tool_router(
     hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
     enforce_strict_3p_tools(turn_context, model_info, &mut registry);
+    if turn_context.provider.capabilities().responses
+        == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
+    {
+        for tool in registry.entries_mut() {
+            if tool.exposure == ToolExposure::Deferred {
+                tool.exposure = ToolExposure::Direct;
+            }
+        }
+    }
     let tool_mode = effective_tool_mode(turn_context, model_info);
     let code_mode_enabled = matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly);
     if code_mode_enabled {

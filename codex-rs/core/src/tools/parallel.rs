@@ -111,6 +111,8 @@ impl ToolCallRuntime {
             }
         };
         let error_call = call.clone();
+        let bridged_freeform = matches!(wire_call.payload, ToolPayload::Function { .. })
+            && matches!(call.payload, ToolPayload::Custom { .. });
         let recorder = self.session.services.executed_tool_calls.clone();
         let recorded_call = recorder.prepare_direct_call(&call, &source, &self.step_context);
         let step_context = Arc::clone(&self.step_context);
@@ -145,6 +147,18 @@ impl ToolCallRuntime {
                     .metadata
                     .get_or_insert_default()
                     .delivered_assistant_message = Some(text.clone());
+            }
+            if bridged_freeform
+                && let codex_protocol::models::ResponseItem::CustomToolCallOutput {
+                    call_id,
+                    output,
+                    ..
+                } = response.item
+            {
+                // Stored incoming history retains the external function call.
+                // Match that call's output dialect after the native handler has
+                // completed, including its validation/cancellation failures.
+                response.item = ResponseInputItem::FunctionCallOutput { call_id, output }.into();
             }
             recorder.attach_direct_call_to_output(&mut response.item, recorded_call);
             Ok(response)
