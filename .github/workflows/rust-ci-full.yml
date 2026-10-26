@@ -91,7 +91,7 @@ jobs:
 
   argument_comment_lint_prebuilt:
     name: Argument comment lint - ${{ matrix.name }}
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.runner) || fromJSON('{"macos-15-xlarge":"macos-15","windows-x64":"windows-2025","windows-latest":"windows-2025","windows-arm64":"windows-11-arm"}')[matrix.runner] || matrix.runner }}
     timeout-minutes: 30
     environment:
       name: bazel
@@ -122,7 +122,7 @@ jobs:
   # --- CI to validate on different os/targets --------------------------------
   lint_build:
     name: Lint/Build — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.profile == 'release' && ' (release)' || '' }}
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.runner) || fromJSON('{"macos-15-xlarge":"macos-15","windows-x64":"windows-2025","windows-latest":"windows-2025","windows-arm64":"windows-11-arm"}')[matrix.runner] || matrix.runner }}
     timeout-minutes: 30
     defaults:
       run:

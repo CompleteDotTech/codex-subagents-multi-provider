@@ -35,3 +35,34 @@ The workflows in this directory are split so that pull requests get fast, review
 - If a build/test/clippy check can be expressed in Bazel, prefer putting the PR-time version in `bazel.yml`.
 - Keep `rust-ci.yml` fast enough that it usually does not dominate PR latency.
 - Reserve `rust-ci-full.yml` for heavyweight Cargo-native coverage that Bazel does not replace yet.
+
+## Fork runner selection
+
+The blocking CI family and full Cargo workflows retain the upstream runner
+selection for `openai/codex`. In other repositories, their `runs-on` expressions
+use standard GitHub-hosted runners instead of the upstream private runner groups
+and larger macOS runners:
+
+| Upstream runner | Fork runner | Architecture |
+| --- | --- | --- |
+| Linux x64 group | `ubuntu-24.04` | x64 |
+| Linux ARM64 group | `ubuntu-24.04-arm` | ARM64 |
+| Windows x64 group | `windows-2025` | x64 |
+| Windows ARM64 group | `windows-11-arm` | ARM64 |
+| `macos-15-xlarge` | `macos-15` | ARM64 |
+
+The matrix names and cache identities remain upstream logical identifiers; the
+workflow's runner setup log identifies the actual hosted image. The macOS x64
+target retains its existing cross-build on an ARM64 host. Windows ARM64 nextest
+archives still build on x64 and execute on native ARM64 shards. Test commands,
+matrix targets, toolchains, actions, and required-result jobs are unchanged.
+
+These mappings require neither a BuildBuddy key nor private runner provisioning;
+the existing Bazel wrapper falls back to local execution without that key.
+Standard hosted machines have fewer resources than upstream's private/larger
+runners, so startup alone does not establish build success or native test
+coverage. Record actual job results and artifact source identities.
+
+GitHub documents the labels and architecture under
+[standard hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+This mapping does not change release workflows or billing settings.

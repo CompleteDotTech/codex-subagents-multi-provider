@@ -163,7 +163,7 @@ jobs:
 
   argument_comment_lint_prebuilt:
     name: Argument comment lint - ${{ matrix.name }}
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.runner) || fromJSON('{"macos-15-xlarge":"macos-15","windows-x64":"windows-2025","windows-latest":"windows-2025","windows-arm64":"windows-11-arm"}')[matrix.runner] || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     needs: changed
     environment:

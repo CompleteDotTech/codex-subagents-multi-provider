@@ -43,7 +43,7 @@ jobs:
           # - os: ubuntu-24.04-arm
           #   target: aarch64-unknown-linux-gnu
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.repository == 'openai/codex' && matrix.os || fromJSON('{"macos-15-xlarge":"macos-15","windows-x64":"windows-2025","windows-latest":"windows-2025","windows-arm64":"windows-11-arm"}')[matrix.os] || matrix.os }}
 
     # Configure a human readable name for each job
     name: Bazel test on ${{ matrix.os }} for ${{ matrix.target }}
@@ -152,9 +152,7 @@ jobs:
           - 2
           - 3
           - 4
-    runs-on:
-      group: ${{ github.event.repository.name }}-runners
-      labels: ${{ github.event.repository.name }}-windows-x64
+    runs-on: ${{ github.repository == 'openai/codex' && fromJSON(format('{{"group":"{0}-runners","labels":"{0}-windows-x64"}}', github.event.repository.name)) || 'windows-2025' }}
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm shard ${{ matrix.shard }}/4
     environment:
       name: bazel
@@ -264,9 +262,7 @@ jobs:
     # it a larger timeout. Also allow manual runs for native toolchain changes.
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     timeout-minutes: 40
-    runs-on:
-      group: ${{ github.event.repository.name }}-runners
-      labels: ${{ github.event.repository.name }}-windows-x64
+    runs-on: ${{ github.repository == 'openai/codex' && fromJSON(format('{{"group":"{0}-runners","labels":"{0}-windows-x64"}}', github.event.repository.name)) || 'windows-2025' }}
     name: Bazel test on windows-latest for x86_64-pc-windows-msvc (native main)
     environment:
       name: bazel
@@ -359,7 +355,7 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-windows-x64
-    runs-on: ${{ matrix.runs_on || matrix.os }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.os) || fromJSON('{"macos-15-xlarge":"macos-15","windows-x64":"windows-2025","windows-latest":"windows-2025","windows-arm64":"windows-11-arm"}')[matrix.os] || matrix.os }}
     name: Bazel clippy on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
       name: bazel
@@ -466,7 +462,7 @@ jobs:
             runs_on:
               group: ${{ github.event.repository.name }}-runners
               labels: ${{ github.event.repository.name }}-windows-x64
-    runs-on: ${{ matrix.runs_on || matrix.os }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.os) || fromJSON('{"macos-15-xlarge":"macos-15","windows-x64":"windows-2025","windows-latest":"windows-2025","windows-arm64":"windows-11-arm"}')[matrix.os] || matrix.os }}
     name: Verify release build on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
       name: bazel
