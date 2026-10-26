@@ -163,8 +163,8 @@ jobs:
 
   argument_comment_lint_prebuilt:
     name: Argument comment lint - ${{ matrix.name }}
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout_minutes }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.runner) || fromJSON('{"macos-15-xlarge":"macos-15","windows-x64":"windows-2025","windows-latest":"windows-2025","windows-arm64":"windows-11-arm"}')[matrix.runner] || matrix.runner }}
+    timeout-minutes: ${{ github.repository == 'openai/codex' && matrix.timeout_minutes || 90 }}
     needs: changed
     environment:
       name: bazel
@@ -200,6 +200,11 @@ jobs:
 
           echo "No argument-comment-lint relevant changes."
           echo "run=false" >> "$GITHUB_OUTPUT"
+      - name: Enable long paths for Windows checkout
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: git config --global core.longpaths true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: ${{ steps.argument_comment_lint_gate.outputs.run == 'true' }}
         with:

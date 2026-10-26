@@ -68,7 +68,13 @@ provider definitions, endpoints, authentication, or catalog paths. Ordinary
 children require no role file:
 
 ```json
-{"message":"Use a benign workspace tool and report the result.","task_name":"zai-check","model_provider":"zai","model":"glm-5.3","fork_turns":"none"}
+{
+  "message": "Use a benign workspace tool and report the result.",
+  "task_name": "zai-check",
+  "model_provider": "zai",
+  "model": "glm-5.3",
+  "fork_turns": "none"
+}
 ```
 
 This example is the V2 `spawn_agent` argument shape. For V1 omit `task_name` and
@@ -92,13 +98,13 @@ provider ID and trusted definition, model, catalog identity, capabilities,
 reasoning, service tier, transport, and authentication policy. Validate final
 settings against that tuple, not the parent's models manager.
 
-| Setting | Highest to lowest priority |
-| --- | --- |
-| Provider | Explicit spawn `model_provider`; applicable role `model_provider`; trusted `agents.default_subagent_model_provider`; invoking parent's effective provider |
-| Model, same provider | Applicable role `model`; explicit spawn `model`; existing `agents.default_subagent_model`; captured invoking-step model |
-| Reasoning, same provider | Apply the model-selection-dependent fallback below, then any applicable role effort |
-| Model, changed provider | Applicable role `model`; explicit spawn `model`; trusted target `agents.provider_defaults.<id>.model`; otherwise fail |
-| Reasoning, changed provider | Applicable role effort; explicit spawn effort; existing default subagent effort if supported by target; target model default |
+| Setting                     | Highest to lowest priority                                                                                                                                |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provider                    | Explicit spawn `model_provider`; applicable role `model_provider`; trusted `agents.default_subagent_model_provider`; invoking parent's effective provider |
+| Model, same provider        | Applicable role `model`; explicit spawn `model`; existing `agents.default_subagent_model`; captured invoking-step model                                   |
+| Reasoning, same provider    | Apply the model-selection-dependent fallback below, then any applicable role effort                                                                       |
+| Model, changed provider     | Applicable role `model`; explicit spawn `model`; trusted target `agents.provider_defaults.<id>.model`; otherwise fail                                     |
+| Reasoning, changed provider | Applicable role effort; explicit spawn effort; existing default subagent effort if supported by target; target model default                              |
 
 For same-provider children, first resolve the explicit spawn model or existing
 `agents.default_subagent_model`. If either selects a model, use explicit spawn
@@ -143,14 +149,14 @@ requirements are an intersection/constraint, never broadened by lower layers.
 An exact managed required provider rejects a conflicting selector, including a
 conflicting configured default; it does not silently rewrite the request.
 
-| Source | Select provider ID | Authorize IDs / define provider, endpoint, credential helper, catalog |
-| --- | --- | --- |
-| Managed/system/user configuration | Yes | Yes, subject to higher managed constraints |
-| Project configuration or project-discovered role | Only an authorized ID | No |
-| User role file / built-in role | Only an authorized ID | No; role projection stays bounded even if the file is user-owned |
-| Model-generated spawn / ordinary CLI/session override | Only an authorized ID | No; cannot extend host allowlist or replace registry definitions |
-| Persisted child metadata | Restore identity subject to current policy | No |
-| Host-owned control agent | Only as its host policy permits | Delegated settings do not apply |
+| Source                                                | Select provider ID                         | Authorize IDs / define provider, endpoint, credential helper, catalog |
+| ----------------------------------------------------- | ------------------------------------------ | --------------------------------------------------------------------- |
+| Managed/system/user configuration                     | Yes                                        | Yes, subject to higher managed constraints                            |
+| Project configuration or project-discovered role      | Only an authorized ID                      | No                                                                    |
+| User role file / built-in role                        | Only an authorized ID                      | No; role projection stays bounded even if the file is user-owned      |
+| Model-generated spawn / ordinary CLI/session override | Only an authorized ID                      | No; cannot extend host allowlist or replace registry definitions      |
+| Persisted child metadata                              | Restore identity subject to current policy | No                                                                    |
+| Host-owned control agent                              | Only as its host policy permits            | Delegated settings do not apply                                       |
 
 At root thread creation, and after a successful host-authorized root provider
 reconfiguration (including standalone `thread/resume` with `modelProvider`), the
@@ -229,16 +235,16 @@ or bypass permission prompts or managed network policy.
 
 ## History and lifecycle matrix
 
-| Native operation | Same provider | Changed provider |
-| --- | --- | --- |
-| V1 fresh (`fork_context: false` / absent) | Existing behavior | Supported with resolved target tuple |
-| V1 full (`fork_context: true`) | Existing behavior, including role restriction | Reject before network: use fresh child and an explicit textual task summary |
-| V2 fresh (`fork_turns: "none"`) | Existing behavior | Supported with resolved target tuple |
-| V2 full (`fork_turns: "all"` / absent) | Existing behavior, including prefix handling | Reject before network: explicitly choose `"none"` |
-| V2 numeric legacy `fork_turns` | Existing full-history alias, not partial history | Same full-history rejection |
-| Native V1/V2 `spawn_agent` partial/selected-turn history | No new partial native spawn mode; reject unsupported native spawn arguments | Same restriction; never pretend a full native spawn fork is a partial one |
-| Owned native child warm/cold resume, eviction/reload | Restore stored provider/model and revalidate current authority | No implicit switch during child resume; explicit child migration is unsupported |
-| Steering, result collection, cancellation | Existing child identity and routing | Route to that child's resolved provider; parent remains unchanged |
+| Native operation                                         | Same provider                                                               | Changed provider                                                                |
+| -------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| V1 fresh (`fork_context: false` / absent)                | Existing behavior                                                           | Supported with resolved target tuple                                            |
+| V1 full (`fork_context: true`)                           | Existing behavior, including role restriction                               | Reject before network: use fresh child and an explicit textual task summary     |
+| V2 fresh (`fork_turns: "none"`)                          | Existing behavior                                                           | Supported with resolved target tuple                                            |
+| V2 full (`fork_turns: "all"` / absent)                   | Existing behavior, including prefix handling                                | Reject before network: explicitly choose `"none"`                               |
+| V2 numeric legacy `fork_turns`                           | Existing full-history alias, not partial history                            | Same full-history rejection                                                     |
+| Native V1/V2 `spawn_agent` partial/selected-turn history | No new partial native spawn mode; reject unsupported native spawn arguments | Same restriction; never pretend a full native spawn fork is a partial one       |
+| Owned native child warm/cold resume, eviction/reload     | Restore stored provider/model and revalidate current authority              | No implicit switch during child resume; explicit child migration is unsupported |
+| Steering, result collection, cancellation                | Existing child identity and routing                                         | Route to that child's resolved provider; parent remains unchanged               |
 
 The table above governs owned native children. Standalone app-server
 `thread/fork` already accepts `lastTurnId` (inclusive) or `beforeTurnId`
@@ -283,11 +289,11 @@ and managed-policy revalidation also applies to warm resume.
 
 ## Provider and transport requirements
 
-| Provider | Catalog / authentication owner | Required compatibility and evidence |
-| --- | --- | --- |
-| OpenAI | Trusted host discovery/catalog; existing OpenAI auth store | Existing stream/tool behavior; parent turn succeeds after other-provider children |
-| Z.ai (example configured ID `zai`) | Trusted provider catalog/default; existing `ZAI_KEY` environment/helper | Bounded real Responses function-tool call, result consumption, and completion; quota errors remain blockers |
-| Built-in Ollama or configured compatible endpoint | Trusted host endpoint/catalog; no foreign bearer credentials | Stateless Responses, streamed function tools and result consumption; exact server/model recorded |
+| Provider                                          | Catalog / authentication owner                                          | Required compatibility and evidence                                                                         |
+| ------------------------------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| OpenAI                                            | Trusted host discovery/catalog; existing OpenAI auth store              | Existing stream/tool behavior; parent turn succeeds after other-provider children                           |
+| Z.ai (example configured ID `zai`)                | Trusted provider catalog/default; existing `ZAI_KEY` environment/helper | Bounded real Responses function-tool call, result consumption, and completion; quota errors remain blockers |
+| Built-in Ollama or configured compatible endpoint | Trusted host endpoint/catalog; no foreign bearer credentials            | Stateless Responses, streamed function tools and result consumption; exact server/model recorded            |
 
 Catalog/cache keys include provider identity and trusted definition/catalog
 fingerprint, model ID, and relevant auth/tenant scope. Equal model slugs on two
@@ -313,19 +319,19 @@ Error codes below are stable resolver categories; adapters may add context but
 must retain the category and sanitized provider/model IDs. Failures before
 network must not execute a credential helper or attempt an alternate endpoint.
 
-| Condition | Category / result |
-| --- | --- |
-| Unknown provider ID | `child_provider_unknown`; list how to configure a host ID |
-| Switching not allowed, disabled, or revoked | `child_provider_not_authorized`; identify required host authorization |
-| Exact managed-provider conflict / control-agent override | `child_provider_policy_conflict`; preserve existing required policy |
-| Definition/catalog from untrusted shadow layer | `child_provider_untrusted_source`; identify the offending layer, without secrets |
-| Changed provider without eligible model/default | `child_provider_model_required`; request explicit model or trusted target default |
-| Model missing from authoritative catalog / missing metadata | `child_provider_model_unavailable`; do not use parent fallback metadata |
-| Invalid effort / explicit tier / unsupported tools | `child_provider_capability_unsupported`; identify rejected setting |
-| Cross-provider full fork / unsafe resumed history | `child_provider_history_unsupported`; suggest fresh child |
-| Missing/expired credentials | `child_provider_auth_unavailable`; preserve selected ID, give sanitized source guidance |
-| Rate limit / quota / upstream failure | Existing provider error plus selected ID; bounded retry only, no provider fallback |
-| Persisted provider absent or newly prohibited | Fail resume with the relevant category; preserve resumable metadata |
+| Condition                                                   | Category / result                                                                       |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Unknown provider ID                                         | `child_provider_unknown`; list how to configure a host ID                               |
+| Switching not allowed, disabled, or revoked                 | `child_provider_not_authorized`; identify required host authorization                   |
+| Exact managed-provider conflict / control-agent override    | `child_provider_policy_conflict`; preserve existing required policy                     |
+| Definition/catalog from untrusted shadow layer              | `child_provider_untrusted_source`; identify the offending layer, without secrets        |
+| Changed provider without eligible model/default             | `child_provider_model_required`; request explicit model or trusted target default       |
+| Model missing from authoritative catalog / missing metadata | `child_provider_model_unavailable`; do not use parent fallback metadata                 |
+| Invalid effort / explicit tier / unsupported tools          | `child_provider_capability_unsupported`; identify rejected setting                      |
+| Cross-provider full fork / unsafe resumed history           | `child_provider_history_unsupported`; suggest fresh child                               |
+| Missing/expired credentials                                 | `child_provider_auth_unavailable`; preserve selected ID, give sanitized source guidance |
+| Rate limit / quota / upstream failure                       | Existing provider error plus selected ID; bounded retry only, no provider fallback      |
+| Persisted provider absent or newly prohibited               | Fail resume with the relevant category; preserve resumable metadata                     |
 
 Status/events expose effective `model_provider_id` and model, including after
 spawn, reload, resume, cancellation and failure. App-server uses generated

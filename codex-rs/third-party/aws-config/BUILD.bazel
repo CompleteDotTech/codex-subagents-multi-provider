@@ -4,9 +4,8 @@ load("//:defs.bzl", "codex_rust_crate")
 # upstream crate. Its public authentication feature set remains enabled.
 codex_rust_crate(
     name = "aws-config",
-    crate_name = "aws_config",
-    crate_edition = "2021",
     compile_data = ["src/profile/location_of_profile_files.md"],
+    crate_edition = "2021",
     crate_features = [
         "default-https-client",
         "rt-tokio",
@@ -14,6 +13,7 @@ codex_rust_crate(
         "sso",
         "credentials-login",
     ],
+    crate_name = "aws_config",
     test_data_extra = glob(["test-data/**"]),
     unit_test_working_directory_marker = ":Cargo.toml",
 )
