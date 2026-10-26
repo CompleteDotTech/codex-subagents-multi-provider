@@ -280,7 +280,7 @@ impl RetainedAgentAuthority {
             .models_manager
             .try_pinned_authority_model(&settings.model, &config.to_models_manager_config())
             .as_ref()
-            .and_then(durable::model_fingerprint);
+            .and_then(|model| durable::model_fingerprint(&config, model));
         Arc::new(Self {
             root_session_id: session.session_id(),
             model_authority,
@@ -825,7 +825,7 @@ impl ChildResumePermit {
             let selected = manager
                 .try_pinned_authority_model(&resolved.model, &config.to_models_manager_config())
                 .as_ref()
-                .and_then(durable::model_fingerprint);
+                .and_then(|model| durable::model_fingerprint(config, model));
             if selected.is_none() || selected != ceiling.model_authority {
                 return Err(invalid(
                     "saved selected model tool authority changed or is unavailable",

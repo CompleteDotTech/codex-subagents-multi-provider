@@ -267,11 +267,14 @@ fn local_guardian_grants(config: &Config, model: &ModelInfo) -> Option<serde_jso
     }))
 }
 
-pub(crate) fn model_fingerprint(model: &ModelInfo) -> Option<String> {
+pub(crate) fn model_fingerprint(config: &Config, model: &ModelInfo) -> Option<String> {
     if model.used_fallback_model_metadata {
         return None;
     }
-    let bytes = serde_json::to_vec(&canonical_json(model_grants(model)?)).ok()?;
+    let bytes = serde_json::to_vec(&canonical_json(
+        json!({"model":model_grants(model)?,"guardian":local_guardian_grants(config, model)?}),
+    ))
+    .ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -636,7 +639,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .classifier_instructions = Some("custom safety classifier".into());
-        assert!(model_fingerprint(&model).is_none());
+        assert!(model_fingerprint(&config, &model).is_none());
         assert!(fingerprint(&config, &scope, &model, &[], &[]).is_none());
         model.model_messages.as_mut().unwrap().guardian_v2 = None;
         let overridden = ConfigBuilder::without_managed_config_for_tests()

@@ -94,6 +94,9 @@ model = "gpt-5.5"
 [agents.provider_defaults.ollama]
 model = "shared"
 model_catalog_json = "ollama.json"
+[agents.guardian]
+description = "Typed Guardian ceiling fixture"
+config_file = "guardian.toml"
 [agents.tier]
 description = "Select an explicit service tier"
 config_file = "tier.toml"
@@ -123,6 +126,11 @@ request_max_retries = 0
         std::fs::write(
             host.path().join("reasoning.toml"),
             "model_reasoning_effort = 'low'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("guardian.toml"),
+            "[features.guardianv2]\nreview_threshold=0.25\n",
         )
         .unwrap();
         let mut config = ConfigBuilder::without_managed_config_for_tests()
@@ -1397,6 +1405,55 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
         .await
         .err()
         .expect("changed selected model grants must not bypass the warm ceiling");
+    assert!(
+        error
+            .to_string()
+            .contains("selected model tool authority changed"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.manager.list_thread_ids().await,
+        vec![fixture.parent.session.thread_id]
+    );
+}
+
+#[tokio::test]
+async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
+    let fixture = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let config = fixture
+        .prepared(&resolved, Some("guardian"), None)
+        .await
+        .unwrap()
+        .config;
+    let child = fixture.start_native_child(config).await;
+    child.inject_response_items(vec![serde_json::from_value(serde_json::json!({
+        "type":"message","role":"user","content":[{"type":"input_text","text":"persist typed Guardian ceiling"}]
+    })).unwrap()]).await.unwrap();
+    child.ensure_rollout_materialized().await;
+    child.session.flush_rollout().await.unwrap();
+    child.shutdown_and_wait().await.unwrap();
+    fixture
+        .manager
+        .remove_thread(&child.session.thread_id)
+        .await
+        .unwrap();
+    std::fs::write(
+        fixture._host.path().join("guardian.toml"),
+        "[features.guardianv2]\nreview_threshold=0.75\n",
+    )
+    .unwrap();
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    let error = runtime
+        .control(fixture.parent.session.session_id())
+        .resume_agent_from_rollout(
+            fixture.config.clone(),
+            child.session.thread_id,
+            child.session_source.clone(),
+        )
+        .await
+        .err()
+        .expect("warm reload must retain actual local Guardian safety ceiling");
     assert!(
         error
             .to_string()
