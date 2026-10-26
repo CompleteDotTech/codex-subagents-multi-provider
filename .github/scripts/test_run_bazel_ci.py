@@ -37,6 +37,71 @@ raise SystemExit(int(os.environ.get("BAZEL_STUB_EXIT", "0")))
 
 
 class RunBazelCiTest(unittest.TestCase):
+    def test_native_fork_binds_actual_workspace_status_producer(self):
+        _, args = self.successful_call(flags=("--windows-cross-compile",))
+        self.assertEqual(
+            args.count("--workspace_status_command=scripts/workspace-status.cmd"), 1
+        )
+
+    def test_explicit_workspace_producer_choices_are_preserved(self):
+        for choice in (
+            ("--workspace_status_command=custom-producer.cmd",),
+            ("--workspace_status_command", "custom producer.cmd"),
+        ):
+            with self.subTest(choice=choice):
+                _, args = self.successful_call(
+                    flags=("--windows-cross-compile",), args=choice
+                )
+                self.assertNotIn(
+                    "--workspace_status_command=scripts/workspace-status.cmd", args
+                )
+                for arg in choice:
+                    self.assertIn(arg, args)
+
+    def test_empty_or_missing_workspace_producer_fails_before_bazel(self):
+        for choice in (
+            ("--workspace_status_command=",),
+            ("--workspace_status_command",),
+            ("--workspace_status_command", ""),
+            ("--workspace_status_command", "--keep_going"),
+        ):
+            with self.subTest(choice=choice):
+                result, calls = self.invoke(
+                    flags=("--windows-cross-compile",), args=choice
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+                self.assertIn(
+                    "requires a nonempty --workspace_status_command", result.stderr
+                )
+
+    def test_workspace_producer_binding_is_scoped_to_keyless_fork_actions(self):
+        for environment in (
+            {"GITHUB_REPOSITORY": "openai/codex"},
+            {"GITHUB_REPOSITORY": "other/fork"},
+            {"GITHUB_ACTIONS": "false"},
+            {"BUILDBUDDY_API_KEY": "synthetic-command-test-key"},
+            {"RUNNER_OS": "Linux"},
+        ):
+            with self.subTest(environment=environment):
+                _, args = self.successful_call(
+                    flags=("--windows-cross-compile",), env=environment
+                )
+                self.assertFalse(
+                    any(arg.startswith("--workspace_status_command") for arg in args)
+                )
+
+    def test_payload_workspace_status_literal_does_not_suppress_binding(self):
+        payload = (TARGET, "--workspace_status_command=payload-literal")
+        _, args = self.successful_call(
+            flags=("--windows-cross-compile",), targets=payload
+        )
+        separator = args.index("--")
+        self.assertIn(
+            "--workspace_status_command=scripts/workspace-status.cmd", args[:separator]
+        )
+        self.assertEqual(args[separator + 1 :], list(payload))
+
     def invoke(self, *, args=(), flags=(), env=None, targets=(TARGET,), provision=True):
         bash = (
             str(

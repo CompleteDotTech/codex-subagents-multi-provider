@@ -272,6 +272,30 @@ if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 && -z "${BUI
 fi
 
 post_config_bazel_args=()
+if [[ $windows_native_fallback -eq 1 && "${GITHUB_ACTIONS:-}" == true && "${GITHUB_REPOSITORY:-}" == CompleteDotTech/codex-subagents-multi-provider ]]; then
+  # Native runtime receipts require the actual checkout's workspace status.
+  # Bind the real producer explicitly; preserve an operator's nonempty choice.
+  # Only Bazel options before our target/payload separator participate.
+  requested_workspace_status=0
+  for ((i = 0; i < ${#bazel_args[@]}; i++)); do
+    case "${bazel_args[$i]}" in
+      --workspace_status_command=*) status_value="${bazel_args[$i]#*=}" ;;
+      --workspace_status_command)
+        i=$((i + 1))
+        status_value="${bazel_args[$i]:-}"
+        ;;
+      *) continue ;;
+    esac
+    if [[ -z "$status_value" || "$status_value" == -* ]]; then
+      echo "Native Windows CI requires a nonempty --workspace_status_command producer for runtime receipt provenance." >&2
+      exit 1
+    fi
+    requested_workspace_status=1
+  done
+  if [[ $requested_workspace_status -eq 0 ]]; then
+    post_config_bazel_args+=(--workspace_status_command=scripts/workspace-status.cmd)
+  fi
+fi
 if [[ $windows_native_fallback -eq 1 ]]; then
   requested_target_platform=""
   requested_host_platform=""
