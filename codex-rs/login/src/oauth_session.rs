@@ -196,7 +196,9 @@ impl OAuthSessionManager {
         {
             return Ok(None);
         }
-        let _credential_lock = storage::lock_credentials(&self.state.codex_home).await?;
+        let Some(_credential_lock) = storage::try_lock_credentials(&self.state.codex_home)? else {
+            return Ok(None);
+        };
         let Some(stored) = self.load_token_async().await? else {
             return Ok(None);
         };

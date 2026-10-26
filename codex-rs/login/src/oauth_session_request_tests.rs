@@ -151,3 +151,50 @@ async fn request_refresh_retry_keeps_the_same_sign_in() {
         "replacement"
     );
 }
+
+#[tokio::test]
+async fn cache_scope_observation_does_not_wait_for_the_shared_credential_store() {
+    let server = MockServer::start().await;
+    let (manager, home) = client(config(&server), Arc::new(MockKeyringStore::default()));
+    manager
+        .save_token(&StoredToken {
+            access_token: "test-observed-token".into(),
+            authorization_id: Some("test-grant".into()),
+            refresh_token: None,
+            expires_at: Some(i64::MAX),
+        })
+        .unwrap();
+    let expected = manager.observe_credential_identity().await.unwrap();
+    assert!(expected.is_some());
+    let mut other_config = config(&server);
+    other_config.client_id = "unrelated-client".into();
+    let other = OAuthSessionManager::new(
+        other_config,
+        home.path().to_path_buf(),
+        transport_default_auth_route_config().http_client_factory(),
+        Arc::new(MockKeyringStore::default()),
+    )
+    .unwrap();
+    let store_guard = super::super::storage::lock_credentials(home.path())
+        .await
+        .unwrap();
+    for observed in [&manager, &other] {
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                observed.observe_credential_identity()
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            None
+        );
+        assert!(observed.state.cached_token.try_lock().is_ok());
+    }
+    drop(store_guard);
+    assert_eq!(
+        manager.observe_credential_identity().await.unwrap(),
+        expected
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

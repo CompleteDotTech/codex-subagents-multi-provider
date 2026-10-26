@@ -33,7 +33,7 @@ impl ModelsEndpointClient for ObservedEndpoint {
         &'a self,
         _version: &'a str,
         _http: HttpClientFactory,
-    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+    ) -> ModelsEndpointFuture<'a, Result<ModelsEndpointResponse, ModelsEndpointError>> {
         Box::pin(async move {
             let identity = self.identity().unwrap();
             if self.replace_during_fetch {
@@ -307,5 +307,112 @@ async fn matching_etag_cannot_renew_a_different_identity_or_catalog() {
         )
         .unwrap();
         assert_eq!(actual, stored);
+    }
+}
+
+#[derive(Debug)]
+struct RejectedAttemptEndpoint {
+    observed: Mutex<String>,
+    reject: std::sync::atomic::AtomicBool,
+}
+impl ModelsEndpointClient for RejectedAttemptEndpoint {
+    fn identity(&self) -> Option<String> {
+        Some(self.observed.lock().unwrap().clone())
+    }
+    fn has_command_auth(&self) -> bool {
+        true
+    }
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+    fn list_models<'a>(
+        &'a self,
+        _: &'a str,
+        _: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, Result<ModelsEndpointResponse, ModelsEndpointError>> {
+        Box::pin(async move {
+            if self.reject.swap(false, Ordering::SeqCst) {
+                // The actual rejected B request differs from preflight/current A.
+                return Err(ModelsEndpointError {
+                    error: catalog_http_error(403),
+                    identity: Some("grant-b".into()),
+                });
+            }
+            Ok(ModelsEndpointResponse {
+                identity: self.identity().unwrap(),
+                etag: None,
+                models: vec![remote_model("shared", "fresh", 0)],
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn rejection_survives_account_switches_when_persistent_invalidation_fails() {
+    for load_error in [false, true] {
+        let stale = vec![remote_model("shared", "stale B", 0)];
+        let cache = Arc::new(TestModelsCache {
+            entry: Mutex::new(Some(ModelsCacheEntry {
+                fetched_at: Utc::now(),
+                etag: None,
+                client_version: Some(crate::client_version_to_whole()),
+                identity: Some("grant-b".into()),
+                models: stale.clone(),
+            })),
+            load_error,
+            store_error: true,
+            stored_entries: Mutex::new(Vec::new()),
+        });
+        let endpoint = Arc::new(RejectedAttemptEndpoint {
+            observed: Mutex::new("grant-a".into()),
+            reject: std::sync::atomic::AtomicBool::new(true),
+        });
+        let manager = OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
+            .with_provider_catalog();
+        assert!(
+            manager
+                .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+                .models
+                .is_empty()
+        );
+        // Unrelated A success must not erase the B rejection marker.
+        assert_eq!(
+            manager
+                .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+                .models[0]
+                .display_name,
+            "fresh"
+        );
+        *endpoint.observed.lock().unwrap() = "grant-b".into();
+        assert!(
+            manager
+                .raw_model_catalog(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+                .models
+                .is_empty()
+        );
+        assert!(manager.get_remote_models().await.is_empty());
+        assert!(
+            manager
+                .get_model_info("shared", &Default::default())
+                .await
+                .used_fallback_model_metadata
+        );
+        assert_eq!(cache.entry.lock().unwrap().as_ref().unwrap().models, stale);
+        // Only an authenticated B fetch rehabilitates B, even when cache writes still fail.
+        assert_eq!(
+            manager
+                .raw_model_catalog(
+                    RefreshStrategy::OnlineIfUncached,
+                    DEFAULT_HTTP_CLIENT_FACTORY
+                )
+                .await
+                .models[0]
+                .display_name,
+            "fresh"
+        );
+        assert!(!manager.identity_rejected("grant-b"));
     }
 }

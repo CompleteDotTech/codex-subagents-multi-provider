@@ -27,6 +27,7 @@ use codex_login::default_client::create_client_for_route_async;
 use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
+use codex_models_manager::manager::ModelsEndpointError;
 use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_models_manager::manager::ModelsEndpointResponse;
 use codex_otel::TelemetryAuthMode;
@@ -97,7 +98,7 @@ impl OpenAiModelsEndpoint {
         &self,
         client_version: &str,
         http_client_factory: HttpClientFactory,
-    ) -> CoreResult<ModelsEndpointResponse> {
+    ) -> Result<ModelsEndpointResponse, ModelsEndpointError> {
         let auth = self.auth().await;
         let metric_auth_mode = if self.has_provider_api_key()
             || auth.as_ref().is_some_and(CodexAuth::is_api_key_auth)
@@ -133,80 +134,90 @@ impl OpenAiModelsEndpoint {
             Some(scope) => crate::models_identity::with_gateway_scope(base_identity, &scope),
             None => base_identity,
         };
-        let api_auth = resolved.auth;
-        let request_url = match self.provider_info.model_catalog_url.as_deref() {
-            Some(catalog_url) => ModelsClient::<ReqwestTransport>::catalog_request_url(
-                &api_provider,
-                catalog_url,
-                client_version,
-            )
-            .map_err(map_api_error)?,
-            None => ModelsClient::<ReqwestTransport>::request_url(&api_provider, client_version),
-        };
-        let auth_telemetry = auth_header_telemetry(api_auth.as_ref())
-            .map_err(|error| map_api_error(error.into()))?;
-        let agent_identity_telemetry = if let Some(CodexAuth::AgentIdentity(auth)) = auth.as_ref() {
-            Some(agent_identity_telemetry(auth))
-        } else {
-            None
-        };
-        let request_telemetry: Arc<dyn RequestTelemetry> = Arc::new(ModelsRequestTelemetry {
-            include_response_debug: self.provider_info.model_catalog_url.is_none(),
-            auth_mode: auth_mode.map(|mode| TelemetryAuthMode::from(mode).to_string()),
-            auth_header_attached: auth_telemetry.attached,
-            auth_header_name: auth_telemetry.name,
-            agent_identity_telemetry,
-            auth_env: self.auth_env(),
-        });
-        let (models, etag) = timeout(MODELS_REFRESH_TIMEOUT, async {
-            let transport = self
-                .transport_builder
-                .build(http_client_factory, request_url.clone())
-                .await?;
-            let client = ModelsClient::new(transport, api_provider, api_auth)
-                .with_telemetry(Some(request_telemetry));
-            let response_body_limit_bytes = self
-                .provider_info
-                .model_catalog_url
-                .as_ref()
-                .map(|_| MAX_MODEL_CATALOG_BYTES);
-            client
-                .list_models(request_url, HeaderMap::new(), response_body_limit_bytes)
-                .await
-                .map_err(|mut error| {
-                    if self.provider_info.model_catalog_url.is_some()
-                        && let codex_api::ApiError::Transport(TransportError::Http {
-                            url,
-                            headers,
-                            body,
-                            ..
-                        }) = &mut error
-                    {
-                        // Provider diagnostics may echo URL credentials or other secrets.
-                        *url = None;
-                        *headers = None;
-                        *body = None;
-                    }
-                    map_api_error(error)
-                })
-        })
-        .await
-        .map_err(|_| CodexErr::RequestTimeout)??;
-        if self.provider_info.model_catalog_url.is_some() {
-            let mut slugs = HashSet::new();
-            if models
-                .iter()
-                .any(|model| model.slug.trim().is_empty() || !slugs.insert(&model.slug))
-            {
-                return Err(CodexErr::InvalidRequest(
-                    "model catalog must contain unique, non-empty model slugs".to_string(),
-                ));
+        let result: CoreResult<ModelsEndpointResponse> = async {
+            let api_auth = resolved.auth;
+            let request_url = match self.provider_info.model_catalog_url.as_deref() {
+                Some(catalog_url) => ModelsClient::<ReqwestTransport>::catalog_request_url(
+                    &api_provider,
+                    catalog_url,
+                    client_version,
+                )
+                .map_err(map_api_error)?,
+                None => {
+                    ModelsClient::<ReqwestTransport>::request_url(&api_provider, client_version)
+                }
+            };
+            let auth_telemetry = auth_header_telemetry(api_auth.as_ref())
+                .map_err(|error| map_api_error(error.into()))?;
+            let agent_identity_telemetry =
+                if let Some(CodexAuth::AgentIdentity(auth)) = auth.as_ref() {
+                    Some(agent_identity_telemetry(auth))
+                } else {
+                    None
+                };
+            let request_telemetry: Arc<dyn RequestTelemetry> = Arc::new(ModelsRequestTelemetry {
+                include_response_debug: self.provider_info.model_catalog_url.is_none(),
+                auth_mode: auth_mode.map(|mode| TelemetryAuthMode::from(mode).to_string()),
+                auth_header_attached: auth_telemetry.attached,
+                auth_header_name: auth_telemetry.name,
+                agent_identity_telemetry,
+                auth_env: self.auth_env(),
+            });
+            let (models, etag) = timeout(MODELS_REFRESH_TIMEOUT, async {
+                let transport = self
+                    .transport_builder
+                    .build(http_client_factory, request_url.clone())
+                    .await?;
+                let client = ModelsClient::new(transport, api_provider, api_auth)
+                    .with_telemetry(Some(request_telemetry));
+                let response_body_limit_bytes = self
+                    .provider_info
+                    .model_catalog_url
+                    .as_ref()
+                    .map(|_| MAX_MODEL_CATALOG_BYTES);
+                client
+                    .list_models(request_url, HeaderMap::new(), response_body_limit_bytes)
+                    .await
+                    .map_err(|mut error| {
+                        if self.provider_info.model_catalog_url.is_some()
+                            && let codex_api::ApiError::Transport(TransportError::Http {
+                                url,
+                                headers,
+                                body,
+                                ..
+                            }) = &mut error
+                        {
+                            // Provider diagnostics may echo URL credentials or other secrets.
+                            *url = None;
+                            *headers = None;
+                            *body = None;
+                        }
+                        map_api_error(error)
+                    })
+            })
+            .await
+            .map_err(|_| CodexErr::RequestTimeout)??;
+            if self.provider_info.model_catalog_url.is_some() {
+                let mut slugs = HashSet::new();
+                if models
+                    .iter()
+                    .any(|model| model.slug.trim().is_empty() || !slugs.insert(&model.slug))
+                {
+                    return Err(CodexErr::InvalidRequest(
+                        "model catalog must contain unique, non-empty model slugs".to_string(),
+                    ));
+                }
             }
+            Ok(ModelsEndpointResponse {
+                models,
+                etag,
+                identity: identity.clone(),
+            })
         }
-        Ok(ModelsEndpointResponse {
-            models,
-            etag,
-            identity,
+        .await;
+        result.map_err(|error| ModelsEndpointError {
+            error,
+            identity: Some(identity),
         })
     }
 
@@ -282,7 +293,7 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
         &'a self,
         client_version: &'a str,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+    ) -> ModelsEndpointFuture<'a, Result<ModelsEndpointResponse, ModelsEndpointError>> {
         Box::pin(OpenAiModelsEndpoint::list_models(
             self,
             client_version,
