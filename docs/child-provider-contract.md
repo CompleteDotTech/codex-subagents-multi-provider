@@ -10,8 +10,10 @@ Baseline: `rust-v0.164.0`, commit
 
 Any user-delegated ordinary/default, built-in-role, custom-role, or nested child
 can select a host-authorized configured provider. The OpenAI parent need not
-change profile. The same resolver governs native V1/V2 spawning and supported
-app-server entry points; direct internal spawn/reload paths must not bypass it.
+change profile. The same resolver governs native V1/V2 child spawning and any
+app-server path that operates on an owned native child; direct internal child
+spawn/reload paths must not bypass it. Standalone app-server conversation
+start/fork/resume operations are root APIs, not delegated child spawn APIs.
 Host-owned safety, review, and control agents retain their host policy and cannot
 be rerouted by user-delegated settings. Parent and sibling configuration objects,
 credentials, sessions, catalogs, and caches remain independent.
@@ -76,8 +78,11 @@ Omitting `model` uses the target's trusted provider default when switching
 provider. Existing role selectors remain `agent_type`. App-server request
 fields use the protocol's generated camelCase spelling `modelProvider`; native
 tool arguments and role TOML use `model_provider`. All selectors are optional
-strings containing an ID, never a provider object. Resume selects the persisted
-provider; it does not expose an implicit provider-switch argument.
+strings containing an ID, never a provider object. Owned native child resume
+selects the persisted provider and does not expose an implicit provider switch.
+General app-server `thread/resume` already has `modelProvider`; preserve that
+root-conversation override, subject to existing policy and safe stored-history
+compatibility checks. Do not add a duplicate protocol field.
 
 ## Resolution order
 
@@ -147,20 +152,50 @@ conflicting configured default; it does not silently rewrite the request.
 | Persisted child metadata | Restore identity subject to current policy | No |
 | Host-owned control agent | Only as its host policy permits | Delegated settings do not apply |
 
-At root thread creation, the host records an immutable nonsecret
-`provider_authorization_root_id`: the root's effective provider ID. The host
-copies it into every descendant's in-memory state and persisted child metadata;
-model input, role files, project settings, and restored child fields cannot
-replace it. Recover it from the root's host-owned thread record and lineage on
-reload; reject inconsistent provenance. The root ID is an authorization origin,
-not the immediate-parent provider used by the selection fallback.
+At root thread creation, and after a successful host-authorized root provider
+reconfiguration (including standalone `thread/resume` with `modelProvider`), the
+host records the effective provider as `provider_authorization_root_id` for NEW
+delegated children. This is an immutable value within one root configuration
+origin, not an immutable provider for the root thread's entire lifetime.
+
+Implement `provider_authorization_origin` as an opaque host-generated UUID
+referencing a new nonsecret host-owned origin record with `origin_id`,
+`root_thread_id`, and `provider_id`. Reuse the repository's UUID conventions;
+there is no incrementing epoch counter. Existing root/session ID alone cannot
+distinguish reconfigurations because it survives resume. The new origin store
+must retain immutable records while any descendant references them, independently
+of visible-history compaction/truncation. Verify both the provider and root
+ownership from this record. For ephemeral roots, keep the equivalent record in
+host memory; do not claim a cold-resumable origin without a durable record.
+This record/reference is required implementation work, not an existing storage
+or `SessionConfigured` durability guarantee.
+
+Establish a new origin only after root authorization, configuration validation,
+and stored-history compatibility checks succeed. Publish it atomically for
+subsequent root spawns. A failed override does not change the origin. An
+unchanged-provider root resume can retain its existing origin; a provider change
+uses its newly persisted origin record. Thus an OpenAI root legitimately
+resumed on Z.ai can spawn new inheriting Z.ai children without a new allowlist.
+This does not grant provider-selection authority to project/model input or to
+any owned native child resume path.
+
+Each delegated child captures both origin fields at spawn and passes those
+same fields to its own descendants. Existing children keep their earlier origin
+after a root reconfiguration; they must not adopt the root's newest provider or
+exemption during warm/cold resume. Model input, roles, project settings, and
+restored child fields cannot replace an origin. Resolve the captured origin ID
+against the retained host record and verify delegated ownership lineage on
+reload; reject inconsistencies. Copy origins along delegated ownership edges,
+not merely `forked_from_thread_id` history lineage. A standalone app-server
+conversation fork creates its own root controller/configuration origin under
+existing root policy; copied history does not make it an owned native child.
 
 A selected provider equal to `provider_authorization_root_id` has the legacy
 allowlist exemption, whether inherited, explicitly selected, or selected on a
 return from a different provider. Every other selected provider requires current
 membership in trusted `allowed_model_providers`, even when it equals the
 immediate parent's provider. Absent/empty allowlist therefore permits only the
-lineage's root provider, subject to all other policy and definition checks.
+captured origin's provider, subject to all other policy and definition checks.
 Recheck this rule before every inference/network use, new descendant spawn, and
 warm/cold resume: deleting `zai` from the list blocks an already-switched Z.ai
 child and its inheriting grandchildren, without requiring provider deletion.
@@ -169,9 +204,11 @@ without a new provider request; it must not issue another inference request.
 An explicit fresh switch back to the root provider remains permitted. An
 already-dispatched request cannot be recalled; cancellation is best effort.
 
-Legacy persisted trees lacking this field may derive it only from a verifiable
-host-owned root/lineage record. If the origin cannot be recovered, require current
-allowlist authorization for that provider or reject resume; never treat a
+Legacy persisted trees lacking these fields may derive them only from a
+verifiable host-owned root configuration record applicable when the child was
+created, together with its ownership lineage; the root's current configuration
+is not sufficient evidence for an older child. If the origin cannot be
+recovered, require current allowlist authorization for that provider or reject resume; never treat a
 child's stored provider as a new exempt root. At every use, the target must also
 exist and satisfy current managed policy. An allowed or exempt ID does
 not authorize arbitrary configuration attached to that ID: project/session
@@ -199,12 +236,29 @@ or bypass permission prompts or managed network policy.
 | V2 fresh (`fork_turns: "none"`) | Existing behavior | Supported with resolved target tuple |
 | V2 full (`fork_turns: "all"` / absent) | Existing behavior, including prefix handling | Reject before network: explicitly choose `"none"` |
 | V2 numeric legacy `fork_turns` | Existing full-history alias, not partial history | Same full-history rejection |
-| Partial/selected-turn history | No new partial mode in this change; reject unsupported API modes | Reject unsupported API modes; never pretend a full fork is a partial one |
-| Warm/cold resume, eviction/reload | Restore stored provider/model and revalidate current authority | No implicit switch during resume; explicit migration is unsupported |
+| Native V1/V2 `spawn_agent` partial/selected-turn history | No new partial native spawn mode; reject unsupported native spawn arguments | Same restriction; never pretend a full native spawn fork is a partial one |
+| Owned native child warm/cold resume, eviction/reload | Restore stored provider/model and revalidate current authority | No implicit switch during child resume; explicit child migration is unsupported |
 | Steering, result collection, cancellation | Existing child identity and routing | Route to that child's resolved provider; parent remains unchanged |
 
-Cross-provider full-history rejection is deliberate: foreign response IDs,
-opaque reasoning, tool declarations, and freeform tool records cannot safely be
+The table above governs owned native children. Standalone app-server
+`thread/fork` already accepts `lastTurnId` (inclusive) or `beforeTurnId`
+(exclusive), as well as `modelProvider`; these history boundaries are not native
+V2 numeric `fork_turns`. Preserve existing same-provider partial/full standalone
+fork behavior and its validation, including mutually exclusive boundaries and
+prediction-mode restrictions. A standalone fork creates a separate root agent
+controller with history lineage, not delegated parent/child ownership.
+
+For a standalone cross-provider stored-history fork or root resume override,
+validate the selected provider and stored history compatibility before any
+network request. Permit only a representation proven safe for that target;
+otherwise reject explicitly with `child_provider_history_unsupported` and
+suggest a fresh conversation with a textual task summary. Do not blindly replay
+foreign response IDs, opaque reasoning, or unsupported tool history, and do not
+apply delegated-child allowlists to unrelated root APIs. A valid root provider
+override remains supported; this ADR does not remove that API capability.
+
+Cross-provider full-history rejection for native children is deliberate: foreign
+response IDs, opaque reasoning, tool declarations, and freeform tool records cannot safely be
 replayed merely because the model names match. A fresh child can receive a
 plain-text task summary as user input, not fabricated historical authorization.
 Same-provider Ollama history is still subject to its stateless serializer: send
@@ -215,8 +269,8 @@ rollouts. Local compaction uses the child's model/capabilities; remote compactio
 is allowed only when that provider advertises the supported protocol.
 
 Persist only nonsecret provider ID, model ID,
-`provider_authorization_root_id`, effective identity/provenance version, and
-history compatibility information needed to reconstruct the child. Validate the
+`provider_authorization_root_id`, `provider_authorization_origin`, effective
+identity/provenance version, and history compatibility information needed to reconstruct the child. Validate the
 authorization origin against host-owned lineage rather than trusting the child
 snapshot alone.
 Do not serialize tokens, auth headers, resolved helper output, or full provider
@@ -289,6 +343,11 @@ misleading started/success event.
   block warm/cold resume, another inference, and an inheriting grandchild; a
   fresh explicit switch back to the verified OpenAI root remains permitted.
   Cover legacy provenance recovery and denial when its origin is unverifiable.
+  Also cover a host-authorized OpenAI-root resume on Z.ai followed by a new
+  inheriting child with no allowlist; it uses the new Z.ai origin. Pre-existing
+  children retain their original origin, and owned-child resume, forged origin
+  IDs, failed root overrides, and merely copied fork history cannot reset
+  an origin or bypass revocation.
 - #10–#12: provider-scoped model managers, auth/transport isolation, stateless
   Responses and function-tool handling; test same model slug with different
   metadata and distinct endpoint credentials.
@@ -308,6 +367,10 @@ Source anchors at the pinned revision: `codex-rs/core/src/agent/child_config.rs`
 (resolution and existing precedence), `agent/role.rs` and `agent/role_tests.rs`
 (bounded projection), `agent/control/spawn.rs` (history/reload),
 `core/src/tools/handlers/multi_agents_v2/spawn.rs` (numeric full-history alias),
+`app-server-protocol/src/protocol/v2/thread.rs` and
+`app-server/src/request_processors/thread_processor.rs` (standalone fork
+boundaries and root resume overrides), `core/src/thread_manager.rs`
+(standalone controller versus delegated ownership),
 `config/src/config_toml.rs` (flattened roles),
 `config/src/model_provider_requirements.rs` (managed definitions), and
 `model-provider-info/src/lib.rs` (built-in IDs and provider authentication).
