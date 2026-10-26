@@ -537,7 +537,7 @@ impl ChildResumePermit {
             ));
         }
         let target = saved.conversation_id;
-        let ceiling = runtime.registry.retained_authority(target);
+        let ceiling = runtime.retained_authority(target);
         if let Some(ceiling) = &ceiling {
             if ceiling.thread_id != target
                 || ceiling.source != *source
@@ -781,7 +781,7 @@ impl ChildResumePermit {
                 "private resume permit does not match this runtime/history/config",
             ));
         }
-        let retained = runtime.registry.retained_authority(self.target);
+        let retained = runtime.retained_authority(self.target);
         if match (&retained, &self.target_ceiling) {
             (Some(current), Some(captured)) => !Arc::ptr_eq(current, captured),
             (None, None) => false,

@@ -207,6 +207,20 @@ pub(crate) struct LocalAgentRuntime {
 }
 
 impl LocalAgentRuntime {
+    pub(crate) fn retain_authority(
+        &self,
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+    ) {
+        self.registry.retain_authority(authority);
+    }
+
+    pub(crate) fn retained_authority(
+        &self,
+        target: ThreadId,
+    ) -> Option<Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>> {
+        self.registry.retained_authority(target)
+    }
+
     pub(super) fn new(
         manager: Weak<ThreadManagerState>,
         thread_id_generator: ThreadIdGenerator,

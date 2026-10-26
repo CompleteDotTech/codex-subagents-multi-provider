@@ -1477,7 +1477,6 @@ impl ThreadManager {
             .session
             .services
             .local_agent_runtime
-            .registry
             .retain_authority(authority);
         Ok(threads
             .remove(thread_id)
@@ -1510,7 +1509,6 @@ impl ThreadManager {
             .session
             .services
             .local_agent_runtime
-            .registry
             .retain_authority(authority);
         threads
             .remove(thread_id)
@@ -1574,7 +1572,6 @@ impl ThreadManager {
                     .session
                     .services
                     .local_agent_runtime
-                    .registry
                     .retain_authority(authority);
             }
         }
@@ -1989,7 +1986,6 @@ impl ThreadManagerState {
             .session
             .services
             .local_agent_runtime
-            .registry
             .retain_authority(authority);
         threads
             .remove(thread_id)
@@ -2520,7 +2516,6 @@ impl ThreadManagerState {
                         .session
                         .services
                         .local_agent_runtime
-                        .registry
                         .retain_authority(authority);
                 }
                 threads.remove(&resumed.conversation_id);
@@ -2838,7 +2833,6 @@ impl ThreadManagerState {
                 session
                     .services
                     .local_agent_runtime
-                    .registry
                     .retain_authority(retained_authority);
                 ema_cancellation.publish();
                 let thread = Arc::new(CodexThread::new(
