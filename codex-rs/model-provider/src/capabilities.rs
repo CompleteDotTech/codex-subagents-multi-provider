@@ -3,6 +3,7 @@
 use codex_api::is_azure_responses_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::RemoteCompactionSupport;
+use codex_model_provider_info::ResponsesCompatibility;
 
 /// Optional provider-backed features that Codex may expose at runtime.
 ///
@@ -14,6 +15,7 @@ pub struct ProviderCapabilities {
     pub web_search: bool,
     pub external_web_access: bool,
     pub remote_compaction: RemoteCompactionSupport,
+    pub responses: ResponsesCompatibility,
 }
 
 impl Default for ProviderCapabilities {
@@ -23,6 +25,7 @@ impl Default for ProviderCapabilities {
             web_search: true,
             external_web_access: true,
             remote_compaction: RemoteCompactionSupport::Unsupported,
+            responses: ResponsesCompatibility::Full,
         }
     }
 }
@@ -40,14 +43,23 @@ impl ProviderCapabilities {
             ..Self::default()
         };
         let overrides = info.capabilities.unwrap_or_default();
+        let responses = overrides.responses.unwrap_or_default();
+        let stateless = responses == ResponsesCompatibility::StatelessFunctions;
         Self {
-            external_web_access: overrides
-                .external_web_access
-                .unwrap_or(defaults.external_web_access),
-            remote_compaction: overrides
-                .remote_compaction
-                .unwrap_or(defaults.remote_compaction),
-            ..defaults
+            image_generation: !stateless && defaults.image_generation,
+            web_search: !stateless && defaults.web_search,
+            external_web_access: !stateless
+                && overrides
+                    .external_web_access
+                    .unwrap_or(defaults.external_web_access),
+            remote_compaction: if stateless {
+                RemoteCompactionSupport::Unsupported
+            } else {
+                overrides
+                    .remote_compaction
+                    .unwrap_or(defaults.remote_compaction)
+            },
+            responses,
         }
     }
 }

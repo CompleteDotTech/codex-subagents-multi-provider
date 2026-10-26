@@ -3,6 +3,9 @@
 #[path = "code_mode_dynamic_tools_tests.rs"]
 mod dynamic_tools;
 
+#[path = "code_mode_stateless_tests.rs"]
+mod stateless;
+
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
