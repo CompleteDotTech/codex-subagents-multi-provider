@@ -91,12 +91,23 @@ settings against that tuple, not the parent's models manager.
 | --- | --- |
 | Provider | Explicit spawn `model_provider`; applicable role `model_provider`; trusted `agents.default_subagent_model_provider`; invoking parent's effective provider |
 | Model, same provider | Applicable role `model`; explicit spawn `model`; existing `agents.default_subagent_model`; captured invoking-step model |
-| Reasoning, same provider | Applicable role effort; explicit spawn effort; existing default subagent effort; captured invoking-step effort |
+| Reasoning, same provider | Apply the model-selection-dependent fallback below, then any applicable role effort |
 | Model, changed provider | Applicable role `model`; explicit spawn `model`; trusted target `agents.provider_defaults.<id>.model`; otherwise fail |
 | Reasoning, changed provider | Applicable role effort; explicit spawn effort; existing default subagent effort if supported by target; target model default |
 
-The model/effort order preserves `child_config.rs`: role projection follows
-explicit/default overrides. Provider order intentionally differs: an explicit
+For same-provider children, first resolve the explicit spawn model or existing
+`agents.default_subagent_model`. If either selects a model, use explicit spawn
+effort or existing default subagent effort when present; otherwise replace the
+captured effort with that selected model's `default_reasoning_level` (including
+`None`). If neither selects a model, an explicit/default effort overrides the
+captured effort; when neither effort is present, retain captured invoking-step
+effort. Apply role model/effort projection afterward exactly as before: a role
+model without a role effort does not itself reset the effort already chosen.
+For example, selecting a model with default `medium` from a parent using `high`,
+without an explicit/default/role effort, yields `medium`, not `high`.
+
+This preserves `child_config.rs`: role projection follows explicit/default
+overrides. Provider order intentionally differs: an explicit
 provider wins over the role. Thus a role's incompatible model can cause an error
 even when an explicit provider is valid; do not silently discard role settings.
 An explicit model equal in spelling to the parent's is valid only when it is
@@ -136,10 +147,33 @@ conflicting configured default; it does not silently rewrite the request.
 | Persisted child metadata | Restore identity subject to current policy | No |
 | Host-owned control agent | Only as its host policy permits | Delegated settings do not apply |
 
-Absent/empty `allowed_model_providers` allows same-provider inheritance and
-same-provider explicit selection only. Switching requires target membership in
-the trusted allowlist. At every use, the target must exist and satisfy current
-managed policy. Inheritance never bypasses policy revocation. An allowed ID does
+At root thread creation, the host records an immutable nonsecret
+`provider_authorization_root_id`: the root's effective provider ID. The host
+copies it into every descendant's in-memory state and persisted child metadata;
+model input, role files, project settings, and restored child fields cannot
+replace it. Recover it from the root's host-owned thread record and lineage on
+reload; reject inconsistent provenance. The root ID is an authorization origin,
+not the immediate-parent provider used by the selection fallback.
+
+A selected provider equal to `provider_authorization_root_id` has the legacy
+allowlist exemption, whether inherited, explicitly selected, or selected on a
+return from a different provider. Every other selected provider requires current
+membership in trusted `allowed_model_providers`, even when it equals the
+immediate parent's provider. Absent/empty allowlist therefore permits only the
+lineage's root provider, subject to all other policy and definition checks.
+Recheck this rule before every inference/network use, new descendant spawn, and
+warm/cold resume: deleting `zai` from the list blocks an already-switched Z.ai
+child and its inheriting grandchildren, without requiring provider deletion.
+A still-running revoked child may be cancelled and its stored results collected
+without a new provider request; it must not issue another inference request.
+An explicit fresh switch back to the root provider remains permitted. An
+already-dispatched request cannot be recalled; cancellation is best effort.
+
+Legacy persisted trees lacking this field may derive it only from a verifiable
+host-owned root/lineage record. If the origin cannot be recovered, require current
+allowlist authorization for that provider or reject resume; never treat a
+child's stored provider as a new exempt root. At every use, the target must also
+exist and satisfy current managed policy. An allowed or exempt ID does
 not authorize arbitrary configuration attached to that ID: project/session
 shadowing of `model_providers.zai`, built-in endpoint overrides, catalog paths,
 capabilities, or auth headers must not replace its trusted definition. Definitions
@@ -180,8 +214,11 @@ Apply the same validation to compacted replacement histories and resumed
 rollouts. Local compaction uses the child's model/capabilities; remote compaction
 is allowed only when that provider advertises the supported protocol.
 
-Persist only nonsecret provider ID, model ID, effective identity/provenance
-version, and history compatibility information needed to reconstruct the child.
+Persist only nonsecret provider ID, model ID,
+`provider_authorization_root_id`, effective identity/provenance version, and
+history compatibility information needed to reconstruct the child. Validate the
+authorization origin against host-owned lineage rather than trusting the child
+snapshot alone.
 Do not serialize tokens, auth headers, resolved helper output, or full provider
 objects into child metadata. Reconstruct transport/auth from current trusted
 configuration on reload; recheck revocation before sending. If a trusted
@@ -248,6 +285,10 @@ misleading started/success event.
 
 - #9: typed fields, trusted-layer provenance, shared resolver, managed-policy and
   hostile-input tests, schema generation. Preserve omitted-field compatibility.
+  Include revocation after OpenAI-to-Z.ai spawn: removing Z.ai authorization must
+  block warm/cold resume, another inference, and an inheriting grandchild; a
+  fresh explicit switch back to the verified OpenAI root remains permitted.
+  Cover legacy provenance recovery and denial when its origin is unverifiable.
 - #10–#12: provider-scoped model managers, auth/transport isolation, stateless
   Responses and function-tool handling; test same model slug with different
   metadata and distinct endpoint credentials.
