@@ -26,6 +26,13 @@ pub(crate) struct BundledBwrapLauncher {
     program: AbsolutePathBuf,
 }
 
+#[cfg(test)]
+pub(crate) fn test_launcher(program: &Path) -> BundledBwrapLauncher {
+    BundledBwrapLauncher {
+        program: AbsolutePathBuf::from_absolute_path(program).expect("absolute bundled test path"),
+    }
+}
+
 pub(crate) fn launcher() -> Option<BundledBwrapLauncher> {
     let current_exe = std::env::current_exe().ok()?;
     find_program(

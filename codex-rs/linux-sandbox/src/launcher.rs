@@ -27,6 +27,7 @@ struct SystemBwrapLauncher {
     program: AbsolutePathBuf,
     supports_argv0: bool,
     supports_ro_bind_fd: bool,
+    supports_dev_without_fd: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,7 @@ struct SystemBwrapCapabilities {
     supports_argv0: bool,
     supports_perms: bool,
     supports_ro_bind_fd: bool,
+    supports_dev_without_fd: bool,
 }
 
 static LAUNCHER: OnceLock<BubblewrapLauncher> = OnceLock::new();
@@ -47,7 +49,10 @@ pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> !
         argv.insert(1, "--as-pid-1".to_string());
     }
 
-    match preferred_bwrap_launcher() {
+    let launcher =
+        launcher_for_invocation(preferred_bwrap_launcher(), &argv, bundled_bwrap::launcher)
+            .unwrap_or_else(|error| panic!("{error}"));
+    match launcher {
         BubblewrapLauncher::System(launcher) => {
             if !launcher.supports_ro_bind_fd {
                 translate_legacy_bwrap_fd_mounts(&mut argv)
@@ -63,6 +68,25 @@ pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> !
             )
         }
     }
+}
+
+fn launcher_for_invocation(
+    preferred: &BubblewrapLauncher,
+    argv: &[String],
+    bundled: impl FnOnce() -> Option<BundledBwrapLauncher>,
+) -> Result<BubblewrapLauncher, &'static str> {
+    if let BubblewrapLauncher::System(system) = preferred
+        && !system.supports_dev_without_fd
+        && argv
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "--dev-without-fd")
+    {
+        return bundled().map(BubblewrapLauncher::Bundled).ok_or(
+            "cannot enforce denied /dev/fd: system bubblewrap lacks --dev-without-fd and no trusted bundled bubblewrap is available",
+        );
+    }
+    Ok(preferred.clone())
 }
 
 fn translate_legacy_bwrap_fd_mounts(argv: &mut Vec<String>) -> Result<(), String> {
@@ -172,6 +196,7 @@ fn system_bwrap_launcher_for_path_with_probe(
         supports_argv0,
         supports_perms: true,
         supports_ro_bind_fd,
+        supports_dev_without_fd,
     }) = system_bwrap_capabilities(system_bwrap_path)
     else {
         return None;
@@ -187,6 +212,7 @@ fn system_bwrap_launcher_for_path_with_probe(
         program: system_bwrap_path,
         supports_argv0,
         supports_ro_bind_fd,
+        supports_dev_without_fd,
     })
 }
 
@@ -216,6 +242,8 @@ fn system_bwrap_capabilities(system_bwrap_path: &Path) -> Option<SystemBwrapCapa
         supports_argv0: stdout.contains("--argv0") || stderr.contains("--argv0"),
         supports_perms: stdout.contains("--perms") || stderr.contains("--perms"),
         supports_ro_bind_fd: stdout.contains("--ro-bind-fd") || stderr.contains("--ro-bind-fd"),
+        supports_dev_without_fd: stdout.contains("--dev-without-fd")
+            || stderr.contains("--dev-without-fd"),
     })
 }
 

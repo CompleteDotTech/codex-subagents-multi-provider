@@ -4,6 +4,66 @@ use super::*;
 use pretty_assertions::assert_eq;
 use tempfile::NamedTempFile;
 
+fn old_system_launcher() -> BubblewrapLauncher {
+    BubblewrapLauncher::System(SystemBwrapLauncher {
+        program: AbsolutePathBuf::from_absolute_path("/usr/bin/bwrap").unwrap(),
+        supports_argv0: false,
+        supports_ro_bind_fd: false,
+        supports_dev_without_fd: false,
+    })
+}
+
+#[test]
+fn denied_dev_fd_requires_bundle_before_legacy_fd_translation() {
+    let argv = [
+        "bwrap",
+        "--dev-without-fd",
+        "/dev",
+        "--ro-bind-fd",
+        "invalid",
+        "/target",
+        "--",
+        "true",
+    ]
+    .map(str::to_string);
+    let bundled = bundled_bwrap::test_launcher(Path::new("/trusted/bwrap"));
+    assert_eq!(
+        launcher_for_invocation(&old_system_launcher(), &argv, || Some(bundled.clone())),
+        Ok(BubblewrapLauncher::Bundled(bundled)),
+    );
+    assert!(
+        launcher_for_invocation(&old_system_launcher(), &argv, || None)
+            .unwrap_err()
+            .contains("cannot enforce denied /dev/fd")
+    );
+}
+
+#[test]
+fn ordinary_invocation_keeps_system_launcher_and_command_flags_are_ignored() {
+    let argv = ["bwrap", "--dev", "/dev", "--", "echo", "--dev-without-fd"].map(str::to_string);
+    let preferred = old_system_launcher();
+    assert_eq!(
+        launcher_for_invocation(&preferred, &argv, || panic!(
+            "must not probe bundled launcher"
+        )),
+        Ok(preferred)
+    );
+}
+
+#[test]
+fn capable_system_bwrap_keeps_denied_dev_fd_invocation() {
+    let mut preferred = old_system_launcher();
+    let BubblewrapLauncher::System(system) = &mut preferred else {
+        unreachable!()
+    };
+    system.supports_dev_without_fd = true;
+    let argv = ["bwrap", "--dev-without-fd", "/dev", "--", "true"].map(str::to_string);
+    assert_eq!(
+        launcher_for_invocation(&preferred, &argv, || panic!("must not probe bundle")),
+        Ok(preferred)
+    );
+}
+
 #[test]
 fn prefers_system_bwrap_when_help_lists_argv0() {
     let fake_bwrap = NamedTempFile::new().expect("temp file");
@@ -16,12 +76,14 @@ fn prefers_system_bwrap_when_help_lists_argv0() {
                 supports_argv0: true,
                 supports_perms: true,
                 supports_ro_bind_fd: true,
+                supports_dev_without_fd: false,
             })
         }),
         Some(SystemBwrapLauncher {
             program: expected,
             supports_argv0: true,
             supports_ro_bind_fd: true,
+            supports_dev_without_fd: false,
         })
     );
 }
@@ -37,12 +99,14 @@ fn prefers_system_bwrap_when_system_bwrap_lacks_argv0() {
                 supports_argv0: false,
                 supports_perms: true,
                 supports_ro_bind_fd: false,
+                supports_dev_without_fd: false,
             })
         }),
         Some(SystemBwrapLauncher {
             program: AbsolutePathBuf::from_absolute_path(fake_bwrap_path).expect("absolute"),
             supports_argv0: false,
             supports_ro_bind_fd: false,
+            supports_dev_without_fd: false,
         })
     );
 }
@@ -57,6 +121,7 @@ fn ignores_system_bwrap_when_system_bwrap_lacks_perms() {
                 supports_argv0: false,
                 supports_perms: false,
                 supports_ro_bind_fd: false,
+                supports_dev_without_fd: false,
             })
         }),
         None
@@ -64,12 +129,12 @@ fn ignores_system_bwrap_when_system_bwrap_lacks_perms() {
 }
 
 #[test]
-fn detects_fd_backed_read_only_mount_support_in_system_bwrap_help() {
+fn detects_fd_mount_and_device_layout_support_in_system_bwrap_help() {
     let temp_dir = tempfile::tempdir().expect("temp directory");
     let fake_bwrap_path = temp_dir.path().join("bwrap");
     codex_utils_cargo_bin::write_executable(
         &fake_bwrap_path,
-        "#!/bin/sh\nprintf '%s\\n' '--as-pid-1' '--perms' '--argv0' '--ro-bind-fd'\n",
+        "#!/bin/sh\nprintf '%s\\n' '--as-pid-1' '--perms' '--argv0' '--ro-bind-fd' '--dev-without-fd'\n",
     )
     .expect("write fake bubblewrap");
 
@@ -79,6 +144,7 @@ fn detects_fd_backed_read_only_mount_support_in_system_bwrap_help() {
             supports_argv0: true,
             supports_perms: true,
             supports_ro_bind_fd: true,
+            supports_dev_without_fd: true,
         })
     );
 }

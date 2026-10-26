@@ -12,6 +12,116 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
+fn policy_denying_dev_path(path: &str) -> FileSystemSandboxPolicy {
+    let mut policy = PermissionProfile::read_only().file_system_sandbox_policy();
+    policy.entries.push(FileSystemSandboxEntry::new(
+        FileSystemPath::Path {
+            path: AbsolutePathBuf::from_absolute_path(path).unwrap().into(),
+        },
+        FileSystemAccessMode::Deny,
+    ));
+    policy
+}
+
+#[test]
+fn exact_dev_fd_denial_uses_real_directory_mask() {
+    let policy = policy_denying_dev_path("/dev/fd");
+    let args = create_bwrap_command_args(
+        vec!["/bin/true".to_string()],
+        &policy,
+        Path::new("/"),
+        Path::new("/"),
+        BwrapOptions::default(),
+    )
+    .expect("denied descriptor directory must support startup")
+    .args;
+    assert!(
+        args.windows(2)
+            .any(|args| args == ["--dev-without-fd", "/dev"])
+    );
+    assert!(!args.iter().any(|arg| arg == "--dev"));
+    assert!(args.windows(6).any(|args| args
+        == [
+            "--perms",
+            "000",
+            "--tmpfs",
+            "/dev/fd",
+            "--remount-ro",
+            "/dev/fd"
+        ]));
+}
+
+#[test]
+fn nested_dev_fd_denial_fails_closed_even_for_missing_descriptor() {
+    let policy = policy_denying_dev_path("/dev/fd/2147483647");
+    let error =
+        create_filesystem_args(&policy, Path::new("/"), BwrapOptions::default()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot enforce sandbox deny-read path below /dev/fd")
+    );
+}
+
+#[test]
+fn dev_fd_denial_rejects_writable_dev_rebind() {
+    let mut policy = policy_denying_dev_path("/dev/fd");
+    policy.entries.push(FileSystemSandboxEntry::new(
+        FileSystemPath::Path {
+            path: AbsolutePathBuf::from_absolute_path("/dev").unwrap().into(),
+        },
+        FileSystemAccessMode::Write,
+    ));
+    let error =
+        create_filesystem_args(&policy, Path::new("/"), BwrapOptions::default()).unwrap_err();
+    assert!(error.to_string().contains("writable device bind"));
+}
+
+#[test]
+fn ancestor_dev_denial_retains_normal_device_tree_then_masks_parent() {
+    let policy = policy_denying_dev_path("/dev");
+    let args = create_filesystem_args(&policy, Path::new("/"), BwrapOptions::default())
+        .unwrap()
+        .args;
+    assert!(args.windows(2).any(|args| args == ["--dev", "/dev"]));
+    assert!(!args.iter().any(|arg| arg == "--dev-without-fd"));
+    assert!(
+        args.windows(6)
+            .any(|args| args == ["--perms", "000", "--tmpfs", "/dev", "--remount-ro", "/dev"])
+    );
+}
+
+#[test]
+fn dev_fd_denial_rejects_canonical_device_alias_grants() {
+    for (target, access) in [
+        ("/dev", FileSystemAccessMode::Write),
+        ("/", FileSystemAccessMode::Write),
+        ("/dev", FileSystemAccessMode::Read),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let alias = temp.path().join("device-alias");
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        let mut policy = policy_denying_dev_path("/dev/fd");
+        // Use a minimal readable baseline so a read alias is mounted explicitly.
+        if access == FileSystemAccessMode::Read {
+            policy =
+                FileSystemSandboxPolicy::restricted(vec![policy.entries.last().unwrap().clone()]);
+        }
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::Path {
+                path: AbsolutePathBuf::from_absolute_path(&alias).unwrap().into(),
+            },
+            access,
+        ));
+        let error =
+            create_filesystem_args(&policy, Path::new("/"), BwrapOptions::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("device bind"),
+            "target={target}, access={access:?}: {error}"
+        );
+    }
+}
+
 #[test]
 fn default_unreadable_glob_scan_has_no_depth_cap() {
     assert_eq!(BwrapOptions::default().glob_scan_max_depth, None);
