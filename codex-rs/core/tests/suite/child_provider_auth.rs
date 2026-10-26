@@ -15,21 +15,23 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
-use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::responses::start_websocket_server_with_headers;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
+use futures::SinkExt;
+use futures::StreamExt;
 use http::HeaderMap;
 use http::HeaderValue;
+use serde_json::Value;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -39,6 +41,98 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+#[derive(Clone)]
+struct SocketObservation {
+    path: String,
+    headers: HeaderMap,
+    requests: Vec<Value>,
+}
+
+struct AuthSocketFixture {
+    base_url: String,
+    connections: Arc<Mutex<Vec<SocketObservation>>>,
+    rejected_generations: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AuthSocketFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+// Startup can open an eager socket before the generate=false warmup. Respond to
+// actual request kinds instead of letting empty sockets consume a finite script.
+async fn auth_socket_fixture(reject_first_generation: bool) -> anyhow::Result<AuthSocketFixture> {
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("ws://{}/v1", listener.local_addr()?);
+    let connections = Arc::new(Mutex::new(Vec::<SocketObservation>::new()));
+    let rejected_generations = Arc::new(AtomicUsize::new(0));
+    let log = connections.clone();
+    let rejected = rejected_generations.clone();
+    let task = tokio::spawn(async move {
+        let mut clients = tokio::task::JoinSet::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            let log = log.clone();
+            let rejected = rejected.clone();
+            clients.spawn(async move {
+                let mut handshake = None;
+                let socket = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        handshake = Some((request.uri().to_string(), request.headers().clone()));
+                        Ok(response)
+                    },
+                ).await;
+                let Ok(mut socket) = socket else { return };
+                let (path, headers) = handshake.unwrap();
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    let index = log.len();
+                    log.push(SocketObservation { path, headers, requests: vec![] });
+                    index
+                };
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Text(payload) = message else { continue };
+                    let request: Value = serde_json::from_str(&payload).unwrap();
+                    let request_index = {
+                        let mut log = log.lock().unwrap();
+                        log[index].requests.push(request.clone());
+                        log[index].requests.len() - 1
+                    };
+                    assert_eq!(request["type"], "response.create");
+                    let generation = request["generate"] != false;
+                    if generation && reject_first_generation
+                        && rejected.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+                    {
+                        let error = serde_json::json!({"type": "error", "status": 400, "error": {
+                            "type": "invalid_request_error", "code": "websocket_connection_limit_reached",
+                            "message": "synthetic reconnect",
+                        }});
+                        socket.send(Message::Text(error.to_string().into())).await.unwrap();
+                        let _ = socket.close(None).await;
+                        break;
+                    }
+                    let id = format!("response-{index}-{request_index}");
+                    for event in [ev_response_created(&id), ev_completed(&id)] {
+                        if socket.send(Message::Text(event.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(AuthSocketFixture {
+        base_url,
+        connections,
+        rejected_generations,
+        task,
+    })
+}
 
 struct HostAuth {
     auth: CodexAuth,
@@ -445,40 +539,24 @@ async fn command_child_401_refreshes_only_its_helper_through_model_client() -> a
 async fn websocket_child_reconnect_keeps_parent_and_local_connections_isolated()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
-    let completion = || vec![ev_response_created("r"), ev_completed("r")];
-    let connection = |requests| WebSocketConnectionConfig {
-        requests,
-        response_headers: vec![],
-        accept_delay: None,
-        close_after_requests: false,
-    };
-    let parent_server =
-        start_websocket_server_with_headers(vec![connection(vec![completion(), completion()])])
-            .await;
-    let local_server =
-        start_websocket_server_with_headers(vec![connection(vec![completion(), completion()])])
-            .await;
-    let mut rejected_connection = connection(vec![vec![
-        serde_json::json!({"type": "error", "status": 400, "error": {
-            "type": "invalid_request_error", "code": "websocket_connection_limit_reached",
-            "message": "synthetic reconnect",
-        }}),
-    ]]);
-    rejected_connection.close_after_requests = true;
-    let child_server = start_websocket_server_with_headers(vec![
-        rejected_connection,
-        connection(vec![completion(), completion()]),
-    ])
-    .await;
+    let http_fixture = start_mock_server().await;
+    let parent_server = auth_socket_fixture(false).await?;
+    let local_server = auth_socket_fixture(false).await?;
+    let child_server = auth_socket_fixture(true).await?;
     let (helper_home, auth) = rotating_helper()?;
     let host = shared_host();
     let manager = AuthManager::from_auth_for_testing(host.auth.clone());
     manager.set_external_auth(host.clone()).await?;
-    let mut parent_builder = test_codex().with_auth_manager(manager.clone());
-    let parent = parent_builder
-        .build_with_websocket_server(&parent_server)
-        .await?;
-    let child_url = format!("{}/v1", child_server.uri());
+    let parent_url = parent_server.base_url.clone();
+    let mut parent_builder = test_codex()
+        .with_auth_manager(manager.clone())
+        .with_models_manager(static_models())
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(parent_url);
+            config.model_provider.supports_websockets = true;
+        });
+    let parent = parent_builder.build_with_auto_env(&http_fixture).await?;
+    let child_url = child_server.base_url.clone();
     let mut child_builder = test_codex()
         .with_auth_manager(manager.clone())
         .with_models_manager(static_models())
@@ -492,13 +570,12 @@ async fn websocket_child_reconnect_keeps_parent_and_local_connections_isolated()
                 wire_api: WireApi::Responses,
                 request_max_retries: Some(0),
                 stream_max_retries: Some(1),
+                supports_websockets: true,
                 ..Default::default()
             };
         });
-    let child = child_builder
-        .build_with_websocket_server(&child_server)
-        .await?;
-    let local_url = format!("{}/v1", local_server.uri());
+    let child = child_builder.build_with_auto_env(&http_fixture).await?;
+    let local_url = local_server.base_url.clone();
     let mut local_builder = test_codex()
         .with_auth_manager(manager.clone())
         .with_models_manager(static_models())
@@ -511,12 +588,11 @@ async fn websocket_child_reconnect_keeps_parent_and_local_connections_isolated()
                 wire_api: WireApi::Responses,
                 request_max_retries: Some(0),
                 stream_max_retries: Some(0),
+                supports_websockets: true,
                 ..Default::default()
             };
         });
-    let local = local_builder
-        .build_with_websocket_server(&local_server)
-        .await?;
+    let local = local_builder.build_with_auto_env(&http_fixture).await?;
     let (a, b, c) = tokio::join!(
         successful_turn(&parent, "parent"),
         successful_turn(&child, "child reconnect"),
@@ -533,44 +609,63 @@ async fn websocket_child_reconnect_keeps_parent_and_local_connections_isolated()
     a?;
     b?;
     c?;
-    assert_eq!(parent_server.handshakes().len(), 1);
-    assert_eq!(local_server.handshakes().len(), 1);
-    assert_eq!(child_server.handshakes().len(), 2);
-    assert_eq!(parent_server.single_connection().len(), 2);
-    assert_eq!(local_server.single_connection().len(), 2);
-    assert_eq!(
-        child_server
-            .connections()
-            .iter()
-            .map(Vec::len)
-            .sum::<usize>(),
-        3
-    );
-    assert_eq!(
-        parent_server
-            .single_handshake()
-            .header("authorization")
-            .as_deref(),
-        Some("Bearer synthetic-parent-token")
-    );
-    for (server, token) in [
-        (&child_server, Some("Bearer synthetic-command-initial")),
-        (&local_server, None),
+    assert_eq!(child_server.rejected_generations.load(Ordering::SeqCst), 1);
+    for (server, token, generation_counts) in [
+        (
+            &parent_server,
+            Some("Bearer synthetic-parent-token"),
+            vec![2],
+        ),
+        (
+            &child_server,
+            Some("Bearer synthetic-command-initial"),
+            vec![1, 2],
+        ),
+        (&local_server, None, vec![2]),
     ] {
-        for handshake in server.handshakes() {
-            assert_eq!(handshake.uri(), "/v1/responses");
-            assert_eq!(handshake.header("authorization").as_deref(), token);
+        let connections = server.connections.lock().unwrap().clone();
+        let actual_generation_counts: Vec<_> = connections
+            .iter()
+            .map(|connection| {
+                connection
+                    .requests
+                    .iter()
+                    .filter(|request| request["generate"] != false)
+                    .count()
+            })
+            .filter(|count| *count > 0)
+            .collect();
+        // Empty eager sockets and startup warmups do not count as generation retries.
+        // Both successful child turns must reuse the socket opened after rejection.
+        assert_eq!(actual_generation_counts, generation_counts);
+        assert!(
+            connections
+                .iter()
+                .flat_map(|connection| &connection.requests)
+                .any(|request| request["generate"] == false)
+        );
+        for connection in connections {
+            assert_eq!(connection.path, "/v1/responses");
+            assert_eq!(
+                connection
+                    .headers
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap()),
+                token
+            );
             for name in [
                 "chatgpt-account-id",
                 "x-openai-actor-id",
                 "x-openai-account-routing-override",
                 "x-codex-routing-hint",
             ] {
-                assert_eq!(handshake.header(name), None);
+                if token != Some("Bearer synthetic-parent-token") {
+                    assert_eq!(connection.headers.get(name), None);
+                }
             }
-        }
-        for request in server.connections().into_iter().flatten() {
-            assert_eq!(request.body_json()["model"], "gpt-5.5");
+            for request in connection.requests {
+                assert_eq!(request["model"], "gpt-5.5");
+            }
         }
     }
     assert_eq!(
@@ -584,9 +679,6 @@ async fn websocket_child_reconnect_keeps_parent_and_local_connections_isolated()
     parent.codex.shutdown_and_wait().await?;
     child.codex.shutdown_and_wait().await?;
     local.codex.shutdown_and_wait().await?;
-    parent_server.shutdown().await;
-    child_server.shutdown().await;
-    local_server.shutdown().await;
     Ok(())
 }
 
