@@ -418,6 +418,20 @@ fn create_filesystem_args(
             .mask_wslg_distro
             .then_some(Path::new(WSLG_DISTRO_ROOT)),
     )?;
+    create_filesystem_args_with_daemon_directories(
+        file_system_sandbox_policy,
+        cwd,
+        options,
+        &daemon_directories,
+    )
+}
+
+fn create_filesystem_args_with_daemon_directories(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+    options: BwrapOptions,
+    daemon_directories: &BTreeSet<PathBuf>,
+) -> Result<BwrapArgs> {
     let unreadable_globs = file_system_sandbox_policy.get_unreadable_globs_with_cwd(cwd);
     // Bubblewrap requires bind mount targets to exist. Skip missing writable
     // roots so mixed-platform configs can keep harmless paths for other
@@ -500,6 +514,49 @@ fn create_filesystem_args(
     unreadable_roots.sort();
     unreadable_roots.dedup();
 
+    // A mount through bubblewrap's /dev/fd symlink resolves against the setup
+    // process's procfs, not the future command's descriptor table. Never silently
+    // skip a missing descriptor: the command could open it later.
+    if unreadable_roots
+        .iter()
+        .any(|path| path != Path::new("/dev/fd") && path.starts_with("/dev/fd"))
+    {
+        return Err(CodexErr::Fatal(
+            "cannot enforce sandbox deny-read path below /dev/fd".to_string(),
+        ));
+    }
+    let deny_dev_fd = unreadable_roots
+        .iter()
+        .any(|path| path == Path::new("/dev/fd"));
+    // Capture exactly the physical targets used below. Re-resolving an alias
+    // after this check could bind a different device tree over the fd mask.
+    let writable_mount_targets: BTreeMap<PathBuf, PathBuf> = writable_roots
+        .iter()
+        .filter_map(|root| {
+            let root = root.root.as_path();
+            canonical_target_if_symlinked_path(root).map(|target| (root.to_path_buf(), target))
+        })
+        .collect();
+    if deny_dev_fd
+        && writable_roots.iter().any(|root| {
+            let root = root.root.as_path();
+            let target = writable_mount_targets.get(root);
+            let overlaps =
+                |path: &Path| Path::new("/dev/fd").starts_with(path) || path.starts_with("/dev/fd");
+            (root != Path::new("/") && overlaps(root))
+                || target.is_some_and(|target| overlaps(target))
+        })
+    {
+        return Err(CodexErr::Fatal(
+            "cannot enforce sandbox deny-read /dev/fd through a writable device bind".to_string(),
+        ));
+    }
+    let dev_option = if deny_dev_fd {
+        "--dev-without-fd"
+    } else {
+        "--dev"
+    };
+
     let mut args = if file_system_sandbox_policy.has_full_disk_read_access() {
         // Read-only root, then mount a minimal device tree.
         // In bubblewrap (`bubblewrap.c`, `SETUP_MOUNT_DEV`), `--dev /dev`
@@ -510,7 +567,7 @@ fn create_filesystem_args(
             "--ro-bind".to_string(),
             "/".to_string(),
             "/".to_string(),
-            "--dev".to_string(),
+            dev_option.to_string(),
             "/dev".to_string(),
         ]
     } else {
@@ -519,7 +576,7 @@ fn create_filesystem_args(
         let mut args = vec![
             "--tmpfs".to_string(),
             "/".to_string(),
-            "--dev".to_string(),
+            dev_option.to_string(),
             "/dev".to_string(),
         ];
 
@@ -528,6 +585,25 @@ fn create_filesystem_args(
             .into_iter()
             .map(PathBuf::from)
             .collect();
+        if deny_dev_fd
+            && readable_roots.iter().any(|root| {
+                let target = canonical_target_if_symlinked_path(root);
+                [Some(root.as_path()), target.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|path| {
+                        path != Path::new("/")
+                            && (Path::new("/dev/fd").starts_with(path)
+                                || path.starts_with("/dev/fd"))
+                    })
+                    || target.as_deref() == Some(Path::new("/"))
+            })
+        {
+            return Err(CodexErr::Fatal(
+                "cannot enforce sandbox deny-read /dev/fd through a readable device bind"
+                    .to_string(),
+            ));
+        }
         if file_system_sandbox_policy.include_platform_defaults() {
             readable_roots.extend(
                 LINUX_PLATFORM_DEFAULT_READ_ROOTS
@@ -550,7 +626,7 @@ fn create_filesystem_args(
                 "--ro-bind".to_string(),
                 "/".to_string(),
                 "/".to_string(),
-                "--dev".to_string(),
+                dev_option.to_string(),
                 "/dev".to_string(),
             ];
         } else {
@@ -573,14 +649,14 @@ fn create_filesystem_args(
                 args.push("--ro-bind".to_string());
                 args.push(path_to_string(&mount_root));
                 args.push(path_to_string(&mount_root));
-                append_daemon_socket_masks(&mut args, &mount_root, &daemon_directories)?;
+                append_daemon_socket_masks(&mut args, &mount_root, daemon_directories)?;
             }
         }
 
         args
     };
     if args[0] == "--ro-bind" {
-        append_daemon_socket_masks(&mut args, Path::new("/"), &daemon_directories)?;
+        append_daemon_socket_masks(&mut args, Path::new("/"), daemon_directories)?;
     }
     let mut bwrap_args = BwrapArgs {
         args,
@@ -591,8 +667,8 @@ fn create_filesystem_args(
     for writable_root in &writable_roots {
         let root = writable_root.root.as_path();
         allowed_write_paths.push(root.to_path_buf());
-        if let Some(target) = canonical_target_if_symlinked_path(root) {
-            allowed_write_paths.push(target);
+        if let Some(target) = writable_mount_targets.get(root) {
+            allowed_write_paths.push(target.clone());
         }
     }
     let unreadable_paths: HashSet<PathBuf> = unreadable_roots.iter().cloned().collect();
@@ -625,7 +701,7 @@ fn create_filesystem_args(
 
     for writable_root in &sorted_writable_roots {
         let root = writable_root.root.as_path();
-        let symlink_target = canonical_target_if_symlinked_path(root);
+        let symlink_target = writable_mount_targets.get(root).cloned();
         // If a denied ancestor was already masked, recreate any missing mount
         // target parents before binding the narrower writable descendant.
         if let Some(masking_root) = unreadable_roots
@@ -650,14 +726,14 @@ fn create_filesystem_args(
                 // The root bind shadows the earlier device tree and applies nodev.
                 // Recreate only standard devices before applying explicit deny masks.
                 bwrap_args.args.extend([
-                    "--dev".to_string(),
+                    dev_option.to_string(),
                     "/dev".to_string(),
                     "--bind-try".to_string(),
                     "/dev/shm".to_string(),
                     "/dev/shm".to_string(),
                 ]);
             }
-            append_daemon_socket_masks(&mut bwrap_args.args, mount_root, &daemon_directories)?;
+            append_daemon_socket_masks(&mut bwrap_args.args, mount_root, daemon_directories)?;
         }
 
         let mut read_only_subpaths: Vec<PathBuf> = writable_root
@@ -721,7 +797,7 @@ fn create_filesystem_args(
                 &mut bwrap_args,
                 &subpath,
                 &allowed_write_paths,
-                &daemon_directories,
+                daemon_directories,
             )?;
         }
         // Protect the registry only where a writable bind exposes it. Apply
@@ -740,7 +816,7 @@ fn create_filesystem_args(
             bwrap_args.args.push("--ro-bind".to_string());
             bwrap_args.args.push(path_to_string(registry_mount));
             bwrap_args.args.push(path_to_string(registry_mount));
-            append_daemon_socket_masks(&mut bwrap_args.args, registry_mount, &daemon_directories)?;
+            append_daemon_socket_masks(&mut bwrap_args.args, registry_mount, daemon_directories)?;
         }
         let mut nested_unreadable_roots: Vec<PathBuf> = unreadable_roots
             .iter()
@@ -1330,6 +1406,19 @@ fn append_unreadable_root_args(
     unreadable_root: &Path,
     allowed_write_paths: &[PathBuf],
 ) -> Result<()> {
+    if unreadable_root == Path::new("/dev/fd") {
+        // The planner selected --dev-without-fd and rejected writable device
+        // rebinds. This is a new directory, not the host's mutable procfs alias.
+        bwrap_args.args.extend([
+            "--perms".to_string(),
+            "000".to_string(),
+            "--tmpfs".to_string(),
+            "/dev/fd".to_string(),
+            "--remount-ro".to_string(),
+            "/dev/fd".to_string(),
+        ]);
+        return Ok(());
+    }
     if let Some(symlink) =
         first_writable_symlink_component_in_path(unreadable_root, allowed_write_paths)
     {
