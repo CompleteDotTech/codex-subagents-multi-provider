@@ -73,10 +73,14 @@ async fn apply_role_to_config_inner(
 ) -> anyhow::Result<()> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
+        config.agent_role_model_provider = None;
         return Ok(());
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
     let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
+    // Keep only the ID for the shared child resolver. Provider objects, auth,
+    // catalogs and policy remain owned by the host configuration.
+    let model_provider = role_config.model_provider;
     let mut overrides = AgentRoleOverrides {
         developer_instructions: role_config.developer_instructions,
         model: role_config.model,
@@ -121,9 +125,11 @@ async fn apply_role_to_config_inner(
         .as_table()
         .is_some_and(toml::map::Map::is_empty)
     {
+        config.agent_role_model_provider = model_provider;
         return Ok(());
     }
     *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
+    config.agent_role_model_provider = model_provider;
     Ok(())
 }
 

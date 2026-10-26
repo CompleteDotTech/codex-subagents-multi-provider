@@ -45,8 +45,19 @@
         "$ref": "#/definitions/AgentRoleToml"
       },
       "properties": {
+        "allowed_model_providers": {
+          "description": "Host-authorized provider IDs for children outside the root provider's lineage exemption. Project and session layers cannot grant this authority.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "default_subagent_model": {
           "description": "Default model for spawned subagents when the spawn call does not select one.",
+          "type": "string"
+        },
+        "default_subagent_model_provider": {
+          "description": "Host default provider for newly delegated children; absent inherits the immediate parent.",
           "type": "string"
         },
         "default_subagent_reasoning_effort": {
@@ -75,6 +86,14 @@
           "description": "Maximum nesting depth for V1 agent threads. Ignored by V2.",
           "format": "int32",
           "type": "integer"
+        },
+        "provider_defaults": {
+          "additionalProperties": {
+            "$ref": "#/definitions/ChildProviderDefaultsToml"
+          },
+          "default": {},
+          "description": "Host-owned model and catalog defaults, keyed by configured provider ID.",
+          "type": "object"
         }
       },
       "type": "object"
@@ -557,6 +576,23 @@
         "enabled": {
           "default": true,
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ChildProviderDefaultsToml": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "model_catalog_json": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Provider-scoped catalog; relative paths resolve against the declaring host config."
         }
       },
       "type": "object"

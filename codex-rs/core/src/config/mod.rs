@@ -671,6 +671,12 @@ pub struct Config {
     /// Info needed to make an API request to the model.
     pub model_provider: ModelProviderInfo,
 
+    /// Host-only provider definitions and authorization for user-delegated children.
+    pub child_provider_policy: codex_config::child_provider::ChildProviderPolicy,
+
+    /// Bounded role selector consumed by child resolution, never a provider definition.
+    pub agent_role_model_provider: Option<String>,
+
     /// Deprecated: `friendly` and `pragmatic` no longer select a style.
     pub personality: Option<Personality>,
 
@@ -4367,6 +4373,23 @@ impl Config {
         }
         let effective_file_system_sandbox_policy = effective_file_system_sandbox_policy
             .with_additional_readable_roots(resolved_cwd.as_path(), &helper_readable_roots);
+        let effective_writable_roots = effective_file_system_sandbox_policy
+            .get_writable_roots_with_cwd(resolved_cwd.as_path());
+        let mut child_provider_scope_roots = workspace_roots.clone();
+        child_provider_scope_roots.extend(effective_writable_roots.iter().map(|root| root.root.clone()));
+        dedupe_absolute_paths(&mut child_provider_scope_roots);
+        let protected_catalog_roots: Vec<_> = effective_writable_roots
+            .into_iter()
+            .flat_map(|root| root.read_only_subpaths)
+            .collect();
+        let child_provider_policy =
+            codex_config::child_provider::ChildProviderPolicy::from_config_layers(
+                &config_layer_stack,
+                &resolved_cwd,
+                &child_provider_scope_roots,
+                &protected_catalog_roots,
+                &effective_file_system_sandbox_policy,
+            )?;
         let effective_permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
             effective_permission_profile.enforcement(),
             &effective_file_system_sandbox_policy,
@@ -4466,6 +4489,8 @@ impl Config {
             async_compaction_threshold_percent,
             model_provider_id,
             model_provider,
+            child_provider_policy,
+            agent_role_model_provider: None,
             cwd: resolved_cwd,
             workspace_roots: workspace_roots.clone(),
             workspace_roots_explicit,
