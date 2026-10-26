@@ -489,6 +489,40 @@ async fn pinned_authority_snapshot_is_nonblocking_and_never_reconciles_or_fetche
     );
 }
 
+#[tokio::test]
+async fn pinned_default_catalog_never_turns_identity_mismatch_into_builtin_proof() {
+    let endpoint = Arc::new(ObservedEndpoint {
+        persisted: Mutex::new(Some("grant-b".into())),
+        observed: Mutex::new(Some("grant-a".into())),
+        replace_during_fetch: false,
+    });
+    let manager = OpenAiModelsManager::new_without_cache(endpoint.clone(), None);
+    let slug = manager
+        .remote_models
+        .read()
+        .await
+        .models
+        .first()
+        .unwrap()
+        .slug
+        .clone();
+    let config = ModelsManagerConfig::default();
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_some());
+    *endpoint.observed.lock().unwrap() = Some("grant-b".into());
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_none());
+    *endpoint.observed.lock().unwrap() = Some("grant-a".into());
+    let held = manager.remote_models.write().await;
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_none());
+    drop(held);
+    manager.remote_models.write().await.fetched_at = chrono::DateTime::<Utc>::MIN_UTC;
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_none());
+    assert_eq!(
+        endpoint.identity().as_deref(),
+        Some("grant-a"),
+        "no reconciliation or endpoint fetch"
+    );
+}
+
 #[test]
 fn pinned_static_authority_snapshot_uses_only_immutable_available_metadata() {
     let manager = StaticModelsManager::new(

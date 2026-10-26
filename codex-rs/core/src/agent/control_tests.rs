@@ -1856,6 +1856,10 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
     .await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let parent = harness
         .manager
@@ -4627,6 +4631,12 @@ async fn resume_agent_respects_max_threads_limit() {
         )
         .await
         .expect("spawn_agent should succeed");
+    let saved_source = manager
+        .get_thread(resumable_id)
+        .await
+        .unwrap()
+        .session_source
+        .clone();
     let _ = control
         .shutdown_live_agent(resumable_id)
         .await
@@ -4642,7 +4652,7 @@ async fn resume_agent_respects_max_threads_limit() {
         .expect("spawn_agent should succeed for active slot");
 
     let err = control
-        .resume_agent_from_rollout(config, resumable_id, SessionSource::Exec)
+        .resume_agent_from_rollout(config, resumable_id, saved_source)
         .await
         .expect_err("resume should respect max threads");
     let CodexErrorDetails::AgentLimitReached {
@@ -6484,14 +6494,28 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
 async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool) {
     let role = if nested { "restricted" } else { "default" };
     let host = format!(
-        "[agents]\nallowed_model_providers=['openai']\n[agents.{role}]\nconfig_file='restricted.toml'\n"
+        "[agents]\nallowed_model_providers=['openai']\n[agents.{role}]\nconfig_file='restricted.toml'\ndescription='Restricted authority fixture'\n"
     );
-    let (home, mut config) = test_config_with_host_configuration(Vec::new(), Some(&host)).await;
+    let (home, _initial_config) = test_config_with_host_configuration(Vec::new(), Some(&host)).await;
     std::fs::write(home.path().join("restricted.toml"), "[features]\nshell_tool=false\n[skills]\ninclude_instructions=false\nbundled={enabled=false}\n").unwrap();
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .cli_overrides(vec![("agents.max_depth".into(), TomlValue::Integer(8))])
+        .build()
+        .await
+        .unwrap();
+    assert!(
+        config.agent_roles.contains_key(role),
+        "host role must load before runtime startup"
+    );
     for feature in [Feature::Sqlite, Feature::MultiAgentV2, Feature::ShellTool] {
         config.features.enable(feature).unwrap();
     }
     config.model = Some("gpt-5.6-sol".into());
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let root = harness
         .manager
@@ -6646,7 +6670,18 @@ async fn failed_saved_authority_invalidation_prevents_runtime_and_auth_helper_st
     let (home, mut config) = test_config().await;
     config.features.enable(Feature::Sqlite).unwrap();
     let harness = AgentControlHarness::new_with_config(home, config).await;
-    let (id, thread) = harness.start_thread().await;
+    let started = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .unwrap();
+    let (id, thread) = (started.thread_id, started.thread);
     persist_thread_for_tree_resume(&thread, "sealed root before unavailable store").await;
     let stored = thread.read_thread(true, true).await.unwrap();
     let initial = InitialHistory::Resumed(ResumedHistory {

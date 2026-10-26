@@ -521,7 +521,8 @@ impl ModelsManager for OpenAiModelsManager {
         let identity = self.endpoint_client.try_pinned_identity()?;
         let entry = self.remote_models.try_read().ok()?;
         let rejected = self.rejected_identities.try_read().ok()?;
-        if entry.fetched_at == chrono::DateTime::<Utc>::MIN_UTC
+        if entry.identity.as_deref() != Some(identity.identity.as_str())
+            || entry.fetched_at == chrono::DateTime::<Utc>::MIN_UTC
             || entry.client_version.as_deref() != Some(crate::client_version_to_whole().as_str())
             || entry
                 .identity
@@ -534,16 +535,16 @@ impl ModelsManager for OpenAiModelsManager {
             && !self.endpoint_client.has_command_auth()
             && (!self.endpoint_client.supports_api_key_models()
                 || !self.api_key_model_discovery_enabled.load(Ordering::SeqCst));
-        let catalog = if !discovery_disabled
-            && entry.identity.as_deref() == Some(identity.identity.as_str())
+        // An authority snapshot may only describe the actual pinned entry. Normal
+        // discovery can synthesize fallback metadata; that is not launch proof.
+        if discovery_disabled
+            && (!matches!(self.catalog_source, CatalogSource::Default)
+                || self.catalog_source.fallback_models()?.as_slice() != entry.models.as_slice())
         {
-            Cow::Borrowed(entry.models.as_slice())
-        } else if matches!(self.catalog_source, CatalogSource::Default) {
-            Cow::Owned(self.catalog_source.fallback_models()?)
-        } else {
             return None;
-        };
-        let selected = construct_model_info_from_candidates(model, &catalog, config);
+        }
+        let catalog = entry.models.as_slice();
+        let selected = construct_model_info_from_candidates(model, catalog, config);
         (!selected.used_fallback_model_metadata).then_some(selected)
     }
 

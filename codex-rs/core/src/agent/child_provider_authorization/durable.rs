@@ -35,6 +35,41 @@ fn canonical_existing_or_parent(path: &Path) -> Option<PathBuf> {
     }
 }
 
+// SQLite opens the configured lexical path. Reject aliases before resolving it:
+// checking only the current destination cannot authenticate an already-open pool.
+fn unaliased_storage_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        ) {
+            return false;
+        }
+        prefix.push(component.as_os_str());
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return false;
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if metadata.file_attributes() & 0x400 != 0 {
+                        return false;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && prefix == path => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Check actual store replacement and sidecar paths, never a rollout-supplied path.
 pub(crate) fn protected_storage(
     storage: &NativeAuthorityStorage,
@@ -47,6 +82,11 @@ pub(crate) fn protected_storage(
     else {
         return true;
     };
+    if !unaliased_storage_path(directory) || !unaliased_storage_path(database) {
+        return false;
+    }
+    let lexical_directory = directory.clone();
+    let lexical_database = database.clone();
     let Some(directory) = directory.canonicalize().ok() else {
         return false;
     };
@@ -56,15 +96,33 @@ pub(crate) fn protected_storage(
     if database.parent() != Some(directory.as_path()) {
         return false;
     }
-    let mut paths = vec![directory, database.clone()];
+    let mut paths = vec![
+        lexical_directory,
+        lexical_database,
+        directory,
+        database.clone(),
+    ];
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut path = database.as_os_str().to_owned();
         path.push(suffix);
+        if !unaliased_storage_path(Path::new(&path)) {
+            return false;
+        }
+        paths.push(PathBuf::from(&path));
         let Some(path) = canonical_existing_or_parent(Path::new(&path)) else {
             return false;
         };
         paths.push(path);
     }
+    // Replacing a writable ancestor can redirect a later SQLite open even if
+    // the database itself has a read-only carveout.
+    let ancestors = paths
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|path| path.parent().is_some())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.extend(ancestors);
     let denied = |profile: &PermissionProfile, cwd: &Path| {
         paths.iter().all(|path| {
             !profile
@@ -116,22 +174,104 @@ fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn model_grants(model: &ModelInfo) -> serde_json::Value {
-    json!({
+// Bump this semantic revision whenever the compiled classifier policy changes.
+// Text is compared only in memory, never serialized or hashed into a receipt.
+const BUILTIN_GUARDIAN_POLICY: &str = "codex-builtin-guardian-policy-20261026-v1";
+
+fn model_grants(model: &ModelInfo) -> Option<serde_json::Value> {
+    let guardian = model
+        .model_messages
+        .as_ref()
+        .and_then(|m| m.guardian_v2.as_ref());
+    let policy_id = match guardian.and_then(|g| g.classifier_instructions.as_deref()) {
+        None => None,
+        Some(instructions) => {
+            let bundled = codex_models_manager::bundled_models_response().ok()?;
+            let owner = if instructions
+                == codex_prompts::ResolvedModelMessages::bundled()
+                    .guardian_classifier_instructions()
+            {
+                "default".to_owned()
+            } else {
+                bundled
+                    .models
+                    .iter()
+                    .find(|m| {
+                        m.model_messages
+                            .as_ref()
+                            .and_then(|m| m.guardian_v2.as_ref())
+                            .and_then(|g| g.classifier_instructions.as_deref())
+                            == Some(instructions)
+                    })?
+                    .slug
+                    .clone()
+            };
+            Some(format!("{BUILTIN_GUARDIAN_POLICY}:{owner}"))
+        }
+    };
+    let guardian = guardian.map(|g| json!({
+        "policy":policy_id,
+        "mode":g.async_classifier_mode,"conversation_limit":g.async_classifier_conversation_token_limit,
+        "threshold":g.review_threshold_basis_points,"lag":g.max_tool_call_lag,
+        "effort":g.reasoning_effort,"transcript":g.transcript,"action_limit":g.max_action_tokens,
+        "instruction_limit":g.max_classifier_instruction_tokens,"reuse_compaction":g.reuse_parent_compaction,
+        "compaction_limit":g.max_parent_compaction_tokens,
+    }));
+    Some(json!({
         "shell":model.shell_type,"patch":model.apply_patch_tool_type,"search":model.web_search_tool_type,
         "experimental_tools":model.experimental_supported_tools,"supports_search":model.supports_search_tool,
         "node_disabled":model.node_repl_disabled,"node_review":model.node_repl_auto_review_required,
         "tool_mode":model.tool_mode,"multi_agent":model.multi_agent_version,"guardian":model.guardian,
-        "review_model":model.auto_review_model_override,
-        "guardian_v2":model.model_messages.as_ref().and_then(|messages| messages.guardian_v2.as_ref()),
-    })
+        "review_model":model.auto_review_model_override,"guardian_v2":guardian,
+    }))
+}
+
+fn local_guardian_grants(config: &Config, model: &ModelInfo) -> Option<serde_json::Value> {
+    if config.guardian_policy_config.is_some() || config.guardian_extra_policy.is_some() {
+        return None;
+    }
+    let effective = config.config_layer_stack.effective_config();
+    let mut local = match effective
+        .get("features")
+        .and_then(|f| f.get("guardianv2"))
+        .cloned()
+    {
+        Some(value) => {
+            let parsed: codex_features::FeatureToml<codex_features::GuardianV2ConfigToml> =
+                value.try_into().ok()?;
+            match parsed {
+                codex_features::FeatureToml::Enabled(_) => {
+                    codex_features::GuardianV2ConfigToml::default()
+                }
+                codex_features::FeatureToml::Config(value) => value,
+            }
+        }
+        None => codex_features::GuardianV2ConfigToml::default(),
+    };
+    if local.classifier_instructions.is_some() {
+        return None;
+    }
+    local.enabled = Some(config.features.enabled(codex_features::Feature::GuardianV2));
+    let legacy = codex_features::FeatureToml::Config(local.clone());
+    let requirements = config.config_layer_stack.requirements();
+    let mut policy =
+        codex_config::GuardianPolicyLoader::new(Some(&legacy), requirements).resolve(Some(model));
+    requirements.constrain_guardian_policy(&mut policy, &model.slug);
+    Some(json!({
+        "policy_revision":BUILTIN_GUARDIAN_POLICY,"policy":policy,"transcript_mode":config.guardian_transcript_mode,
+        "mode":local.async_classifier_mode,"conversation_limit":local.async_classifier_conversation_token_limit,
+        "threshold":local.review_threshold,"lag":local.max_tool_call_lag,"effort":local.reasoning_effort,
+        "action_limit":local.max_action_tokens,"instruction_limit":local.max_classifier_instruction_tokens,
+        "reuse_compaction":local.reuse_parent_compaction,"compaction_limit":local.max_parent_compaction_tokens,
+        "scope":local.review_scope,"transcript":local.transcript,
+    }))
 }
 
 pub(crate) fn model_fingerprint(model: &ModelInfo) -> Option<String> {
     if model.used_fallback_model_metadata {
         return None;
     }
-    let bytes = serde_json::to_vec(&canonical_json(model_grants(model))).ok()?;
+    let bytes = serde_json::to_vec(&canonical_json(model_grants(model)?)).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -237,7 +377,7 @@ pub(crate) fn fingerprint(
         "update_plan":config.update_plan_enabled,"tool_registry":config.tool_registry,"code_mode":config.code_mode,
         "capability_roots":roots,"executors":grants,
         "provider_tool_capabilities":config.model_provider.capabilities,
-        "model_capabilities":model_grants(model),
+        "model_capabilities":model_grants(model)?,"guardian_config":local_guardian_grants(config, model)?,
     });
     let bytes = serde_json::to_vec(&canonical_json(projection)).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
@@ -455,6 +595,120 @@ mod tests {
         );
         model.used_fallback_model_metadata = true;
         assert!(fingerprint(&config, &scope, &model, &[], &[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn guardian_grants_exclude_nonpolicy_prompts_and_reject_opaque_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        let scope = candidate_scope(&config, None);
+        let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.6-sol");
+        model.used_fallback_model_metadata = false;
+        let before = fingerprint(&config, &scope, &model, &[], &[]).unwrap();
+        model
+            .model_messages
+            .get_or_insert_with(Default::default)
+            .instructions_template = Some("nonpolicy developer text".into());
+        assert_eq!(
+            fingerprint(&config, &scope, &model, &[], &[]).unwrap(),
+            before
+        );
+        let guardian = model
+            .model_messages
+            .as_mut()
+            .unwrap()
+            .guardian_v2
+            .get_or_insert_with(Default::default);
+        guardian.review_threshold_basis_points = Some(1234);
+        assert_ne!(
+            fingerprint(&config, &scope, &model, &[], &[]).unwrap(),
+            before
+        );
+        model
+            .model_messages
+            .as_mut()
+            .unwrap()
+            .guardian_v2
+            .as_mut()
+            .unwrap()
+            .classifier_instructions = Some("custom safety classifier".into());
+        assert!(model_fingerprint(&model).is_none());
+        assert!(fingerprint(&config, &scope, &model, &[], &[]).is_none());
+        model.model_messages.as_mut().unwrap().guardian_v2 = None;
+        let overridden = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![(
+                "features.guardianv2.review_threshold".into(),
+                toml::Value::Float(0.25),
+            )])
+            .build()
+            .await
+            .unwrap();
+        assert_ne!(
+            fingerprint(&config, &scope, &model, &[], &[]),
+            fingerprint(&overridden, &scope, &model, &[], &[])
+        );
+        let opaque = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![(
+                "features.guardianv2.classifier_instructions".into(),
+                toml::Value::String("opaque local policy".into()),
+            )])
+            .build()
+            .await
+            .unwrap();
+        assert!(fingerprint(&opaque, &scope, &model, &[], &[]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_pool_path_alias_cannot_become_protected_authority_after_replacement() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let original = tempfile::tempdir().unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let alias = home.path().join("sqlite-alias");
+        symlink(original.path(), &alias).unwrap();
+        let sqlite = codex_state::SqliteConfig::new_for_testing(
+            AbsolutePathBuf::try_from(alias.clone()).unwrap(),
+        );
+        let database = sqlite.state_db_path().to_path_buf();
+        let runtime = codex_state::StateRuntime::init(sqlite, "test".into())
+            .await
+            .unwrap();
+        let root = ThreadId::new();
+        let epoch = NativeAuthorityEpoch {
+            version: codex_thread_store::NATIVE_AUTHORITY_VERSION,
+            thread_id: root,
+            root_thread_id: root,
+            parent_thread_id: None,
+            generation: uuid::Uuid::now_v7(),
+        };
+        runtime.begin_native_authority_epoch(&epoch).await.unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink(replacement.path(), &alias).unwrap();
+        assert_eq!(
+            runtime.read_native_authority_epoch(root).await.unwrap(),
+            Some(epoch)
+        );
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        let mut scope = candidate_scope(&config, None);
+        scope.profile = PermissionProfile::read_only();
+        assert!(!protected_storage(
+            &NativeAuthorityStorage::Local {
+                directory: alias,
+                database
+            },
+            &scope
+        ));
     }
 
     #[tokio::test]
