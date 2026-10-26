@@ -179,7 +179,8 @@ mod test {
 
     #[test]
     fn empty_chain() {
-        let chain = RegionProviderChain::first_try(None).or_else(None);
+        let chain =
+            RegionProviderChain::first_try(/*provider*/ None).or_else(/*fallback*/ None);
         assert_eq!(chain.region().now_or_never().expect("ready"), None);
     }
 }
