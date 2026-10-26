@@ -18,6 +18,36 @@ use crate::RouteAwareClientPool;
 
 #[tokio::test]
 async fn route_aware_pool_re_resolves_redirects_and_logs_only_final_outcome() {
+    const SUBPROCESS_ENV_VAR: &str = "CODEX_HTTP_CLIENT_REDIRECT_SUCCESS_LOG_TEST";
+    if std::env::var_os(SUBPROCESS_ENV_VAR).is_none() {
+        // Isolate the tracing subscriber and callsite cache from concurrent tests,
+        // as in the redirected-failure logging fixture.
+        let test_module = module_path!()
+            .split_once("::")
+            .expect("test module should include the crate name")
+            .1;
+        let test_name = format!(
+            "{test_module}::route_aware_pool_re_resolves_redirects_and_logs_only_final_outcome"
+        );
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("test executable should be available"),
+        )
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(SUBPROCESS_ENV_VAR, "1")
+        .output()
+        .expect("logging test subprocess should finish");
+        assert!(
+            output.status.success(),
+            "logging test subprocess failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!("test {test_name} ... ok")),
+            "isolated logging fixture did not execute the exact test"
+        );
+        return;
+    }
     let (proxy_addr, proxy_thread) =
         spawn_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     let (redirect_addr, redirect_thread) = spawn_response(
@@ -49,6 +79,7 @@ async fn route_aware_pool_re_resolves_redirects_and_logs_only_final_outcome() {
             ),
     );
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::debug!(target: "codex_http_client", "log capture sentinel");
 
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -75,6 +106,7 @@ async fn route_aware_pool_re_resolves_redirects_and_logs_only_final_outcome() {
 
     let logs = String::from_utf8(log_buffer.lock().expect("log buffer lock").clone())
         .expect("logs should be UTF-8");
+    assert!(logs.contains("log capture sentinel"));
     assert!(logs.contains(&initial_url));
     assert_eq!(logs.matches("Request completed").count(), 1);
     assert!(!logs.contains("redirect-target-secret"));
