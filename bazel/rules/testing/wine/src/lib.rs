@@ -299,7 +299,7 @@ fn log_panic_cleanup(args: std::fmt::Arguments<'_>) {
 fn configure_wine_environment(command: &mut StdCommand, runtime: &WineRuntimePaths, prefix: &Path) {
     // These headless test prefixes do not use host printers. An absent private
     // socket makes CUPS fail locally instead of delaying Wine's first-run printer
-    // registration while connecting to the host server. Caller envs are applied
+    // registration during host printer initialization. Caller envs are applied
     // after these defaults by WineTestCommand::spawn.
     command
         .env_remove("DISPLAY")
