@@ -674,7 +674,8 @@ impl Session {
             &configuration.model_info_overrides,
         ))
         .await;
-        snapshot.service_tier = get_service_tier(
+        snapshot.service_tier = super::get_service_tier_for_provider(
+            &configuration.original_config_do_not_use.model_provider_id,
             snapshot.service_tier.take(),
             &configuration.original_config_do_not_use.features,
             &model_info,
@@ -1805,6 +1806,7 @@ impl Session {
                         AgentIdentityAuthPolicy::JwtOnly
                     },
                     thread_id,
+                    config.model_provider_id.clone(),
                     session_configuration.provider.info().clone(),
                     session_configuration.session_source.clone(),
                     session_configuration.originator.clone(),

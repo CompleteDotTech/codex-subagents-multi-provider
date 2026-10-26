@@ -33,6 +33,16 @@ pub trait ModelsCache: fmt::Debug + Send + Sync {
         client_version: &'a str,
     ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>>;
 
+    /// Load the snapshot for the effective provider/tenant identity. Backends that
+    /// already capture a partition at construction can retain the default.
+    fn load_scoped<'a>(
+        &'a self,
+        client_version: &'a str,
+        _identity: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
+        self.load(client_version)
+    }
+
     /// Stores `entry`, replacing the snapshot for this cache implementation's lookup identity.
     ///
     /// The implementation derives that identity from its own configuration and the entry metadata.
@@ -128,19 +138,55 @@ impl std::error::Error for ModelsCacheError {}
 pub(crate) struct FileModelsCache {
     cache_path: PathBuf,
     cache_ttl: Duration,
+    partitioned: bool,
 }
 
 impl FileModelsCache {
     /// Create a file-backed cache with the given path and TTL.
+    #[cfg(test)]
     pub(crate) fn new(cache_path: PathBuf, cache_ttl: Duration) -> Self {
         Self {
             cache_path,
             cache_ttl,
+            partitioned: false,
         }
+    }
+
+    pub(crate) fn partitioned(cache_path: PathBuf, cache_ttl: Duration) -> Self {
+        Self {
+            cache_path,
+            cache_ttl,
+            partitioned: true,
+        }
+    }
+
+    fn path_for_identity(&self, identity: &str) -> PathBuf {
+        use sha2::Digest;
+        if !self.partitioned {
+            return self.cache_path.clone();
+        }
+        let digest = sha2::Sha256::digest(identity.as_bytes());
+        self.cache_path
+            .with_extension("d")
+            .join(format!("{digest:x}.json"))
     }
 }
 
 impl ModelsCache for FileModelsCache {
+    fn load_scoped<'a>(
+        &'a self,
+        client_version: &'a str,
+        identity: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
+        Box::pin(async move {
+            load_fresh_file(
+                &self.path_for_identity(identity),
+                self.cache_ttl,
+                client_version,
+            )
+            .await
+        })
+    }
     fn load<'a>(
         &'a self,
         client_version: &'a str,
@@ -154,7 +200,14 @@ impl ModelsCache for FileModelsCache {
         &'a self,
         entry: &'a ModelsCacheEntry,
     ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
-        Box::pin(async move { save_file(&self.cache_path, entry).await })
+        Box::pin(async move {
+            let path = match entry.identity.as_deref() {
+                Some(identity) => self.path_for_identity(identity),
+                None if self.partitioned => return Ok(()),
+                None => self.cache_path.clone(),
+            };
+            save_file(&path, entry).await
+        })
     }
 
     fn refresh_ttl<'a>(
@@ -164,7 +217,8 @@ impl ModelsCache for FileModelsCache {
         etag: &'a str,
     ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
         Box::pin(async move {
-            let mut entry = load_file(&self.cache_path)
+            let path = self.path_for_identity(identity);
+            let mut entry = load_file(&path)
                 .await
                 .map_err(cache_error)?
                 .ok_or_else(|| ModelsCacheError::new("cache not found"))?;
@@ -176,7 +230,7 @@ impl ModelsCache for FileModelsCache {
                 return Ok(());
             }
             entry.fetched_at = Utc::now();
-            save_file(&self.cache_path, &entry).await
+            save_file(&path, &entry).await
         })
     }
 }

@@ -86,6 +86,7 @@ pub(crate) async fn spawn(
         session,
         step_context,
         SpawnConfigOptions {
+            resolved_provider: None,
             version: SpawnConfigVersion::V2,
             full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),
             role_name,
@@ -112,11 +113,13 @@ pub(crate) async fn spawn(
     let multi_agent_v2_usage_hints = if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory))
         && turn.multi_agent_version == MultiAgentVersion::V2
     {
+        let selected_models = config.prepared_child_models.as_ref();
+        let models_manager = selected_models
+            .map(|prepared| prepared.manager())
+            .unwrap_or(&session.services.models_manager);
         let child_model_info = match config.model.as_deref() {
-            Some(model) if model != turn.model_info().slug => Some(
-                session
-                    .services
-                    .models_manager
+            Some(model) if selected_models.is_some() || model != turn.model_info().slug => Some(
+                models_manager
                     .get_model_info(model, &config.to_models_manager_config())
                     .await,
             ),

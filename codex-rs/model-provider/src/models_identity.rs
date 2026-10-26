@@ -11,6 +11,15 @@ use sha2::Sha256;
 
 use crate::auth::resolve_provider_auth;
 
+pub(crate) fn with_gateway_scope(base: String, gateway_scope: &str) -> String {
+    let mut digest = Sha256::new();
+    for field in ["models-gateway-scope-v1", &base, gateway_scope] {
+        digest.update((field.len() as u64).to_le_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 pub(crate) fn identity(
     provider_info: &ModelProviderInfo,
     auth: Option<&CodexAuth>,
@@ -22,9 +31,16 @@ pub(crate) fn identity(
         digest.update((value.len() as u64).to_le_bytes());
         digest.update(value);
     };
-    field(b"models-cache-v1");
+    field(b"models-cache-v2");
     field(api_provider.name.as_bytes());
     field(api_provider.base_url.as_bytes());
+    // Routing alone is insufficient when the same endpoint exposes different
+    // compatibility/catalog policies or credential helper scopes.
+    field(&serde_json::to_vec(&provider_info.wire_api)?);
+    field(&serde_json::to_vec(&provider_info.capabilities)?);
+    field(&serde_json::to_vec(&provider_info.auth)?);
+    field(&serde_json::to_vec(&provider_info.aws)?);
+    field(&[u8::from(provider_info.supports_websockets)]);
     // Preserve existing cache identities when no explicit catalog is configured.
     // The API provider resolves base_url defaults; model_catalog_url stays on ModelProviderInfo.
     if let Some(catalog_url) = &provider_info.model_catalog_url {
