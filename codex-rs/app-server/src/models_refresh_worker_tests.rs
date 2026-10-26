@@ -12,12 +12,12 @@ use codex_core::config::ConfigOverrides;
 use codex_feedback::CodexFeedback;
 use codex_http_client::HttpClientFactory;
 use codex_models_manager::manager::ModelsEndpointClient;
+use codex_models_manager::manager::ModelsEndpointError;
 use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_models_manager::manager::ModelsEndpointResponse;
 use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::error::CodexErr;
-use codex_protocol::error::Result as CoreResult;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
@@ -72,12 +72,12 @@ impl ModelsEndpointClient for TestModelsEndpoint {
         &'a self,
         _client_version: &'a str,
         _http_client_factory: HttpClientFactory,
-    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+    ) -> ModelsEndpointFuture<'a, Result<ModelsEndpointResponse, ModelsEndpointError>> {
         Box::pin(async move {
             let fetch_index = self.fetch_count.fetch_add(1, Ordering::SeqCst);
             self.fetched.notify_one();
             if fetch_index == 0 {
-                return Err(CodexErr::Io(std::io::Error::other("test failure")));
+                return Err(CodexErr::Io(std::io::Error::other("test failure")).into());
             }
             if fetch_index == 1 {
                 self.release_second_fetch.notified().await;

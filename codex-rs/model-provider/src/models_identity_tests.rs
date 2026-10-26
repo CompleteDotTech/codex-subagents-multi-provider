@@ -5,6 +5,32 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use pretty_assertions::assert_eq;
 
+#[test]
+fn cache_identity_tracks_compatibility_and_helper_scope() {
+    let provider =
+        ModelProviderInfo::create_openai_provider(Some("https://same.example/v1".into()));
+    let auth = CodexAuth::from_api_key("key");
+    let initial = identity(&provider, Some(&auth)).unwrap();
+    let mut changed = provider.clone();
+    changed.supports_websockets = !provider.supports_websockets;
+    assert_ne!(identity(&changed, Some(&auth)).unwrap(), initial);
+    changed = provider.clone();
+    changed.capabilities = Some(
+        serde_json::from_value(serde_json::json!({"remote_compaction": "unsupported"})).unwrap(),
+    );
+    assert_ne!(identity(&changed, Some(&auth)).unwrap(), initial);
+    changed = provider;
+    changed.auth = Some(
+        serde_json::from_value(serde_json::json!({
+            "command": "scope-a", "cwd": std::env::current_dir().unwrap()
+        }))
+        .unwrap(),
+    );
+    let helper_a = identity(&changed, Some(&auth)).unwrap();
+    changed.auth.as_mut().unwrap().command = "scope-b".into();
+    assert_ne!(identity(&changed, Some(&auth)).unwrap(), helper_a);
+}
+
 fn chatgpt_auth(email: &str, user: &str, account: &str, plan: &str, signature: &str) -> CodexAuth {
     let claims = serde_json::json!({
         "email": email,
