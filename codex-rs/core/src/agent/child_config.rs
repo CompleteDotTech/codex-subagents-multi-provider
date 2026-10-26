@@ -191,6 +191,7 @@ pub(crate) async fn prepare_agent_spawn_config(
             .await?;
     }
     if options.resolved_provider.is_some() && role_service_tier.is_some() {
+        config.child_role_service_tier_override = true;
         if let Some(tier) = role_service_tier.as_deref()
             && tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
         {
@@ -410,6 +411,7 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, String> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
     config.prepared_child_models = None;
+    config.child_role_service_tier_override = false;
     if config
         .features
         .enabled(Feature::SubagentDefaultContextLimits)
@@ -590,13 +592,7 @@ fn model_supports_selected_tier(
 ) -> bool {
     // The protocol helper treats Flex as universally available for OpenAI.
     // Other providers must advertise it in their own authoritative catalog.
-    if config.model_provider_id == "openai" {
-        info.supports_service_tier(tier)
-    } else {
-        info.service_tiers
-            .iter()
-            .any(|candidate| candidate.id == tier)
-    }
+    crate::session::model_supports_provider_service_tier(&config.model_provider_id, info, tier)
 }
 
 async fn apply_spawn_agent_role(

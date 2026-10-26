@@ -202,6 +202,7 @@ fn session_telemetry_for_request(
 #[derive(Debug)]
 struct ModelClientState {
     thread_id: ThreadId,
+    model_provider_id: String,
     provider: SharedModelProvider,
     workspace_routing: WorkspaceRoutingContext,
     auth_env_telemetry: AuthEnvTelemetry,
@@ -547,6 +548,7 @@ impl ModelClient {
         auth_manager: Option<Arc<AuthManager>>,
         agent_identity_policy: AgentIdentityAuthPolicy,
         thread_id: ThreadId,
+        model_provider_id: String,
         provider_info: ModelProviderInfo,
         session_source: SessionSource,
         originator: String,
@@ -584,6 +586,7 @@ impl ModelClient {
         Self {
             state: Arc::new(ModelClientState {
                 thread_id,
+                model_provider_id,
                 provider: model_provider,
                 workspace_routing,
                 auth_env_telemetry,
@@ -1092,17 +1095,11 @@ impl ModelClient {
             &prompt.output_schema,
             prompt.output_schema_strict,
         );
-        let service_tier = model_info
-            .service_tier_for_request(service_tier)
-            .filter(|tier| {
-                // Bedrock requires an advertised tier, including for flex, which the
-                // generic OpenAI resolver permits without catalog support.
-                !self.state.provider.info().is_amazon_bedrock()
-                    || model_info
-                        .service_tiers
-                        .iter()
-                        .any(|supported| supported.id == *tier)
-            });
+        let service_tier = crate::session::service_tier_for_provider_request(
+            &self.state.model_provider_id,
+            model_info,
+            service_tier,
+        );
         if !include_internal {
             for item in &mut input {
                 item.clear_tool_result_metadata();
@@ -1634,9 +1631,12 @@ impl ModelClientSession {
                 client_setup.auth.as_ref(),
                 &responses_headers,
                 &model_info.slug,
-                model_info
-                    .service_tier_for_request(service_tier.clone())
-                    .as_deref(),
+                crate::session::service_tier_for_provider_request(
+                    &self.client.state.model_provider_id,
+                    model_info,
+                    service_tier.clone(),
+                )
+                .as_deref(),
             );
             match self
                 .websocket_connection(WebsocketConnectParams {

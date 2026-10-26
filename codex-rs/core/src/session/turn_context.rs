@@ -825,10 +825,11 @@ impl TurnContext {
             Some(reasoning_effort),
             /*developer_instructions*/ None,
         );
-        let step_settings = Arc::new(ResolvedStepSettings::new(
+        let step_settings = Arc::new(ResolvedStepSettings::new_for_provider(
             Arc::new(selected),
             model_info,
             &config.features,
+            &config.model_provider_id,
         ));
         config.service_tier = step_settings.service_tier.clone();
         let session_telemetry = step_settings.telemetry(&self.session_telemetry);
@@ -1342,10 +1343,11 @@ impl Session {
                 .snapshot_for_config(&skills_input, fs)
                 .await
         };
-        let step_settings = Arc::new(ResolvedStepSettings::new(
+        let step_settings = Arc::new(ResolvedStepSettings::new_for_provider(
             Arc::clone(&session_configuration.step_settings),
             Arc::new(model_info),
             &self.features,
+            &per_turn_config.model_provider_id,
         ));
         let mut turn_context: TurnContext = Self::make_turn_context(
             self.thread_id(),

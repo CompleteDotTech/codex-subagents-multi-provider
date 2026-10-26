@@ -39,6 +39,7 @@ pub(crate) struct StepSettings {
 /// snapshot does not change steps or actions that have already captured it.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedStepSettings {
+    model_provider_id: String,
     /// Inputs for later sparse patches. Unset defaults and unsupported requested
     /// tiers must not be reconstructed from the effective values below.
     selected: Arc<StepSettings>,
@@ -54,17 +55,32 @@ pub(crate) struct ResolvedStepSettings {
 
 impl ResolvedStepSettings {
     /// Derives request values from selected settings and pinned metadata.
+    #[cfg(test)]
     pub(super) fn new(
         selected: Arc<StepSettings>,
         model_info: Arc<ModelInfo>,
         features: &Features,
     ) -> Self {
+        Self::new_for_provider(selected, model_info, features, "openai")
+    }
+
+    pub(super) fn new_for_provider(
+        selected: Arc<StepSettings>,
+        model_info: Arc<ModelInfo>,
+        features: &Features,
+        provider_id: &str,
+    ) -> Self {
         let reasoning_summary = selected
             .reasoning_summary
             .unwrap_or(model_info.default_reasoning_summary);
-        let service_tier =
-            super::get_service_tier(selected.service_tier.clone(), features, &model_info);
+        let service_tier = super::get_service_tier_for_provider(
+            provider_id,
+            selected.service_tier.clone(),
+            features,
+            &model_info,
+        );
         Self {
+            model_provider_id: provider_id.to_owned(),
             selected,
             model_info,
             reasoning_summary,
@@ -135,7 +151,12 @@ impl ResolvedStepSettings {
             } else {
                 Arc::new(selected.resolve_model_info(models_manager, overrides).await)
             };
-        let mut next = Self::new(Arc::new(selected), model_info, features);
+        let mut next = Self::new_for_provider(
+            Arc::new(selected),
+            model_info,
+            features,
+            &self.model_provider_id,
+        );
         next.mcp_approvals_reviewer_override = update
             .approvals_reviewer
             .or(self.mcp_approvals_reviewer_override);

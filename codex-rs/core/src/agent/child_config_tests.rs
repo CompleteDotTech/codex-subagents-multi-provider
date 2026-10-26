@@ -15,6 +15,24 @@ struct Fixture {
 }
 
 impl Fixture {
+    async fn start_native_child(&self, config: Config) -> Arc<crate::CodexThread> {
+        self.manager
+            .start_thread(StartThreadOptions {
+                session_source: Some(codex_protocol::protocol::SessionSource::SubAgent(
+                    codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                        parent_thread_id: self.parent.session.thread_id,
+                        depth: 1,
+                        agent_path: None,
+                        agent_nickname: None,
+                        agent_role: None,
+                    },
+                )),
+                ..StartThreadOptions::new(config)
+            })
+            .await
+            .unwrap()
+            .thread
+    }
     async fn new() -> Self {
         let host = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -404,6 +422,70 @@ async fn unsupported_inherited_tier_is_omitted_and_default_sentinel_is_preserved
             .service_tier,
         Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.into())
     );
+}
+
+#[tokio::test]
+async fn native_step_does_not_reintroduce_an_unsupported_root_flex_tier() {
+    let fixture = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let prepared = fixture.prepared(&resolved, None, None).await.unwrap();
+    let child = fixture.start_native_child(prepared.config).await;
+    child
+        .session
+        .services
+        .agent_control
+        .propagate_config_update(crate::agent::api::AgentConfigUpdate::ServiceTier(Some(
+            "flex".into(),
+        )));
+    let turn = child.session.new_default_turn().await;
+    let step = child
+        .session
+        .capture_step_context(turn, &tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(step.settings.service_tier, None);
+}
+
+#[tokio::test]
+async fn native_explicit_role_tier_survives_root_updates_and_is_not_inherited_as_role_authority() {
+    let fixture = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let path = resolved.model_catalog_json.as_ref().unwrap();
+    let mut catalog: ModelsResponse =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    catalog.models[0]
+        .service_tiers
+        .push(codex_protocol::openai_models::ModelServiceTier {
+            id: "flex".into(),
+            name: "Flex".into(),
+            description: "fixture".into(),
+        });
+    std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let prepared = fixture
+        .prepared(&resolved, Some("tier"), None)
+        .await
+        .unwrap();
+    assert!(prepared.config.child_role_service_tier_override);
+    let child = fixture.start_native_child(prepared.config).await;
+    for root_tier in [None, Some("default".into()), Some("unsupported".into())] {
+        child
+            .session
+            .services
+            .agent_control
+            .propagate_config_update(crate::agent::api::AgentConfigUpdate::ServiceTier(root_tier));
+        let turn = child.session.new_default_turn().await;
+        assert!(
+            !build_agent_resume_config(&turn)
+                .unwrap()
+                .child_role_service_tier_override
+        );
+        let step = child
+            .session
+            .capture_step_context(turn, &tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(step.settings.service_tier.as_deref(), Some("flex"));
+    }
 }
 
 #[tokio::test]
