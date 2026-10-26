@@ -1,0 +1,10 @@
+{
+  "catalog_sha256": "d02b5d5c779cc76f8eb9262a8bbac2084dabc6f6125a6acab2b441ad1260409c",
+  "model": "gemma4:31b-cloud",
+  "canonical_response_models": ["gemma4:31b"],
+  "observed_service_version": "0.21.1",
+  "advertised_context_window": 262144,
+  "advertised_capabilities": ["completion", "thinking", "tools", "vision"],
+  "qualified_scope": "Streamed stateless Responses function-tool roundtrip only; cloud backed, not offline weights or context stress.",
+  "client_policy": "Text-only, direct unified_exec, no unqualified reasoning levels/search/parallel/compaction capabilities. Generic first-party agent instructions are host prompt policy, not vendor capability metadata."
+}
