@@ -3,6 +3,7 @@ mod application_storage_requirements;
 mod auth_policy;
 mod browser_computer_use_requirements;
 mod browser_use;
+pub mod child_provider;
 mod cloud_config_bundle;
 mod cloud_config_layers;
 #[cfg(target_os = "macos")]
