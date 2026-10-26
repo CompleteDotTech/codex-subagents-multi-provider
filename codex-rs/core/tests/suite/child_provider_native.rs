@@ -119,6 +119,9 @@ impl Fixture {
             .unwrap();
         info.slug = "shared".into();
         info.multi_agent_version = Some(version);
+        // Exercise native direct tools; deferred tool_search advertisement is
+        // covered by the separate Responses capability suites.
+        info.supports_search_tool = false;
         info.used_fallback_model_metadata = false;
         std::fs::write(
             home.path().join("catalog.json"),
@@ -192,7 +195,8 @@ request_max_retries = 0
             .with_home(home.clone())
             .with_auth(CodexAuth::from_api_key("synthetic-root"))
             .with_model_info_override("gpt-5.5", move |info| {
-                info.multi_agent_version = Some(version)
+                info.multi_agent_version = Some(version);
+                info.supports_search_tool = false;
             })
             .with_config(move |config| {
                 config.features.enable(Feature::Collab).unwrap();
