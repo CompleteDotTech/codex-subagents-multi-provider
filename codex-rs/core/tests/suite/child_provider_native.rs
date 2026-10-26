@@ -263,29 +263,38 @@ request_max_retries = 0
     }
 
     async fn assert_provider_headers(&self) {
-        let mut expected_a = 0;
-        let mut expected_b = 0;
+        let mut expected_a = std::collections::HashSet::new();
+        let mut expected_b = std::collections::HashSet::new();
         for id in self.test.thread_manager.list_thread_ids().await {
             let child = self.test.thread_manager.get_thread(id).await.unwrap();
             match child.config_snapshot().await.model_provider_id.as_str() {
-                "a" => expected_a += 1,
-                "b" => expected_b += 1,
+                "a" => {
+                    expected_a.insert(id.to_string());
+                }
+                "b" => {
+                    expected_b.insert(id.to_string());
+                }
                 _ => {}
             }
         }
         // Registration precedes the child's first request. Wait for the wire
-        // evidence before checking isolation so an empty request list cannot pass.
+        // evidence for each actual child identity, so a parent's second request
+        // cannot stand in for a nested child's first request.
         for (server, expected) in [(&self.a, expected_a), (&self.b, expected_b)] {
             tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
-                    let count = server
+                    let requests = server
                         .received_requests()
                         .await
-                        .unwrap()
+                        .expect("mock request recording must be enabled");
+                    let observed = requests
                         .iter()
                         .filter(|request| request.method.as_str() == "POST")
-                        .count();
-                    if count >= expected {
+                        .filter_map(|request| request.headers.get("thread-id"))
+                        .filter_map(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                        .collect::<std::collections::HashSet<_>>();
+                    if expected.iter().all(|id| observed.contains(id)) {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -346,8 +355,22 @@ async fn ordinary_and_builtin_role_native_children_select_provider_in_both_backe
             );
             fixture.turn("parent subsequent turn").await?;
             fixture.assert_provider_headers().await;
-            assert!(!fixture.a.received_requests().await?.is_empty());
-            assert!(fixture.b.received_requests().await?.is_empty());
+            assert!(
+                !fixture
+                    .a
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
+            assert!(
+                fixture
+                    .b
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
         }
     }
     Ok(())
@@ -466,7 +489,14 @@ async fn role_provider_is_resolved_by_both_native_backends_without_explicit_sele
         let children = fixture.children(1).await?;
         assert_eq!(children[0].config_snapshot().await.model_provider_id, "b");
         fixture.assert_provider_headers().await;
-        assert!(fixture.a.received_requests().await?.is_empty());
+        assert!(
+            fixture
+                .a
+                .received_requests()
+                .await
+                .expect("mock request recording must be enabled")
+                .is_empty()
+        );
     }
     Ok(())
 }
@@ -498,10 +528,28 @@ async fn native_history_and_authority_rejections_happen_before_catalog_helper_or
             scripted_spawn(&fixture.root, version, "rejected", args).await;
             fixture.turn("try a rejected delegation").await?;
             assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
-            assert!(fixture.a.received_requests().await?.is_empty());
-            assert!(fixture.b.received_requests().await?.is_empty());
+            assert!(
+                fixture
+                    .a
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
+            assert!(
+                fixture
+                    .b
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
             assert!(!fixture.home.path().join("helper-marker").exists());
-            let requests = fixture.root.received_requests().await?;
+            let requests = fixture
+                .root
+                .received_requests()
+                .await
+                .expect("mock request recording must be enabled");
             assert!(
                 requests
                     .iter()
@@ -588,14 +636,29 @@ async fn native_managed_constraints_override_user_authorization_before_child_io(
             .await;
             fixture.turn("try managed-restricted delegation").await?;
             assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
-            assert!(fixture.a.received_requests().await?.is_empty());
-            assert!(fixture.b.received_requests().await?.is_empty());
+            assert!(
+                fixture
+                    .a
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
+            assert!(
+                fixture
+                    .b
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
             assert!(!fixture.home.path().join("helper-marker").exists());
             assert!(
                 fixture
                     .root
                     .received_requests()
-                    .await?
+                    .await
+                    .expect("mock request recording must be enabled")
                     .iter()
                     .filter(|request| request.method.as_str() == "POST")
                     .any(|request| body(request).to_string().contains(expected))
@@ -623,7 +686,8 @@ async fn native_runtime_cwd_and_write_scope_revoke_host_file_authority() -> Resu
                 fixture
                     .root
                     .received_requests()
-                    .await?
+                    .await
+                    .expect("mock request recording must be enabled")
                     .iter()
                     .filter(|request| request.method.as_str() == "POST")
                     .any(|request| body(request)["tools"].to_string().contains("blocked"))
@@ -666,14 +730,29 @@ async fn native_runtime_cwd_and_write_scope_revoke_host_file_authority() -> Resu
                 .turn("try delegation after runtime scope change")
                 .await?;
             assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
-            assert!(fixture.a.received_requests().await?.is_empty());
-            assert!(fixture.b.received_requests().await?.is_empty());
+            assert!(
+                fixture
+                    .a
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
+            assert!(
+                fixture
+                    .b
+                    .received_requests()
+                    .await
+                    .expect("mock request recording must be enabled")
+                    .is_empty()
+            );
             assert!(!fixture.home.path().join("helper-marker").exists());
             assert!(
                 fixture
                     .root
                     .received_requests()
-                    .await?
+                    .await
+                    .expect("mock request recording must be enabled")
                     .iter()
                     .filter(|request| request.method.as_str() == "POST")
                     .any(|request| {
@@ -750,8 +829,22 @@ async fn public_resumed_child_history_cannot_be_reclassified_by_source_labels() 
         );
         assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
         assert!(!fixture.home.path().join("helper-marker").exists());
-        assert!(fixture.a.received_requests().await?.is_empty());
-        assert!(fixture.b.received_requests().await?.is_empty());
+        assert!(
+            fixture
+                .a
+                .received_requests()
+                .await
+                .expect("mock request recording must be enabled")
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .b
+                .received_requests()
+                .await
+                .expect("mock request recording must be enabled")
+                .is_empty()
+        );
     }
     let internal = fixture
         .test
