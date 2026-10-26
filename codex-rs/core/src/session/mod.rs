@@ -596,6 +596,27 @@ impl Session {
     }
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+        // Final native admission runs on this future's first poll, after all
+        // manager preparation awaits and before the first startup I/O/helper.
+        let native = matches!(
+            &args.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) || args
+            .conversation_history
+            .get_resumed_session_sources()
+            .is_some_and(|(source, _)| {
+                matches!(
+                    source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                )
+            });
+        if let Some(startup) = &args.startup {
+            startup.admit_native(native)?;
+        } else if native {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "native startup admission authority is missing",
+            ));
+        }
         args.config
             .config_layer_stack
             .ensure_config_server_applied()?;

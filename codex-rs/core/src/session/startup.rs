@@ -24,12 +24,80 @@ use super::session::Session;
 #[derive(Default)]
 pub(crate) struct SessionStartup {
     teardown: StdMutex<Option<AgentTreeTeardownGuard>>,
+    native_admission: StdMutex<NativeAdmissionState>,
     pub(crate) persistence: Mutex<LiveThreadInitGuard>,
     pub(crate) session: OnceLock<Arc<Session>>,
     pub(crate) io: OnceLock<SessionIo>,
 }
 
+#[derive(Default)]
+enum NativeAdmissionState {
+    #[default]
+    Unclassified,
+    Pending(crate::agent::child_provider_authorization::NativeChildAdmission),
+    Consumed,
+}
+
 impl SessionStartup {
+    pub(crate) fn set_native_admission(
+        &self,
+        admission: crate::agent::child_provider_authorization::NativeChildAdmission,
+    ) -> codex_protocol::error::Result<()> {
+        let mut state = self
+            .native_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*state, NativeAdmissionState::Unclassified) {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "native startup admission already classified",
+            ));
+        }
+        *state = NativeAdmissionState::Pending(admission);
+        Ok(())
+    }
+
+    pub(crate) fn check_native_current(&self) -> codex_protocol::error::Result<()> {
+        let state = self
+            .native_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match &*state {
+            NativeAdmissionState::Pending(admission) => admission.check_current(),
+            NativeAdmissionState::Unclassified => Ok(()),
+            NativeAdmissionState::Consumed => {
+                Err(crate::agent::child_provider_authorization::invalid(
+                    "native startup admission was already consumed",
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn admit_native(&self, required: bool) -> codex_protocol::error::Result<()> {
+        let mut state = self
+            .native_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match std::mem::replace(&mut *state, NativeAdmissionState::Consumed) {
+            NativeAdmissionState::Unclassified if required => {
+                Err(crate::agent::child_provider_authorization::invalid(
+                    "native startup admission authority is missing",
+                ))
+            }
+            NativeAdmissionState::Unclassified => {
+                // Existing explicit host root/internal paths do not carry a
+                // native permit. ThreadManager requires it for delegated paths.
+                *state = NativeAdmissionState::Unclassified;
+                Ok(())
+            }
+            NativeAdmissionState::Pending(admission) => admission.admit(),
+            NativeAdmissionState::Consumed => {
+                Err(crate::agent::child_provider_authorization::invalid(
+                    "native startup admission was already consumed",
+                ))
+            }
+        }
+    }
+
     fn lock_teardown(&self) -> MutexGuard<'_, Option<AgentTreeTeardownGuard>> {
         self.teardown.lock().unwrap_or_else(PoisonError::into_inner)
     }

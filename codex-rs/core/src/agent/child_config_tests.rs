@@ -93,6 +93,18 @@ impl Fixture {
         binding: Option<codex_config::CloudConfigBundleBinding>,
         guardian_threshold: Option<f64>,
     ) -> Self {
+        Self::with_admission_setup(fast_mode, binding, guardian_threshold, None, None).await
+    }
+
+    async fn with_admission_setup(
+        fast_mode: Option<bool>,
+        binding: Option<codex_config::CloudConfigBundleBinding>,
+        guardian_threshold: Option<f64>,
+        thread_instructions_provider: Option<
+            Arc<dyn codex_extension_api::ThreadInstructionsProvider>,
+        >,
+        child_base_url: Option<&str>,
+    ) -> Self {
         let host = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -149,6 +161,30 @@ request_max_retries = 0
             ));
             std::fs::write(path, contents).unwrap();
         }
+        if let Some(base_url) = child_base_url {
+            let script = host.path().join(if cfg!(windows) {
+                "admission-helper.cmd"
+            } else {
+                "admission-helper.sh"
+            });
+            std::fs::write(&script, if cfg!(windows) {
+                "@echo off\r\necho call>>native-admission-helper.calls\r\necho synthetic-token\r\n"
+            } else { "printf 'call\\n' >> native-admission-helper.calls\nprintf synthetic-token\n" }).unwrap();
+            let auth = if cfg!(windows) {
+                serde_json::json!({"command":"cmd.exe","args":["/D","/C",script],"cwd":host.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+            } else {
+                serde_json::json!({"command":"sh","args":[script],"cwd":host.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+            };
+            let path = host.path().join("config.toml");
+            let mut contents = std::fs::read_to_string(&path).unwrap().replacen(
+                "base_url = \"http://127.0.0.1:1/v1\"",
+                &format!("base_url = {}", toml::Value::String(base_url.to_owned())),
+                1,
+            );
+            contents.push_str("\n[model_providers.zai.auth]\n");
+            contents.push_str(&toml::to_string(&auth).unwrap());
+            std::fs::write(path, contents).unwrap();
+        }
         let mut config = ConfigBuilder::without_managed_config_for_tests()
             .codex_home(host.path().to_path_buf())
             .harness_overrides(ConfigOverrides {
@@ -183,7 +219,10 @@ request_max_retries = 0
             Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         );
         let parent = manager
-            .start_thread(StartThreadOptions::new(config.clone()))
+            .start_thread(StartThreadOptions {
+                thread_instructions_provider,
+                ..StartThreadOptions::new(config.clone())
+            })
             .await
             .unwrap()
             .thread;
@@ -1163,6 +1202,260 @@ async fn native_preparation_rejects_stale_step_approval_and_reviewer_before_cata
         assert!(result.is_err_and(|error| error.to_string().contains("authority changed")));
         assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
     }
+}
+
+struct RevokeDuringInheritedInstructions {
+    policy: codex_config::CloudConfigBundlePolicy,
+    armed: std::sync::atomic::AtomicBool,
+    revocations: std::sync::atomic::AtomicUsize,
+}
+
+fn revoke_native_child_access(policy: &codex_config::CloudConfigBundlePolicy) {
+    let mut revoked = codex_config::CloudConfigBundle::default();
+    revoked
+        .config_toml
+        .enterprise_managed
+        .push(codex_config::CloudConfigFragment {
+            id: "post-mint-child-revocation".into(),
+            name: "revoked native child access".into(),
+            contents: "[agents]\nallowed_model_providers=[]".into(),
+        });
+    policy.observe_remote_bundle(&revoked).unwrap();
+}
+
+impl codex_extension_api::ThreadInstructionsProvider for RevokeDuringInheritedInstructions {
+    fn share_with_subagents(&self) -> bool {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.revocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            revoke_native_child_access(&self.policy);
+        }
+        true
+    }
+
+    fn load_thread_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
+        Box::pin(async { codex_extension_api::LoadedUserInstructions::default() })
+    }
+}
+
+#[test_case::test_case(0; "revoked after mint before lower start")]
+#[test_case::test_case(1; "revoked during real manager instruction await")]
+#[test_case::test_case(2; "unchanged managed admission succeeds")]
+#[tokio::test]
+async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8) {
+    let server = wiremock::MockServer::start().await;
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    let provider = Arc::new(RevokeDuringInheritedInstructions {
+        policy: policy.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        revocations: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let base_url = format!("{}/v1", server.uri());
+    let fixture = Fixture::with_admission_setup(
+        None,
+        snapshot.binding,
+        None,
+        Some(provider.clone()),
+        Some(&base_url),
+    )
+    .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_bytes(std::fs::read(fixture._host.path().join("zai.json")).unwrap()),
+        )
+        .mount(&server)
+        .await;
+    let resolved = fixture.resolved("zai").await;
+    let mut prepared = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    assert!(
+        prepared.model_provider.auth.is_some(),
+        "real configured auth-helper path must be present"
+    );
+    let source = prepared_source(&fixture.parent, &prepared);
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    let permit = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            runtime,
+            fixture.parent.session.thread_id,
+            &prepared,
+            false,
+            &source,
+        )
+        .await
+        .expect("permit must mint successfully before the revocation under test");
+    let marker = fixture._host.path().join("native-admission-helper.calls");
+    let read_marker = || match std::fs::read(&marker) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("cannot read synthetic helper receipt: {error}"),
+    };
+    let helper_before = read_marker();
+    let requests_before = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .len();
+    if stage == 0 {
+        revoke_native_child_access(&policy);
+    }
+    if stage == 1 {
+        provider
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    let result = runtime
+        .upgrade()
+        .unwrap()
+        .spawn_child_thread(
+            StartThreadOptions {
+                session_source: Some(source),
+                ..StartThreadOptions::new(prepared)
+            },
+            runtime.control(fixture.parent.session.session_id()),
+            Some(fixture.parent.session.thread_id),
+            None,
+            permit,
+        )
+        .await;
+    if stage == 2 {
+        let child = result.expect("unchanged live managed policy remains authorized");
+        assert_eq!(fixture.manager.list_thread_ids().await.len(), 2);
+        assert_eq!(
+            child.thread.session.session_id(),
+            fixture.parent.session.session_id()
+        );
+        child.thread.shutdown_and_wait().await.unwrap();
+    } else {
+        let error = result
+            .err()
+            .expect("post-mint revoked policy must not start a child");
+        assert!(
+            error
+                .to_string()
+                .contains("revoked before startup admission"),
+            "{error}"
+        );
+        assert_eq!(
+            read_marker(),
+            helper_before,
+            "revoked startup must not invoke its auth helper"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("request recording is enabled")
+                .len(),
+            requests_before,
+            "revoked startup must not make a provider request"
+        );
+        assert_eq!(
+            fixture.manager.list_thread_ids().await,
+            vec![fixture.parent.session.thread_id]
+        );
+    }
+    assert_eq!(
+        provider
+            .revocations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        usize::from(stage == 1),
+        "the real manager inherited-instruction await must be crossed in the delayed case"
+    );
+}
+
+#[test_case::test_case(true; "revoked during resumed manager instruction await")]
+#[test_case::test_case(false; "unchanged managed resume succeeds")]
+#[tokio::test]
+async fn native_managed_resume_keeps_live_binding_through_final_admission(revoke: bool) {
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    let provider = Arc::new(RevokeDuringInheritedInstructions {
+        policy: policy.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        revocations: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fixture =
+        Fixture::with_admission_setup(None, snapshot.binding, None, Some(provider.clone()), None)
+            .await;
+    let config = fixture
+        .prepared(&fixture.resolved("zai").await, None, None)
+        .await
+        .unwrap()
+        .config;
+    let child = fixture.start_native_child(config).await;
+    child.ensure_rollout_materialized().await;
+    child.session.flush_rollout().await.unwrap();
+    child.shutdown_and_wait().await.unwrap();
+    fixture
+        .manager
+        .remove_thread(&child.session.thread_id)
+        .await
+        .unwrap();
+    provider
+        .armed
+        .store(revoke, std::sync::atomic::Ordering::SeqCst);
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    let result = runtime
+        .control(fixture.parent.session.session_id())
+        .resume_agent_from_rollout(
+            fixture.config.clone(),
+            child.session.thread_id,
+            child.session_source.clone(),
+        )
+        .await;
+    if revoke {
+        let error = result
+            .err()
+            .expect("revoked resumed startup must not publish the target");
+        assert!(
+            error
+                .to_string()
+                .contains("revoked before startup admission"),
+            "{error}"
+        );
+        assert_eq!(
+            fixture.manager.list_thread_ids().await,
+            vec![fixture.parent.session.thread_id]
+        );
+    } else {
+        assert_eq!(result.unwrap(), child.session.thread_id);
+        let restored = fixture
+            .manager
+            .get_thread(child.session.thread_id)
+            .await
+            .unwrap();
+        assert_eq!(restored.thread_settings_snapshot().await.model, "shared");
+        assert_eq!(
+            restored.session.session_id(),
+            fixture.parent.session.session_id()
+        );
+        restored.shutdown_and_wait().await.unwrap();
+    }
+    assert_eq!(
+        provider
+            .revocations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        usize::from(revoke)
+    );
 }
 
 #[tokio::test]

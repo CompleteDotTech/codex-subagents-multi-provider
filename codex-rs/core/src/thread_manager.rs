@@ -354,6 +354,7 @@ impl StartThreadOptions {
 
 struct ThreadSpawnRequest {
     delegated_launch: bool,
+    native_admission: Option<crate::agent::child_provider_authorization::NativeChildAdmission>,
     provider_origin: Option<codex_config::child_provider::VerifiedChildProviderOrigin>,
     startup: Option<Arc<crate::session::startup::SessionStartup>>,
     options: StartThreadOptions,
@@ -377,6 +378,7 @@ impl ThreadSpawnRequest {
     ) -> Self {
         Self {
             delegated_launch: false,
+            native_admission: None,
             provider_origin: None,
             startup: None,
             options,
@@ -2249,7 +2251,7 @@ impl ThreadManagerState {
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         launch_permit: crate::agent::child_provider_authorization::ChildLaunchPermit,
     ) -> CodexResult<NewThread> {
-        let (origin, session_id) =
+        let (origin, session_id, native_admission) =
             launch_permit.consume(&agent_control.runtime, parent_thread_id, &options.config)?;
         let agent_control = agent_control.runtime.control(session_id);
         (options.client_mcp_extensions, options.prompt_cache_key) =
@@ -2260,6 +2262,7 @@ impl ThreadManagerState {
         request.parent_thread_id = parent_thread_id;
         request.inherited_exec_policy = inherited_exec_policy;
         request.delegated_launch = true;
+        request.native_admission = Some(native_admission);
         request.provider_origin = origin;
         if forked {
             request.forked_from_thread_id = parent_thread_id;
@@ -2307,8 +2310,8 @@ impl ThreadManagerState {
             }
             _ => None,
         };
-        let provider_origin = if let Some(authorization) = authorization {
-            authorization
+        let (provider_origin, native_admission) = if let Some(authorization) = authorization {
+            let (origin, admission) = authorization
                 .consume(
                     &agent_control.runtime,
                     &config,
@@ -2318,7 +2321,8 @@ impl ThreadManagerState {
                     &environment_selections,
                     inherited_environments.as_ref(),
                 )
-                .await?
+                .await?;
+            (origin, Some(admission))
         } else {
             if delegated_parent.is_some()
                 || initial_history.get_resumed_parent_thread_id().is_some()
@@ -2327,7 +2331,7 @@ impl ThreadManagerState {
                     "saved child launch requires private host resume authorization",
                 ));
             }
-            None
+            (None, None)
         };
         let (parent_client_mcp_extensions, inherited_prompt_cache_key) =
             self.inherited_child_settings(parent_thread_id).await;
@@ -2352,6 +2356,7 @@ impl ThreadManagerState {
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
         request.parent_thread_id = parent_thread_id;
         request.delegated_launch = delegated_parent.is_some();
+        request.native_admission = native_admission;
         request.provider_origin = provider_origin;
         request.inherited_environments = inherited_environments;
         request.inherited_instructions = inherited_instructions;
@@ -2424,6 +2429,14 @@ impl ThreadManagerState {
                 "prepared delegated configuration cannot be used as an independent root or host session",
             ));
         }
+        if request.delegated_launch && request.native_admission.is_none() {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "native startup requires its private final admission authority",
+            ));
+        }
+        if let Some(admission) = &request.native_admission {
+            admission.check_current()?;
+        }
         let cancellation = request
             .options
             .config
@@ -2443,11 +2456,15 @@ impl ThreadManagerState {
                 .startup
                 .get_or_insert_with(|| Arc::new(SessionStartup::default())),
         );
+        if let Some(admission) = request.native_admission.take() {
+            startup_state.set_native_admission(admission)?;
+        }
         startup_state.hold_membership(membership);
         let startup_guard =
             owns_startup.then(|| SessionStartupGuard::new(Arc::clone(&startup_state)));
         let ThreadSpawnRequest {
             delegated_launch,
+            native_admission: _,
             provider_origin,
             startup,
             options,
@@ -2645,6 +2662,9 @@ impl ThreadManagerState {
                 }
             }
         }
+        // A host factory is injectable code, so guard its invocation as well
+        // as the final Session startup after the remaining metadata awaits.
+        startup_state.check_native_current()?;
         let agent_control = match (&self.agent_control_factory, agent_control) {
             (Some(factory), AgentControlInit::Local(local)) => {
                 let thread_id = match &initial_history {

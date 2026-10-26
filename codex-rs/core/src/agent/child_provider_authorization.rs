@@ -444,6 +444,7 @@ impl PreparedChildAuthorization {
             origins: self.origins,
             origin: self.origin,
             approved: self.approved,
+            admission: NativeChildAdmission::new(&current),
         })
     }
 }
@@ -455,6 +456,7 @@ pub(crate) struct ChildLaunchPermit {
     origins: Arc<ChildProviderOrigins>,
     origin: Option<VerifiedChildProviderOrigin>,
     approved: Arc<Config>,
+    admission: NativeChildAdmission,
 }
 
 impl ChildLaunchPermit {
@@ -466,6 +468,7 @@ impl ChildLaunchPermit {
     ) -> Result<(
         Option<VerifiedChildProviderOrigin>,
         codex_protocol::SessionId,
+        NativeChildAdmission,
     )> {
         if parent != Some(self.caller)
             || !Arc::ptr_eq(&self.origins, &runtime.child_provider_origins)
@@ -475,7 +478,42 @@ impl ChildLaunchPermit {
                 "native child launch authority does not match its configuration",
             ));
         }
-        Ok((self.origin, self.session_id))
+        self.admission.check_current()?;
+        Ok((self.origin, self.session_id, self.admission))
+    }
+}
+
+/// Opaque, non-cloneable continuation of a real native launch authorization.
+/// Config equality cannot freeze this live managed-policy binding.
+pub(crate) struct NativeChildAdmission {
+    binding: Option<codex_config::CloudConfigBundleBinding>,
+}
+
+impl NativeChildAdmission {
+    fn new(config: &Config) -> Self {
+        Self {
+            binding: config.config_layer_stack.cloud_config_binding().cloned(),
+        }
+    }
+
+    pub(crate) fn check_current(&self) -> Result<()> {
+        let binding = self.binding.as_ref().map(|binding| binding.read());
+        if binding.as_ref().is_some_and(|guard| {
+            guard.status != codex_config::CloudConfigBundleBindingStatus::Current
+        }) {
+            return Err(invalid(
+                "managed native child policy was revoked before startup admission",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit(self) -> Result<()> {
+        // This synchronous live-binding read is the native startup admission
+        // linearization point. Its guard never crosses an await. Revocation
+        // observed before this point rejects the startup, including after all
+        // controller/manager preparation awaits.
+        self.check_current()
     }
 }
 
@@ -917,7 +955,7 @@ impl ChildResumePermit {
         parent: Option<ThreadId>,
         selections: &Option<Vec<TurnEnvironmentSelection>>,
         inherited: Option<&TurnEnvironmentSnapshot>,
-    ) -> Result<Option<VerifiedChildProviderOrigin>> {
+    ) -> Result<(Option<VerifiedChildProviderOrigin>, NativeChildAdmission)> {
         let InitialHistory::Resumed(saved) = history else {
             return Err(invalid("reload history changed"));
         };
@@ -996,7 +1034,7 @@ impl ChildResumePermit {
                 self.authorization_origin.as_ref(),
             )
             .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-        Ok(self.origin)
+        Ok((self.origin, NativeChildAdmission::new(&current.config)))
     }
 }
 
