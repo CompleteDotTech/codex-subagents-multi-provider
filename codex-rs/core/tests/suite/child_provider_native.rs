@@ -144,11 +144,30 @@ impl Fixture {
                 "touch helper-marker\nprintf synthetic-blocked\n"
             },
         )?;
-        let helper_auth = if cfg!(windows) {
-            json!({"command":"cmd.exe","args":["/D","/C",helper],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+        // Build TOML integers directly: serde_json's arbitrary-precision Number
+        // serialization uses an internal map that is not a TOML integer.
+        let helper_arg = helper.to_string_lossy().into_owned();
+        let args = if cfg!(windows) {
+            vec!["/D".to_owned(), "/C".to_owned(), helper_arg]
         } else {
-            json!({"command":"sh","args":[helper],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+            vec![helper_arg]
         };
+        let helper_auth = toml::Value::Table(toml::Table::from_iter([
+            (
+                "command".into(),
+                toml::Value::String(if cfg!(windows) { "cmd.exe" } else { "sh" }.into()),
+            ),
+            (
+                "args".into(),
+                toml::Value::Array(args.into_iter().map(toml::Value::String).collect()),
+            ),
+            (
+                "cwd".into(),
+                toml::Value::String(home.path().to_string_lossy().into_owned()),
+            ),
+            ("timeout_ms".into(), toml::Value::Integer(5000)),
+            ("refresh_interval_ms".into(), toml::Value::Integer(0)),
+        ]));
         let default = default_provider
             .map(|id| format!("default_subagent_model_provider = '{id}'\n"))
             .unwrap_or_default();
@@ -197,9 +216,7 @@ request_max_retries = 0
             .and_then(toml::Value::as_table_mut)
             .expect("fixture declares the blocked provider table");
         assert!(
-            blocked
-                .insert("auth".into(), toml::Value::try_from(helper_auth)?)
-                .is_none(),
+            blocked.insert("auth".into(), helper_auth).is_none(),
             "the helper is configured exactly once"
         );
         std::fs::write(home.path().join("config.toml"), toml::to_string(&config)?)?;
