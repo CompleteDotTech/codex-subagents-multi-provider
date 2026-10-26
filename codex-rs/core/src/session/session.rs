@@ -143,7 +143,7 @@ pub(crate) struct SessionConfiguration {
     /// Thread-owned plugin selection inherited by future turns.
     pub(super) disabled_plugin_ids: Vec<String>,
 
-    //Â TODO(pakrym): Remove config from here
+    // TODO(pakrym): Remove config from here
     pub(super) original_config_do_not_use: Arc<Config>,
     /// Optional service name tag for session metrics.
     pub(super) metrics_service_name: Option<String>,
