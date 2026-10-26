@@ -48,7 +48,7 @@ def main() -> None:
                     diff.extend(difflib.unified_diff(
                         original.decode().splitlines(True),
                         (vendor / name).read_text().splitlines(True),
-                        fromfile=f"a/{name}", tofile=f"b/{name}",
+                        fromfile=f"a/{name}", tofile=f"b/{name}", n=0,
                     ))
         require("".join(diff) == (root / "aws-config.patch").read_text(), "patch does not reconstruct")
     print(f"Verified {len(upstream['files'])} upstream files, {len(patched)} patched files, and {len(fixtures)} fixtures")

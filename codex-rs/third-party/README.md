@@ -7,7 +7,8 @@ crate's recorded upstream Git revision f031610a8cbb4ac2dac3229bfaeaa88182787ab4.
 The fixtures contain public upstream test credentials, not operational secrets.
 
 Only Cargo.toml, Cargo.toml.orig and src/login/dpop.rs differ from the archive.
-`aws-config.patch` exposes their complete delta; `aws-config.patched.json` pins
+`aws-config.patch` exposes their complete zero-context delta; apply it with
+`git apply --unidiff-zero`. `aws-config.patched.json` pins
 those reviewed results. The source patch moves P-256 to maintained 0.14 and its
 RNG to compatible rand 0.10, retaining SEC1 keys, ES256, JWK coordinates and raw
 64-byte JWS signatures. OS entropy/signing failures propagate as provider errors.
