@@ -199,8 +199,7 @@ impl LocalAgentControl {
             *agent_role = config
                 .prepared_child_authorization
                 .as_ref()
-                .and_then(|authorization| authorization.role_name())
-                .map(str::to_owned);
+                .and_then(|authorization| authorization.role_name());
         }
         let caller = source
             .parent_thread_id()
