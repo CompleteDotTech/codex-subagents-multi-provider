@@ -4,6 +4,7 @@ use codex_model_provider_info::ModelProviderCapabilities;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::ResponsesCompatibility;
 use core_test_support::wait_for_event_with_timeout;
+use pretty_assertions::assert_eq;
 
 struct NamespacedEcho {
     calls: Arc<AtomicUsize>,
