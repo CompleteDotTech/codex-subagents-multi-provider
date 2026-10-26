@@ -121,7 +121,10 @@ pub(crate) async fn prepare_agent_spawn_config(
     }
     let parent_settings = session.thread_settings_snapshot().await;
     let parent_base = session.get_config().await;
-    if parent_settings.cwd != config.cwd
+    if parent_base.config_layer_stack != config.config_layer_stack
+        || parent_settings.approval_policy != config.permissions.approval_policy.value()
+        || parent_settings.approvals_reviewer != config.approvals_reviewer
+        || parent_settings.cwd != config.cwd
         || parent_settings.permission_profile != config.permissions.effective_permission_profile()
         || parent_settings
             .runtime_workspace_roots
@@ -306,6 +309,7 @@ pub(crate) async fn prepare_agent_spawn_config(
         .await?;
     }
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    apply_step_security_overrides(&mut config, step_context)?;
 
     // Remember an applied configured default so cold reload reapplies its restrictions.
     let role_name = options
@@ -479,6 +483,7 @@ pub(crate) fn build_agent_spawn_config(
 ) -> Result<Config, String> {
     let mut config = build_agent_shared_config(step_context.turn.as_ref())?;
     let settings = &step_context.settings;
+    apply_step_security_overrides(&mut config, step_context)?;
     config.model = Some(settings.model_info.slug.clone());
     config.model_reasoning_effort = settings.effective_reasoning_effort();
     config.model_reasoning_summary = Some(settings.reasoning_summary);
@@ -545,6 +550,18 @@ fn reject_full_fork_agent_type_override(agent_type: Option<&str>) -> Result<(), 
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale can
 /// make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
+// Native launches are step-scoped: TurnContext deliberately retains the
+// initial-turn approval values and cannot authorize a later step's child.
+fn apply_step_security_overrides(config: &mut Config, step: &StepContext) -> Result<(), String> {
+    config
+        .permissions
+        .approval_policy
+        .set(step.settings.approval_policy())
+        .map_err(|error| format!("approval_policy is invalid: {error}"))?;
+    config.approvals_reviewer = step.settings.approvals_reviewer();
+    Ok(())
+}
+
 fn apply_spawn_agent_runtime_overrides(
     config: &mut Config,
     turn: &TurnContext,

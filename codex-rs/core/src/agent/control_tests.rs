@@ -164,7 +164,19 @@ impl LocalAgentControl {
             },
         )
         .await
-        .map(|prepared| prepared.config)
+        .map(|prepared| {
+            if full_history {
+                if let Some(expected) = requested.developer_instructions.as_ref() {
+                    assert_eq!(prepared.config.developer_instructions.as_ref(), Some(expected),
+                        "child fixture must configure its developer text through the real host parent/role");
+                }
+                if !requested.multi_agent_v2.preserve_fork_prefix {
+                    assert!(!prepared.config.multi_agent_v2.preserve_fork_prefix,
+                        "child fixture must configure fork rewriting through the real host parent");
+                }
+            }
+            prepared.config
+        })
         .map_err(CodexErr::InvalidRequest)
     }
 }
@@ -2999,10 +3011,12 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     child_config.developer_instructions = Some("Child developer instructions.".to_string());
     child_config.multi_agent_v2.subagent_developer_instructions =
         Some("Child developer instructions.".to_string());
-    child_config.multi_agent_v2.root_agent_usage_hint_text =
-        Some("Child root guidance.".to_string());
-    child_config.multi_agent_v2.subagent_usage_hint_text =
-        Some("Child subagent guidance.".to_string());
+    parent_config.multi_agent_v2.subagent_developer_instructions = child_config
+        .multi_agent_v2
+        .subagent_developer_instructions
+        .clone();
+    parent_config.multi_agent_v2.preserve_fork_prefix =
+        child_config.multi_agent_v2.preserve_fork_prefix;
     let new_thread = harness
         .manager
         .start_thread_with_control_for_tests(
@@ -3184,6 +3198,12 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                multi_agent_v2_usage_hints: Some(ResolvedMultiAgentV2UsageHints {
+                    root: None,
+                    subagent: Some(MultiAgentRoleInstructions::Configured(
+                        "Child subagent guidance.".into(),
+                    )),
+                }),
                 ..Default::default()
             },
         )
@@ -3317,21 +3337,37 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         "full-history forks must retain the catalog baseline with its declarations"
     );
 
-    let mut no_hint_child_config = harness.config.clone();
-    no_hint_child_config.multi_agent_v2.preserve_fork_prefix = false;
-    let _ = no_hint_child_config.features.enable(Feature::MultiAgentV2);
-    no_hint_child_config.developer_instructions = Some(String::new());
-    no_hint_child_config
+    let mut no_hint_parent_config = parent_config.clone();
+    no_hint_parent_config.multi_agent_v2.preserve_fork_prefix = false;
+    no_hint_parent_config
         .multi_agent_v2
         .subagent_developer_instructions = Some(String::new());
-    no_hint_child_config.multi_agent_v2.subagent_usage_hint_text = Some(String::new());
+    let stored = parent_thread
+        .read_thread(true, true)
+        .await
+        .expect("read parent fixture history");
+    let no_hint_parent = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                initial_history: InitialHistory::Forked(
+                    stored.history.expect("parent history").items,
+                ),
+                ..StartThreadOptions::new(no_hint_parent_config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .expect("start host-configured no-hint parent fixture");
+    let mut no_hint_child_config = no_hint_parent_config;
+    no_hint_child_config.developer_instructions = Some(String::new());
     let no_hint_child_thread_id = harness
         .control
         .spawn_agent_with_metadata(
             no_hint_child_config,
             text_input("child task without hints"),
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
+                parent_thread_id: no_hint_parent.thread_id,
                 depth: 1,
                 agent_path: None,
                 agent_nickname: None,
@@ -3340,6 +3376,10 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                multi_agent_v2_usage_hints: Some(ResolvedMultiAgentV2UsageHints {
+                    root: None,
+                    subagent: None,
+                }),
                 ..Default::default()
             },
         )
@@ -3396,6 +3436,11 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .shutdown_live_agent(no_hint_child_thread_id)
         .await
         .expect("no-hint child shutdown should submit");
+    no_hint_parent
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("no-hint parent shutdown");
     let _ = parent_thread
         .submit(Op::Shutdown {})
         .await
@@ -3420,10 +3465,12 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(marke
     child_config.developer_instructions = Some("Child developer instructions.".to_string());
     child_config.multi_agent_v2.subagent_developer_instructions =
         Some("Child developer instructions.".to_string());
-    child_config.multi_agent_v2.root_agent_usage_hint_text =
-        Some("Child root guidance.".to_string());
-    child_config.multi_agent_v2.subagent_usage_hint_text =
-        Some("Child subagent guidance.".to_string());
+    parent_config.multi_agent_v2.subagent_developer_instructions = child_config
+        .multi_agent_v2
+        .subagent_developer_instructions
+        .clone();
+    parent_config.multi_agent_v2.preserve_fork_prefix =
+        child_config.multi_agent_v2.preserve_fork_prefix;
     let new_thread = harness
         .manager
         .start_thread_with_control_for_tests(
@@ -3714,6 +3761,12 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
     child_config.multi_agent_v2.subagent_developer_instructions =
         Some("Child developer instructions.".to_string());
 
+    parent_config.multi_agent_v2.subagent_developer_instructions = child_config
+        .multi_agent_v2
+        .subagent_developer_instructions
+        .clone();
+    parent_config.multi_agent_v2.preserve_fork_prefix =
+        child_config.multi_agent_v2.preserve_fork_prefix;
     let new_thread = harness
         .manager
         .start_thread_with_control_for_tests(
@@ -3935,6 +3988,12 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
         child_config.multi_agent_v2.subagent_developer_instructions =
             Some("Child developer instructions.".to_string());
 
+        parent_config.multi_agent_v2.subagent_developer_instructions = child_config
+            .multi_agent_v2
+            .subagent_developer_instructions
+            .clone();
+        parent_config.multi_agent_v2.preserve_fork_prefix =
+            child_config.multi_agent_v2.preserve_fork_prefix;
         let new_thread = harness
             .manager
             .start_thread_with_control_for_tests(

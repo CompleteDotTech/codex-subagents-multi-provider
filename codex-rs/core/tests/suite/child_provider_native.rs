@@ -100,6 +100,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new(version: MultiAgentVersion, default_provider: Option<&str>) -> Result<Self> {
+        Self::with_host_setup(version, default_provider, |_| {}).await
+    }
+
+    async fn with_host_setup(
+        version: MultiAgentVersion,
+        default_provider: Option<&str>,
+        setup: fn(&mut codex_core::config::Config),
+    ) -> Result<Self> {
         let root = start_mock_server().await;
         let a = start_mock_server().await;
         let b = start_mock_server().await;
@@ -194,6 +202,7 @@ request_max_retries = 0
                     config.features.disable(Feature::MultiAgentV2).unwrap();
                 }
                 config.agent_max_depth = 5;
+                setup(config);
             });
         let test = builder.build_with_auto_env(&root).await?;
         Ok(Self {
@@ -468,7 +477,7 @@ async fn native_history_and_authority_rejections_happen_before_catalog_helper_or
                 Some(json!("all")),
                 "child_provider_history_unsupported",
             ),
-            ("a", Some(json!(1)), "child_provider_history_unsupported"),
+            ("a", Some(json!("1")), "child_provider_history_unsupported"),
             ("blocked", None, "child_provider_not_authorized"),
             ("missing", None, "child_provider_not_authorized"),
         ] {
@@ -498,5 +507,284 @@ async fn native_history_and_authority_rejections_happen_before_catalog_helper_or
             );
         }
     }
+    Ok(())
+}
+
+fn allow_helper_provider_setup(config: &mut codex_core::config::Config) {
+    let stack = &config.config_layer_stack;
+    let mut layers = stack.layers_low_to_high().cloned().collect::<Vec<_>>();
+    for layer in &mut layers {
+        if matches!(layer.name, codex_config::ConfigLayerSource::User { .. }) {
+            layer.config["agents"]["allowed_model_providers"]
+                .as_array_mut()
+                .unwrap()
+                .push(toml::Value::String("blocked".into()));
+        }
+    }
+    config.config_layer_stack = codex_config::ConfigLayerStack::new(
+        layers,
+        stack.requirements().clone(),
+        stack.requirements_toml().clone(),
+    )
+    .unwrap();
+}
+
+fn managed_provider_setup(config: &mut codex_core::config::Config) {
+    let stack = &config.config_layer_stack;
+    let mut required = stack.requirements_toml().clone();
+    required.model_provider = Some("openai".into());
+    config.config_layer_stack = codex_config::ConfigLayerStack::new(
+        stack.layers_low_to_high().cloned().collect(),
+        stack.requirements().clone(),
+        required,
+    )
+    .unwrap();
+}
+
+fn managed_allowlist_setup(config: &mut codex_core::config::Config) {
+    let stack = &config.config_layer_stack;
+    let mut layers = stack.layers_low_to_high().cloned().collect::<Vec<_>>();
+    layers.push(codex_config::ConfigLayerEntry::new(
+        codex_config::ConfigLayerSource::Mdm {
+            domain: "native-test".into(),
+            key: "providers".into(),
+        },
+        toml::from_str("[agents]\nallowed_model_providers=['b']").unwrap(),
+    ));
+    layers.sort_by(|left, right| left.name.partial_cmp(&right.name).unwrap());
+    config.config_layer_stack = codex_config::ConfigLayerStack::new(
+        layers,
+        stack.requirements().clone(),
+        stack.requirements_toml().clone(),
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_managed_constraints_override_user_authorization_before_child_io() -> Result<()> {
+    for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
+        for (setup, expected) in [
+            (
+                managed_provider_setup as fn(&mut codex_core::config::Config),
+                "child_provider_policy_conflict",
+            ),
+            (
+                managed_allowlist_setup as fn(&mut codex_core::config::Config),
+                "child_provider_not_authorized",
+            ),
+        ] {
+            let fixture = Fixture::with_host_setup(version, None, setup).await?;
+            std::fs::remove_file(fixture.home.path().join("catalog.json"))?;
+            scripted_spawn(
+                &fixture.root,
+                version,
+                "managed_rejection",
+                json!({"message":"disallowed by managed policy", "model_provider":"a"}),
+            )
+            .await;
+            fixture.turn("try managed-restricted delegation").await?;
+            assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
+            assert!(fixture.a.received_requests().await?.is_empty());
+            assert!(fixture.b.received_requests().await?.is_empty());
+            assert!(!fixture.home.path().join("helper-marker").exists());
+            assert!(
+                fixture
+                    .root
+                    .received_requests()
+                    .await?
+                    .iter()
+                    .filter(|request| request.method.as_str() == "POST")
+                    .any(|request| body(request).to_string().contains(expected))
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_runtime_cwd_and_write_scope_revoke_host_file_authority() -> Result<()> {
+    for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
+        for change_cwd in [true, false] {
+            let fixture =
+                Fixture::with_host_setup(version, None, allow_helper_provider_setup).await?;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(completion("baseline"))
+                .mount(&fixture.root)
+                .await;
+            fixture
+                .turn("advertise initially trusted providers")
+                .await?;
+            assert!(
+                fixture
+                    .root
+                    .received_requests()
+                    .await?
+                    .iter()
+                    .filter(|request| request.method.as_str() == "POST")
+                    .any(|request| body(request)["tools"].to_string().contains("blocked"))
+            );
+            fixture.root.reset().await;
+            let mut overrides = codex_protocol::protocol::ThreadSettingsOverrides::default();
+            if change_cwd {
+                // Moving cwd above the host file makes it project-owned even
+                // without widening the permission profile.
+                let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+                    fixture.home.path(),
+                )?;
+                let uri = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
+                let requests = fixture
+                    .test
+                    .codex
+                    .environment_selections()
+                    .await
+                    .into_iter()
+                    .map(|selection| {
+                        let mut request = selection.into_request();
+                        request.cwd = uri.clone();
+                        request.workspace_roots = vec![uri.clone()];
+                        request
+                    })
+                    .collect();
+                overrides.environments = Some(
+                    codex_protocol::protocol::TurnEnvironmentRequests::new(cwd.clone(), requests),
+                );
+                overrides.runtime_workspace_roots = Some(vec![cwd]);
+            } else {
+                overrides.permission_profile =
+                    Some(codex_protocol::models::PermissionProfile::Disabled);
+            }
+            fixture.test.codex.update_thread_settings(overrides).await?;
+            scripted_spawn(&fixture.root, version, "scope_rejection",
+                json!({"message":"source became writable/project-owned", "model_provider":"blocked"})).await;
+            // blocked owns an executable helper, providing a direct before-I/O marker.
+            fixture
+                .turn("try delegation after runtime scope change")
+                .await?;
+            assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
+            assert!(fixture.a.received_requests().await?.is_empty());
+            assert!(fixture.b.received_requests().await?.is_empty());
+            assert!(!fixture.home.path().join("helper-marker").exists());
+            assert!(
+                fixture
+                    .root
+                    .received_requests()
+                    .await?
+                    .iter()
+                    .filter(|request| request.method.as_str() == "POST")
+                    .any(|request| {
+                        let text = body(request).to_string();
+                        text.contains("child_provider_not_authorized")
+                            || text.contains("child_provider_untrusted_source")
+                    })
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_resumed_child_history_cannot_be_reclassified_by_source_labels() -> Result<()> {
+    use codex_core::StartThreadOptions;
+    use codex_history::InitialHistory;
+    use codex_history::ResumedHistory;
+    use codex_history::RolloutItem;
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::InternalSessionSource;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
+    let fixture = Fixture::with_host_setup(MultiAgentVersion::V2, None, |config| {
+        config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    })
+    .await?;
+    let parent = fixture.test.session_configured.thread_id;
+    let native = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: parent,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    for source in [
+        SessionSource::Internal(InternalSessionSource::Guardian),
+        SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
+        SessionSource::Exec,
+        SessionSource::SubAgent(SubAgentSource::Review),
+    ] {
+        let child = ThreadId::new();
+        let history = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: child,
+            history_revision: None,
+            rollout_path: None,
+            history: Arc::new(vec![RolloutItem::SessionMeta(Box::new(SessionMetaLine {
+                meta: SessionMeta {
+                    id: child,
+                    parent_thread_id: Some(parent),
+                    source: native.clone(),
+                    model_provider: Some("blocked".into()),
+                    ..Default::default()
+                },
+                git: None,
+            }))]),
+        });
+        let mut config = fixture.test.config.clone();
+        config.model_provider_id = "blocked".into();
+        config.model_provider = config.model_providers["blocked"].clone();
+        let result = fixture
+            .test
+            .thread_manager
+            .start_thread(StartThreadOptions {
+                initial_history: history,
+                session_source: Some(source),
+                ..StartThreadOptions::new(config)
+            })
+            .await;
+        assert!(
+            result.is_err_and(|error| error.to_string().contains("private native launch path"))
+        );
+        assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
+        assert!(!fixture.home.path().join("helper-marker").exists());
+        assert!(fixture.a.received_requests().await?.is_empty());
+        assert!(fixture.b.received_requests().await?.is_empty());
+    }
+    let internal = fixture
+        .test
+        .thread_manager
+        .spawn_internal_session(
+            parent,
+            StartThreadOptions {
+                session_source: Some(SessionSource::Internal(
+                    InternalSessionSource::MemoryConsolidation,
+                )),
+                ..StartThreadOptions::new(fixture.test.config.clone())
+            },
+        )
+        .await?;
+    assert!(matches!(
+        internal.thread.config_snapshot().await.session_source,
+        SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+    ));
+    internal.thread.shutdown_and_wait().await?;
+    assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    // A subsequent real child demonstrates that rejected attempts did not
+    // consume the controller's child slot or corrupt its parent registration.
+    scripted_spawn(
+        &fixture.root,
+        MultiAgentVersion::V2,
+        "real_child",
+        json!({"message":"valid child", "model_provider":"a"}),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("valid-done"))
+        .mount(&fixture.a)
+        .await;
+    fixture.turn("delegate after forged attempts").await?;
+    assert_eq!(fixture.children(1).await?.len(), 1);
+    fixture.assert_provider_headers().await;
     Ok(())
 }

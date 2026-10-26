@@ -2293,13 +2293,10 @@ impl ThreadManagerState {
                         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
                     )
                 });
-        if (explicit_native || resumed_native)
-            && !request.delegated_launch
-            && !matches!(
-                request.options.session_source,
-                Some(SessionSource::Internal(_))
-            )
-        {
+        // A source label never grants a private launch classification. Genuine
+        // internal helpers carry a captured parent and only New/Forked history;
+        // owned resumed history must pass the validated child-resume path.
+        if (explicit_native || resumed_native) && !request.delegated_launch {
             return Err(crate::agent::child_provider_authorization::invalid(
                 "delegated thread source requires the private native launch path",
             ));

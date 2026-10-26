@@ -94,6 +94,21 @@ impl ChildProviderOrigins {
 
 /// Refresh provenance against exactly the effective runtime filesystem scope.
 pub(crate) fn current_policy(config: &Config) -> std::io::Result<ChildProviderPolicy> {
+    // Retained layer snapshots cannot authorize new launches after the host
+    // observes a changed or suspended managed bundle.
+    let managed = config
+        .config_layer_stack
+        .cloud_config_binding()
+        .map(|binding| binding.read());
+    if managed
+        .as_ref()
+        .is_some_and(|guard| guard.status != codex_config::CloudConfigBundleBindingStatus::Current)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed child-provider policy is no longer current",
+        ));
+    }
     let filesystem = config.permissions.file_system_sandbox_policy();
     let writable = filesystem.get_writable_roots_with_cwd(config.cwd.as_path());
     let mut roots = config.workspace_roots.clone();

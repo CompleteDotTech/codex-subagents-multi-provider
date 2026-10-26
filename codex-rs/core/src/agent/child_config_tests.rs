@@ -70,11 +70,19 @@ impl Fixture {
     }
 
     async fn with_fast_mode(fast_mode: Option<bool>) -> Self {
+        Self::with_binding(fast_mode, None).await
+    }
+
+    async fn with_binding(
+        fast_mode: Option<bool>,
+        binding: Option<codex_config::CloudConfigBundleBinding>,
+    ) -> Self {
         let host = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
             host.path().join("config.toml"),
             r#"
+approval_policy = "on-request"
 [agents]
 max_depth = 5
 allowed_model_providers = ["zai", "ollama", "openai", "offline"]
@@ -126,6 +134,10 @@ request_max_retries = 0
             .build()
             .await
             .unwrap();
+        config.config_layer_stack = config
+            .config_layer_stack
+            .clone()
+            .with_cloud_config_binding(binding);
         if let Some(enabled) = fast_mode {
             if enabled {
                 config.features.enable(Feature::FastMode).unwrap();
@@ -948,4 +960,231 @@ async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenan
         "a writable host definition/catalog cannot retain its old trust exemption"
     );
     assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
+}
+
+#[tokio::test]
+async fn native_preparation_rejects_stale_step_approval_and_reviewer_before_catalog_io() {
+    use codex_protocol::config_types::ApprovalsReviewer;
+    use codex_protocol::protocol::AskForApproval;
+    for reviewer_change in [false, true] {
+        let fixture = Fixture::new().await;
+        let resolved = fixture.resolved("zai").await;
+        let turn = fixture.parent.session.new_default_turn().await;
+        let stale_step = StepContext::for_test(Arc::clone(&turn));
+        fixture
+            .parent
+            .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: (!reviewer_change).then_some(AskForApproval::Never),
+                approvals_reviewer: reviewer_change.then_some(ApprovalsReviewer::AutoReview),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let catalog = resolved.model_catalog_json.as_ref().unwrap();
+        let contents = std::fs::read(catalog).unwrap();
+        std::fs::remove_file(catalog).unwrap();
+        let rejected = prepare_agent_spawn_config(
+            &fixture.parent.session,
+            &stale_step,
+            SpawnConfigOptions {
+                model_provider: Some("zai"),
+                resolved_provider: None,
+                version: SpawnConfigVersion::V2,
+                full_history_fork: false,
+                role_name: None,
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await;
+        assert!(
+            rejected.is_err_and(|error| error.contains("runtime scope changed before preparation"))
+        );
+        assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
+        std::fs::write(catalog, contents).unwrap();
+        // An idle test turn is not installed as the running turn. Pair a real
+        // current host settings snapshot with the retained initial TurnContext,
+        // exactly the split a later step has after an active-turn update.
+        let mut current = StepContext::for_test(fixture.parent.session.new_default_turn().await);
+        Arc::get_mut(&mut current).unwrap().turn = turn;
+        let mut prepared = prepare_agent_spawn_config(
+            &fixture.parent.session,
+            &current,
+            SpawnConfigOptions {
+                model_provider: Some("zai"),
+                resolved_provider: None,
+                version: SpawnConfigVersion::V2,
+                full_history_fork: false,
+                role_name: None,
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await
+        .unwrap()
+        .config;
+        let settings = fixture.parent.thread_settings_snapshot().await;
+        assert_eq!(
+            prepared.permissions.approval_policy.value(),
+            settings.approval_policy
+        );
+        assert_eq!(prepared.approvals_reviewer, settings.approvals_reviewer);
+        // Changing either field again after preparation revokes that proof.
+        fixture
+            .parent
+            .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: (!reviewer_change).then_some(AskForApproval::OnRequest),
+                approvals_reviewer: reviewer_change.then_some(ApprovalsReviewer::User),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let source = prepared_source(&fixture.parent, &prepared);
+        let result = prepared
+            .prepared_child_authorization
+            .take()
+            .unwrap()
+            .consume(
+                &fixture.parent.session.services.local_agent_runtime,
+                fixture.parent.session.thread_id,
+                &prepared,
+                false,
+                &source,
+            )
+            .await;
+        assert!(result.is_err_and(|error| error.to_string().contains("authority changed")));
+        assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn managed_bundle_revocation_invalidates_retained_preparation_before_admission() {
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    let fixture = Fixture::with_binding(None, snapshot.binding).await;
+    let resolved = fixture.resolved("zai").await;
+    let mut prepared = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    let source = prepared_source(&fixture.parent, &prepared);
+    let mut revoked = codex_config::CloudConfigBundle::default();
+    revoked
+        .config_toml
+        .enterprise_managed
+        .push(codex_config::CloudConfigFragment {
+            id: "child-provider-revocation".into(),
+            name: "revoked child access".into(),
+            contents: "[agents]\nallowed_model_providers=[]".into(),
+        });
+    policy.observe_remote_bundle(&revoked).unwrap();
+    assert!(current_policy(&prepared).is_err());
+    let result = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &fixture.parent.session.services.local_agent_runtime,
+            fixture.parent.session.thread_id,
+            &prepared,
+            false,
+            &source,
+        )
+        .await;
+    assert!(result.is_err_and(|error| {
+        error
+            .to_string()
+            .contains("current child policy cannot be established")
+    }));
+    assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
+}
+
+#[tokio::test]
+async fn controller_rejects_transplanted_mutated_and_relabelled_prepared_launches() {
+    let fixture = Fixture::new().await;
+    let other = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let prepared = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    let caller = fixture.parent.session.thread_id;
+    for mutation in 0..6 {
+        let mut config = prepared.clone();
+        let mut source = prepared_source(&fixture.parent, &config);
+        let mut options = crate::agent::types::SpawnAgentOptions {
+            parent_thread_id: Some(caller),
+            ..Default::default()
+        };
+        let mut request_caller = caller;
+        match mutation {
+            0 => config.model_provider.base_url = Some("http://127.0.0.1:9/forged".into()),
+            1 => config.cwd = fixture._host.path().to_path_buf().try_into().unwrap(),
+            2 => {
+                source = codex_protocol::protocol::SessionSource::Internal(
+                    codex_protocol::protocol::InternalSessionSource::Guardian,
+                );
+            }
+            3 => options.fork_mode = Some(crate::agent::types::SpawnAgentForkMode::FullHistory),
+            4 => request_caller = other.parent.session.thread_id,
+            _ => {
+                source = codex_protocol::protocol::SessionSource::SubAgent(
+                    codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                        parent_thread_id: caller,
+                        depth: 3,
+                        agent_path: None,
+                        agent_nickname: None,
+                        agent_role: None,
+                    },
+                );
+            }
+        }
+        let result = fixture
+            .parent
+            .session
+            .services
+            .agent_control
+            .spawn(crate::agent::api::SpawnRequest {
+                caller: request_caller,
+                config,
+                input: crate::agent::api::AgentInput::UserInput(vec![
+                    codex_protocol::user_input::UserInput::Text {
+                        text: "forged prepared child".into(),
+                        text_elements: vec![],
+                    },
+                ]),
+                source,
+                options,
+            })
+            .await;
+        assert!(
+            result.is_err_and(|error| error.to_string().contains("child_provider_policy_conflict"))
+        );
+        assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
+    }
+    // All negative branches return before the shared single-use nonce is spent.
+    // A real registered parent can still consume its original proof.
+    let mut valid = prepared;
+    let source = prepared_source(&fixture.parent, &valid);
+    let permit = valid
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &fixture.parent.session.services.local_agent_runtime,
+            caller,
+            &valid,
+            false,
+            &source,
+        )
+        .await
+        .unwrap();
+    drop(permit);
 }
