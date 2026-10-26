@@ -23,11 +23,11 @@ use http::HeaderValue;
 pub(crate) async fn compose_auth(
     provider: &ModelProviderInfo,
     manager: Option<&std::result::Result<Arc<GatewayAuthManager>, String>>,
-    mut resolved: ResolvedProviderAuth,
+    resolved: ResolvedProviderAuth,
 ) -> Result<ResolvedProviderAuth> {
-    let Some(config) = provider.gateway_oauth.as_ref() else {
+    if provider.gateway_oauth.is_none() {
         return Ok(resolved);
-    };
+    }
     provider.validate().map_err(CodexErr::InvalidRequest)?;
     let manager = manager.ok_or_else(|| {
         CodexErr::InvalidRequest("gateway_oauth requires auth runtime configuration".into())
@@ -35,28 +35,72 @@ pub(crate) async fn compose_auth(
     let manager = manager
         .as_ref()
         .map_err(|error| CodexErr::InvalidRequest(error.clone()))?;
-    let token = manager.resolve_access_token().await.map_err(|error| {
-        if let Some(login_error) = error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<GatewayAuthError>())
-        {
-            return match login_error {
-                GatewayAuthError::LoginRequired => {
-                    CodexErrorDetails::GatewayLoginRequired(login_error.to_string()).into()
-                }
-                GatewayAuthError::LoginInProgress => {
-                    CodexErr::InvalidRequest(login_error.to_string())
-                }
-            };
-        }
-        // Issuer errors may echo arbitrary credentials from configured URLs. Keep the
-        // diagnostic safe and bounded, preserving retries for transient failures.
-        CodexErr::Io(std::io::Error::new(
-            error.kind(),
-            "Gateway OAuth authentication failed; check the gateway configuration and credential store.",
-        ))
-    })?;
-    let (name, value) = gateway_header(config, &token)?;
+    let token = manager
+        .resolve_access_token()
+        .await
+        .map_err(gateway_auth_error)?;
+    compose_auth_with_token(provider, &token, resolved)
+}
+
+pub(crate) async fn compose_catalog_auth(
+    provider: &ModelProviderInfo,
+    manager: Option<&std::result::Result<Arc<GatewayAuthManager>, String>>,
+    resolved: ResolvedProviderAuth,
+) -> Result<(ResolvedProviderAuth, Option<String>)> {
+    if provider.gateway_oauth.is_none() {
+        return Ok((resolved, None));
+    }
+    provider.validate().map_err(CodexErr::InvalidRequest)?;
+    let manager = manager
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest("gateway_oauth requires auth runtime configuration".into())
+        })?
+        .as_ref()
+        .map_err(|error| CodexErr::InvalidRequest(error.clone()))?;
+    let credentials = manager
+        .begin_request()
+        .credentials()
+        .await
+        .map_err(gateway_auth_error)?;
+    let identity = credentials.cache_identity(&manager.credential_id());
+    Ok((
+        compose_auth_with_token(provider, &credentials.access_token, resolved)?,
+        Some(identity),
+    ))
+}
+
+fn gateway_auth_error(error: std::io::Error) -> CodexErr {
+    if let Some(login_error) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<GatewayAuthError>())
+    {
+        return match login_error {
+            GatewayAuthError::LoginRequired => {
+                CodexErrorDetails::GatewayLoginRequired(login_error.to_string()).into()
+            }
+            GatewayAuthError::LoginInProgress => CodexErr::InvalidRequest(login_error.to_string()),
+        };
+    }
+    // Issuer errors may echo arbitrary credentials from configured URLs. Keep the
+    // diagnostic safe and bounded, preserving retries for transient failures.
+    CodexErr::Io(std::io::Error::new(
+        error.kind(),
+        "Gateway OAuth authentication failed; check the gateway configuration and credential store.",
+    ))
+}
+
+/// Compose a credential already captured for this request, without resolving a
+/// second token that could belong to a different authorization grant.
+pub(crate) fn compose_auth_with_token(
+    provider: &ModelProviderInfo,
+    token: &str,
+    mut resolved: ResolvedProviderAuth,
+) -> Result<ResolvedProviderAuth> {
+    let Some(config) = provider.gateway_oauth.as_ref() else {
+        return Ok(resolved);
+    };
+    provider.validate().map_err(CodexErr::InvalidRequest)?;
+    let (name, value) = gateway_header(config, token)?;
     if resolved
         .auth
         .to_auth_headers()

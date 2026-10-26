@@ -90,10 +90,11 @@ pub(super) async fn spawn_review_thread(
     selected.collaboration_mode.settings.model = model.clone();
     selected.collaboration_mode.settings.reasoning_effort = reasoning_effort.clone();
     selected.service_tier = service_tier;
-    let step_settings = Arc::new(ResolvedStepSettings::new(
+    let step_settings = Arc::new(ResolvedStepSettings::new_for_provider(
         Arc::new(selected),
         Arc::new(model_info.clone()),
         &review_features,
+        &per_turn_config.model_provider_id,
     ));
     per_turn_config.model = Some(model);
     per_turn_config.model_reasoning_effort = reasoning_effort;

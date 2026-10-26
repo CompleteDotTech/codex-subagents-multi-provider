@@ -908,6 +908,7 @@ impl Session {
             )
         });
         let initial_service_tier_warning = unsupported_service_tier_warning(
+            &config.model_provider_id,
             config.service_tier.as_deref(),
             &config.features,
             &model_info,
@@ -1200,12 +1201,53 @@ pub(crate) fn new_submission_id() -> String {
     Uuid::now_v7().to_string()
 }
 
+#[cfg(test)]
 pub(crate) fn get_service_tier(
     configured_service_tier: Option<String>,
     features: &Features,
     model_info: &ModelInfo,
 ) -> Option<String> {
+    get_service_tier_for_provider("openai", configured_service_tier, features, model_info)
+}
+
+pub(crate) fn model_supports_provider_service_tier(
+    provider_id: &str,
+    model_info: &ModelInfo,
+    tier: &str,
+) -> bool {
+    if provider_id == "openai" {
+        model_info.supports_service_tier(tier)
+    } else {
+        model_info
+            .service_tiers
+            .iter()
+            .any(|supported| supported.id == tier)
+    }
+}
+
+pub(crate) fn service_tier_for_provider_request(
+    provider_id: &str,
+    model_info: &ModelInfo,
+    tier: Option<String>,
+) -> Option<String> {
+    tier.filter(|tier| {
+        tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            && model_supports_provider_service_tier(provider_id, model_info, tier)
+    })
+}
+
+pub(crate) fn get_service_tier_for_provider(
+    provider_id: &str,
+    configured_service_tier: Option<String>,
+    features: &Features,
+    model_info: &ModelInfo,
+) -> Option<String> {
     let service_tier = configured_service_tier?;
+    if service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+        && !model_supports_provider_service_tier(provider_id, model_info, &service_tier)
+    {
+        return None;
+    }
     if service_tier == ServiceTier::Flex.request_value() {
         return Some(service_tier);
     }
@@ -1219,6 +1261,7 @@ pub(crate) fn get_service_tier(
 }
 
 fn unsupported_service_tier_warning(
+    provider_id: &str,
     configured_service_tier: Option<&str>,
     features: &Features,
     model_info: &ModelInfo,
@@ -1226,7 +1269,7 @@ fn unsupported_service_tier_warning(
     let service_tier = configured_service_tier.filter(|service_tier| {
         features.service_tier_enabled(service_tier)
             && *service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
-            && !model_info.supports_service_tier(service_tier)
+            && !model_supports_provider_service_tier(provider_id, model_info, service_tier)
     })?;
     Some(format!(
         "Configured service tier `{service_tier}` is not advertised as supported for model `{}` and will be omitted from requests.",
@@ -3954,15 +3997,17 @@ impl Session {
         if matches!(
             turn_context.session_source,
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-        ) {
+        ) && !turn_context.config.child_role_service_tier_override
+        {
             let root_service_tier = self.services.agent_control.service_tier();
             if settings.selected().service_tier != root_service_tier {
                 let mut selected = settings.selected().clone();
                 selected.service_tier = root_service_tier;
-                let mut inherited_settings = ResolvedStepSettings::new(
+                let mut inherited_settings = ResolvedStepSettings::new_for_provider(
                     Arc::new(selected),
                     Arc::clone(&settings.model_info),
                     &self.features,
+                    &turn_context.config.model_provider_id,
                 );
                 inherited_settings.mcp_approvals_reviewer_override =
                     settings.mcp_approvals_reviewer_override;

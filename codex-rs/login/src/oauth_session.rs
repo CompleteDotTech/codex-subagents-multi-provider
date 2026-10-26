@@ -179,6 +179,48 @@ impl OAuthSessionManager {
         OAuthSessionRequest::new(self.clone())
     }
 
+    /// Observe the current persisted grant for derived-cache scoping without
+    /// refreshing tokens or starting login. Busy, rejected, pending, missing,
+    /// and expired state cannot authorize reuse of a derived cache.
+    pub async fn observe_credential_identity(&self) -> io::Result<Option<String>> {
+        let Ok(cached) = self.state.cached_token.try_lock() else {
+            return Ok(None);
+        };
+        if cached.pending.is_some()
+            || self
+                .state
+                .status
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.status == OAuthSessionStatus::Started)
+        {
+            return Ok(None);
+        }
+        let Some(_credential_lock) = storage::try_lock_credentials(&self.state.codex_home)? else {
+            return Ok(None);
+        };
+        let Some(stored) = self.load_token_async().await? else {
+            return Ok(None);
+        };
+        if !token_is_usable(&stored)
+            || cached.login_required.as_ref() == Some(&stored)
+            || self.state.status.borrow().as_ref().is_some_and(|state| {
+                state.status == OAuthSessionStatus::Started
+                    || (matches!(
+                        state.status,
+                        OAuthSessionStatus::NotReady | OAuthSessionStatus::Failed { .. }
+                    ) && state.credential.as_ref() == Some(&stored))
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(request::credential_cache_identity(
+            &self.credential_id(),
+            &stored.access_token,
+            stored.authorization_id.as_deref(),
+        )))
+    }
+
     /// Returns a usable token, refreshing or starting browser login according to the host policy.
     pub async fn resolve_access_token(&self) -> io::Result<String> {
         self.resolve_with_browser(RefreshPolicy::WhenExpired, login::open_browser)

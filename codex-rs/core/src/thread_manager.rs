@@ -2396,6 +2396,10 @@ impl ThreadManagerState {
         };
         let attachment_source =
             forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
+        let models_manager =
+            crate::agent::child_config::take_prepared_child_models(&mut config, &auth_manager)
+                .map_err(CodexErr::InvalidRequest)?
+                .unwrap_or_else(|| Arc::clone(&self.models_manager));
         let spawn_result = Session::spawn(SessionSpawnArgs {
             startup,
             config,
@@ -2404,7 +2408,7 @@ impl ThreadManagerState {
             instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: Arc::clone(&self.models_manager),
+            models_manager,
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),
