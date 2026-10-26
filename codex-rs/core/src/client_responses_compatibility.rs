@@ -90,7 +90,7 @@ pub(crate) fn function_tools(tools: &[ToolSpec]) -> Result<Vec<Value>, CodexErr>
     for tool in tools {
         append(
             serde_json::to_value(tool).map_err(|_| unsupported("invalid tool schema"))?,
-            None,
+            /*namespace*/ None,
             &mut result,
             &mut names,
         )?;
@@ -103,7 +103,7 @@ pub(crate) fn portable_history(input: Vec<ResponseItem>) -> Result<Vec<ResponseI
     let mut calls = HashSet::new();
     let mut completed = HashSet::new();
     for mut item in input {
-        item.set_id(None);
+        item.set_id(/*new_id*/ None);
         item.clear_internal_chat_message_metadata_passthrough();
         item.clear_content_item_metadata();
         match &mut item {

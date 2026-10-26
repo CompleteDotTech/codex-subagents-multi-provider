@@ -66,7 +66,7 @@ async fn send(provider: &SharedModelProvider, model: &str) -> Result<(), ApiErro
             json!({"model": model, "input": []}),
             HeaderMap::new(),
             Compression::None,
-            None,
+            /*turn_state*/ None,
         )
         .await
         .map(|_| ())
@@ -92,9 +92,9 @@ async fn simultaneous_providers_keep_credentials_models_and_failures_isolated() 
     let parent_server = MockServer::start().await;
     let keyed_server = MockServer::start().await;
     let local_server = MockServer::start().await;
-    respond(&parent_server, 200).await;
-    respond(&keyed_server, 401).await;
-    respond(&local_server, 200).await;
+    respond(&parent_server, /*status*/ 200).await;
+    respond(&keyed_server, /*status*/ 401).await;
+    respond(&local_server, /*status*/ 200).await;
     let parent = create_model_provider(
         ModelProviderInfo::create_openai_provider(Some(parent_server.uri())),
         Some(host.clone()),
@@ -135,7 +135,7 @@ async fn simultaneous_providers_keep_credentials_models_and_failures_isolated() 
     );
     // Quota and transport retries stay on the selected endpoint too.
     keyed_server.reset().await;
-    respond(&keyed_server, 429).await;
+    respond(&keyed_server, /*status*/ 429).await;
     assert!(send(&keyed, "child-model").await.is_err());
     assert!(send(&parent, "parent-after-child-error").await.is_ok());
     assert_eq!(host.auth().await, Some(host_auth()));
@@ -235,7 +235,7 @@ async fn env_key_overrides_host_auth_without_sharing_its_lifecycle() {
         return;
     }
     let server = MockServer::start().await;
-    respond(&server, 200).await;
+    respond(&server, /*status*/ 200).await;
     let host = AuthManager::from_auth_for_testing(host_auth());
     let mut info = independent_provider(&server);
     info.env_key = Some(KEY.into());
@@ -255,7 +255,7 @@ async fn env_key_overrides_host_auth_without_sharing_its_lifecycle() {
 #[tokio::test]
 async fn command_managers_are_independent_from_host_and_each_other() {
     let server = MockServer::start().await;
-    respond(&server, 200).await;
+    respond(&server, /*status*/ 200).await;
     let home = tempfile::tempdir().unwrap();
     let token_file = home.path().join("token");
     std::fs::write(&token_file, "synthetic-command-token").unwrap();
@@ -341,7 +341,7 @@ async fn connection_retry_keeps_the_selected_endpoint_and_credentials() {
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    respond(&server, 200).await;
+    respond(&server, /*status*/ 200).await;
     let host = AuthManager::from_auth_for_testing(host_auth());
     let mut info = independent_provider(&server);
     info.request_max_retries = Some(2);

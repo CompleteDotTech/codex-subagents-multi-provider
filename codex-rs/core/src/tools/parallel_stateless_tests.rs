@@ -121,7 +121,7 @@ async fn fixture(finishes: bool) -> (ToolCallRuntime, Arc<Gates>, Arc<Observer>)
             }),
             ..Default::default()
         },
-        None,
+        /*auth_manager*/ None,
     );
     let observer = Arc::new(Observer::default());
     let mut extensions =
@@ -140,7 +140,7 @@ async fn fixture(finishes: bool) -> (ToolCallRuntime, Arc<Gates>, Arc<Observer>)
         specs,
         ToolMode::Direct,
         BTreeMap::new(),
-        None,
+        /*tool_namespaces_info*/ None,
         &[],
     ));
     let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
@@ -174,7 +174,7 @@ async fn shadow_fixture(
     Arc<Observer>,
     Vec<codex_tools::ToolSpec>,
 ) {
-    let (mut runtime, _, observer) = fixture(false).await;
+    let (mut runtime, _, observer) = fixture(/*finishes*/ false).await;
     let visible_gates = Arc::new(Gates::default());
     let hidden_gates = Arc::new(Gates::default());
     let visible = Arc::new(NamespacedRuntime {
@@ -199,7 +199,7 @@ async fn shadow_fixture(
         specs.clone(),
         ToolMode::Direct,
         BTreeMap::new(),
-        None,
+        /*tool_namespaces_info*/ None,
         &[],
     ));
     runtime.step_context = runtime.step_context.with_tool_router_for_test(router);
@@ -221,7 +221,7 @@ async fn advertised_plain_alias_dispatches_without_hidden_shadow_and_keeps_runti
     ] {
         for finishes in [false, true] {
             let (runtime, visible, hidden, observer, specs) =
-                shadow_fixture(exposure, false, finishes).await;
+                shadow_fixture(exposure, /*advertise_both*/ false, finishes).await;
             let wire = crate::client::responses_compatibility::function_tools(&specs).unwrap();
             assert_eq!(wire.len(), 1);
             assert_eq!(wire[0]["name"], "a__b");
@@ -235,7 +235,7 @@ async fn advertised_plain_alias_dispatches_without_hidden_shadow_and_keeps_runti
                             ..wire_call()
                         },
                         &ToolCallSource::Direct,
-                        true
+                        /*stateless*/ true
                     )
                     .is_err()
             );
@@ -307,8 +307,12 @@ async fn advertised_plain_alias_dispatches_without_hidden_shadow_and_keeps_runti
 
 #[tokio::test]
 async fn genuinely_advertised_alias_collision_fails_preflight_and_before_runtime_side_effects() {
-    let (runtime, visible, other, observer, specs) =
-        shadow_fixture(crate::tools::registry::ToolExposure::Direct, true, false).await;
+    let (runtime, visible, other, observer, specs) = shadow_fixture(
+        crate::tools::registry::ToolExposure::Direct,
+        /*advertise_both*/ true,
+        /*finishes*/ false,
+    )
+    .await;
     assert!(crate::client::responses_compatibility::function_tools(&specs).is_err());
     let result = runtime
         .handle_tool_call(shadow_call(), CancellationToken::new())
@@ -327,7 +331,7 @@ async fn genuinely_advertised_alias_collision_fails_preflight_and_before_runtime
 
 #[tokio::test]
 async fn stateless_alias_waits_for_registered_runtime_readiness_and_records_canonical_name() {
-    let (runtime, gates, observer) = fixture(false).await;
+    let (runtime, gates, observer) = fixture(/*finishes*/ false).await;
     let mut task = tokio::spawn(runtime.handle_tool_call(wire_call(), CancellationToken::new()));
     tokio::time::timeout(Duration::from_secs(2), gates.waiting.notified())
         .await
@@ -353,7 +357,7 @@ async fn stateless_alias_waits_for_registered_runtime_readiness_and_records_cano
 
 #[tokio::test]
 async fn stateless_alias_preserves_finish_on_cancel_and_waits_for_native_terminal_result() {
-    let (runtime, gates, _) = fixture(true).await;
+    let (runtime, gates, _) = fixture(/*finishes*/ true).await;
     let cancellation = CancellationToken::new();
     let mut task = tokio::spawn(runtime.handle_tool_call(wire_call(), cancellation.clone()));
     tokio::time::timeout(Duration::from_secs(2), gates.waiting.notified())
