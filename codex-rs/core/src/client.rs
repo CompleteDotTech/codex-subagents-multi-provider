@@ -2725,6 +2725,12 @@ where
                             },
                         ));
                         let error = provider.map_api_error(error);
+                        inference_trace_attempt.record_failed(
+                            &error,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        session_telemetry.see_event_completed_failed(&error);
                         let _ = tx_event.send(Err(error)).await;
                         return;
                     }
