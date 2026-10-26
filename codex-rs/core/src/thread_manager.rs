@@ -353,6 +353,8 @@ impl StartThreadOptions {
 }
 
 struct ThreadSpawnRequest {
+    delegated_launch: bool,
+    provider_origin: Option<codex_config::child_provider::VerifiedChildProviderOrigin>,
     startup: Option<Arc<crate::session::startup::SessionStartup>>,
     options: StartThreadOptions,
     auth_manager: Arc<AuthManager>,
@@ -374,6 +376,8 @@ impl ThreadSpawnRequest {
         agent_control: impl Into<AgentControlInit>,
     ) -> Self {
         Self {
+            delegated_launch: false,
+            provider_origin: None,
             startup: None,
             options,
             auth_manager,
@@ -1117,6 +1121,17 @@ impl ThreadManager {
         Ok(subtree_thread_ids)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn start_thread_with_control_for_tests(
+        &self,
+        options: StartThreadOptions,
+        control: LocalAgentControl,
+    ) -> CodexResult<NewThread> {
+        self.state
+            .start_root_with_control_for_tests(options, control)
+            .await
+    }
+
     pub async fn start_thread(&self, options: StartThreadOptions) -> CodexResult<NewThread> {
         Box::pin(self.start_thread_inner(
             options, /*forked_from_thread_id*/ None, /*startup*/ None,
@@ -1165,7 +1180,9 @@ impl ThreadManager {
         history: InitialHistory,
         inherited_instructions: Option<SessionInstructions>,
     ) -> CodexResult<NewThread> {
-        if !matches!(options.session_source, Some(SessionSource::Internal(_))) {
+        if options.config.prepared_child_authorization.is_some()
+            || !matches!(options.session_source, Some(SessionSource::Internal(_)))
+        {
             return Err(CodexErr::InvalidRequest(
                 "internal sessions require an internal session source".to_string(),
             ));
@@ -1248,6 +1265,16 @@ impl ThreadManager {
         forked_from_thread_id: ThreadId,
         mut options: StartThreadOptions,
     ) -> CodexResult<NewThread> {
+        if options.config.prepared_child_authorization.is_some()
+            || matches!(
+                options.session_source,
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }))
+            )
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "host legacy review does not accept delegated launch preferences",
+            ));
+        }
         let fork_source = self.get_thread(forked_from_thread_id).await?;
         // Persist queued rollout updates before reading the fork snapshot.
         fork_source.ensure_rollout_materialized().await;
@@ -1725,6 +1752,31 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    /// Real host root startup for controller fixtures, with the tested tree runtime.
+    /// This does not create a delegated proof or accept a caller/source shortcut.
+    #[cfg(test)]
+    pub(crate) async fn start_root_with_control_for_tests(
+        &self,
+        options: StartThreadOptions,
+        control: LocalAgentControl,
+    ) -> CodexResult<NewThread> {
+        if options
+            .session_source
+            .as_ref()
+            .is_some_and(SessionSource::is_non_root_agent)
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "root fixture cannot use a delegated or internal source",
+            ));
+        }
+        self.spawn_thread(ThreadSpawnRequest::new(
+            options,
+            Arc::clone(&self.auth_manager),
+            control,
+        ))
+        .await
+    }
+
     pub(crate) fn shared_thread_instructions_provider(
         &self,
         root_thread_id: ThreadId,
@@ -2029,7 +2081,10 @@ impl ThreadManagerState {
         agent_control: LocalAgentControl,
         parent_thread_id: Option<ThreadId>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+        launch_permit: crate::agent::child_provider_authorization::ChildLaunchPermit,
     ) -> CodexResult<NewThread> {
+        let origin =
+            launch_permit.consume(&agent_control.runtime, parent_thread_id, &options.config)?;
         (options.client_mcp_extensions, options.prompt_cache_key) =
             self.inherited_child_settings(parent_thread_id).await;
         let forked = matches!(options.initial_history, InitialHistory::Forked(_));
@@ -2037,6 +2092,8 @@ impl ThreadManagerState {
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
         request.parent_thread_id = parent_thread_id;
         request.inherited_exec_policy = inherited_exec_policy;
+        request.delegated_launch = true;
+        request.provider_origin = origin;
         if forked {
             request.forked_from_thread_id = parent_thread_id;
             request.fork_persistence = ForkPersistence::CopiedDeferred;
@@ -2061,6 +2118,104 @@ impl ThreadManagerState {
             inherited_exec_policy,
             client_mcp_extensions,
         } = options;
+        // This private path is reached only after the controller has loaded and
+        // checked host-owned rollout metadata. A supplied history/source at a
+        // public root API never sets this delegated-start classification.
+        let delegated_parent = match &session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: owner,
+                ..
+            }) => {
+                if parent_thread_id != Some(*owner)
+                    || initial_history
+                        .get_resumed_parent_thread_id()
+                        .is_some_and(|parent| parent != *owner)
+                {
+                    return Err(crate::agent::child_provider_authorization::invalid(
+                        "resumed child ownership is inconsistent",
+                    ));
+                }
+                Some(*owner)
+            }
+            _ => None,
+        };
+        let provider_origin = if let Some(parent_id) = delegated_parent {
+            let InitialHistory::Resumed(history) = &initial_history else {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "private child reload requires resumed host history",
+                ));
+            };
+            let stored_provider = history.history.iter().find_map(|item| match item {
+                RolloutItem::SessionMeta(meta) => meta.meta.model_provider.as_deref(),
+                _ => None,
+            });
+            if stored_provider != Some(config.model_provider_id.as_str()) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "child reload cannot switch its stored provider",
+                ));
+            }
+            let parent = self.get_thread(parent_id).await?;
+            if !Arc::ptr_eq(
+                &parent
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .child_provider_origins,
+                &agent_control.runtime.child_provider_origins,
+            ) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "resumed parent belongs to another host tree",
+                ));
+            }
+            let origin = agent_control
+                .runtime
+                .child_provider_origins
+                .verified(history.conversation_id);
+            let mut current = (*parent.session.get_config().await).clone();
+            let settings = parent.config_snapshot().await;
+            current.cwd = settings.cwd().clone();
+            current.workspace_roots = settings.workspace_roots.clone();
+            current
+                .permissions
+                .set_workspace_roots(settings.workspace_roots);
+            current
+                .permissions
+                .set_permission_profile(settings.permission_profile)
+                .map_err(|_| {
+                    crate::agent::child_provider_authorization::invalid(
+                        "current parent permissions cannot be restored",
+                    )
+                })?;
+            let policy = crate::agent::child_provider_authorization::current_policy(&current)
+                .map_err(|_| {
+                    crate::agent::child_provider_authorization::invalid(
+                        "current resume policy cannot be established",
+                    )
+                })?;
+            let selected = policy
+                .resolve(codex_config::child_provider::ChildProviderRequest {
+                    explicit_provider: Some(&config.model_provider_id),
+                    role_provider: None,
+                    parent_provider_id: &current.model_provider_id,
+                    parent_provider: &current.model_provider,
+                    parent_model: current.model.as_deref().unwrap_or(&settings.model),
+                    authorization_origin: origin.clone(),
+                    explicit_model: config.model.as_deref(),
+                    role_model: None,
+                    default_subagent_model: None,
+                    full_history: false,
+                    host_owned: false,
+                })
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+            if selected.provider != config.model_provider {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "stored child provider definition changed",
+                ));
+            }
+            origin
+        } else {
+            None
+        };
         let (parent_client_mcp_extensions, inherited_prompt_cache_key) =
             self.inherited_child_settings(parent_thread_id).await;
         let client_mcp_extensions = client_mcp_extensions.unwrap_or(parent_client_mcp_extensions);
@@ -2083,6 +2238,8 @@ impl ThreadManagerState {
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
         request.parent_thread_id = parent_thread_id;
+        request.delegated_launch = delegated_parent.is_some();
+        request.provider_origin = provider_origin;
         request.inherited_environments = inherited_environments;
         request.inherited_instructions = inherited_instructions;
         request.inherited_exec_policy = inherited_exec_policy;
@@ -2113,6 +2270,50 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(&self, mut request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        let explicit_native = matches!(
+            request
+                .options
+                .session_source
+                .as_ref()
+                .unwrap_or(&self.session_source),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        );
+        let resumed_native = request
+            .options
+            .initial_history
+            .get_resumed_parent_thread_id()
+            .is_some()
+            || request
+                .options
+                .initial_history
+                .get_resumed_session_sources()
+                .is_some_and(|(source, _)| {
+                    matches!(
+                        source,
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                    )
+                });
+        if (explicit_native || resumed_native)
+            && !request.delegated_launch
+            && !matches!(
+                request.options.session_source,
+                Some(SessionSource::Internal(_))
+            )
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "delegated thread source requires the private native launch path",
+            ));
+        }
+        if request
+            .options
+            .config
+            .prepared_child_authorization
+            .is_some()
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "prepared delegated configuration cannot be used as an independent root or host session",
+            ));
+        }
         let cancellation = request
             .options
             .config
@@ -2136,6 +2337,8 @@ impl ThreadManagerState {
         let startup_guard =
             owns_startup.then(|| SessionStartupGuard::new(Arc::clone(&startup_state)));
         let ThreadSpawnRequest {
+            delegated_launch,
+            provider_origin,
             startup,
             options,
             auth_manager,
@@ -2502,7 +2705,14 @@ impl ThreadManagerState {
             session.services.mcp_runtime.enable_full_access_form_input();
         }
         let finalize_result = self
-            .finalize_thread_spawn(session, io, tracked_session_source, initial_host_config)
+            .finalize_thread_spawn(
+                session,
+                io,
+                tracked_session_source,
+                initial_host_config,
+                delegated_launch.then_some(parent_thread_id).flatten(),
+                provider_origin,
+            )
             .await;
         let new_thread = match finalize_result {
             Ok(new_thread) => new_thread,
@@ -2533,6 +2743,8 @@ impl ThreadManagerState {
         io: SessionIo,
         session_source: SessionSource,
         initial_host_config: Option<AgentConfigUpdate>,
+        delegated_parent: Option<ThreadId>,
+        provider_origin: Option<codex_config::child_provider::VerifiedChildProviderOrigin>,
     ) -> CodexResult<NewThread> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -2555,6 +2767,12 @@ impl ThreadManagerState {
         {
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
+                let origins = &session.services.local_agent_runtime.child_provider_origins;
+                if let Some(parent) = delegated_parent {
+                    origins.publish_child(thread_id, parent, provider_origin);
+                } else if !session_source.is_non_root_agent() {
+                    origins.publish_root(thread_id, &session_configured.model_provider_id);
+                }
                 if let Some(update) = initial_host_config {
                     session
                         .services

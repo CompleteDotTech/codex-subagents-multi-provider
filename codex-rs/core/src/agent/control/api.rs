@@ -67,6 +67,12 @@ impl AgentControl for LocalAgentControl {
                 source,
                 options,
             } = request;
+            if source.parent_thread_id() != Some(caller) || options.parent_thread_id != Some(caller)
+            {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "spawn caller and captured parent must agree",
+                ));
+            }
             let input = match input {
                 AgentInput::UserInput(input) => SpawnInitialInput::UserInput(input),
                 AgentInput::Message { message, mode } => {

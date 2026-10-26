@@ -415,3 +415,37 @@ fn list_agents_tool_status_schema_includes_interrupted() {
         ])
     );
 }
+
+#[test]
+fn both_native_schemas_expose_only_authorized_provider_ids_even_with_hidden_model_metadata() {
+    let options = SpawnAgentToolOptions {
+        allowed_model_providers: vec!["openai".into(), "allowed".into()],
+        hide_agent_type_model_reasoning: true,
+        expose_spawn_agent_model_overrides: false,
+        ..Default::default()
+    };
+    let ToolSpec::Namespace(v1) = create_spawn_agent_tool_v1(options.clone()) else {
+        panic!("v1 namespace")
+    };
+    let ResponsesApiNamespaceTool::Function(v1) = &v1.tools[0] else {
+        panic!("v1 function")
+    };
+    let ToolSpec::Function(v2) = create_spawn_agent_tool_v2(options, None) else {
+        panic!("v2 function")
+    };
+    for schema in [&v1.parameters, &v2.parameters] {
+        let value = schema.to_value();
+        assert_eq!(value["properties"]["model_provider"]["type"], "string");
+        assert_eq!(
+            value["properties"]["model_provider"]["enum"],
+            json!(["openai", "allowed"])
+        );
+        assert!(
+            !value["required"]
+                .as_array()
+                .is_some_and(|fields| fields.iter().any(|f| f == "model_provider"))
+        );
+        assert!(value["properties"].get("provider_definition").is_none());
+        assert!(!value.to_string().contains("base_url"));
+    }
+}

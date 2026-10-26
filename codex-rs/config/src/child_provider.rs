@@ -143,6 +143,30 @@ pub struct ResolvedChildProvider {
 }
 
 impl ChildProviderPolicy {
+    /// Safe IDs for native tool guidance. No discovery or credential work occurs.
+    pub fn selectable_provider_ids(
+        &self,
+        origin: Option<&VerifiedChildProviderOrigin>,
+        parent_provider_id: &str,
+    ) -> Vec<String> {
+        let mut candidates = self.providers.keys().cloned().collect::<BTreeSet<_>>();
+        if let Some(origin) = origin
+            && origin.provider_id() == parent_provider_id
+        {
+            candidates.insert(parent_provider_id.to_owned());
+        }
+        candidates
+            .into_iter()
+            .filter(|id| {
+                self.authorize(id, origin).is_ok()
+                    && (!self.untrusted_provider_ids.contains(id)
+                        || origin.is_some_and(|origin| {
+                            origin.provider_id() == id && id == parent_provider_id
+                        }))
+            })
+            .collect()
+    }
+
     /// Capture only enabled host-owned layers. Project/session authority cannot leak in
     /// through a provider definition, a provider default, or a built-in endpoint override.
     /// `protected_catalog_roots` must be actual read-only carveouts from the finalized

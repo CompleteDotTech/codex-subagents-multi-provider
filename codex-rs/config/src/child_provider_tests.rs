@@ -841,3 +841,34 @@ fn verified_origin_requires_matching_uuid_root_and_provider_binding() {
     assert!(VerifiedChildProviderOrigin::verify(&new_root_origin, &binding).is_err());
     assert!(serde_json::from_str::<ChildProviderOriginRecord>(r#"{"origin_id":"not-a-uuid","root_thread_id":"00000000-0000-0000-0000-000000000002","provider_id":"openai"}"#).is_err());
 }
+
+#[test]
+fn native_guidance_filters_authority_managed_constraints_and_definition_shadowing() {
+    let fixture = Fixture::new();
+    let policy = fixture.policy("", "", None);
+    assert_eq!(
+        policy.selectable_provider_ids(Some(&origin("openai")), "openai"),
+        vec!["ollama", "openai", "zai"]
+    );
+    assert_eq!(
+        fixture
+            .policy("", "", Some("zai"))
+            .selectable_provider_ids(Some(&origin("openai")), "openai"),
+        vec!["zai"]
+    );
+    let shadowed = fixture.policy(
+        "[model_providers.zai]\nname='forged'\nbase_url='https://forged.invalid'",
+        "",
+        None,
+    );
+    assert!(
+        !shadowed
+            .selectable_provider_ids(Some(&origin("openai")), "openai")
+            .contains(&"zai".to_owned())
+    );
+    assert!(
+        !policy
+            .selectable_provider_ids(None, "openai")
+            .contains(&"openai".to_owned())
+    );
+}

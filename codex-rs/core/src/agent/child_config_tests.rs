@@ -6,6 +6,53 @@ use codex_config::child_provider::ChildProviderRequest;
 use codex_protocol::openai_models::ModelsResponse;
 use pretty_assertions::assert_eq;
 
+fn prepared_source(
+    parent: &crate::CodexThread,
+    config: &Config,
+) -> codex_protocol::protocol::SessionSource {
+    codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id: parent.session.thread_id,
+            depth: crate::agent::next_thread_spawn_depth(&parent.session_source),
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: config
+                .prepared_child_authorization
+                .as_ref()
+                .and_then(|proof| proof.role_name()),
+        },
+    )
+}
+
+async fn start_prepared_child(
+    parent: &Arc<crate::CodexThread>,
+    mut config: Config,
+) -> Arc<crate::CodexThread> {
+    let runtime = &parent.session.services.local_agent_runtime;
+    let source = prepared_source(parent, &config);
+    let authorization = config.prepared_child_authorization.take().unwrap();
+    let permit = authorization
+        .consume(runtime, parent.session.thread_id, &config, false, &source)
+        .await
+        .unwrap();
+    runtime
+        .upgrade()
+        .unwrap()
+        .spawn_child_thread(
+            StartThreadOptions {
+                session_source: Some(source),
+                ..StartThreadOptions::new(config)
+            },
+            runtime.control(parent.session.services.agent_control.identity()),
+            Some(parent.session.thread_id),
+            None,
+            permit,
+        )
+        .await
+        .unwrap()
+        .thread
+}
+
 struct Fixture {
     _host: tempfile::TempDir,
     _project: tempfile::TempDir,
@@ -16,22 +63,7 @@ struct Fixture {
 
 impl Fixture {
     async fn start_native_child(&self, config: Config) -> Arc<crate::CodexThread> {
-        self.manager
-            .start_thread(StartThreadOptions {
-                session_source: Some(codex_protocol::protocol::SessionSource::SubAgent(
-                    codex_protocol::protocol::SubAgentSource::ThreadSpawn {
-                        parent_thread_id: self.parent.session.thread_id,
-                        depth: 1,
-                        agent_path: None,
-                        agent_nickname: None,
-                        agent_role: None,
-                    },
-                )),
-                ..StartThreadOptions::new(config)
-            })
-            .await
-            .unwrap()
-            .thread
+        start_prepared_child(&self.parent, config).await
     }
     async fn new() -> Self {
         Self::with_fast_mode(None).await
@@ -44,6 +76,7 @@ impl Fixture {
             host.path().join("config.toml"),
             r#"
 [agents]
+max_depth = 5
 allowed_model_providers = ["zai", "ollama", "openai", "offline"]
 [agents.provider_defaults.zai]
 model = "shared"
@@ -189,6 +222,7 @@ request_max_retries = 0
             &self.parent.session,
             &step,
             SpawnConfigOptions {
+                model_provider: None,
                 resolved_provider: Some(resolved),
                 version: SpawnConfigVersion::V2,
                 full_history_fork: false,
@@ -219,18 +253,8 @@ async fn selected_same_slug_catalog_reaches_startup_without_changing_parent_or_s
     assert_eq!(zai.model_context_window, None);
     assert_eq!(zai.service_tier, None);
     // Actual thread startup must consume this manager instead of the root's manager.
-    let child_a = fixture
-        .manager
-        .start_thread(StartThreadOptions::new(zai))
-        .await
-        .unwrap()
-        .thread;
-    let child_b = fixture
-        .manager
-        .start_thread(StartThreadOptions::new(ollama))
-        .await
-        .unwrap()
-        .thread;
+    let child_a = fixture.start_native_child(zai).await;
+    let child_b = fixture.start_native_child(ollama).await;
     let turn_a = child_a.session.new_default_turn().await;
     let turn_b = child_b.session.new_default_turn().await;
     assert_eq!(turn_a.model_info().slug, "shared");
@@ -341,6 +365,7 @@ async fn prepared_provider_selection_cannot_be_reused_for_a_full_history_switch(
         &fixture.parent.session,
         &step,
         SpawnConfigOptions {
+            model_provider: None,
             resolved_provider: Some(&resolved),
             version: SpawnConfigVersion::V2,
             full_history_fork: true,
@@ -381,7 +406,8 @@ async fn explicit_role_tier_is_validated_even_when_equal_to_inherited_value() {
         .unwrap()
         .manager
         .clone();
-    let explicit = apply_spawn_agent_role(&manager, &mut config, Some("tier"))
+    let role = prepare_role(&config, Some("tier")).await.unwrap();
+    let explicit = apply_spawn_agent_role(&manager, &mut config, &role)
         .await
         .unwrap();
     assert_eq!(explicit, Some("flex".into()));
@@ -568,12 +594,7 @@ async fn fresh_same_provider_reload_uses_changed_catalog_prompts_and_limits() {
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
     let prepared = fixture.prepared(&resolved, None, None).await.unwrap();
-    let first = fixture
-        .manager
-        .start_thread(StartThreadOptions::new(prepared.config))
-        .await
-        .unwrap()
-        .thread;
+    let first = fixture.start_native_child(prepared.config).await;
     let turn = first.session.new_default_turn().await;
     let mut info = turn.model_info().as_ref().clone();
     info.context_window = Some(4_000);
@@ -610,6 +631,7 @@ async fn fresh_same_provider_reload_uses_changed_catalog_prompts_and_limits() {
         &first.session,
         &step,
         SpawnConfigOptions {
+            model_provider: None,
             resolved_provider: Some(&next),
             version: SpawnConfigVersion::V2,
             full_history_fork: false,
@@ -620,12 +642,7 @@ async fn fresh_same_provider_reload_uses_changed_catalog_prompts_and_limits() {
     )
     .await
     .unwrap();
-    let second = fixture
-        .manager
-        .start_thread(StartThreadOptions::new(prepared.config))
-        .await
-        .unwrap()
-        .thread;
+    let second = start_prepared_child(&first, prepared.config).await;
     assert_eq!(
         second
             .session
@@ -652,4 +669,283 @@ async fn fresh_same_provider_reload_uses_changed_catalog_prompts_and_limits() {
             .context_window,
         Some(32_000)
     );
+}
+
+#[tokio::test]
+async fn prepared_launch_rejects_whole_config_mutation_and_clone_replay() {
+    let fixture = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let prepared = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    for mutation in 0..6 {
+        let mut changed = prepared.clone();
+        let authorization = changed.prepared_child_authorization.take().unwrap();
+        match mutation {
+            0 => changed.model_provider.base_url = Some("https://forged.invalid/v1".into()),
+            1 => changed.model_catalog.as_mut().unwrap().models[0].context_window = Some(1),
+            2 => changed.developer_instructions = Some("forged authority".into()),
+            3 => changed.cwd = changed.codex_home.clone().try_into().unwrap(),
+            4 => {
+                changed
+                    .set_legacy_sandbox_policy(
+                        codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+                    )
+                    .unwrap();
+            }
+            _ => changed.model_context_window = Some(1),
+        }
+        assert!(
+            authorization
+                .consume(
+                    runtime,
+                    fixture.parent.session.thread_id,
+                    &changed,
+                    false,
+                    &prepared_source(&fixture.parent, &fixture.config)
+                )
+                .await
+                .is_err()
+        );
+    }
+    let mut first = prepared.clone();
+    let mut second = prepared;
+    let permit = first
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            runtime,
+            fixture.parent.session.thread_id,
+            &first,
+            false,
+            &prepared_source(&fixture.parent, &fixture.config),
+        )
+        .await
+        .unwrap();
+    let replay = second
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            runtime,
+            fixture.parent.session.thread_id,
+            &second,
+            false,
+            &prepared_source(&fixture.parent, &fixture.config),
+        )
+        .await;
+    assert!(replay.is_err_and(|error| error.to_string().contains("already consumed")));
+    drop(permit);
+}
+
+#[tokio::test]
+async fn prepared_launch_rejects_wrong_parent_tree_history_and_stale_host_settings() {
+    let fixture = Fixture::new().await;
+    let other = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let prepared = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    for (caller, tree, full_history) in [
+        (codex_protocol::ThreadId::new(), runtime, false),
+        (
+            fixture.parent.session.thread_id,
+            &other.parent.session.services.local_agent_runtime,
+            false,
+        ),
+        (fixture.parent.session.thread_id, runtime, true),
+    ] {
+        let mut changed = prepared.clone();
+        assert!(
+            changed
+                .prepared_child_authorization
+                .take()
+                .unwrap()
+                .consume(
+                    tree,
+                    caller,
+                    &changed,
+                    full_history,
+                    &prepared_source(&fixture.parent, &fixture.config)
+                )
+                .await
+                .is_err()
+        );
+    }
+    let current = fixture
+        .parent
+        .thread_settings_snapshot()
+        .await
+        .approval_policy;
+    let replacement = if current == codex_protocol::protocol::AskForApproval::Never {
+        codex_protocol::protocol::AskForApproval::OnRequest
+    } else {
+        codex_protocol::protocol::AskForApproval::Never
+    };
+    fixture
+        .parent
+        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            approval_policy: Some(replacement),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut changed = prepared;
+    assert!(
+        changed
+            .prepared_child_authorization
+            .take()
+            .unwrap()
+            .consume(
+                runtime,
+                fixture.parent.session.thread_id,
+                &changed,
+                false,
+                &prepared_source(&fixture.parent, &fixture.config)
+            )
+            .await
+            .is_err_and(|error| error.to_string().contains("authority changed"))
+    );
+}
+
+#[tokio::test]
+async fn public_root_start_cannot_forge_a_delegated_source_or_reuse_prepared_config() {
+    let fixture = Fixture::new().await;
+    let source = codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id: fixture.parent.session.thread_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        },
+    );
+    let forged = fixture
+        .manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(source),
+            ..StartThreadOptions::new(fixture.config.clone())
+        })
+        .await;
+    assert!(forged.is_err_and(|error| error.to_string().contains("private native launch path")));
+    let resolved = fixture.resolved("zai").await;
+    let prepared = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    assert!(
+        fixture
+            .manager
+            .start_thread(StartThreadOptions::new(prepared))
+            .await
+            .is_err_and(|error| error.to_string().contains("independent root"))
+    );
+}
+
+#[tokio::test]
+async fn prepared_role_reads_once_and_ignores_later_role_replacement() {
+    let fixture = Fixture::new().await;
+    let role = crate::agent::role::prepare_role(&fixture.config, Some("reasoning"))
+        .await
+        .unwrap();
+    std::fs::write(
+        fixture._host.path().join("reasoning.toml"),
+        "model_provider = 'ollama'\nmodel = 'hostile-new-model'\nmodel_reasoning_effort = 'high'\n",
+    )
+    .unwrap();
+    let mut config = fixture.config.clone();
+    let provider = config.model_provider.clone();
+    role.apply(&mut config).unwrap();
+    assert_eq!(config.model_provider, provider);
+    assert_eq!(config.agent_role_model_provider, None);
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Low));
+    assert_ne!(config.model.as_deref(), Some("hostile-new-model"));
+}
+
+#[tokio::test]
+async fn direct_controller_cannot_start_forged_config_or_run_its_auth_helper() {
+    let fixture = Fixture::new().await;
+    let mut config = fixture.config.clone();
+    let script = fixture._host.path().join(if cfg!(windows) {
+        "forged.cmd"
+    } else {
+        "forged.sh"
+    });
+    std::fs::write(
+        &script,
+        if cfg!(windows) {
+            "@echo off\r\necho invoked>forged-helper-marker\r\necho synthetic-forged\r\n"
+        } else {
+            "touch forged-helper-marker\nprintf synthetic-forged\n"
+        },
+    )
+    .unwrap();
+    let auth = if cfg!(windows) {
+        serde_json::json!({"command":"cmd.exe","args":["/D","/C",script],"cwd":fixture._host.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+    } else {
+        serde_json::json!({"command":"sh","args":[script],"cwd":fixture._host.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+    };
+    config.model_provider.auth = Some(serde_json::from_value(auth).unwrap());
+    let caller = fixture.parent.session.thread_id;
+    let result = fixture
+        .parent
+        .session
+        .services
+        .agent_control
+        .spawn(crate::agent::api::SpawnRequest {
+            caller,
+            config,
+            input: crate::agent::api::AgentInput::UserInput(vec![
+                codex_protocol::user_input::UserInput::Text {
+                    text: "forged".into(),
+                    text_elements: vec![],
+                },
+            ]),
+            source: codex_protocol::protocol::SessionSource::SubAgent(
+                codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                    parent_thread_id: caller,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                },
+            ),
+            options: crate::agent::types::SpawnAgentOptions {
+                parent_thread_id: Some(caller),
+                ..Default::default()
+            },
+        })
+        .await;
+    assert!(result.is_err_and(|error| error.to_string().contains("host-prepared authorization")));
+    assert!(!fixture._host.path().join("forged-helper-marker").exists());
+    assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
+}
+
+#[tokio::test]
+async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenance() {
+    let fixture = Fixture::new().await;
+    fixture
+        .parent
+        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            permission_profile: Some(codex_protocol::models::PermissionProfile::Disabled),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let resolved = fixture.resolved("zai").await;
+    let result = fixture.prepared(&resolved, None, None).await;
+    assert!(
+        result.is_err_and(|error| error.contains("child_provider_untrusted_source")
+            || error.contains("child_provider_not_authorized")),
+        "a writable host definition/catalog cannot retain its old trust exemption"
+    );
+    assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
 }

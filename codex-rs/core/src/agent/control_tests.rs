@@ -125,17 +125,66 @@ use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 
 impl LocalAgentControl {
+    pub(crate) async fn prepare_spawn_fixture(
+        &self,
+        requested: &Config,
+        source: &SessionSource,
+        full_history: bool,
+    ) -> CodexResult<Config> {
+        let caller = source
+            .parent_thread_id()
+            .ok_or_else(|| CodexErr::InvalidRequest("fixture needs a real native parent".into()))?;
+        let state = self.runtime.upgrade()?;
+        let parent = state.get_thread(caller).await?;
+        let turn = parent.session.new_default_turn().await;
+        let current = parent.session.get_config().await;
+        let model = (requested.model != current.model)
+            .then_some(requested.model.as_deref())
+            .flatten();
+        let effort = (requested.model_reasoning_effort != current.model_reasoning_effort)
+            .then_some(requested.model_reasoning_effort.clone())
+            .flatten();
+        let role = source.get_agent_role();
+        let step = StepContext::for_test(turn);
+        crate::agent::child_config::prepare_agent_spawn_config(
+            &parent.session,
+            &step,
+            crate::agent::child_config::SpawnConfigOptions {
+                resolved_provider: None,
+                model_provider: None,
+                version: if current.multi_agent_version_from_features() == MultiAgentVersion::V2 {
+                    crate::agent::child_config::SpawnConfigVersion::V2
+                } else {
+                    crate::agent::child_config::SpawnConfigVersion::V1
+                },
+                full_history_fork: full_history,
+                role_name: role.as_deref(),
+                model,
+                reasoning_effort: effort,
+            },
+        )
+        .await
+        .map(|prepared| prepared.config)
+        .map_err(CodexErr::InvalidRequest)
+    }
+}
+
+impl LocalAgentControl {
     /// Create a child fixture through the production spawn entry point.
     pub(crate) async fn spawn_agent_with_metadata(
         &self,
         config: Config,
         initial_input: Vec<UserInput>,
         source: SessionSource,
-        options: SpawnAgentOptions,
+        mut options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
+        let config = self
+            .prepare_spawn_fixture(&config, &source, options.fork_mode.is_some())
+            .await?;
         let caller = source
             .parent_thread_id()
             .expect("child fixture has a parent");
+        options.parent_thread_id = Some(caller);
         self.spawn(SpawnRequest {
             caller,
             config,
@@ -152,16 +201,31 @@ async fn test_config_with_cli_overrides(
     mut cli_overrides: Vec<(String, TomlValue)>,
 ) -> (TempDir, Config) {
     let home = TempDir::new().expect("create temp dir");
+    if !cli_overrides
+        .iter()
+        .any(|(key, _)| key == "agents.max_depth")
+    {
+        cli_overrides.push(("agents.max_depth".into(), TomlValue::Integer(8)));
+    }
     cli_overrides.push((
         "model".to_string(),
         TomlValue::String("gpt-5.5".to_string()),
     ));
-    let config = ConfigBuilder::without_managed_config_for_tests()
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(home.path().to_path_buf())
         .cli_overrides(cli_overrides)
         .build()
         .await
         .expect("load default test config");
+    // Reviewer names used by metadata tests are explicit host-owned roles.
+    config
+        .agent_roles
+        .entry("reviewer".into())
+        .or_insert(AgentRoleConfig {
+            description: Some("Controller review fixture".into()),
+            config_file: None,
+            nickname_candidates: None,
+        });
     (home, config)
 }
 
@@ -296,7 +360,10 @@ impl AgentControlHarness {
     async fn start_thread(&self) -> (ThreadId, Arc<CodexThread>) {
         let new_thread = self
             .manager
-            .start_thread(StartThreadOptions::new(self.config.clone()))
+            .start_thread_with_control_for_tests(
+                StartThreadOptions::new(self.config.clone()),
+                self.control.clone(),
+            )
             .await
             .expect("start thread");
         (new_thread.thread_id, new_thread.thread)
@@ -305,11 +372,14 @@ impl AgentControlHarness {
     async fn start_paginated_thread(&self) -> (ThreadId, Arc<CodexThread>) {
         let new_thread = self
             .manager
-            .start_thread(StartThreadOptions {
-                history_mode: Some(ThreadHistoryMode::Paginated),
-                environments: Some(Vec::new()),
-                ..StartThreadOptions::new(self.config.clone())
-            })
+            .start_thread_with_control_for_tests(
+                StartThreadOptions {
+                    history_mode: Some(ThreadHistoryMode::Paginated),
+                    environments: Some(Vec::new()),
+                    ..StartThreadOptions::new(self.config.clone())
+                },
+                self.control.clone(),
+            )
             .await
             .expect("start paginated thread");
         (new_thread.thread_id, new_thread.thread)
@@ -749,15 +819,27 @@ async fn spawn_failure_context_survives_manager_and_fork_errors() {
         )
         .await
         .expect_err("missing manager");
+    let (parent_id, _) = harness.start_thread().await;
+    let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: parent_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let config = harness
+        .control
+        .prepare_spawn_fixture(&harness.config, &source, true)
+        .await
+        .expect("prepare genuine child");
     let fork_error = harness
         .control
         .spawn_agent_internal(
-            harness.config.clone(),
+            config,
             spawn::SpawnInitialInput::UserInput(text_input("hello")),
-            Some(SessionSource::SubAgent(SubAgentSource::Other(
-                "worker".to_string(),
-            ))),
+            Some(source),
             SpawnAgentOptions {
+                parent_thread_id: Some(parent_id),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
             },
@@ -780,20 +862,31 @@ async fn spawn_failure_context_survives_manager_and_fork_errors() {
 async fn spawn_failure_context_preserves_shutdown_during_child_startup() {
     let harness = AgentControlHarness::new().await;
     let state = harness.control.runtime.upgrade().expect("live manager");
-    let spawn = harness.control.spawn_agent(
-        harness.config.clone(),
-        text_input("hello"),
-        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: ThreadId::new(),
-            depth: 1,
-            agent_path: None,
-            agent_nickname: None,
-            agent_role: None,
-        })),
+    let (parent_id, _) = harness.start_thread().await;
+    let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: parent_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let config = harness
+        .control
+        .prepare_spawn_fixture(&harness.config, &source, false)
+        .await
+        .expect("prepare genuine child");
+    let spawn = harness.control.spawn_agent_internal(
+        config,
+        spawn::SpawnInitialInput::UserInput(text_input("hello")),
+        Some(source),
+        SpawnAgentOptions {
+            parent_thread_id: Some(parent_id),
+            ..Default::default()
+        },
     );
     tokio::pin!(spawn);
     let shutdown = {
-        // Block parent lookup after outer admission. Poll synchronously so the guard
+        // Block proof validation at real parent lookup. Poll synchronously so the guard
         // never crosses an await, including the one hidden inside futures::poll!.
         let _threads = state.threads.write().await;
         assert!(
@@ -829,10 +922,22 @@ async fn spawn_failure_context_preserves_shutdown_during_child_startup() {
 async fn cancelled_spawn_after_input_admission_discards_child() {
     let harness = AgentControlHarness::new().await;
     let state = harness.control.runtime.upgrade().expect("live manager");
-    let parent_id = ThreadId::new();
+    let (parent_id, _parent) = harness.start_thread().await;
+    let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: parent_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let prepared = harness
+        .control
+        .prepare_spawn_fixture(&harness.config, &source, false)
+        .await
+        .unwrap();
     let mut spawn = harness.control.spawn(SpawnRequest {
         caller: parent_id,
-        config: harness.config.clone(),
+        config: prepared,
         input: AgentInput::UserInput(text_input("child task")),
         source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: parent_id,
@@ -841,7 +946,10 @@ async fn cancelled_spawn_after_input_admission_discards_child() {
             agent_nickname: None,
             agent_role: None,
         }),
-        options: SpawnAgentOptions::default(),
+        options: SpawnAgentOptions {
+            parent_thread_id: Some(parent_id),
+            ..Default::default()
+        },
     });
     let child = poll_fn(|cx| {
         assert!(spawn.as_mut().poll(cx).is_pending());
@@ -886,6 +994,28 @@ async fn cancelled_spawn_after_input_admission_discards_child() {
         .wait()
         .await
         .expect("provisional cleanup releases tree membership");
+}
+
+#[tokio::test]
+async fn native_spawn_fixture_rejects_nonexistent_parent() {
+    let harness = AgentControlHarness::new().await;
+    let missing = ThreadId::new();
+    let result = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("unowned child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: missing,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+        )
+        .await;
+    assert!(matches!(result, Err(CodexErr::ThreadNotFound(id)) if id == missing));
+    assert!(harness.manager.list_thread_ids().await.is_empty());
 }
 
 #[tokio::test]
@@ -1266,22 +1396,25 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         ClientMcpExtensions::new([(OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({}))]);
     let root = harness
         .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Paginated),
-            client_mcp_extensions: client_mcp_extensions.clone(),
-            user_instructions: Some(LoadedUserInstructions {
-                instructions: Some(Instructions {
-                    text: "global instructions survive parent eviction".to_string(),
-                    source: None,
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Paginated),
+                client_mcp_extensions: client_mcp_extensions.clone(),
+                user_instructions: Some(LoadedUserInstructions {
+                    instructions: Some(Instructions {
+                        text: "global instructions survive parent eviction".to_string(),
+                        source: None,
+                    }),
+                    warnings: Vec::new(),
                 }),
-                warnings: Vec::new(),
-            }),
-            thread_instructions_provider: Some(Arc::new(TestThreadInstructionsProvider {
-                text: "thread instructions survive parent eviction".into(),
-                shared: false,
-            })),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+                thread_instructions_provider: Some(Arc::new(TestThreadInstructionsProvider {
+                    text: "thread instructions survive parent eviction".into(),
+                    shared: false,
+                })),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start root thread");
     let control = root
@@ -1685,14 +1818,17 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let parent = harness
         .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Legacy),
-            thread_instructions_provider: Some(Arc::new(TestThreadInstructionsProvider {
-                text: "initial thread instructions".into(),
-                shared,
-            })),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                thread_instructions_provider: Some(Arc::new(TestThreadInstructionsProvider {
+                    text: "initial thread instructions".into(),
+                    shared,
+                })),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start parent with thread instructions");
     let parent_thread_id = parent.thread_id;
@@ -1874,10 +2010,13 @@ async fn v2_reload_preserves_shared_instructions_after_root_unloads(
     });
     let root = harness
         .manager
-        .start_thread(StartThreadOptions {
-            thread_instructions_provider: Some(provider.clone()),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                thread_instructions_provider: Some(provider.clone()),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start root");
     let expected_provider = root
@@ -2115,11 +2254,16 @@ async fn v2_spawn_resolves_reported_effort_without_changing_child_selection(
         Some("worker".to_string()),
     )
     .expect("child source");
+    let prepared = harness
+        .control
+        .prepare_spawn_fixture(&harness.config, &source, false)
+        .await
+        .expect("prepare child");
     let (agent, snapshot) = harness
         .control
         .spawn(SpawnRequest {
             caller: parent_id,
-            config: harness.config.clone(),
+            config: prepared,
             input: AgentInput::Message {
                 message: AgentMessage::Plaintext("child task".to_string()),
                 mode: MessageDeliveryMode::TriggerTurn,
@@ -2186,11 +2330,14 @@ async fn pending_environment_failure_reaches_child_and_grandchild() {
     thread_extension_init.insert(roots);
     let root = harness
         .manager
-        .start_thread(StartThreadOptions {
-            environments: Some(vec![pending.clone().into_request()]),
-            thread_extension_init,
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                environments: Some(vec![pending.clone().into_request()]),
+                thread_extension_init,
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start root")
         .thread;
@@ -2293,12 +2440,15 @@ async fn spawn_agent_disabled_plugins_follow_parent_unless_overridden(
     let harness = AgentControlHarness::new().await;
     let parent = harness
         .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Paginated),
-            environments: Some(Vec::new()),
-            disabled_plugin_ids: Some(vec!["parent-plugin".to_string()]),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Paginated),
+                environments: Some(Vec::new()),
+                disabled_plugin_ids: Some(vec!["parent-plugin".to_string()]),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start parent with a disabled plugin");
     let parent_spawn_call_id = "spawn-plugin-child";
@@ -2358,12 +2508,15 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix(
         ClientMcpExtensions::new([(OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({}))]);
     let parent = harness
         .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Paginated),
-            environments: Some(Vec::new()),
-            client_mcp_extensions: client_mcp_extensions.clone(),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Paginated),
+                environments: Some(Vec::new()),
+                client_mcp_extensions: client_mcp_extensions.clone(),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start paginated parent");
     let parent_thread_id = parent.thread_id;
@@ -2573,12 +2726,15 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
     )];
     let parent = harness
         .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Paginated),
-            environments: Some(Vec::new()),
-            dynamic_tools: dynamic_tools.clone(),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Paginated),
+                environments: Some(Vec::new()),
+                dynamic_tools: dynamic_tools.clone(),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start parent with dynamic tools");
     let parent_thread_id = parent.thread_id;
@@ -2849,10 +3005,13 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         Some("Child subagent guidance.".to_string());
     let new_thread = harness
         .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Legacy),
-            ..StartThreadOptions::new(parent_config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(parent_config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start parent thread");
     let parent_thread_id = new_thread.thread_id;
@@ -3267,7 +3426,10 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(marke
         Some("Child subagent guidance.".to_string());
     let new_thread = harness
         .manager
-        .start_thread(StartThreadOptions::new(parent_config))
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(parent_config),
+            harness.control.clone(),
+        )
         .await
         .expect("start parent thread");
     let parent_thread_id = new_thread.thread_id;
@@ -3554,7 +3716,10 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
 
     let new_thread = harness
         .manager
-        .start_thread(StartThreadOptions::new(parent_config))
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(parent_config),
+            harness.control.clone(),
+        )
         .await
         .expect("start parent thread");
     let parent_thread_id = new_thread.thread_id;
@@ -3772,7 +3937,10 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
 
         let new_thread = harness
             .manager
-            .start_thread(StartThreadOptions::new(parent_config))
+            .start_thread_with_control_for_tests(
+                StartThreadOptions::new(parent_config),
+                harness.control.clone(),
+            )
             .await
             .expect("start parent thread");
         let parent_thread_id = new_thread.thread_id;
@@ -4023,10 +4191,13 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests(
     let harness = AgentControlHarness::new().await;
     let source = harness
         .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Legacy),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start legacy source");
     let source_thread_id = source.thread_id;
@@ -4218,7 +4389,10 @@ async fn spawn_agent_respects_legacy_max_threads_alias() {
     let control = manager.agent_control();
 
     let _ = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(config.clone()),
+            control.clone(),
+        )
         .await
         .expect("start thread");
 
@@ -4469,7 +4643,10 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
     let _ = config.features.enable(Feature::MultiAgentV2);
     let root = harness
         .manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(config.clone()),
+            harness.control.clone(),
+        )
         .await
         .expect("root thread should start");
     let root_thread_id = root.thread_id;
@@ -4577,7 +4754,10 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
     let tester_thread_id = harness
         .manager
-        .start_thread(StartThreadOptions::new(tester_config.clone()))
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(tester_config.clone()),
+            harness.control.clone(),
+        )
         .await
         .expect("tester thread should start")
         .thread_id;
@@ -4785,11 +4965,14 @@ async fn spawn_thread_subagents_persist_parent_originator_across_new_and_full_fo
     let harness = AgentControlHarness::new().await;
     let parent = harness
         .manager
-        .start_thread(StartThreadOptions {
-            metrics_service_name: Some("codex_work_desktop".to_string()),
-            environments: Some(Vec::new()),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                metrics_service_name: Some("codex_work_desktop".to_string()),
+                environments: Some(Vec::new()),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("parent thread should start");
     let parent_originator = persisted_originator(&parent.thread).await;
@@ -4935,10 +5118,13 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     thread_extension_init.insert(roots.clone());
     let parent = harness
         .manager
-        .start_thread(StartThreadOptions {
-            thread_extension_init,
-            ..StartThreadOptions::new(harness.config.clone())
-        })
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                thread_extension_init,
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
         .await
         .expect("start parent with roots");
     let parent_thread_id = parent.thread_id;
@@ -5391,7 +5577,10 @@ async fn list_agent_subtree_thread_ids_finds_live_descendants_of_unloaded_root()
     );
     let control = manager.agent_control();
     let parent_thread_id = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(config.clone()),
+            control.clone(),
+        )
         .await
         .expect("parent should start")
         .thread_id;

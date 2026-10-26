@@ -1,0 +1,502 @@
+//! Real native tool dispatch, provider routing, and rejection-before-I/O coverage.
+use anyhow::Result;
+use codex_core::TurnInputRequest;
+use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_models_manager::bundled_models_response;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::user_input::UserInput;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call_with_namespace;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event_with_timeout;
+use serde_json::Value;
+use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::Request;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
+
+fn body(request: &Request) -> Value {
+    let compressed = request
+        .headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        == Some("zstd");
+    let bytes = if compressed {
+        zstd::stream::decode_all(request.body.as_slice()).unwrap()
+    } else {
+        request.body.clone()
+    };
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn completion(id: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(sse(vec![
+            ev_response_created(id),
+            ev_assistant_message(id, "done"),
+            ev_completed(id),
+        ]))
+}
+
+fn spawn_response(version: MultiAgentVersion, id: &str, mut args: Value) -> ResponseTemplate {
+    let namespace = if version == MultiAgentVersion::V2 {
+        "collaboration"
+    } else {
+        "multi_agent_v1"
+    };
+    if version == MultiAgentVersion::V2 {
+        args["task_name"] = json!(id);
+        if args.get("fork_turns").is_none() {
+            args["fork_turns"] = json!("none");
+        }
+    } else if args.get("fork_context").is_none() {
+        args["fork_context"] = json!(false);
+    }
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(sse(vec![
+            ev_response_created(id),
+            ev_function_call_with_namespace(id, namespace, "spawn_agent", &args.to_string()),
+            ev_completed(id),
+        ]))
+}
+
+async fn scripted_spawn(server: &MockServer, version: MultiAgentVersion, id: &str, args: Value) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(spawn_response(version, id, args))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("complete"))
+        .mount(server)
+        .await;
+}
+
+struct Fixture {
+    root: MockServer,
+    a: MockServer,
+    b: MockServer,
+    test: TestCodex,
+    home: Arc<TempDir>,
+}
+
+impl Fixture {
+    async fn new(version: MultiAgentVersion, default_provider: Option<&str>) -> Result<Self> {
+        let root = start_mock_server().await;
+        let a = start_mock_server().await;
+        let b = start_mock_server().await;
+        let home = Arc::new(tempfile::tempdir()?);
+        let mut info = bundled_models_response()?
+            .models
+            .into_iter()
+            .find(|m| m.slug == "gpt-5.5")
+            .unwrap();
+        info.slug = "shared".into();
+        info.multi_agent_version = Some(version);
+        info.used_fallback_model_metadata = false;
+        std::fs::write(
+            home.path().join("catalog.json"),
+            serde_json::to_vec(&json!({"models":[info]}))?,
+        )?;
+        std::fs::write(
+            home.path().join("role.toml"),
+            "model_provider = 'b'\nmodel = 'shared'\n",
+        )?;
+        let helper = home.path().join(if cfg!(windows) {
+            "blocked.cmd"
+        } else {
+            "blocked.sh"
+        });
+        std::fs::write(
+            &helper,
+            if cfg!(windows) {
+                "@echo off\r\necho invoked>helper-marker\r\necho synthetic-blocked\r\n"
+            } else {
+                "touch helper-marker\nprintf synthetic-blocked\n"
+            },
+        )?;
+        let helper_auth = if cfg!(windows) {
+            json!({"command":"cmd.exe","args":["/D","/C",helper],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+        } else {
+            json!({"command":"sh","args":[helper],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+        };
+        let default = default_provider
+            .map(|id| format!("default_subagent_model_provider = '{id}'\n"))
+            .unwrap_or_default();
+        let config = format!(
+            r#"
+[agents]
+allowed_model_providers = ["a", "b", "openai"]
+{default}
+[agents.provider_defaults.a]
+model = "shared"
+model_catalog_json = "catalog.json"
+[agents.provider_defaults.b]
+model = "shared"
+model_catalog_json = "catalog.json"
+[agents.provider_defaults.blocked]
+model = "shared"
+model_catalog_json = "catalog.json"
+[agents.provider_role]
+description = "A bounded provider role"
+config_file = "role.toml"
+[model_providers.a]
+name = "First native provider"
+base_url = "{}/v1"
+experimental_bearer_token = "synthetic-a"
+request_max_retries = 0
+[model_providers.b]
+name = "Second native provider"
+base_url = "{}/v1"
+experimental_bearer_token = "synthetic-b"
+request_max_retries = 0
+[model_providers.blocked]
+name = "Unauthorized helper provider"
+base_url = "{}/v1"
+request_max_retries = 0
+"#,
+            a.uri(),
+            b.uri(),
+            b.uri()
+        );
+        let mut config: toml::Value = toml::from_str(&config)?;
+        config["model_providers"]["blocked"]["auth"] = toml::Value::try_from(helper_auth)?;
+        std::fs::write(home.path().join("config.toml"), toml::to_string(&config)?)?;
+        let mut builder = test_codex()
+            .with_home(home.clone())
+            .with_auth(CodexAuth::from_api_key("synthetic-root"))
+            .with_model_info_override("gpt-5.5", move |info| {
+                info.multi_agent_version = Some(version)
+            })
+            .with_config(move |config| {
+                config.features.enable(Feature::Collab).unwrap();
+                if version == MultiAgentVersion::V2 {
+                    config.features.enable(Feature::MultiAgentV2).unwrap();
+                } else {
+                    config.features.disable(Feature::MultiAgentV2).unwrap();
+                }
+                config.agent_max_depth = 5;
+            });
+        let test = builder.build_with_auto_env(&root).await?;
+        Ok(Self {
+            root,
+            a,
+            b,
+            test,
+            home,
+        })
+    }
+
+    async fn turn(&self, text: &str) -> Result<()> {
+        self.test
+            .codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.into(),
+                text_elements: vec![],
+            }]))
+            .await?;
+        let EventMsg::TurnComplete(done) = wait_for_event_with_timeout(
+            &self.test.codex,
+            |event| matches!(event, EventMsg::TurnComplete(_)),
+            Duration::from_secs(30),
+        )
+        .await
+        else {
+            unreachable!()
+        };
+        assert!(
+            done.error.is_none(),
+            "root turn must succeed: {:?}",
+            done.error
+        );
+        Ok(())
+    }
+
+    async fn children(&self, expected: usize) -> Result<Vec<Arc<codex_core::CodexThread>>> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let ids = self.test.thread_manager.list_thread_ids().await;
+                if ids.len() >= expected + 1 {
+                    let mut children = vec![];
+                    for id in ids {
+                        if id != self.test.session_configured.thread_id {
+                            children.push(self.test.thread_manager.get_thread(id).await?);
+                        }
+                    }
+                    return Ok(children);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?
+    }
+
+    async fn assert_provider_headers(&self) {
+        let mut expected_a = 0;
+        let mut expected_b = 0;
+        for id in self.test.thread_manager.list_thread_ids().await {
+            let child = self.test.thread_manager.get_thread(id).await.unwrap();
+            match child.config_snapshot().await.model_provider_id.as_str() {
+                "a" => expected_a += 1,
+                "b" => expected_b += 1,
+                _ => {}
+            }
+        }
+        // Registration precedes the child's first request. Wait for the wire
+        // evidence before checking isolation so an empty request list cannot pass.
+        for (server, expected) in [(&self.a, expected_a), (&self.b, expected_b)] {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let count = server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .filter(|request| request.method.as_str() == "POST")
+                        .count();
+                    if count >= expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("selected provider receives each native child request");
+        }
+        for (server, token) in [
+            (&self.a, "Bearer synthetic-a"),
+            (&self.b, "Bearer synthetic-b"),
+        ] {
+            for request in server.received_requests().await.unwrap() {
+                if request.method.as_str() != "POST" {
+                    continue;
+                }
+                assert_eq!(request.headers.get("authorization").unwrap(), token);
+                assert!(!request.headers.contains_key("chatgpt-account-id"));
+                assert!(!request.headers.contains_key("x-openai-actor-id"));
+                assert_eq!(body(&request)["model"], "shared");
+            }
+        }
+        for request in self.root.received_requests().await.unwrap() {
+            if request.method.as_str() == "POST" {
+                assert_eq!(
+                    request.headers.get("authorization").unwrap(),
+                    "Bearer synthetic-root"
+                );
+                assert_eq!(body(&request)["model"], "gpt-5.5");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_and_builtin_role_native_children_select_provider_in_both_backends() -> Result<()>
+{
+    for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
+        for role in [None, Some("default")] {
+            let fixture = Fixture::new(version, None).await?;
+            let mut args = json!({"message":"ordinary child", "model_provider":"a"});
+            if let Some(role) = role {
+                args["agent_type"] = json!(role);
+            }
+            scripted_spawn(&fixture.root, version, "worker", args).await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(completion("a-done"))
+                .mount(&fixture.a)
+                .await;
+            fixture.turn("delegate an ordinary child").await?;
+            let children = fixture.children(1).await?;
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].config_snapshot().await.model_provider_id, "a");
+            assert_eq!(
+                fixture.test.codex.config_snapshot().await.model_provider_id,
+                "openai"
+            );
+            fixture.turn("parent subsequent turn").await?;
+            fixture.assert_provider_headers().await;
+            assert!(!fixture.a.received_requests().await?.is_empty());
+            assert!(fixture.b.received_requests().await?.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_native_omission_inherits_parent_and_explicit_override_selects_another_provider()
+-> Result<()> {
+    for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
+        for target in [None, Some("b")] {
+            let fixture = Fixture::new(version, None).await?;
+            scripted_spawn(
+                &fixture.root,
+                version,
+                "worker",
+                json!({"message":"delegate a nested child", "model_provider":"a"}),
+            )
+            .await;
+            let mut nested = json!({"message":"nested ordinary child"});
+            if let Some(target) = target {
+                nested["model_provider"] = json!(target);
+            }
+            scripted_spawn(&fixture.a, version, "grandchild", nested).await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(completion("b-done"))
+                .mount(&fixture.b)
+                .await;
+            fixture.turn("delegate a nested tree").await?;
+            let children = fixture.children(2).await?;
+            assert_eq!(children.len(), 2);
+            let mut providers = vec![];
+            for child in children {
+                providers.push(child.config_snapshot().await.model_provider_id);
+            }
+            providers.sort();
+            assert_eq!(
+                providers,
+                if target.is_some() {
+                    vec!["a", "b"]
+                } else {
+                    vec!["a", "a"]
+                }
+            );
+            fixture.turn("parent remains usable").await?;
+            fixture.assert_provider_headers().await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_selector_beats_role_provider_and_configured_default_applies_at_each_depth()
+-> Result<()> {
+    for default in [None, Some("b")] {
+        let fixture = Fixture::new(MultiAgentVersion::V2, default).await?;
+        scripted_spawn(
+            &fixture.root,
+            MultiAgentVersion::V2,
+            "worker",
+            json!({"message":"nested task", "model_provider":"a", "agent_type":"provider_role"}),
+        )
+        .await;
+        scripted_spawn(
+            &fixture.a,
+            MultiAgentVersion::V2,
+            "grandchild",
+            json!({"message":"nested ordinary task"}),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(completion("b-done"))
+            .mount(&fixture.b)
+            .await;
+        fixture
+            .turn("delegate with explicit provider and a role")
+            .await?;
+        let children = fixture.children(2).await?;
+        let mut providers = vec![];
+        for child in children {
+            providers.push(child.config_snapshot().await.model_provider_id);
+        }
+        providers.sort();
+        assert_eq!(
+            providers,
+            if default.is_some() {
+                vec!["a", "b"]
+            } else {
+                vec!["a", "a"]
+            }
+        );
+        fixture.assert_provider_headers().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_provider_is_resolved_by_both_native_backends_without_explicit_selector() -> Result<()>
+{
+    for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
+        let fixture = Fixture::new(version, Some("a")).await?;
+        scripted_spawn(
+            &fixture.root,
+            version,
+            "role_worker",
+            json!({"message":"role-selected child", "agent_type":"provider_role"}),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(completion("role-done"))
+            .mount(&fixture.b)
+            .await;
+        fixture.turn("delegate using role provider").await?;
+        let children = fixture.children(1).await?;
+        assert_eq!(children[0].config_snapshot().await.model_provider_id, "b");
+        fixture.assert_provider_headers().await;
+        assert!(fixture.a.received_requests().await?.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_history_and_authority_rejections_happen_before_catalog_helper_or_child_network()
+-> Result<()> {
+    for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
+        for (provider, history, expected) in [
+            (
+                "a",
+                Some(json!("all")),
+                "child_provider_history_unsupported",
+            ),
+            ("a", Some(json!(1)), "child_provider_history_unsupported"),
+            ("blocked", None, "child_provider_not_authorized"),
+            ("missing", None, "child_provider_not_authorized"),
+        ] {
+            let fixture = Fixture::new(version, None).await?;
+            let mut args = json!({"message":"rejected native child", "model_provider":provider});
+            if let Some(history) = history {
+                if version == MultiAgentVersion::V2 {
+                    args["fork_turns"] = history;
+                } else {
+                    args["fork_context"] = json!(true);
+                }
+                std::fs::remove_file(fixture.home.path().join("catalog.json"))?;
+            }
+            scripted_spawn(&fixture.root, version, "rejected", args).await;
+            fixture.turn("try a rejected delegation").await?;
+            assert_eq!(fixture.test.thread_manager.list_thread_ids().await.len(), 1);
+            assert!(fixture.a.received_requests().await?.is_empty());
+            assert!(fixture.b.received_requests().await?.is_empty());
+            assert!(!fixture.home.path().join("helper-marker").exists());
+            let requests = fixture.root.received_requests().await?;
+            assert!(
+                requests
+                    .iter()
+                    .filter(|request| request.method.as_str() == "POST")
+                    .any(|request| body(request).to_string().contains(expected)),
+                "expected explicit native rejection {expected}"
+            );
+        }
+    }
+    Ok(())
+}

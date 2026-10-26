@@ -182,6 +182,8 @@ impl Drop for AgentTreeTeardownGuard {
 /// Local tree state, kept separate from the shared agent operation interface.
 #[derive(Clone)]
 pub(crate) struct LocalAgentRuntime {
+    pub(crate) child_provider_origins:
+        Arc<crate::agent::child_provider_authorization::ChildProviderOrigins>,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form
     /// `ThreadManagerState -> CodexThread -> Session -> SessionServices -> ThreadManagerState`.
@@ -211,6 +213,7 @@ impl LocalAgentRuntime {
         rollout_budget: Option<RolloutBudgetConfig>,
     ) -> Self {
         let runtime = Self {
+            child_provider_origins: Arc::default(),
             manager,
             thread_id_generator,
             registry: Arc::default(),

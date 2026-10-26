@@ -289,11 +289,39 @@ impl LocalAgentControl {
         initial_input: Vec<UserInput>,
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
+        // Legacy fixtures still create an actual registered host root. All children
+        // then use the production preparation and guarded native launch paths.
+        let source = match session_source {
+            Some(source) => source,
+            None => {
+                let state = self.runtime.upgrade()?;
+                let root = state
+                    .start_root_with_control_for_tests(
+                        StartThreadOptions::new(config.clone()),
+                        self.clone(),
+                    )
+                    .await?;
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: root.thread_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })
+            }
+        };
+        let config = self.prepare_spawn_fixture(&config, &source, false).await?;
+        let caller = source.parent_thread_id().ok_or_else(|| {
+            crate::agent::child_provider_authorization::invalid("fixture needs a native parent")
+        })?;
         let (spawned_agent, _) = Box::pin(self.spawn_agent_internal(
             config,
             SpawnInitialInput::UserInput(initial_input),
-            session_source,
-            SpawnAgentOptions::default(),
+            Some(source),
+            SpawnAgentOptions {
+                parent_thread_id: Some(caller),
+                ..Default::default()
+            },
         ))
         .await?;
         Ok(spawned_agent.thread_id)
@@ -724,6 +752,43 @@ impl LocalAgentControl {
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
+        let mut config = config;
+        let parent = session_source
+            .as_ref()
+            .and_then(SessionSource::parent_thread_id)
+            .or(options.parent_thread_id);
+        let launch_permit = if matches!(
+            session_source,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }))
+        ) {
+            let parent = parent.ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid("missing delegated parent")
+            })?;
+            let authorization = config.prepared_child_authorization.take().ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid(
+                    "native child requires host-prepared authorization",
+                )
+            })?;
+            Some(
+                authorization
+                    .consume(
+                        &self.runtime,
+                        parent,
+                        &config,
+                        options.fork_mode.is_some(),
+                        session_source.as_ref().ok_or_else(|| {
+                            crate::agent::child_provider_authorization::invalid(
+                                "missing native source",
+                            )
+                        })?,
+                    )
+                    .await?,
+            )
+        } else {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "delegated spawn requires a native child source",
+            ));
+        };
         let membership = self.runtime.admit_start()?;
         let spawn_started_at = Instant::now();
         let state = self.runtime.upgrade()?;
@@ -883,6 +948,11 @@ impl LocalAgentControl {
                 self.clone(),
                 parent_thread_id,
                 inherited_exec_policy,
+                launch_permit.ok_or_else(|| {
+                    crate::agent::child_provider_authorization::invalid(
+                        "native launch requires a host permit",
+                    )
+                })?,
             )
             .await
             .map_err(|err| err.with_agent_context(AgentErrorContext::ChildStartup))?;

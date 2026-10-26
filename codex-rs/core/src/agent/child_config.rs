@@ -3,12 +3,16 @@
 //! Spawn and reload share live runtime policy; role and model precedence, full-history
 //! inheritance, and validation messages remain the same for each multi-agent version.
 
+use crate::agent::child_provider_authorization::PreparedChildAuthorization;
+use crate::agent::child_provider_authorization::current_policy;
 use crate::agent::role::DEFAULT_ROLE_NAME;
-use crate::agent::role::apply_role_to_config;
+use crate::agent::role::PreparedAgentRole;
+use crate::agent::role::prepare_role;
 use crate::config::Config;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use codex_config::child_provider::ChildProviderRequest;
 use codex_config::child_provider::ResolvedChildProvider;
 use codex_features::Feature;
 use codex_models_manager::manager::RefreshStrategy;
@@ -41,6 +45,7 @@ pub(crate) enum SpawnConfigVersion {
 pub(crate) struct SpawnConfigOptions<'a> {
     /// Already authorized by the shared resolver, including history and origin checks.
     pub(crate) resolved_provider: Option<&'a ResolvedChildProvider>,
+    pub(crate) model_provider: Option<&'a str>,
     pub(crate) version: SpawnConfigVersion,
     pub(crate) full_history_fork: bool,
     pub(crate) role_name: Option<&'a str>,
@@ -114,7 +119,83 @@ pub(crate) async fn prepare_agent_spawn_config(
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
-    let selected_manager = if let Some(resolved) = options.resolved_provider {
+    let parent_settings = session.thread_settings_snapshot().await;
+    let parent_base = session.get_config().await;
+    if parent_settings.cwd != config.cwd
+        || parent_settings.permission_profile != config.permissions.effective_permission_profile()
+        || parent_settings
+            .runtime_workspace_roots
+            .as_ref()
+            .is_some_and(|roots| roots != &config.workspace_roots)
+    {
+        return Err(
+            "child_provider_policy_conflict: invoking runtime scope changed before preparation"
+                .into(),
+        );
+    }
+    let prepared_role = if !options.full_history_fork
+        || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
+    {
+        Some(prepare_role(&config, options.role_name).await?)
+    } else {
+        None
+    };
+    let policy = current_policy(&config).map_err(|_| {
+        "child_provider_policy_conflict: runtime policy cannot be established".to_owned()
+    })?;
+    let origin = session
+        .services
+        .local_agent_runtime
+        .child_provider_origins
+        .verified(session.thread_id);
+    let explicit_provider = options.model_provider.or_else(|| {
+        options
+            .resolved_provider
+            .map(|resolved| resolved.provider_id.as_str())
+    });
+    let role_provider = prepared_role
+        .as_ref()
+        .and_then(|role| role.model_provider.as_deref());
+    let resolved = policy
+        .resolve(ChildProviderRequest {
+            explicit_provider,
+            role_provider,
+            parent_provider_id: &config.model_provider_id,
+            parent_provider: &config.model_provider,
+            parent_model: config
+                .model
+                .as_deref()
+                .unwrap_or(&step_context.settings.model_info.slug),
+            authorization_origin: origin.clone(),
+            explicit_model: options.model.or_else(|| {
+                options
+                    .resolved_provider
+                    .map(|resolved| resolved.model.as_str())
+            }),
+            role_model: prepared_role.as_ref().and_then(PreparedAgentRole::model),
+            default_subagent_model: config.agent_default_subagent_model.as_deref(),
+            full_history: options.full_history_fork,
+            host_owned: false,
+        })
+        .map_err(|error| error.to_string())?;
+    if let Some(provided) = options.resolved_provider
+        && (provided.provider != resolved.provider
+            || provided.model_catalog_json != resolved.model_catalog_json)
+    {
+        return Err("child_provider_policy_conflict: supplied provider selection differs from current trusted policy".into());
+    }
+    // Resolve and authorize every launch, while preserving the legacy catalog path
+    // for ordinary inheritance of the host-captured root provider.
+    let strict_catalog = explicit_provider.is_some()
+        || role_provider.is_some()
+        || policy.default_provider().is_some()
+        || resolved.changed_provider
+        || origin.as_ref().map(|origin| origin.provider_id())
+            != Some(resolved.provider_id.as_str());
+    config.child_provider_policy = policy;
+    let selected_manager = if strict_catalog {
+        let resolved = &resolved;
+
         if options.full_history_fork
             && (resolved.changed_provider
                 || resolved.provider_id != config.model_provider_id
@@ -154,7 +235,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     let models_manager = selected_manager
         .as_ref()
         .unwrap_or(&session.services.models_manager);
-    if options.resolved_provider.is_none() {
+    if !strict_catalog {
         apply_requested_spawn_agent_model_overrides(
             session,
             step_context,
@@ -165,13 +246,11 @@ pub(crate) async fn prepare_agent_spawn_config(
         .await?;
     }
     let mut role_service_tier = None;
-    if !options.full_history_fork
-        || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
-    {
-        role_service_tier = apply_spawn_agent_role(models_manager, &mut config, options.role_name)
+    if let Some(role) = prepared_role.as_ref() {
+        role_service_tier = apply_spawn_agent_role(models_manager, &mut config, role)
             .await
             .map_err(|err| {
-                if options.resolved_provider.is_some() && err.starts_with("Reasoning effort") {
+                if strict_catalog && err.starts_with("Reasoning effort") {
                     format!("child_provider_capability_unsupported: {err}")
                 } else {
                     err
@@ -186,11 +265,12 @@ pub(crate) async fn prepare_agent_spawn_config(
                 .clone_from(&turn.developer_instructions);
         }
     }
-    if let Some(resolved) = options.resolved_provider {
+    if strict_catalog {
+        let resolved = &resolved;
         validate_resolved_child_model(models_manager, &config, resolved, turn.multi_agent_version)
             .await?;
     }
-    if options.resolved_provider.is_some() && role_service_tier.is_some() {
+    if strict_catalog && role_service_tier.is_some() {
         config.child_role_service_tier_override = true;
         if let Some(tier) = role_service_tier.as_deref()
             && tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
@@ -221,7 +301,7 @@ pub(crate) async fn prepare_agent_spawn_config(
             session,
             models_manager,
             &mut config,
-            options.resolved_provider.is_some(),
+            strict_catalog,
         )
         .await?;
     }
@@ -240,6 +320,14 @@ pub(crate) async fn prepare_agent_spawn_config(
             .then_some(DEFAULT_ROLE_NAME)
         })
         .map(str::to_owned);
+    config.prepared_child_authorization = Some(PreparedChildAuthorization::capture(
+        session,
+        &config,
+        options.full_history_fork,
+        parent_settings,
+        parent_base,
+        role_name.clone(),
+    ));
     Ok(PreparedSpawnConfig { config, role_name })
 }
 
@@ -411,6 +499,7 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, String> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
     config.prepared_child_models = None;
+    config.prepared_child_authorization = None;
     config.child_role_service_tier_override = false;
     if config
         .features
@@ -598,7 +687,7 @@ fn model_supports_selected_tier(
 async fn apply_spawn_agent_role(
     models_manager: &SharedModelsManager,
     config: &mut Config,
-    role_name: Option<&str>,
+    role: &PreparedAgentRole,
 ) -> Result<Option<String>, String> {
     let previous_session_layers = config
         .config_layer_stack
@@ -607,7 +696,7 @@ async fn apply_spawn_agent_role(
         .count();
     let previous_model = config.model.clone();
     let previous_reasoning_effort = config.model_reasoning_effort.clone();
-    apply_role_to_config(config, role_name).await?;
+    role.apply(config)?;
     let explicit_tier = config
         .config_layer_stack
         .layers_low_to_high()

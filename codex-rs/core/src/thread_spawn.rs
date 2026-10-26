@@ -36,6 +36,7 @@ pub(crate) struct ThreadSpawnRequest {
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub agent_type: Option<String>,
     pub model: Option<String>,
+    pub model_provider: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -68,6 +69,7 @@ pub(crate) async fn spawn(
         fork_mode,
         agent_type,
         model,
+        model_provider,
         reasoning_effort,
     } = request;
     let message_text = match &message {
@@ -86,6 +88,7 @@ pub(crate) async fn spawn(
         session,
         step_context,
         SpawnConfigOptions {
+            model_provider: model_provider.as_deref(),
             resolved_provider: None,
             version: SpawnConfigVersion::V2,
             full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),

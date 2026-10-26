@@ -26,6 +26,7 @@ const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 #[derive(Debug, Clone)]
 pub struct SpawnAgentToolOptions {
     pub available_models: Vec<ModelPreset>,
+    pub allowed_model_providers: Vec<String>,
     pub agent_type_description: String,
     pub expose_agent_type: bool,
     pub hide_agent_type_model_reasoning: bool,
@@ -39,6 +40,7 @@ impl Default for SpawnAgentToolOptions {
     fn default() -> Self {
         Self {
             available_models: Vec::new(),
+            allowed_model_providers: Vec::new(),
             agent_type_description: String::new(),
             expose_agent_type: true,
             hide_agent_type_model_reasoning: false,
@@ -78,6 +80,7 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
+    add_provider_selector(&mut properties, &options.allowed_model_providers);
     if !options.expose_agent_type {
         properties.remove("agent_type");
     }
@@ -123,6 +126,7 @@ pub fn create_spawn_agent_tool_v2(
             .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE)
     };
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
+    add_provider_selector(&mut properties, &options.allowed_model_providers);
     if !options.expose_agent_type {
         properties.remove("agent_type");
     }
@@ -605,6 +609,15 @@ fn create_collab_input_items_schema() -> JsonSchema {
             "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
                 .to_string(),
         ))
+}
+
+fn add_provider_selector(properties: &mut BTreeMap<String, JsonSchema>, providers: &[String]) {
+    if !providers.is_empty() {
+        properties.insert("model_provider".into(), JsonSchema::string_enum(
+            providers.iter().cloned().map(Value::String).collect(),
+            Some("Host-authorized provider ID. Omit to use the applicable role/provider default, otherwise the immediate parent's provider. A provider change requires fresh history (V1 fork_context=false; V2 fork_turns=none). Use the selected provider's trusted model default or a model valid in that provider's catalog; the parent's model listing does not describe other providers.".into()),
+        ));
+    }
 }
 
 fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<String, JsonSchema> {
