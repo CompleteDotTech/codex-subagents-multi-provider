@@ -92,7 +92,7 @@ async fn stateless_code_mode_keeps_nested_freeform_and_namespaced_function_calls
         .with_extensions(Arc::new(extensions.build()))
         .with_config(move |config| {
             config.features.enable(Feature::CodeMode).unwrap();
-            config.features.disable(Feature::ToolSearch);
+            config.features.disable(Feature::ToolSearch).unwrap();
             config.model_provider_id = "configured-stateless-code".into();
             config.model_provider = ModelProviderInfo {
                 name: "configured-stateless-code".into(),

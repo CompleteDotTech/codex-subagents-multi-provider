@@ -42,7 +42,7 @@ fn compatible(name: &'static str, base_url: String, retries: u64) -> TestCodexBu
                 Feature::ToolSearch,
                 Feature::CodeModeToolSearch,
             ] {
-                config.features.disable(feature);
+                config.features.disable(feature).unwrap();
             }
             config.model_provider_id = name.into();
             config.model_provider = ModelProviderInfo {
@@ -81,6 +81,9 @@ async fn turn(
     let EventMsg::TurnComplete(completed) = event else {
         unreachable!()
     };
+    if let Some(error) = &completed.error {
+        eprintln!("turn {text:?} failed: {error:?}");
+    }
     Ok(completed.error)
 }
 
