@@ -1,0 +1,97 @@
+// Test-only endpoint: upstream Clatter APIs, no cryptographic implementation.
+use clatter::bytearray::ByteArray;
+use clatter::crypto::cipher::AesGcm;
+use clatter::crypto::dh::X25519;
+use clatter::crypto::hash::Sha256;
+use clatter::crypto::kem::rust_crypto_ml_kem::MlKem768;
+use clatter::handshakepattern::noise_hybrid_ik;
+use clatter::traits::Dh;
+use clatter::traits::Handshaker;
+use clatter::traits::Kem;
+use clatter::HybridHandshake;
+use clatter::HybridHandshakeParams;
+use std::io::BufRead;
+use std::io::Write;
+use std::io::{self};
+type H = HybridHandshake<X25519, MlKem768, MlKem768, AesGcm, Sha256>;
+fn send(value: &serde_json::Value) {
+    println!("{value}");
+    io::stdout().flush().unwrap();
+}
+fn recv(lines: &mut impl Iterator<Item = io::Result<String>>) -> serde_json::Value {
+    serde_json::from_str(&lines.next().expect("protocol EOF").unwrap()).unwrap()
+}
+fn bytes(value: &serde_json::Value) -> Vec<u8> {
+    serde_json::from_value(value.clone()).unwrap()
+}
+fn main() {
+    let initiator = std::env::args().nth(1).unwrap() == "initiator";
+    let dh = X25519::genkey().unwrap();
+    let kem = MlKem768::genkey().unwrap();
+    assert_eq!(kem.public.as_slice().len(), 1184);
+    let (ciphertext, shared) = MlKem768::encapsulate(
+        kem.public.as_slice(),
+        &mut clatter::crypto::rng::DefaultRng::default(),
+    )
+    .unwrap();
+    assert_eq!(ciphertext.as_slice().len(), 1088);
+    assert_eq!(
+        MlKem768::decapsulate(ciphertext.as_slice(), kem.secret.as_slice())
+            .unwrap()
+            .as_slice(),
+        shared.as_slice(),
+    );
+    let mut lines = io::stdin().lock().lines();
+    send(&serde_json::json!([
+        dh.public.as_slice(),
+        kem.public.as_slice()
+    ]));
+    let peer = recv(&mut lines);
+    let peer_dh: [u8; 32] = bytes(&peer[0]).try_into().unwrap();
+    let peer_kem = <MlKem768 as Kem>::PubKey::from_slice(&bytes(&peer[1]));
+    let mut params = HybridHandshakeParams::new(noise_hybrid_ik(), initiator)
+        .with_prologue(b"codex-exec-server-relay-noise/v1/interop")
+        .with_s(dh)
+        .with_s_kem(kem);
+    if initiator {
+        params = params.with_rs(peer_dh).with_rs_kem(peer_kem.clone());
+    }
+    let mut handshake = H::new(params).unwrap();
+    if initiator {
+        let mut frame = vec![0; 65535];
+        let n = handshake
+            .write_message(b"registry-authorization", &mut frame)
+            .unwrap();
+        frame.truncate(n);
+        send(&serde_json::json!(frame));
+        let frame = bytes(&recv(&mut lines));
+        let mut payload = vec![0; 65535];
+        assert_eq!(handshake.read_message(&frame, &mut payload).unwrap(), 0);
+    } else {
+        let frame = bytes(&recv(&mut lines));
+        let mut payload = vec![0; 65535];
+        let n = handshake.read_message(&frame, &mut payload).unwrap();
+        assert_eq!(&payload[..n], b"registry-authorization");
+        let authenticated = handshake.get_remote_static().unwrap();
+        assert_eq!(authenticated.dh().as_slice(), peer_dh.as_slice());
+        assert_eq!(authenticated.kem().as_slice(), peer_kem.as_slice());
+        let mut frame = vec![0; 65535];
+        let n = handshake.write_message(&[], &mut frame).unwrap();
+        frame.truncate(n);
+        send(&serde_json::json!(frame));
+    }
+    let mut transport = handshake.finalize().unwrap();
+    let frame = transport.send_vec(b"encrypted-json-rpc").unwrap();
+    let second = transport.send_vec(b"second-record").unwrap();
+    send(&serde_json::json!([frame, second]));
+    let frame = bytes(&recv(&mut lines));
+    assert_eq!(
+        transport.receive_vec(&frame).unwrap(),
+        b"encrypted-json-rpc"
+    );
+    let tampered = bytes(&recv(&mut lines));
+    assert!(transport.receive_vec(&tampered).is_err());
+    send(&serde_json::json!(
+        "authenticated-transport-and-tamper-rejection"
+    ));
+}
