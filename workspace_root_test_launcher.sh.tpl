@@ -156,6 +156,16 @@ run_selected_libtest() {
 
 __WORKSPACE_ROOT_SETUP__
 
+working_directory_marker_logical="__WORKING_DIRECTORY_MARKER__"
+if [[ -n "${working_directory_marker_logical}" ]]; then
+  working_directory_marker="$(resolve_runfile "${working_directory_marker_logical}")"
+  if [[ ! -f "${working_directory_marker}" ]]; then
+    echo "working directory marker is not a file: ${working_directory_marker}" >&2
+    exit 1
+  fi
+  cd "$(dirname "${working_directory_marker}")"
+fi
+
 TOTAL_SHARDS="${RULES_RUST_TEST_TOTAL_SHARDS:-${TEST_TOTAL_SHARDS:-}}"
 SHARD_INDEX="${RULES_RUST_TEST_SHARD_INDEX:-${TEST_SHARD_INDEX:-}}"
 if [[ -n "${CODEX_BAZEL_TEST_SKIP_FILTERS:-}" || ( -n "${TOTAL_SHARDS}" && "${TOTAL_SHARDS}" != "0" ) ]]; then

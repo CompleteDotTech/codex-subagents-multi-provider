@@ -758,6 +758,14 @@ pub struct GoalsToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentsToml {
+    /// Host-authorized provider IDs for children outside the root provider's lineage exemption.
+    /// Project and session layers cannot grant this authority.
+    pub allowed_model_providers: Option<Vec<String>>,
+    /// Host default provider for newly delegated children; absent inherits the immediate parent.
+    pub default_subagent_model_provider: Option<String>,
+    /// Host-owned model and catalog defaults, keyed by configured provider ID.
+    #[serde(default)]
+    pub provider_defaults: BTreeMap<String, ChildProviderDefaultsToml>,
     /// Whether multi-agent tools are enabled. Defaults to true.
     /// An enabled `features.multi_agent_v2` setting takes precedence.
     pub enabled: Option<bool>,
@@ -790,6 +798,14 @@ pub struct AgentsToml {
     /// ```
     #[serde(default, flatten)]
     pub roles: BTreeMap<String, AgentRoleToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChildProviderDefaultsToml {
+    pub model: Option<String>,
+    /// Provider-scoped catalog; relative paths resolve against the declaring host config.
+    pub model_catalog_json: Option<AbsolutePathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
