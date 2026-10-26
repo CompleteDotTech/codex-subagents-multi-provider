@@ -185,6 +185,47 @@ async fn high_stdio_descriptors_use_compatible_fallback() -> anyhow::Result<()> 
         "high-fd phase=limit-readback requested_soft={} requested_hard={} soft={} hard={}",
         limit.rlim_cur, limit.rlim_max, readback.rlim_cur, readback.rlim_max
     );
+    // This fixed, read-only query finishes before descriptor exhaustion. Its
+    // availability is diagnostic only and does not affect the test assertions.
+    match std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.maxfiles", "kern.maxfilesperproc"])
+        .output()
+    {
+        Ok(output) => {
+            let values = std::str::from_utf8(&output.stdout)
+                .ok()
+                .filter(|_| output.stdout.len() <= 128)
+                .and_then(|text| {
+                    let mut lines = text.split_whitespace();
+                    let maxfiles = lines.next()?.parse::<u64>().ok()?;
+                    let maxfilesperproc = lines.next()?.parse::<u64>().ok()?;
+                    lines
+                        .next()
+                        .is_none()
+                        .then_some((maxfiles, maxfilesperproc))
+                });
+            if output.status.success()
+                && let Some((maxfiles, maxfilesperproc)) = values
+            {
+                eprintln!(
+                    "high-fd phase=kernel-limits kern.maxfiles={maxfiles} kern.maxfilesperproc={maxfilesperproc} status={}",
+                    output.status
+                );
+            } else {
+                eprintln!(
+                    "high-fd phase=kernel-limits unavailable status={} stdout_bytes={} stderr_bytes={} numeric_pair={}",
+                    output.status,
+                    output.stdout.len(),
+                    output.stderr.len(),
+                    values.is_some()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "high-fd phase=kernel-limits unavailable errno={:?} error={error}",
+            error.raw_os_error()
+        ),
+    }
     let diagnostic = |phase: &str, count: usize, highest: i32, error: io::Error| {
         let context = format!(
             "high-fd phase={phase} allocated={count} highest_fd={highest} soft={} hard={} errno={:?}",
