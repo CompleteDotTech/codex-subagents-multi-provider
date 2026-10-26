@@ -51,22 +51,31 @@ def _workspace_root_test_impl(ctx):
     launcher = ctx.actions.declare_file(ctx.label.name + ".bat" if is_windows else ctx.label.name)
     test_bin = ctx.executable.test_bin
     workspace_root_marker = ctx.file.workspace_root_marker
+    working_directory_marker = ctx.file.working_directory_marker
     launcher_template = ctx.file._windows_launcher_template if is_windows else ctx.file._bash_launcher_template
     runfile_env_exports = _windows_runfile_env_exports(ctx) if is_windows else _bash_runfile_env_exports(ctx)
     workspace_root_setup = _windows_workspace_root_setup(ctx) if is_windows else _bash_workspace_root_setup(ctx)
+    substitutions = {
+        "__RUNFILE_ENV_EXPORTS__": runfile_env_exports,
+        "__TEST_BIN__": test_bin.short_path,
+        "__WORKSPACE_ROOT_SETUP__": workspace_root_setup,
+        "__WORKSPACE_ROOT_MARKER__": workspace_root_marker.short_path,
+        "__WORKING_DIRECTORY_MARKER__": _runfile_logical_path(working_directory_marker) if working_directory_marker else "",
+    }
+    if is_windows:
+        # The batch template is checked out with CRLF on every host. Preserve
+        # that format in generated multiline substitutions as well.
+        substitutions = {key: value.replace("\r\n", "\n").replace("\n", "\r\n") for key, value in substitutions.items()}
     ctx.actions.expand_template(
         template = launcher_template,
         output = launcher,
         is_executable = True,
-        substitutions = {
-            "__RUNFILE_ENV_EXPORTS__": runfile_env_exports,
-            "__TEST_BIN__": test_bin.short_path,
-            "__WORKSPACE_ROOT_SETUP__": workspace_root_setup,
-            "__WORKSPACE_ROOT_MARKER__": workspace_root_marker.short_path,
-        },
+        substitutions = substitutions,
     )
 
     runfiles = ctx.runfiles(files = [test_bin, workspace_root_marker]).merge(ctx.attr.test_bin[DefaultInfo].default_runfiles)
+    if working_directory_marker:
+        runfiles = runfiles.merge(ctx.runfiles(files = [working_directory_marker]))
     for data_dep in ctx.attr.data:
         runfiles = runfiles.merge(ctx.runfiles(files = data_dep[DefaultInfo].files.to_list()))
         runfiles = runfiles.merge(data_dep[DefaultInfo].default_runfiles)
@@ -163,6 +172,10 @@ workspace_root_test = rule(
             mandatory = True,
         ),
         "test_threads": attr.int(),
+        "working_directory_marker": attr.label(
+            allow_single_file = True,
+            doc = "Run the test from this runfile's directory, after normal workspace setup.",
+        ),
         "workspace_root_marker": attr.label(
             allow_single_file = True,
             mandatory = True,
@@ -203,6 +216,7 @@ def codex_rust_crate(
         integration_compile_data_extra = [],
         integration_test_args = [],
         unit_test_args = [],
+        unit_test_working_directory_marker = None,
         binary_test_target_compatible_with = [],
         integration_test_timeout = None,
         test_data_extra = [],
@@ -251,6 +265,7 @@ def codex_rust_crate(
         integration_compile_data_extra: Extra compile_data for integration tests.
         integration_test_args: Optional args for integration test binaries.
         unit_test_args: Optional args for the unit test binary.
+        unit_test_working_directory_marker: Optional file whose directory is the unit test cwd.
         binary_test_target_compatible_with: Platform constraints for binary unit tests.
         integration_test_timeout: Optional Bazel timeout for integration test
             targets generated from `tests/*.rs`.
@@ -393,6 +408,7 @@ def codex_rust_crate(
             },
             test_bin = ":" + unit_test_binary,
             workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+            working_directory_marker = unit_test_working_directory_marker,
             tags = test_tags,
             **unit_test_kwargs
         )
@@ -473,6 +489,7 @@ def codex_rust_crate(
             env = test_env,
             test_bin = ":" + binary_unit_test_binary,
             workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+            working_directory_marker = unit_test_working_directory_marker,
             target_compatible_with = binary_test_target_compatible_with,
             tags = test_tags,
             **binary_unit_test_kwargs

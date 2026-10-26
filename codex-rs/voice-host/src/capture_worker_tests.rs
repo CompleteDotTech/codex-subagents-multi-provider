@@ -11,8 +11,7 @@ use rtc::interceptor::NoopInterceptor;
 use rtc::interceptor::Packet;
 use rtc::interceptor::StreamInfo;
 use rtc::interceptor::TaggedPacket;
-use rtc::interceptor::interceptor;
-use rtc::sansio;
+use rtc::sansio::Protocol;
 use rtc::shared::error::Error;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -26,18 +25,32 @@ use webrtc::peer_connection::RTCSessionDescription;
 
 // Consume remote RTP before the upstream track queue: receipt proves the packet
 // traversed negotiation, encryption, the loopback socket, and remote decryption.
-#[derive(Interceptor)]
 struct RemoteRtp {
-    #[next]
     next: NoopInterceptor,
     sender: mpsc::Sender<rtc::rtp::packet::Packet>,
 }
 
-#[interceptor]
-impl RemoteRtp {
-    #[overrides]
+impl Protocol<TaggedPacket, TaggedPacket, ()> for RemoteRtp {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = Error;
+    type Time = std::time::Instant;
+
+    fn poll_read(&mut self) -> Option<Self::Rout> {
+        None
+    }
+
+    fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        self.next.handle_write(message)
+    }
+
+    fn poll_write(&mut self) -> Option<Self::Wout> {
+        self.next.poll_write()
+    }
+
     fn handle_read(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
-        if let Packet::Rtp(packet) = message.message {
+        if let Packet::Rtp(packet) = message.message.packet {
             self.sender.try_send(packet).unwrap();
         }
         Ok(())
@@ -188,16 +201,20 @@ async fn capture_reaches_remote_rtp_and_mute_discards_queued_and_partial_audio()
         let (sender, mut received) = mpsc::channel(/*buffer*/ 32);
         let gathered = Arc::new(Notify::new());
         let (media, _) = AudioTrack::new().unwrap();
-        let mut settings = webrtc::peer_connection::SettingEngine::default();
-        settings.set_lite(/*lite*/ true);
+        let settings = webrtc::peer_connection::SettingEngineBuilder::new()
+            .with_lite(/*lite*/ true)
+            .build();
         let remote = PeerConnectionBuilder::new()
             .with_media_engine(media)
             .with_setting_engine(settings)
             .with_handler(Arc::new(Gathered(gathered.clone())))
-            .with_interceptor_registry(rtc::interceptor::Registry::from(RemoteRtp {
-                next: NoopInterceptor::new(),
-                sender,
-            }))
+            .with_interceptor_registry(rtc::interceptor::Registry::new().with(
+                rtc::interceptor::Slot::Custom(0),
+                RemoteRtp {
+                    next: NoopInterceptor::new(),
+                    sender,
+                },
+            ))
             .with_udp_addrs(vec!["0.0.0.0:0"])
             .build()
             .await
@@ -437,4 +454,11 @@ async fn capture_reaches_remote_rtp_and_mute_discards_queued_and_partial_audio()
     })
     .await
     .unwrap();
+}
+
+impl Interceptor for RemoteRtp {
+    fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }

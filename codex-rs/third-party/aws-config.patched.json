@@ -1,0 +1,14 @@
+{
+  "files": {
+    "Cargo.toml": "fcbc74fc889effe49bebfab3db7e706549d69fd5961969643f4c7cd369b9422e",
+    "Cargo.toml.orig": "77a60c4ff63218052740e08d3e3e3e93b3b2eb18a0fa4cc58e0cf98940a79404",
+    "src/lib.rs": "5ddc23820730ca8b6300419acda41584925d107e156fe4324160e1e1949196a6",
+    "src/login/dpop.rs": "342bfeafc56533afef97d13548f9998792a609899248e1309b4631a374a95ce2"
+  },
+  "style": {
+    "rustfmt.toml": "7dfcb9b8b47ed0e4d068feb4505a14bbd0980651ccfdf0b606b8892635787fe7"
+  },
+  "integration": {
+    "BUILD.bazel": "e4f1bb53f0af6272c01696ec2c35984644550cbc6c94182a77508cd6d29a57d9"
+  }
+}
