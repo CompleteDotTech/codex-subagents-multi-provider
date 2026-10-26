@@ -147,11 +147,24 @@ text(JSON.stringify({{ echo, denied, patchCompleted:true }}));
         ],
     )
     .await;
+    let (sandbox_policy, permission_profile) =
+        core_test_support::test_codex::turn_permission_fields(
+            PermissionProfile::Disabled,
+            test.cwd.path(),
+        );
     test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Use Code Mode to patch and invoke the namespaced tool".into(),
-            text_elements: vec![],
-        }]))
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Use Code Mode to patch and invoke the namespaced tool".into(),
+                text_elements: vec![],
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                ..Default::default()
+            }),
+        )
         .await?;
     let event = wait_for_event_with_timeout(
         &test.codex,
