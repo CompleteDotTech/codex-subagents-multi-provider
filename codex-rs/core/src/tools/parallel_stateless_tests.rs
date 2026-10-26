@@ -272,11 +272,32 @@ async fn advertised_plain_alias_dispatches_without_hidden_shadow_and_keeps_runti
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            assert!(
-                matches!(&result.item, codex_protocol::models::ResponseItem::FunctionCallOutput { output, .. }
-                if matches!(&output.body, codex_protocol::models::FunctionCallOutputBody::Text(text) if text == "terminal native result")),
-                "unexpected output for exposure={exposure:?} finishes={finishes}: {:?}", result.item
-            );
+            let codex_protocol::models::ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } = &result.item
+            else {
+                panic!("unexpected handler result: {:?}", result.item);
+            };
+            assert_eq!(call_id.as_deref(), Some("namespaced-call"));
+            if finishes {
+                assert!(
+                    visible.terminal.load(Ordering::SeqCst),
+                    "native cancellation owner must finish before the runtime returns"
+                );
+                assert!(
+                    matches!(&output.body, codex_protocol::models::FunctionCallOutputBody::Text(text) if text.starts_with("aborted by user after ")),
+                    "unexpected cancelled output: {output:?}"
+                );
+                assert_eq!(output.success, None);
+            } else {
+                assert_eq!(
+                    output.body,
+                    codex_protocol::models::FunctionCallOutputBody::Text(
+                        "terminal native result".into()
+                    )
+                );
+                assert_eq!(output.success, Some(true));
+            }
             assert_eq!(visible.executions.load(Ordering::SeqCst), 1);
             assert_eq!(hidden.executions.load(Ordering::SeqCst), 0);
             assert_eq!(*observer.0.lock().unwrap(), vec![ToolName::plain("a__b")]);
