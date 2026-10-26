@@ -1399,17 +1399,11 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
     );
     assert_ne!(child.thread.session.session_id(), forged);
     child.thread.ensure_rollout_materialized().await;
-    let stored = child.thread.read_thread(true, true).await.unwrap();
-    let meta = stored
-        .history
+    child.thread.session.flush_rollout().await.unwrap();
+    let meta = codex_rollout::read_session_meta_line(&child.thread.rollout_path().unwrap())
+        .await
         .unwrap()
-        .items
-        .into_iter()
-        .find_map(|item| match item {
-            codex_history::RolloutItem::SessionMeta(meta) => Some(meta.meta),
-            _ => None,
-        })
-        .unwrap();
+        .meta;
     assert_eq!(meta.session_id, fixture.parent.session.session_id());
     assert_eq!(
         meta.parent_thread_id,
