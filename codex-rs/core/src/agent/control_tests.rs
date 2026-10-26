@@ -1026,7 +1026,8 @@ async fn native_spawn_fixture_rejects_nonexistent_parent() {
             })),
         )
         .await;
-    assert!(matches!(result, Err(CodexErr::ThreadNotFound(id)) if id == missing));
+    let error = result.expect_err("nonexistent native parent must be rejected");
+    assert!(matches!(error.details(), CodexErrorDetails::ThreadNotFound(id) if *id == missing));
     assert!(harness.manager.list_thread_ids().await.is_empty());
 }
 

@@ -434,7 +434,7 @@ fn both_native_schemas_expose_only_authorized_provider_ids_even_with_hidden_mode
         panic!("v2 function")
     };
     for schema in [&v1.parameters, &v2.parameters] {
-        let value = schema.to_value();
+        let value = serde_json::to_value(schema).expect("serialize native tool schema");
         assert_eq!(value["properties"]["model_provider"]["type"], "string");
         assert_eq!(
             value["properties"]["model_provider"]["enum"],

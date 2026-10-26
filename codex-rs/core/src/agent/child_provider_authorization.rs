@@ -183,6 +183,7 @@ impl PreparedChildAuthorization {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn role_name(&self) -> Option<String> {
         self.role_name.clone()
     }
