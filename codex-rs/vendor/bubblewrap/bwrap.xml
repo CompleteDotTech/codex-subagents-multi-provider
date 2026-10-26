@@ -403,7 +403,11 @@
     </varlistentry>
     <varlistentry>
       <term><option>--dev <arg choice="plain">DEST</arg></option></term>
-      <listitem><para>Mount new devtmpfs on <arg choice="plain">DEST</arg></para></listitem>
+      <term><option>--dev-without-fd <arg choice="plain">DEST</arg></option></term>
+      <listitem><para>Mount new devtmpfs on <arg choice="plain">DEST</arg>.
+        <option>--dev-without-fd</option> creates the same standard devices and
+        fresh devpts, but omits the <filename>fd</filename> symlink so callers
+        can mask that path without following it into procfs.</para></listitem>
     </varlistentry>
     <varlistentry>
       <term><option>--tmpfs <arg choice="plain">DEST</arg></option></term>

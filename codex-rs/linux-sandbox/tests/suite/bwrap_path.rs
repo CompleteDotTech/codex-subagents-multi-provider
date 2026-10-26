@@ -12,6 +12,122 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
+fn denied_dev_fd_starts_with_standard_devices_and_stdio_intact() {
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+    use codex_protocol::protocol::FileSystemAccessMode;
+    use codex_protocol::protocol::FileSystemPath;
+    use codex_protocol::protocol::FileSystemSandboxEntry;
+    use codex_utils_cargo_bin::copy_executable;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let package = tempfile::tempdir().expect("package");
+    let sandbox = package.path().join("codex-linux-sandbox");
+    copy_executable(&cargo_bin("codex-linux-sandbox").unwrap(), &sandbox).unwrap();
+    let resources = package.path().join("codex-resources");
+    std::fs::create_dir(&resources).unwrap();
+    copy_executable(
+        &cargo_bin("bwrap").expect("build bundled bwrap for this test"),
+        &resources.join("bwrap"),
+    )
+    .unwrap();
+    let fake_bin = package.path().join("old-system");
+    std::fs::create_dir(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("bwrap"), "#!/bin/sh\nif [ \"$1\" = --help ]; then printf '%s\\n' '--as-pid-1 --perms'; else exit 92; fi\n").unwrap();
+    let old_system_path = std::env::join_paths([
+        fake_bin.as_path(),
+        std::path::Path::new("/usr/bin"),
+        std::path::Path::new("/bin"),
+    ])
+    .unwrap();
+    let mut denied_profile = String::new();
+    let common = r#"
+        for node in null zero full random urandom tty; do test -c /dev/$node || exit 31; done
+        test -c /dev/pts/ptmx || exit 32
+        test -L /dev/stdin && test -L /dev/stdout && test -L /dev/stderr || exit 33
+        read line < /dev/stdin
+        test "$line" = input || exit 34
+    "#;
+    for denied in [false, true] {
+        let mut policy = PermissionProfile::read_only().file_system_sandbox_policy();
+        if denied {
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path("/dev/fd")
+                        .unwrap()
+                        .into(),
+                },
+                FileSystemAccessMode::Deny,
+            ));
+        }
+        let profile =
+            PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Enabled);
+        let profile = serde_json::to_string(&profile).unwrap();
+        if denied {
+            denied_profile = profile.clone();
+        }
+        let check = if denied {
+            r#"test -d /dev/fd && test ! -L /dev/fd || exit 35
+               test "$(stat -c %a /dev/fd)" = 0 || exit 36
+               if ls /dev/fd >/dev/null 2>&1; then exit 37; fi
+               if cat /dev/fd/0 >/dev/null 2>&1; then exit 38; fi"#
+        } else {
+            "test -L /dev/fd && test -d /dev/fd || exit 39"
+        };
+        let mut command = Command::new(&sandbox);
+        if denied {
+            command.env("PATH", &old_system_path);
+        }
+        let mut child = command
+            .args([
+                "--sandbox-policy-cwd",
+                "/",
+                "--command-cwd",
+                "/",
+                "--permission-profile",
+            ])
+            .arg(&profile)
+            .args([
+                "--",
+                "/bin/sh",
+                "-c",
+                &format!("{common}\n{check}\nprintf started"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start sandbox");
+        child.stdin.take().unwrap().write_all(b"input\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "denied={denied}: {output:?}");
+        assert_eq!(output.stdout, b"started");
+    }
+    std::fs::remove_file(resources.join("bwrap")).unwrap();
+    let absent = Command::new(&sandbox)
+        .args([
+            "--sandbox-policy-cwd",
+            "/",
+            "--permission-profile",
+            &denied_profile,
+            "--",
+            "/bin/true",
+        ])
+        .env("PATH", &old_system_path)
+        .output()
+        .unwrap();
+    assert!(
+        !absent.status.success(),
+        "must fail closed without a capable helper"
+    );
+    assert!(
+        String::from_utf8_lossy(&absent.stderr)
+            .contains("no trusted bundled bubblewrap is available"),
+        "{absent:?}"
+    );
+}
+
+#[test]
 fn child_workdir_does_not_probe_or_launch_writable_parent_bwrap() {
     // Bazel can mount the default temp directory noexec.
     let temp = tempfile::tempdir_in(std::env::current_dir().expect("current directory"))

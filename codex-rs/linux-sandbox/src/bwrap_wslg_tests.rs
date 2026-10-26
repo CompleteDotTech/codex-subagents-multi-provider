@@ -97,23 +97,84 @@ fn wslg_mask_is_omitted_when_policy_already_hides_an_ancestor() {
             missing_path_behavior: None,
         });
         let mut commands = Vec::new();
+        let mut launcher_suffixes = Vec::new();
         for mask_wslg_distro in [false, true] {
             commands.push(
-                create_bwrap_command_args(
-                    vec!["/bin/true".to_string()],
+                create_filesystem_args_with_daemon_directories(
                     &policy,
-                    Path::new("/"),
                     Path::new("/"),
                     BwrapOptions {
                         mask_wslg_distro,
                         ..Default::default()
                     },
+                    &BTreeSet::new(),
                 )
                 .expect("create bwrap args with denied ancestor")
                 .args,
             );
+            let full_args = create_bwrap_command_args(
+                vec!["/bin/true".to_string()],
+                &policy,
+                Path::new("/"),
+                Path::new("/"),
+                BwrapOptions {
+                    mask_wslg_distro,
+                    ..Default::default()
+                },
+            )
+            .expect("create full command with real daemon masks")
+            .args;
+            let suffix = full_args
+                .iter()
+                .position(|arg| arg == "--unshare-user")
+                .unwrap();
+            launcher_suffixes.push(full_args[suffix..].to_vec());
         }
         assert_eq!(commands[0], commands[1]);
+        assert_eq!(launcher_suffixes[0], launcher_suffixes[1]);
+    }
+}
+
+#[test]
+fn denied_wslg_ancestor_preserves_explicit_daemon_alias_masks() {
+    let mut policy = FileSystemSandboxPolicy::read_only();
+    policy.entries.push(FileSystemSandboxEntry {
+        path: AbsolutePathBuf::from_absolute_path("/mnt").unwrap().into(),
+        access: FileSystemAccessMode::Deny,
+        missing_path_behavior: None,
+    });
+    let alias = "/mnt/wslg/distro/tmp/fixture-daemon";
+    for include_alias in [false, true] {
+        let mut directories = BTreeSet::from([PathBuf::from("/tmp/fixture-daemon")]);
+        if include_alias {
+            directories.insert(PathBuf::from(alias));
+        }
+        let args = create_filesystem_args_with_daemon_directories(
+            &policy,
+            Path::new("/"),
+            BwrapOptions {
+                mask_wslg_distro: include_alias,
+                ..Default::default()
+            },
+            &directories,
+        )
+        .unwrap()
+        .args;
+        let mask_index = |path: &str| {
+            args.windows(6)
+                .position(|args| args == ["--perms", "000", "--tmpfs", path, "--remount-ro", path])
+        };
+        let ancestor = mask_index("/mnt").expect("ancestor remains inaccessible and read-only");
+        assert!(mask_index("/tmp/fixture-daemon").is_some());
+        if include_alias {
+            assert!(mask_index(alias).expect("explicit alias remains protected") < ancestor);
+        } else {
+            assert!(mask_index(alias).is_none());
+        }
+        assert!(
+            mask_index(WSLG_DISTRO_ROOT).is_none(),
+            "denied ancestor already hides duplicate distro root"
+        );
     }
 }
 
