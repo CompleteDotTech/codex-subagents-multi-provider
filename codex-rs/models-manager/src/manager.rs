@@ -312,7 +312,7 @@ impl OpenAiModelsManager {
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         Self::new_with_optional_cache(
-            Some(Arc::new(FileModelsCache::new(
+            Some(Arc::new(FileModelsCache::partitioned(
                 cache_path,
                 DEFAULT_MODEL_CACHE_TTL,
             ))),
@@ -623,7 +623,8 @@ impl OpenAiModelsManager {
                         && let Some(cache) = self.cache.as_ref()
                     {
                         let invalidation = async {
-                            if let Some(mut entry) = cache.load(&client_version).await?
+                            if let Some(mut entry) =
+                                cache.load_scoped(&client_version, &identity).await?
                                 && entry.identity.as_deref() == Some(&identity)
                                 && entry.client_version.as_deref() == Some(&client_version)
                             {
@@ -744,7 +745,7 @@ impl OpenAiModelsManager {
                 return false;
             }
         }
-        let cache_entry = match cache.load(&client_version).await {
+        let cache_entry = match cache.load_scoped(&client_version, &identity).await {
             Ok(Some(cache_entry)) => cache_entry,
             Ok(None) => {
                 info!("models cache: no usable cache entry");

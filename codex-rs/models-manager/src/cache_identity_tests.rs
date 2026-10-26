@@ -1,7 +1,72 @@
 //! Coverage for cache identity validation and conditional freshness updates.
 
 use super::*;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
+
+#[tokio::test]
+async fn partitioned_files_preserve_same_slug_metadata_for_each_provider_and_tenant() {
+    let home = tempdir().unwrap();
+    let path = home.path().join(MODEL_CACHE_FILE);
+    let cache = FileModelsCache::partitioned(path.clone(), DEFAULT_MODEL_CACHE_TTL);
+    let version = crate::client_version_to_whole();
+    let mut first = remote_model("shared", "OpenAI", 0);
+    first.context_window = Some(128_000);
+    let mut second = remote_model("shared", "GLM", 0);
+    second.context_window = Some(32_000);
+    second.default_reasoning_level = Some(ReasoningEffort::Low);
+    let entry = |identity: &str, model| ModelsCacheEntry {
+        fetched_at: Utc::now(),
+        etag: Some("same-etag".into()),
+        client_version: Some(version.clone()),
+        identity: Some(identity.into()),
+        models: vec![model],
+    };
+    let first = entry("provider-a/account-1", first);
+    let second = entry("provider-b/account-2", second);
+    let (a, b) = tokio::join!(cache.store(&first), cache.store(&second));
+    a.unwrap();
+    b.unwrap();
+    // A generic cache file must not supply metadata for an unknown identity.
+    FileModelsCache::new(path, DEFAULT_MODEL_CACHE_TTL)
+        .store(&first)
+        .await
+        .unwrap();
+    assert!(
+        cache
+            .load_scoped(&version, "other-tenant")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for _ in 0..3 {
+        for expected in [&first, &second] {
+            assert_eq!(
+                cache
+                    .load_scoped(&version, expected.identity.as_deref().unwrap())
+                    .await
+                    .unwrap(),
+                Some(expected.clone())
+            );
+        }
+    }
+    let reopened =
+        FileModelsCache::partitioned(home.path().join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
+    assert_eq!(
+        reopened
+            .load_scoped(&version, "provider-a/account-1")
+            .await
+            .unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        reopened
+            .load_scoped(&version, "provider-b/account-2")
+            .await
+            .unwrap(),
+        Some(second)
+    );
+}
 
 #[tokio::test]
 async fn mismatched_and_legacy_cache_entries_fetch_the_current_catalog() {

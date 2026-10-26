@@ -9,14 +9,17 @@ use crate::config::Config;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use codex_config::child_provider::ResolvedChildProvider;
 use codex_features::Feature;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::MultiAgentVersion;
+use std::sync::Arc;
 
 pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
 
@@ -36,11 +39,62 @@ pub(crate) enum SpawnConfigVersion {
 }
 
 pub(crate) struct SpawnConfigOptions<'a> {
+    /// Already authorized by the shared resolver, including history and origin checks.
+    pub(crate) resolved_provider: Option<&'a ResolvedChildProvider>,
     pub(crate) version: SpawnConfigVersion,
     pub(crate) full_history_fork: bool,
     pub(crate) role_name: Option<&'a str>,
     pub(crate) model: Option<&'a str>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Binds a validated manager to the exact selected configuration until startup.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedChildModels {
+    provider_id: String,
+    model: Option<String>,
+    provider: codex_model_provider_info::ModelProviderInfo,
+    catalog: Option<codex_protocol::openai_models::ModelsResponse>,
+    manager: SharedModelsManager,
+    auth_manager: Arc<codex_login::AuthManager>,
+}
+
+impl PartialEq for PreparedChildModels {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider_id == other.provider_id
+            && self.model == other.model
+            && self.provider == other.provider
+            && self.catalog == other.catalog
+            && Arc::ptr_eq(&self.manager, &other.manager)
+            && Arc::ptr_eq(&self.auth_manager, &other.auth_manager)
+    }
+}
+
+impl PreparedChildModels {
+    pub(crate) fn manager(&self) -> &SharedModelsManager {
+        &self.manager
+    }
+}
+
+pub(crate) fn take_prepared_child_models(
+    config: &mut Config,
+    auth_manager: &Arc<codex_login::AuthManager>,
+) -> Result<Option<SharedModelsManager>, String> {
+    let Some(prepared) = config.prepared_child_models.take() else {
+        return Ok(None);
+    };
+    if prepared.provider_id != config.model_provider_id
+        || prepared.model != config.model
+        || prepared.provider != config.model_provider
+        || prepared.catalog != config.model_catalog
+        || !Arc::ptr_eq(&prepared.auth_manager, auth_manager)
+    {
+        return Err(
+            "child_provider_model_unavailable: prepared catalog scope changed before startup"
+                .into(),
+        );
+    }
+    Ok(Some(prepared.manager))
 }
 
 pub(crate) struct PreparedSpawnConfig {
@@ -60,18 +114,69 @@ pub(crate) async fn prepare_agent_spawn_config(
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
-    apply_requested_spawn_agent_model_overrides(
-        session,
-        step_context,
-        &mut config,
-        options.model,
-        options.reasoning_effort,
-    )
-    .await?;
+    let selected_manager = if let Some(resolved) = options.resolved_provider {
+        if options.full_history_fork
+            && (resolved.changed_provider
+                || resolved.provider_id != config.model_provider_id
+                || resolved.provider != config.model_provider)
+        {
+            return Err(
+                "child_provider_history_unsupported: use a fresh child when changing provider"
+                    .into(),
+            );
+        }
+        if !options.full_history_fork {
+            // Retain an explicit host instruction override, but do not freeze
+            // instructions resolved from the parent model catalog.
+            config.base_instructions = turn.config.base_instructions.clone();
+            config.base_instructions_provenance = turn.config.base_instructions_provenance.clone();
+            if matches!(
+                config.base_instructions_provenance,
+                Some(codex_protocol::models::BaseInstructionsProvenance::Model { .. })
+            ) {
+                config.base_instructions = None;
+                config.base_instructions_provenance = None;
+            }
+        }
+        Some(
+            prepare_resolved_child_models(
+                session,
+                &mut config,
+                resolved,
+                options.model,
+                options.reasoning_effort.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let models_manager = selected_manager
+        .as_ref()
+        .unwrap_or(&session.services.models_manager);
+    if options.resolved_provider.is_none() {
+        apply_requested_spawn_agent_model_overrides(
+            session,
+            step_context,
+            &mut config,
+            options.model,
+            options.reasoning_effort,
+        )
+        .await?;
+    }
+    let mut role_service_tier = None;
     if !options.full_history_fork
         || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
     {
-        apply_spawn_agent_role(session, &mut config, options.role_name).await?;
+        role_service_tier = apply_spawn_agent_role(models_manager, &mut config, options.role_name)
+            .await
+            .map_err(|err| {
+                if options.resolved_provider.is_some() && err.starts_with("Reasoning effort") {
+                    format!("child_provider_capability_unsupported: {err}")
+                } else {
+                    err
+                }
+            })?;
         if options.version == SpawnConfigVersion::V2
             && options.full_history_fork
             && config.developer_instructions.is_none()
@@ -81,7 +186,44 @@ pub(crate) async fn prepare_agent_spawn_config(
                 .clone_from(&turn.developer_instructions);
         }
     }
-    apply_spawn_agent_service_tier(session, &mut config).await?;
+    if let Some(resolved) = options.resolved_provider {
+        validate_resolved_child_model(models_manager, &config, resolved, turn.multi_agent_version)
+            .await?;
+    }
+    if options.resolved_provider.is_some() && role_service_tier.is_some() {
+        if let Some(tier) = role_service_tier.as_deref()
+            && tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+        {
+            let tier = codex_protocol::config_types::ServiceTier::from_request_value(tier)
+                .map(|tier| tier.request_value().to_string())
+                .unwrap_or_else(|| tier.to_owned());
+            if config.service_tier.is_none() {
+                return Err(format!(
+                    "child_provider_capability_unsupported: service tier `{tier}` is disabled"
+                ));
+            }
+            let model = config
+                .model
+                .as_deref()
+                .ok_or("child_provider_model_required")?;
+            let info = models_manager
+                .get_model_info(model, &config.to_models_manager_config())
+                .await;
+            if !model_supports_selected_tier(&config, &info, &tier) {
+                return Err(format!(
+                    "child_provider_capability_unsupported: service tier `{tier}` is not supported by model `{model}`"
+                ));
+            }
+        }
+    } else {
+        apply_spawn_agent_service_tier_with_manager(
+            session,
+            models_manager,
+            &mut config,
+            options.resolved_provider.is_some(),
+        )
+        .await?;
+    }
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
 
     // Remember an applied configured default so cold reload reapplies its restrictions.
@@ -98,6 +240,141 @@ pub(crate) async fn prepare_agent_spawn_config(
         })
         .map(str::to_owned);
     Ok(PreparedSpawnConfig { config, role_name })
+}
+
+async fn prepare_resolved_child_models(
+    session: &Session,
+    config: &mut Config,
+    resolved: &ResolvedChildProvider,
+    requested_model: Option<&str>,
+    requested_effort: Option<ReasoningEffort>,
+) -> Result<SharedModelsManager, String> {
+    let definition_changed = config.model_provider != resolved.provider;
+    config.model_provider_id = resolved.provider_id.clone();
+    config.model_provider = resolved.provider.clone();
+    if resolved.changed_provider || definition_changed {
+        // These are parent model overrides, not target provider defaults.
+        config.model_context_window = None;
+        config.model_auto_compact_token_limit = None;
+        config.model_reasoning_summary = None;
+        config.model_verbosity = None;
+        config.model_catalog = None;
+        config.service_tier = None;
+    }
+    if let Some(path) = &resolved.model_catalog_json {
+        let bytes = tokio::fs::read(path).await.map_err(|_| {
+            format!(
+                "child_provider_model_unavailable: provider `{}` catalog cannot be read",
+                resolved.provider_id
+            )
+        })?;
+        config.model_catalog = Some(serde_json::from_slice(&bytes).map_err(|_| {
+            format!(
+                "child_provider_model_unavailable: provider `{}` catalog is invalid",
+                resolved.provider_id
+            )
+        })?);
+    }
+    let manager = crate::thread_manager::build_models_manager(
+        config,
+        Arc::clone(&session.services.auth_manager),
+    );
+    let catalog = manager
+        .raw_model_catalog(
+            RefreshStrategy::OnlineIfUncached,
+            config.http_client_factory(),
+        )
+        .await;
+    let info = resolved
+        .validate_model(&config.model_provider_id, &catalog.models)
+        .map_err(|err| err.to_string())?;
+    let effort = requested_effort
+        .clone()
+        .or_else(|| config.agent_default_subagent_reasoning_effort.clone());
+    if resolved.changed_provider {
+        // An unsupported inherited default may be omitted; an explicit effort may not.
+        config.model_reasoning_effort = match effort {
+            Some(effort) if requested_effort.is_some() => Some(effort),
+            Some(effort)
+                if info
+                    .supported_reasoning_levels
+                    .iter()
+                    .any(|preset| preset.effort == effort) =>
+            {
+                Some(effort)
+            }
+            _ => info.default_reasoning_level.clone(),
+        };
+    } else if let Some(selected) =
+        requested_model.or(config.agent_default_subagent_model.as_deref())
+    {
+        let selected = catalog.models.iter().find(|model| model.slug == selected && !model.used_fallback_model_metadata)
+            .ok_or_else(|| format!("child_provider_model_unavailable: model `{selected}` is absent from the selected catalog"))?;
+        if let Some(effort) = effort {
+            validate_spawn_agent_reasoning_effort(
+                &selected.slug,
+                &selected.supported_reasoning_levels,
+                &effort,
+            )?;
+            config.model_reasoning_effort = Some(effort);
+        } else {
+            config.model_reasoning_effort = selected.default_reasoning_level.clone();
+        }
+    } else if let Some(effort) = effort {
+        validate_spawn_agent_reasoning_effort(
+            &resolved.model,
+            &info.supported_reasoning_levels,
+            &effort,
+        )?;
+        config.model_reasoning_effort = Some(effort);
+    }
+    config.model = Some(resolved.model.clone());
+    config.prepared_child_models = Some(PreparedChildModels {
+        provider_id: config.model_provider_id.clone(),
+        model: config.model.clone(),
+        provider: config.model_provider.clone(),
+        catalog: config.model_catalog.clone(),
+        manager: Arc::clone(&manager),
+        auth_manager: Arc::clone(&session.services.auth_manager),
+    });
+    Ok(manager)
+}
+
+async fn validate_resolved_child_model(
+    manager: &SharedModelsManager,
+    config: &Config,
+    resolved: &ResolvedChildProvider,
+    multi_agent_version: MultiAgentVersion,
+) -> Result<(), String> {
+    if config.model.as_deref() != Some(resolved.model.as_str()) {
+        return Err(
+            "child_provider_model_unavailable: role model changed after provider resolution".into(),
+        );
+    }
+    let catalog = manager
+        .raw_model_catalog(RefreshStrategy::Offline, config.http_client_factory())
+        .await;
+    let available = manager.build_available_models(catalog.models.clone());
+    if !available.iter().any(|model| model.model == resolved.model) {
+        return Err("child_provider_model_unavailable: selected model is not available for the provider authentication mode".into());
+    }
+    let info = resolved
+        .validate_model(&config.model_provider_id, &catalog.models)
+        .map_err(|err| err.to_string())?;
+    if info.multi_agent_version == Some(MultiAgentVersion::Disabled)
+        && multi_agent_version == MultiAgentVersion::V2
+    {
+        return Err("child_provider_capability_unsupported: selected model does not support the multi-agent backend".into());
+    }
+    if let Some(effort) = &config.model_reasoning_effort {
+        validate_spawn_agent_reasoning_effort(
+            &resolved.model,
+            &info.supported_reasoning_levels,
+            effort,
+        )
+        .map_err(|err| format!("child_provider_capability_unsupported: {err}"))?;
+    }
+    Ok(())
 }
 
 /// Builds the base config snapshot for a newly spawned sub-agent.
@@ -132,6 +409,7 @@ pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, St
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, String> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
+    config.prepared_child_models = None;
     if config
         .features
         .enabled(Feature::SubagentDefaultContextLimits)
@@ -260,9 +538,25 @@ async fn apply_requested_spawn_agent_model_overrides(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
     config: &mut Config,
+) -> Result<(), String> {
+    apply_spawn_agent_service_tier_with_manager(
+        session,
+        &session.services.models_manager,
+        config,
+        false,
+    )
+    .await
+}
+
+async fn apply_spawn_agent_service_tier_with_manager(
+    session: &Session,
+    models_manager: &SharedModelsManager,
+    config: &mut Config,
+    strict_catalog: bool,
 ) -> Result<(), String> {
     let Some(service_tier) = session.services.agent_control.service_tier() else {
         config.service_tier = None;
@@ -276,51 +570,80 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     let model = config.model.clone().ok_or_else(|| {
         "spawn_agent could not resolve the child model for service tier validation".to_string()
     })?;
-    let model_info = session
-        .services
-        .models_manager
+    let model_info = models_manager
         .get_model_info(model.as_str(), &config.to_models_manager_config())
         .await;
 
-    config.service_tier = model_info
-        .supports_service_tier(service_tier.as_str())
-        .then_some(service_tier);
+    let supported = if strict_catalog {
+        model_supports_selected_tier(config, &model_info, &service_tier)
+    } else {
+        model_info.supports_service_tier(&service_tier)
+    };
+    config.service_tier = supported.then_some(service_tier);
     Ok(())
 }
 
+fn model_supports_selected_tier(
+    config: &Config,
+    info: &codex_protocol::openai_models::ModelInfo,
+    tier: &str,
+) -> bool {
+    // The protocol helper treats Flex as universally available for OpenAI.
+    // Other providers must advertise it in their own authoritative catalog.
+    if config.model_provider_id == "openai" {
+        info.supports_service_tier(tier)
+    } else {
+        info.service_tiers
+            .iter()
+            .any(|candidate| candidate.id == tier)
+    }
+}
+
 async fn apply_spawn_agent_role(
-    session: &Session,
+    models_manager: &SharedModelsManager,
     config: &mut Config,
     role_name: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    let previous_session_layers = config
+        .config_layer_stack
+        .layers_low_to_high()
+        .filter(|layer| layer.name == codex_config::ConfigLayerSource::SessionFlags)
+        .count();
     let previous_model = config.model.clone();
     let previous_reasoning_effort = config.model_reasoning_effort.clone();
     apply_role_to_config(config, role_name).await?;
+    let explicit_tier = config
+        .config_layer_stack
+        .layers_low_to_high()
+        .filter(|layer| layer.name == codex_config::ConfigLayerSource::SessionFlags)
+        .nth(previous_session_layers)
+        .and_then(|layer| layer.config.get("service_tier"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
     if config.model == previous_model && config.model_reasoning_effort == previous_reasoning_effort
     {
-        return Ok(());
+        return Ok(explicit_tier);
     }
 
     let Some(reasoning_effort) = config.model_reasoning_effort.clone() else {
-        return Ok(());
+        return Ok(explicit_tier);
     };
     let model = config.model.clone().ok_or_else(|| {
         "spawn_agent could not resolve the child model for reasoning effort validation".to_string()
     })?;
-    let model_info = session
-        .services
-        .models_manager
+    let model_info = models_manager
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
     if model_info.used_fallback_model_metadata {
-        return Ok(());
+        return Ok(explicit_tier);
     }
 
     validate_spawn_agent_reasoning_effort(
         &model,
         &model_info.supported_reasoning_levels,
         &reasoning_effort,
-    )
+    )?;
+    Ok(explicit_tier)
 }
 
 fn find_spawn_agent_model_name(
@@ -371,3 +694,7 @@ fn validate_spawn_agent_reasoning_effort(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     ))
 }
+
+#[cfg(test)]
+#[path = "child_config_tests.rs"]
+mod tests;

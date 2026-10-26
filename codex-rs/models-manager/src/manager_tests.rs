@@ -336,9 +336,10 @@ where
     F: FnOnce(&mut ModelsCacheEntry),
 {
     let client_version = crate::client_version_to_whole();
-    let cache = FileModelsCache::new(codex_home.join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
+    let cache =
+        FileModelsCache::partitioned(codex_home.join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
     let mut entry = cache
-        .load(&client_version)
+        .load_scoped(&client_version, "test-provider")
         .await
         .expect("cache load succeeds")
         .expect("cache entry exists");
