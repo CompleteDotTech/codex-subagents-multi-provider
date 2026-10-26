@@ -2,3 +2,7 @@ codex-rs/app-server-protocol/schema/** linguist-generated
 codex-rs/hooks/schema/generated/** linguist-generated
 third_party/voice/sources.json text eol=lf
 patches/v8_array_sort_elements_kind.patch text eol=lf
+# Preserve the checksum-pinned upstream AWS snapshot and provenance on Windows.
+codex-rs/third-party/aws-config/** -text
+codex-rs/third-party/aws-config.*.json -text
+codex-rs/third-party/aws-config.patch -text

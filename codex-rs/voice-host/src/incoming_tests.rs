@@ -21,7 +21,8 @@ fn packet(size: usize, at: Instant) -> TaggedPacket {
                 ..Default::default()
             },
             payload: vec![5; size - 12].into(),
-        }),
+        })
+        .into(),
     }
 }
 
@@ -30,7 +31,7 @@ fn arrival_and_rtp_bytes_survive_the_adapter_without_an_upstream_copy() {
     let (mut incoming, mut ingress) = pair();
     let at = Instant::now() - Duration::from_millis(/*millis*/ 20);
     let input = packet(/*size*/ 32, at);
-    let Packet::Rtp(expected) = &input.message else {
+    let Packet::Rtp(expected) = &input.message.packet else {
         panic!()
     };
     let expected = expected.marshal().unwrap();
@@ -38,6 +39,31 @@ fn arrival_and_rtp_bytes_survive_the_adapter_without_an_upstream_copy() {
     let received = incoming.take().unwrap().unwrap();
     assert_eq!((received.at, received.as_ref()), (at, expected.as_ref()));
     assert!(ingress.poll_read().is_none());
+}
+
+#[test]
+fn flat_interceptor_chain_consumes_inbound_rtp_without_delivering_a_second_copy() {
+    let (mut incoming, ingress) = pair();
+    let mut chain = rtc::interceptor::Registry::new()
+        .with(rtc::interceptor::Slot::Custom(0), ingress)
+        .build();
+    chain
+        .handle_read(packet(/*size*/ 32, Instant::now()))
+        .unwrap();
+    assert!(incoming.take().unwrap().is_some());
+    assert!(chain.poll_read().is_none());
+    assert!(incoming.take().unwrap().is_none());
+}
+
+#[test]
+fn flat_interceptor_preserves_the_outgoing_rtp_path() {
+    let (_, mut ingress) = pair();
+    let at = Instant::now();
+    ingress.handle_write(packet(/*size*/ 32, at)).unwrap();
+    let outgoing = ingress.poll_write().unwrap();
+    assert_eq!(outgoing.now, at);
+    assert!(matches!(outgoing.message.packet, Packet::Rtp(_)));
+    assert!(ingress.poll_write().is_none());
 }
 
 #[test]
@@ -109,7 +135,7 @@ fn invalid_stream_and_oversize_packets_fail_without_returning_media() {
         let (mut incoming, mut ingress) = pair();
         let mut input = packet(size, Instant::now());
         if size == 32
-            && let Packet::Rtp(packet) = &mut input.message
+            && let Packet::Rtp(packet) = &mut input.message.packet
         {
             packet.header.payload_type = 96;
         }

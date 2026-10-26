@@ -1,0 +1,168 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -167,14 +167,15 @@
+ version = "1"
+ 
+ [dependencies.p256]
+-version = "0.13.2"
++version = "0.14"
+ optional = true
+ 
+ [dependencies.rand]
+-version = "0.8.5"
++version = "0.10"
+ features = [
+     "std",
+     "std_rng",
++    "sys_rng",
+ ]
+ optional = true
+ default-features = false
+@@ -224,7 +225,7 @@
+ ]
+ 
+ [dev-dependencies.aws-smithy-runtime]
+-version = "1.9.5"
++version = "1.15.0"
+ features = [
+     "client",
+     "test-util",
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -119,7 +119,7 @@
+ version = "1.93.0"
+ 
+ [dependencies.p256]
+-version = "0.13.2"
++version = "0.14"
+ optional = true
+ 
+ [dependencies.sha2]
+@@ -141,9 +141,9 @@
+ optional = true
+ 
+ [dependencies.rand]
+-version = "0.8.5"
++version = "0.10"
+ default-features = false
+-features = ["std", "std_rng"]
++features = ["std", "std_rng", "sys_rng"]
+ optional = true
+ 
+ [dev-dependencies]
+@@ -163,7 +163,7 @@
+ [dev-dependencies.aws-smithy-runtime]
+ path = "../aws-smithy-runtime"
+ features = ["client", "test-util"]
+-version = "1.9.5"
++version = "1.15.0"
+ 
+ [dev-dependencies.aws-smithy-runtime-api]
+ path = "../aws-smithy-runtime-api"
+--- a/src/login/dpop.rs
++++ b/src/login/dpop.rs
+@@ -20,7 +20,7 @@
+ use aws_smithy_types::Number;
+ use p256::ecdsa::signature::RandomizedSigner;
+ use p256::ecdsa::{Signature, SigningKey};
+-use p256::elliptic_curve::sec1::ToEncodedPoint;
++use p256::elliptic_curve::sec1::ToSec1Point;
+ use p256::SecretKey;
+ use rand::SeedableRng;
+ use std::sync::{Arc, LazyLock};
+@@ -69,7 +69,7 @@
+ 
+ fn header(private_key: &SecretKey) -> Result<Header, LoginTokenError> {
+     let public_key = private_key.public_key();
+-    let point = public_key.to_encoded_point(false);
++    let point = public_key.to_sec1_point(false);
+ 
+     let x_bytes = point
+         .x()
+@@ -103,8 +103,12 @@
+ 
+ fn sign(message: &str, private_key: &SecretKey) -> Result<String, LoginTokenError> {
+     let signing_key = SigningKey::from(private_key);
+-    let mut rng = rand::rngs::StdRng::from_entropy();
+-    let signature: Signature = signing_key.sign_with_rng(&mut rng, message.as_bytes());
++    let mut rng = rand::rngs::StdRng::try_from_rng(&mut rand::rngs::SysRng).map_err(|e| {
++        LoginTokenError::other("could not obtain signing randomness", Some(e.into()))
++    })?;
++    let signature: Signature = signing_key
++        .try_sign_with_rng(&mut rng, message.as_bytes())
++        .map_err(|e| LoginTokenError::other("could not sign DPoP proof", Some(e.into())))?;
+     let signature_b64 = base64_simd::URL_SAFE_NO_PAD.encode_to_string(signature.to_bytes());
+     Ok(format!("{message}.{signature_b64}"))
+ }
+@@ -323,4 +327,70 @@
+             .to_string()
+             .contains("invalid secret key"));
+     }
+-}
++    #[test]
++    fn dpop_proof_preserves_es256_wire_format_and_rejects_tampering() {
++        use p256::ecdsa::signature::Verifier;
++        use p256::ecdsa::VerifyingKey;
++
++        let endpoint = "https://signin.aws.amazon.com/v1/token";
++        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1651516560);
++        let private_key = SecretKey::from_sec1_pem(TEST_KEY).unwrap();
++        let proof = calculate(&private_key, endpoint, now).unwrap();
++        let parts: Vec<_> = proof.split('.').collect();
++        assert_eq!(parts.len(), 3);
++        let decode = |part: &str| base64_simd::URL_SAFE_NO_PAD.decode_to_vec(part).unwrap();
++        let header: serde_json::Value = serde_json::from_slice(&decode(parts[0])).unwrap();
++        assert_eq!(header["typ"], "dpop+jwt");
++        assert_eq!(header["alg"], "ES256");
++        assert_eq!(header["jwk"]["kty"], "EC");
++        assert_eq!(header["jwk"]["crv"], "P-256");
++        assert_eq!(
++            header["jwk"]["x"],
++            "Wb1VLi1EA2hJaTz4yYuxSELvY-1GAfL-8rUTCAdiFic"
++        );
++        assert_eq!(
++            header["jwk"]["y"],
++            "fOwX-hmPrNvtUaag79EaWYgyDAq2a7AIfkSvUt0Amhg"
++        );
++        let payload: serde_json::Value = serde_json::from_slice(&decode(parts[1])).unwrap();
++        assert_eq!(payload["htm"], "POST");
++        assert_eq!(payload["htu"], endpoint);
++        assert_eq!(payload["iat"], 1651516560_u64);
++        let jti = uuid::Uuid::parse_str(payload["jti"].as_str().unwrap()).unwrap();
++        assert_eq!(jti.get_version_num(), 4);
++        assert!(!proof.contains('='));
++
++        // Reconstruct the independently specified fixture public key, not a key
++        // exported from the signer, and verify the actual JWS signing input.
++        let mut public_key = vec![4];
++        public_key.extend(decode("Wb1VLi1EA2hJaTz4yYuxSELvY-1GAfL-8rUTCAdiFic"));
++        public_key.extend(decode("fOwX-hmPrNvtUaag79EaWYgyDAq2a7AIfkSvUt0Amhg"));
++        let verifier = VerifyingKey::from_sec1_bytes(&public_key).unwrap();
++        let signature_bytes = decode(parts[2]);
++        assert_eq!(
++            signature_bytes.len(),
++            64,
++            "JWS uses fixed-width R||S, not DER"
++        );
++        let signature = Signature::from_slice(&signature_bytes).unwrap();
++        let message = format!("{}.{}", parts[0], parts[1]);
++        verifier.verify(message.as_bytes(), &signature).unwrap();
++        assert!(verifier
++            .verify(format!("{message}tampered").as_bytes(), &signature)
++            .is_err());
++        assert!(Signature::from_slice(&signature_bytes[..63]).is_err());
++        let other_key = SecretKey::from_slice(&[1_u8; 32]).unwrap();
++        let other_verifier = VerifyingKey::from(other_key.public_key());
++        assert!(other_verifier
++            .verify(message.as_bytes(), &signature)
++            .is_err());
++        assert!(SecretKey::from_slice(&[0_u8; 32]).is_err());
++        assert!(SecretKey::from_slice(&[255_u8; 32]).is_err());
++        assert!(calculate(
++            &private_key,
++            endpoint,
++            SystemTime::UNIX_EPOCH - Duration::from_secs(1)
++        )
++        .is_err());
++    }
++}

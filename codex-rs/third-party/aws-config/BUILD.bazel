@@ -1,0 +1,17 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+# Retain the credential provider suite and fixtures for the narrowly patched
+# upstream crate. Its public authentication feature set remains enabled.
+codex_rust_crate(
+    name = "aws-config",
+    crate_name = "aws_config",
+    crate_edition = "2021",
+    crate_features = [
+        "default-https-client",
+        "rt-tokio",
+        "credentials-process",
+        "sso",
+        "credentials-login",
+    ],
+    test_data_extra = glob(["test-data/**"]),
+)

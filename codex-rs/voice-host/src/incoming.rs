@@ -14,8 +14,7 @@ use rtc::interceptor::NoopInterceptor;
 use rtc::interceptor::Packet;
 use rtc::interceptor::StreamInfo;
 use rtc::interceptor::TaggedPacket;
-use rtc::interceptor::interceptor;
-use rtc::sansio;
+use rtc::sansio::Protocol;
 use rtc::shared::error::Error;
 use rtc::shared::marshal::Marshal;
 use rtc::shared::marshal::MarshalSize;
@@ -53,9 +52,7 @@ pub(crate) struct Incoming {
     receiver: mpsc::Receiver<ReceivedRtp>,
 }
 
-#[derive(Interceptor)]
 pub(crate) struct Ingress {
-    #[next]
     next: NoopInterceptor,
     state: Arc<State>,
     sender: mpsc::Sender<ReceivedRtp>,
@@ -116,11 +113,27 @@ impl Incoming {
     }
 }
 
-#[interceptor]
-impl Ingress {
-    #[overrides]
+impl Protocol<TaggedPacket, TaggedPacket, ()> for Ingress {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = Error;
+    type Time = std::time::Instant;
+
+    fn poll_read(&mut self) -> Option<Self::Rout> {
+        None
+    }
+
+    fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        self.next.handle_write(message)
+    }
+
+    fn poll_write(&mut self) -> Option<Self::Wout> {
+        self.next.poll_write()
+    }
+
     fn handle_read(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
-        let Packet::Rtp(packet) = message.message else {
+        let Packet::Rtp(packet) = message.message.packet else {
             return Ok(());
         };
         let epoch = self.state.epoch.load(Ordering::Acquire);
@@ -160,6 +173,13 @@ impl Ingress {
         // Consume here: no second copy is retained by the upstream track-event queue.
         Ok(())
     }
+}
+
+impl Interceptor for Ingress {
+    fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }
 
 #[cfg(test)]
