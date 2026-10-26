@@ -461,6 +461,117 @@ fn host_catalog_in_active_workspace_requires_actual_read_only_protection() {
 }
 
 #[test]
+fn writable_user_source_cannot_authorize_url_catalogs_endpoints_or_helpers() {
+    let mut fixture = Fixture::new();
+    fixture.home = tempfile::tempdir_in(fixture.project.path()).unwrap();
+    fixture.user = fixture
+        .user
+        .lines()
+        .filter(|line| !line.starts_with("model_catalog_json") && !line.starts_with("env_key"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fixture.user.push_str("\nmodel_catalog_url='https://attacker.invalid/models'\n[model_providers.zai.auth]\ncommand='MUST_NOT_EXECUTE'\n");
+    for endpoint in [
+        "https://trusted.example/v1",
+        "https://reloaded-attacker.invalid/v1",
+    ] {
+        fixture.user = fixture.user.replace("https://trusted.example/v1", endpoint);
+        let policy = fixture.policy_with_protected_roots("", "", None, &[]);
+        assert!(policy.allowed.is_empty());
+        assert!(!policy.providers.contains_key("zai"));
+        assert!(policy.defaults.is_empty());
+        let unsafe_parent = ModelProviderInfo::default();
+        let mut inherited = request(&unsafe_parent);
+        inherited.parent_provider_id = "zai";
+        inherited.authorization_origin = Some(origin("zai"));
+        assert_eq!(
+            policy.resolve(inherited).unwrap_err().code,
+            "child_provider_untrusted_source"
+        );
+
+        let parent = ModelProviderInfo::default();
+        let mut input = request(&parent);
+        input.explicit_provider = Some("zai");
+        assert_eq!(
+            policy.resolve(input).unwrap_err().code,
+            "child_provider_untrusted_source"
+        );
+    }
+    // The same source contributes authority only when the actual host policy protects it.
+    let protected = AbsolutePathBuf::from_absolute_path(fixture.home.path()).unwrap();
+    let policy = fixture.policy_with_protected_roots("", "", None, &[protected]);
+    assert!(policy.allowed.contains("zai"));
+    assert_eq!(
+        policy.providers["zai"].base_url.as_deref(),
+        Some("https://reloaded-attacker.invalid/v1")
+    );
+    assert!(policy.providers["zai"].auth.is_some());
+}
+
+#[test]
+fn user_source_in_additional_writable_root_cannot_supply_authority() {
+    let fixture = Fixture::new();
+    let user = resolve_relative_paths_in_config_toml(
+        toml::from_str(&fixture.user).unwrap(),
+        fixture.home.path(),
+    )
+    .unwrap();
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: AbsolutePathBuf::from_absolute_path(fixture.home.path().join("config.toml"))
+                    .unwrap(),
+                profile: None,
+            },
+            user,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .unwrap();
+    let policy = ChildProviderPolicy::from_config_layers(
+        &stack,
+        &AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap(),
+        &[AbsolutePathBuf::from_absolute_path(fixture.home.path()).unwrap()],
+        &[],
+    )
+    .unwrap();
+    assert!(policy.allowed.is_empty());
+    assert!(!policy.providers.contains_key("zai"));
+    assert_eq!(
+        policy
+            .authorize("zai", Some(&origin("zai")))
+            .unwrap_err()
+            .code,
+        "child_provider_untrusted_source"
+    );
+}
+
+#[test]
+fn writable_user_without_child_authority_preserves_legacy_configuration() {
+    let mut fixture = Fixture::new();
+    fixture.home = tempfile::tempdir_in(fixture.project.path()).unwrap();
+    fixture.user = "model='legacy-model'\n[agents]\nmax_depth=3".to_owned();
+    let policy = fixture.policy_with_protected_roots("", "", None, &[]);
+    let parent = ModelProviderInfo::default();
+    let result = policy.resolve(request(&parent)).unwrap();
+    assert_eq!(result.provider, parent);
+    assert!(policy.allowed.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn user_source_symlink_into_writable_scope_cannot_supply_authority() {
+    let fixture = Fixture::new();
+    let target = fixture.project.path().join("controlled.toml");
+    std::fs::write(&target, &fixture.user).unwrap();
+    std::os::unix::fs::symlink(&target, fixture.home.path().join("config.toml")).unwrap();
+    let policy = fixture.policy_with_protected_roots("", "", None, &[]);
+    assert!(policy.allowed.is_empty());
+    assert!(!policy.providers.contains_key("zai"));
+}
+
+#[test]
 fn active_cwd_and_explicit_roots_protect_catalogs_without_project_config_or_git() {
     for catalog_in_cwd in [true, false] {
         let mut fixture = Fixture::new();

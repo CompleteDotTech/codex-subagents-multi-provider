@@ -4373,8 +4373,12 @@ impl Config {
         }
         let effective_file_system_sandbox_policy = effective_file_system_sandbox_policy
             .with_additional_readable_roots(resolved_cwd.as_path(), &helper_readable_roots);
-        let protected_catalog_roots: Vec<_> = effective_file_system_sandbox_policy
-            .get_writable_roots_with_cwd(resolved_cwd.as_path())
+        let effective_writable_roots = effective_file_system_sandbox_policy
+            .get_writable_roots_with_cwd(resolved_cwd.as_path());
+        let mut child_provider_scope_roots = workspace_roots.clone();
+        child_provider_scope_roots.extend(effective_writable_roots.iter().map(|root| root.root.clone()));
+        dedupe_absolute_paths(&mut child_provider_scope_roots);
+        let protected_catalog_roots: Vec<_> = effective_writable_roots
             .into_iter()
             .flat_map(|root| root.read_only_subpaths)
             .collect();
@@ -4382,7 +4386,7 @@ impl Config {
             codex_config::child_provider::ChildProviderPolicy::from_config_layers(
                 &config_layer_stack,
                 &resolved_cwd,
-                &workspace_roots,
+                &child_provider_scope_roots,
                 &protected_catalog_roots,
             )?;
         let effective_permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(

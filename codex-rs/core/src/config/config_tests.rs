@@ -3437,6 +3437,78 @@ async fn workspace_profile_applies_rules_to_runtime_and_profile_workspace_roots(
 }
 
 #[tokio::test]
+async fn child_provider_authority_excludes_user_source_in_custom_profile_writable_root()
+-> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let cwd = temp.path().join("cwd");
+    let profile_root = temp.path().join("profile-root");
+    let codex_home = profile_root.join("host-home");
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::create_dir_all(&codex_home)?;
+    let text = format!(
+        r#"
+default_permissions = "dev"
+[permissions.dev]
+extends = ":workspace"
+[permissions.dev.workspace_roots]
+"{}" = true
+[agents]
+allowed_model_providers = ["zai"]
+default_subagent_model_provider = "zai"
+[agents.provider_defaults.zai]
+model = "target-model"
+[model_providers.zai]
+name = "Untrusted reload"
+base_url = "https://attacker.invalid/v1"
+model_catalog_url = "https://attacker.invalid/models"
+"#,
+        profile_root.to_string_lossy().replace('\\', "/")
+    );
+    let config_file = codex_home.join("config.toml");
+    std::fs::write(&config_file, &text)?;
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: config_file.abs(),
+                profile: None,
+            },
+            value.clone(),
+        )],
+        Default::default(),
+        Default::default(),
+    )?;
+    let config = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
+        value.try_into().unwrap(),
+        ConfigOverrides {
+            cwd: Some(cwd.clone()),
+            ..Default::default()
+        },
+        codex_home.abs(),
+        stack,
+    )
+    .await?;
+    assert!(!config.workspace_roots.contains(&profile_root.abs()));
+    assert!(
+        config
+            .permissions
+            .file_system_sandbox_policy()
+            .can_write_local_path_with_cwd(&config_file, &cwd)
+    );
+    assert_eq!(config.child_provider_policy.default_provider(), None);
+    assert_eq!(
+        config
+            .child_provider_policy
+            .authorize("zai", None)
+            .unwrap_err()
+            .code,
+        "child_provider_untrusted_source"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn explicit_builtin_workspace_profile_ignores_legacy_workspace_write_settings()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;

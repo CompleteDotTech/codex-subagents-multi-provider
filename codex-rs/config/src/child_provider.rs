@@ -29,6 +29,7 @@ pub struct ChildProviderPolicy {
     default_provider: Option<String>,
     required_provider: Option<String>,
     untrusted_provider_ids: BTreeSet<String>,
+    unsafe_host_provider_ids: BTreeSet<String>,
     project_roots: Vec<PathBuf>,
     catalog_boundaries: BTreeMap<String, PathBuf>,
     protected_catalog_roots: Vec<PathBuf>,
@@ -149,12 +150,48 @@ impl ChildProviderPolicy {
         workspace_roots: &[AbsolutePathBuf],
         protected_catalog_roots: &[AbsolutePathBuf],
     ) -> std::io::Result<Self> {
+        let mut project_roots = vec![cwd.to_path_buf()];
+        project_roots.extend(workspace_roots.iter().map(|root| root.to_path_buf()));
+        for layer in stack.layers_low_to_high() {
+            if let ConfigLayerSource::Project { dot_codex_folder } = &layer.name
+                && let Some(root) = dot_codex_folder.as_path().parent()
+            {
+                project_roots.push(root.to_path_buf());
+            }
+        }
+        let trusted_source = |source: &ConfigLayerSource| {
+            is_host_source(source)
+                && source_file(source).is_none_or(|file| {
+                    canonical_source_path(file).is_some_and(|file| {
+                        !project_roots.iter().any(|root| {
+                            root.canonicalize().is_ok_and(|root| file.starts_with(root))
+                        }) || protected_catalog_roots.iter().any(|root| {
+                            root.as_path()
+                                .canonicalize()
+                                .is_ok_and(|root| file.starts_with(root))
+                        })
+                    })
+                })
+        };
+        // Managed restrictions may never disappear because their backing file is
+        // writable or cannot be resolved. Reject that authority instead.
+        for layer in stack.layers_low_to_high() {
+            if is_managed_source(&layer.name)
+                && !trusted_source(&layer.name)
+                && has_child_provider_authority(&layer.config)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed child-provider authority has an untrusted file source",
+                ));
+            }
+        }
         // Parse only the authority owned by this resolver. Unrelated trusted
         // settings may legitimately be corrected by a higher project layer.
         let mut effective = toml::Value::Table(toml::map::Map::new());
         for layer in stack
             .layers_low_to_high()
-            .filter(|layer| is_host_source(&layer.name))
+            .filter(|layer| trusted_source(&layer.name))
         {
             let mut projected = project_child_provider_config(&layer.config);
             if let Some(directory) = source_directory(&layer.name) {
@@ -203,14 +240,10 @@ impl ChildProviderPolicy {
         })?;
         let mut allowed: BTreeSet<_> = allowed.into_iter().collect();
         let mut untrusted_provider_ids = BTreeSet::new();
-        // Configuration files are not required for an agent-writable workspace.
-        // The caller must supply the current host-resolved scope, including cwd
-        // even when explicit workspace roots replace it in the permission model.
-        let mut project_roots = vec![cwd.to_path_buf()];
-        project_roots.extend(workspace_roots.iter().map(|root| root.to_path_buf()));
+        let mut unsafe_host_provider_ids = BTreeSet::new();
         let mut catalog_boundaries = BTreeMap::new();
         for layer in stack.layers_low_to_high() {
-            if is_host_source(&layer.name) {
+            if trusted_source(&layer.name) {
                 if is_managed_source(&layer.name)
                     && let Some(value) = layer
                         .config
@@ -255,14 +288,15 @@ impl ChildProviderPolicy {
                 .and_then(toml::Value::as_table)
             {
                 untrusted_provider_ids.extend(table.keys().cloned());
+                if is_host_source(&layer.name) {
+                    unsafe_host_provider_ids.extend(table.keys().cloned());
+                }
             }
             if layer.config.get("openai_base_url").is_some() {
                 untrusted_provider_ids.insert(OPENAI_PROVIDER_ID.to_owned());
-            }
-            if let ConfigLayerSource::Project { dot_codex_folder } = &layer.name
-                && let Some(root) = dot_codex_folder.as_path().parent()
-            {
-                project_roots.push(root.to_path_buf());
+                if is_host_source(&layer.name) {
+                    unsafe_host_provider_ids.insert(OPENAI_PROVIDER_ID.to_owned());
+                }
             }
         }
         Ok(Self {
@@ -272,6 +306,7 @@ impl ChildProviderPolicy {
             default_provider: agents.default_subagent_model_provider,
             required_provider: stack.required_model_provider().map(str::to_owned),
             untrusted_provider_ids,
+            unsafe_host_provider_ids,
             project_roots,
             catalog_boundaries,
             protected_catalog_roots: protected_catalog_roots
@@ -305,6 +340,17 @@ impl ChildProviderPolicy {
                 "managed policy requires a different provider",
             ));
         }
+        // A reloaded writable host file must not replace even a root-inherited
+        // definition. Root legacy inheritance covers project/session selection,
+        // not newly promoted file-backed authority.
+        if self.unsafe_host_provider_ids.contains(provider_id) {
+            return Err(error(
+                "child_provider_untrusted_source",
+                provider_id,
+                "the host provider definition has an untrusted file source",
+            ));
+        }
+
         if verified_root_id != Some(provider_id) && !self.allowed.contains(provider_id) {
             return Err(error(
                 "child_provider_not_authorized",
@@ -570,6 +616,37 @@ fn is_managed_source(source: &ConfigLayerSource) -> bool {
             | ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
             | ConfigLayerSource::LegacyManagedConfigTomlFromMdm
     )
+}
+
+fn has_child_provider_authority(config: &toml::Value) -> bool {
+    let projected = project_child_provider_config(config);
+    projected.as_table().is_some_and(|table| {
+        table.iter().any(|(key, value)| {
+            key != "agents" || value.as_table().is_none_or(|agents| !agents.is_empty())
+        })
+    })
+}
+
+fn canonical_source_path(file: &Path) -> Option<PathBuf> {
+    // Optional/synthetic missing config files have no symlink target. Resolve
+    // their existing parent; any other filesystem error fails closed.
+    match file.canonicalize() {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(file.parent()?.canonicalize().ok()?.join(file.file_name()?))
+        }
+        Err(_) => None,
+    }
+}
+
+fn source_file(source: &ConfigLayerSource) -> Option<&Path> {
+    match source {
+        ConfigLayerSource::PackagedDefaults { file }
+        | ConfigLayerSource::System { file }
+        | ConfigLayerSource::User { file, .. }
+        | ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.as_path()),
+        _ => None,
+    }
 }
 
 fn source_directory(source: &ConfigLayerSource) -> Option<&Path> {
