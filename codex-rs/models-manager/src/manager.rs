@@ -42,6 +42,16 @@ const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 /// manager owns refresh policy, cache behavior, and catalog merging; it calls
 /// this endpoint only when it decides a remote refresh should happen.
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
+    /// Observe externally replaceable credential state before serving derived
+    /// metadata. Ordinary providers retain the cheap existing identity path.
+    fn reconcile_identity(&self) -> ModelsEndpointFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Synchronous metadata readers cannot perform the required store observation.
+    fn requires_identity_reconciliation(&self) -> bool {
+        false
+    }
     /// Opaque identity of the current provider and credentials, without resolving auth.
     ///
     /// Must distinguish provider routing and authenticated principals within the
@@ -405,6 +415,7 @@ impl ModelsManager for OpenAiModelsManager {
     ) -> ModelsManagerFuture<'_, ()> {
         Box::pin(async move {
             let refresh = async {
+                self.endpoint_client.reconcile_identity().await;
                 // Resolve lazy command credentials before comparing catalog identities.
                 if !self.should_refresh_models().await {
                     return Ok(());
@@ -431,12 +442,16 @@ impl ModelsManager for OpenAiModelsManager {
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move {
+            self.endpoint_client.reconcile_identity().await;
             let entry = self.remote_models.read().await;
             self.models_for_entry(&entry).into_owned()
         })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+        if self.endpoint_client.requires_identity_reconciliation() {
+            return Ok(Vec::new());
+        }
         let entry = self.remote_models.try_read()?;
         Ok(self.models_for_entry(&entry).into_owned())
     }
@@ -452,6 +467,7 @@ impl ModelsManager for OpenAiModelsManager {
         config: &'a ModelsManagerConfig,
     ) -> ModelsManagerFuture<'a, ModelInfo> {
         Box::pin(async move {
+            self.endpoint_client.reconcile_identity().await;
             let remote = {
                 let entry = self.remote_models.read().await;
                 let models = self.models_for_entry(&entry);
@@ -487,6 +503,11 @@ impl ModelsManager for OpenAiModelsManager {
 impl OpenAiModelsManager {
     /// Selects the catalog available under the current provider and auth identity.
     fn models_for_entry<'a>(&self, entry: &'a ModelsCacheEntry) -> Cow<'a, [ModelInfo]> {
+        if self.endpoint_client.requires_identity_reconciliation()
+            && self.endpoint_client.identity().is_none()
+        {
+            return Cow::Borrowed(&[]);
+        }
         if !self.api_key_discovery_disabled()
             && entry.identity.is_some()
             && entry.identity == self.endpoint_client.identity()
@@ -515,6 +536,7 @@ impl OpenAiModelsManager {
 
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
         let refresh_guard = self.catalog_source.refresh_lock().await;
+        self.endpoint_client.reconcile_identity().await;
         let (identity, current_etag) = {
             let entry = self.remote_models.read().await;
             (entry.identity.clone(), entry.etag.clone())
@@ -548,6 +570,7 @@ impl OpenAiModelsManager {
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
         let _refresh_guard = self.catalog_source.refresh_lock().await;
+        self.endpoint_client.reconcile_identity().await;
         // API-key discovery must be enabled and supported before reusing a remote catalog.
         // Otherwise even a matching cache from an earlier run would bypass bundled-only behavior.
         // Command-auth providers retain their existing discovery behavior.
@@ -644,6 +667,7 @@ impl OpenAiModelsManager {
                 return Err(error);
             }
         };
+        self.endpoint_client.reconcile_identity().await;
         if Some(&identity) != self.endpoint_client.identity().as_ref() {
             return Ok(());
         }
@@ -689,10 +713,12 @@ impl OpenAiModelsManager {
         self.endpoint_client.uses_codex_backend().await
             || self.endpoint_client.has_command_auth()
             || self.supports_api_key_discovery()
+            || matches!(&self.catalog_source, CatalogSource::ExplicitProvider(_))
     }
 
     /// Publish only while the request identity still matches, including after async storage.
     async fn apply_remote_models(&self, mut entry: ModelsCacheEntry) -> bool {
+        self.endpoint_client.reconcile_identity().await;
         let mut current = self.remote_models.write().await;
         if entry.identity != self.endpoint_client.identity() {
             return false;
@@ -729,6 +755,7 @@ impl OpenAiModelsManager {
         let Some(cache) = self.cache.as_ref() else {
             return false;
         };
+        self.endpoint_client.reconcile_identity().await;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::client_version_to_whole();

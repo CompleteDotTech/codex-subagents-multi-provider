@@ -11,6 +11,15 @@ use sha2::Sha256;
 
 use crate::auth::resolve_provider_auth;
 
+pub(crate) fn with_gateway_scope(base: String, gateway_scope: &str) -> String {
+    let mut digest = Sha256::new();
+    for field in ["models-gateway-scope-v1", &base, gateway_scope] {
+        digest.update((field.len() as u64).to_le_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 pub(crate) fn identity(
     provider_info: &ModelProviderInfo,
     auth: Option<&CodexAuth>,

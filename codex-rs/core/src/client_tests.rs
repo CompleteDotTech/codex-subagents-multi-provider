@@ -494,6 +494,7 @@ async fn provider_catalog_tiers_are_enforced_on_actual_http_requests() -> anyhow
         let mut provider =
             ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
         provider.requires_openai_auth = false;
+        provider.model_catalog_url = Some(format!("{}/models", server.uri()).into());
         provider.supports_websockets = false;
         let mut client = test_model_client(SessionSource::Cli);
         let state = Arc::get_mut(&mut client.state).unwrap();
@@ -540,6 +541,98 @@ async fn provider_catalog_tiers_are_enforced_on_actual_http_requests() -> anyhow
             expected,
             "provider {provider_id}, advertised {advertised}, requested {requested}"
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn authoritative_catalog_fallback_is_rejected_before_auth_helpers_or_transport()
+-> anyhow::Result<()> {
+    for websockets in [false, true] {
+        let home = TempDir::new()?;
+        let server = MockServer::start().await;
+        let mut info =
+            ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+        info.model_catalog_url = Some(format!("{}/models", server.uri()).into());
+        info.requires_openai_auth = false;
+        info.supports_websockets = websockets;
+        info.auth = Some(codex_protocol::config_types::ModelProviderAuthInfo {
+            command: if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/D", "/C", "echo invoked>marker&echo fixture-token"]
+            } else {
+                vec!["-c", "printf invoked > marker; printf fixture-token"]
+            }
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            timeout_ms: std::num::NonZeroU64::new(5000).unwrap(),
+            refresh_interval_ms: 60000,
+            cwd: home.path().try_into().unwrap(),
+        });
+        let mut client = test_model_client(SessionSource::Cli);
+        Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(info, None);
+        let mut model = test_model_info();
+        model.used_fallback_model_metadata = true;
+        let metadata = test_responses_metadata_for_client(
+            &client,
+            None,
+            format!("{}:0", client.state.thread_id),
+            None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+        let telemetry = test_session_telemetry();
+        let prompt = Prompt::default();
+        let mut session = client.new_session();
+        let error = session
+            .preconnect_websocket(&model, None, &telemetry, &metadata)
+            .await
+            .err()
+            .expect("invalid catalog must fail preconnect");
+        assert!(
+            error
+                .to_string()
+                .contains("child_provider_model_unavailable")
+        );
+        let error = session
+            .prewarm_websocket(
+                &prompt,
+                &model,
+                &telemetry,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+            )
+            .await
+            .err()
+            .expect("invalid catalog must fail prewarm");
+        assert!(
+            error
+                .to_string()
+                .contains("child_provider_model_unavailable")
+        );
+        let error = session
+            .stream(
+                &prompt,
+                &model,
+                &telemetry,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+                &InferenceTraceContext::disabled(),
+            )
+            .await
+            .err()
+            .expect("invalid catalog must fail inference");
+        assert!(
+            error
+                .to_string()
+                .contains("child_provider_model_unavailable")
+        );
+        assert!(!home.path().join("marker").exists());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
     Ok(())
 }

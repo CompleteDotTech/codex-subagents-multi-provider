@@ -4,6 +4,169 @@ use super::*;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 
+#[derive(Debug)]
+struct ObservedEndpoint {
+    persisted: Mutex<Option<String>>,
+    observed: Mutex<Option<String>>,
+    replace_during_fetch: bool,
+}
+
+impl ModelsEndpointClient for ObservedEndpoint {
+    fn identity(&self) -> Option<String> {
+        self.observed.lock().unwrap().clone()
+    }
+    fn reconcile_identity(&self) -> ModelsEndpointFuture<'_, ()> {
+        Box::pin(async move {
+            *self.observed.lock().unwrap() = self.persisted.lock().unwrap().clone();
+        })
+    }
+    fn requires_identity_reconciliation(&self) -> bool {
+        true
+    }
+    fn has_command_auth(&self) -> bool {
+        true
+    }
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+    fn list_models<'a>(
+        &'a self,
+        _version: &'a str,
+        _http: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+        Box::pin(async move {
+            let identity = self.identity().unwrap();
+            if self.replace_during_fetch {
+                *self.persisted.lock().unwrap() = Some("grant-b".into());
+            }
+            Ok(ModelsEndpointResponse {
+                models: vec![remote_model("shared", "Grant A", 0)],
+                etag: None,
+                identity,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ReplacingCache {
+    endpoint: Arc<ObservedEndpoint>,
+    replace_during_store: bool,
+    entry: Mutex<Option<ModelsCacheEntry>>,
+}
+
+impl ModelsCache for ReplacingCache {
+    fn load<'a>(
+        &'a self,
+        version: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
+        Box::pin(async move {
+            Ok(self
+                .entry
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|entry| entry.client_version.as_deref() == Some(version)))
+        })
+    }
+    fn store<'a>(
+        &'a self,
+        entry: &'a ModelsCacheEntry,
+    ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
+        Box::pin(async move {
+            *self.entry.lock().unwrap() = Some(entry.clone());
+            if self.replace_during_store {
+                *self.endpoint.persisted.lock().unwrap() = Some("grant-b".into());
+            }
+            Ok(())
+        })
+    }
+    fn refresh_ttl<'a>(
+        &'a self,
+        _version: &'a str,
+        _identity: &'a str,
+        _etag: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn persisted_identity_changes_during_fetch_or_cache_write_cannot_publish_stale_metadata() {
+    for during_fetch in [false, true] {
+        let endpoint = Arc::new(ObservedEndpoint {
+            persisted: Mutex::new(Some("grant-a".into())),
+            observed: Mutex::new(None),
+            replace_during_fetch: during_fetch,
+        });
+        let cache = Arc::new(ReplacingCache {
+            endpoint: endpoint.clone(),
+            replace_during_store: !during_fetch,
+            entry: Mutex::new(None),
+        });
+        let manager = OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
+            .with_provider_catalog();
+        assert!(
+            manager
+                .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+                .models
+                .is_empty()
+        );
+        assert_eq!(endpoint.identity().as_deref(), Some("grant-b"));
+        assert_eq!(cache.entry.lock().unwrap().is_some(), !during_fetch);
+        assert!(manager.get_remote_models().await.is_empty());
+        assert!(manager.try_get_remote_models().unwrap().is_empty());
+        assert!(
+            manager
+                .get_model_info("shared", &ModelsManagerConfig::default())
+                .await
+                .used_fallback_model_metadata
+        );
+        assert!(
+            manager
+                .raw_model_catalog(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+                .await
+                .models
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn metadata_reads_observe_persisted_identity_changes_without_catalog_refresh() {
+    let endpoint = Arc::new(ObservedEndpoint {
+        persisted: Mutex::new(Some("grant-a".into())),
+        observed: Mutex::new(None),
+        replace_during_fetch: false,
+    });
+    let manager =
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), None).with_provider_catalog();
+    assert_eq!(
+        manager
+            .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+            .models
+            .len(),
+        1
+    );
+    assert!(
+        !manager
+            .get_model_info("shared", &ModelsManagerConfig::default())
+            .await
+            .used_fallback_model_metadata
+    );
+    *endpoint.persisted.lock().unwrap() = None;
+    assert!(
+        manager
+            .get_model_info("shared", &ModelsManagerConfig::default())
+            .await
+            .used_fallback_model_metadata
+    );
+    assert!(manager.get_remote_models().await.is_empty());
+    assert!(manager.try_get_remote_models().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn partitioned_files_preserve_same_slug_metadata_for_each_provider_and_tenant() {
     let home = tempdir().unwrap();

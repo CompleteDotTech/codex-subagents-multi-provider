@@ -3,6 +3,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use codex_api::AgentIdentityTelemetry;
@@ -39,7 +40,7 @@ use tokio::time::timeout;
 use crate::auth::ResolvedProviderAuth;
 use crate::auth::agent_identity_telemetry;
 use crate::auth::resolve_provider_auth;
-use crate::combined_auth::compose_auth;
+use crate::combined_auth::compose_catalog_auth;
 
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const MODELS_ENDPOINT: &str = "/models";
@@ -53,6 +54,8 @@ pub(crate) struct OpenAiModelsEndpoint {
     auth_manager: Option<Arc<AuthManager>>,
     gateway_auth_manager: Option<Result<Arc<GatewayAuthManager>, String>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
+    gateway_scope: RwLock<Option<String>>,
+    gateway_reconciliation: tokio::sync::Mutex<()>,
 }
 
 impl OpenAiModelsEndpoint {
@@ -71,6 +74,8 @@ impl OpenAiModelsEndpoint {
             auth_manager,
             gateway_auth_manager,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder { redirect_policy }),
+            gateway_scope: RwLock::new(None),
+            gateway_reconciliation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -107,7 +112,7 @@ impl OpenAiModelsEndpoint {
             "codex.remote_models.fetch_update.duration_ms",
             &[("auth_mode", metric_auth_mode)],
         );
-        let identity = crate::models_identity::identity(&self.provider_info, auth.as_ref())?;
+        let base_identity = crate::models_identity::identity(&self.provider_info, auth.as_ref())?;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let mut api_provider = self.provider_info.to_api_provider(auth_mode)?;
         if (auth.as_ref().is_some_and(CodexAuth::is_api_key_auth) || self.has_provider_api_key())
@@ -118,12 +123,16 @@ impl OpenAiModelsEndpoint {
             // Codex metadata is served by the Codex backend, not the public /v1/models API.
             api_provider.base_url = CHATGPT_CODEX_BASE_URL.to_string();
         }
-        let resolved = compose_auth(
+        let (resolved, gateway_scope) = compose_catalog_auth(
             &self.provider_info,
             self.gateway_auth_manager.as_ref(),
             ResolvedProviderAuth::new(resolve_provider_auth(auth.as_ref(), &self.provider_info)?),
         )
         .await?;
+        let identity = match gateway_scope {
+            Some(scope) => crate::models_identity::with_gateway_scope(base_identity, &scope),
+            None => base_identity,
+        };
         let api_auth = resolved.auth;
         let request_url = match self.provider_info.model_catalog_url.as_deref() {
             Some(catalog_url) => ModelsClient::<ReqwestTransport>::catalog_request_url(
@@ -211,6 +220,30 @@ impl OpenAiModelsEndpoint {
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn requires_identity_reconciliation(&self) -> bool {
+        self.provider_info.gateway_oauth.is_some()
+    }
+
+    fn reconcile_identity(&self) -> ModelsEndpointFuture<'_, ()> {
+        Box::pin(async move {
+            if self.provider_info.gateway_oauth.is_none() {
+                return;
+            }
+            let _guard = self.gateway_reconciliation.lock().await;
+            *self
+                .gateway_scope
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            let scope = match self.gateway_auth_manager.as_ref() {
+                Some(Ok(manager)) => manager.observe_credential_identity().await.ok().flatten(),
+                _ => None,
+            };
+            *self
+                .gateway_scope
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = scope;
+        })
+    }
     fn supports_api_key_models(&self) -> bool {
         self.provider_info.model_catalog_url.is_some()
             || (self.provider_info.is_openai() && self.provider_info.base_url.is_none())
@@ -226,7 +259,15 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
             .auth_manager
             .as_ref()
             .and_then(|manager| manager.auth_cached());
-        crate::models_identity::identity(&self.provider_info, auth.as_ref()).ok()
+        let base = crate::models_identity::identity(&self.provider_info, auth.as_ref()).ok()?;
+        if self.provider_info.gateway_oauth.is_none() {
+            return Some(base);
+        }
+        self.gateway_scope
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .map(|scope| crate::models_identity::with_gateway_scope(base, scope))
     }
 
     fn has_command_auth(&self) -> bool {
@@ -397,6 +438,10 @@ impl RequestTelemetry for ModelsRequestTelemetry {
 mod timeout_tests;
 
 #[cfg(test)]
+#[path = "models_endpoint_gateway_tests.rs"]
+mod gateway_tests;
+
+#[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
@@ -487,6 +532,8 @@ mod tests {
             let capture = Arc::new(CaptureModelsUrl(Mutex::new(/*t*/ None)));
             let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-api-key"));
             let endpoint = Arc::new(OpenAiModelsEndpoint {
+                gateway_scope: RwLock::new(None),
+                gateway_reconciliation: tokio::sync::Mutex::new(()),
                 provider_info: ModelProviderInfo {
                     name: name.to_string(),
                     ..ModelProviderInfo::create_openai_provider(base_url.map(str::to_string))
@@ -527,6 +574,8 @@ mod tests {
             let capture = Arc::new(CaptureModelsUrl(Mutex::new(/*t*/ None)));
             let auth_manager = auth.map(AuthManager::from_auth_for_testing);
             let endpoint = Arc::new(OpenAiModelsEndpoint {
+                gateway_scope: RwLock::new(None),
+                gateway_reconciliation: tokio::sync::Mutex::new(()),
                 provider_info: ModelProviderInfo {
                     experimental_bearer_token: Some("provider-key".into()),
                     ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
@@ -607,6 +656,8 @@ mod tests {
 
         let observed_request = Arc::new(Mutex::new(None));
         let endpoint = OpenAiModelsEndpoint {
+            gateway_scope: RwLock::new(None),
+            gateway_reconciliation: tokio::sync::Mutex::new(()),
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             gateway_auth_manager: None,
@@ -653,6 +704,8 @@ mod tests {
             "eu".into(),
         )]));
         let endpoint = OpenAiModelsEndpoint {
+            gateway_scope: RwLock::new(None),
+            gateway_reconciliation: tokio::sync::Mutex::new(()),
             provider_info,
             auth_manager: None,
             gateway_auth_manager: None,

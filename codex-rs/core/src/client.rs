@@ -989,6 +989,7 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
         include_internal: bool,
     ) -> Result<ResponsesApiRequest> {
+        self.validate_catalog_metadata(model_info)?;
         let mut input = prompt.get_formatted_input_for_request(model_info);
         if !self.reasoning_effort_override_enabled(model_info) {
             // Unsupported models and disabled overrides must also accept saved history.
@@ -1124,6 +1125,17 @@ impl ModelClient {
             access_programs: None,
         };
         Ok(request)
+    }
+
+    fn validate_catalog_metadata(&self, model_info: &ModelInfo) -> Result<()> {
+        if self.state.provider.info().model_catalog_url.is_some()
+            && model_info.used_fallback_model_metadata
+        {
+            return Err(CodexErr::InvalidRequest(
+                "child_provider_model_unavailable: authoritative provider catalog metadata is unavailable".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn prepare_response_items_for_request(&self, input: &mut [ResponseItem]) {
@@ -1601,6 +1613,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
+        self.client.validate_catalog_metadata(model_info)?;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -1808,6 +1821,7 @@ impl ResponsesHttpExecutor<'_> {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.client.validate_catalog_metadata(model_info)?;
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
             .as_ref()
@@ -2008,6 +2022,7 @@ impl ModelClientSession {
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
+        self.client.validate_catalog_metadata(model_info)?;
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
@@ -2337,6 +2352,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
+        self.client.validate_catalog_metadata(model_info)?;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -2399,6 +2415,7 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.client.validate_catalog_metadata(model_info)?;
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
