@@ -257,6 +257,7 @@ pub(crate) struct RetainedAgentAuthority {
     pub(crate) settings: ThreadSettingsSnapshot,
     pub(crate) scope: ChildProviderScope,
     pub(crate) source: SessionSource,
+    root_session_id: codex_protocol::SessionId,
     model_authority: Option<String>,
     registration_id: Uuid,
     session_allocation: usize,
@@ -281,6 +282,7 @@ impl RetainedAgentAuthority {
             .as_ref()
             .and_then(durable::model_fingerprint);
         Arc::new(Self {
+            root_session_id: session.session_id(),
             model_authority,
             registration_id,
             session_allocation,
@@ -541,6 +543,7 @@ impl ChildResumePermit {
             || current.settings != caller_epoch.settings
             || current.scope != caller_epoch.scope
             || current.model_authority != caller_epoch.model_authority
+            || current.root_session_id != caller_epoch.root_session_id
         {
             return Err(invalid(
                 "resume caller authority changed during preparation",
@@ -575,6 +578,11 @@ impl ChildResumePermit {
         let target = saved.conversation_id;
         let ceiling = runtime.retained_authority(target);
         if let Some(ceiling) = &ceiling {
+            if ceiling.root_session_id != caller.session.session_id()
+                || ceiling.root_session_id != meta.session_id
+            {
+                return Err(invalid("saved runtime belongs to another actual host root"));
+            }
             if ceiling.thread_id != target
                 || ceiling.source != *source
                 || ceiling.config.model_provider_id != config.model_provider_id
@@ -955,6 +963,7 @@ impl ChildResumePermit {
             || current.settings != self.caller_epoch.settings
             || current.scope != self.caller_epoch.scope
             || current.model_authority != self.caller_epoch.model_authority
+            || current.root_session_id != self.caller_epoch.root_session_id
         {
             return Err(invalid("resume caller authority changed before admission"));
         }

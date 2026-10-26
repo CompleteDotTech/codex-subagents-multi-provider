@@ -2939,7 +2939,7 @@ impl ThreadManagerState {
             )
         {
             if let Err(error) = self
-                .begin_native_authority_epoch(retained_authority.epoch(&session))
+                .begin_native_authority_epoch(retained_authority.epoch())
                 .await
             {
                 if let Err(shutdown_error) = io.shutdown_and_wait().await {

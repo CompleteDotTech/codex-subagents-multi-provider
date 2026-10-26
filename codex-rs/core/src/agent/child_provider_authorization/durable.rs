@@ -14,11 +14,11 @@ use std::path::Path;
 use std::path::PathBuf;
 
 impl RetainedAgentAuthority {
-    pub(crate) fn epoch(&self, session: &Session) -> NativeAuthorityEpoch {
+    pub(crate) fn epoch(&self) -> NativeAuthorityEpoch {
         NativeAuthorityEpoch {
             version: codex_thread_store::NATIVE_AUTHORITY_VERSION,
             thread_id: self.thread_id,
-            root_thread_id: session.session_id().into(),
+            root_thread_id: self.root_session_id.into(),
             parent_thread_id: self.source.parent_thread_id(),
             generation: self.registration_id,
         }
@@ -393,7 +393,7 @@ pub(crate) async fn seal_stopped(
     }
     manager
         .seal_native_authority_receipt(NativeAuthorityReceipt {
-            epoch: authority.epoch(&thread.session),
+            epoch: authority.epoch(),
             fingerprint,
         })
         .await?;

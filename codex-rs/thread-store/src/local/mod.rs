@@ -512,7 +512,7 @@ impl LocalThreadStore {
 impl ThreadStore for LocalThreadStore {
     fn native_authority_storage(&self) -> Option<crate::NativeAuthorityStorage> {
         let actual = self.state_db.as_ref()?.sqlite();
-        if actual != &self.config.sqlite {
+        if actual.state_db_path() != self.config.sqlite.state_db_path() {
             return None;
         }
         Some(crate::NativeAuthorityStorage::Local {

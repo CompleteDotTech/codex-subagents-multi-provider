@@ -1335,6 +1335,19 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
 #[tokio::test]
 async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
     let fixture = Fixture::new().await;
+    let catalog_path = fixture._host.path().join("zai.json");
+    let mut original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+    original["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["slug"] == "shared")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("node_repl_disabled".into(), serde_json::Value::Bool(true));
+    std::fs::write(&catalog_path, serde_json::to_vec(&original).unwrap()).unwrap();
     let resolved = fixture.resolved("zai").await;
     let config = fixture
         .prepared(&resolved, None, None)
@@ -1364,14 +1377,14 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
         .unwrap()
         .as_object_mut()
         .unwrap();
-    let before = model
-        .get("node_repl_disabled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    model.insert(
-        "node_repl_disabled".into(),
-        serde_json::Value::Bool(!before),
+    assert_eq!(
+        model
+            .get("node_repl_disabled")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
     );
+    // Removing an actual old model restriction widens the proposed runtime.
+    model.insert("node_repl_disabled".into(), serde_json::Value::Bool(false));
     std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
     let runtime = &fixture.parent.session.services.local_agent_runtime;
     let error = runtime
@@ -1394,4 +1407,88 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
         fixture.manager.list_thread_ids().await,
         vec![fixture.parent.session.thread_id]
     );
+}
+
+#[tokio::test]
+async fn warm_saved_metadata_cannot_transplant_a_child_between_real_roots_in_one_runtime() {
+    let fixture = Fixture::new().await;
+    let config = fixture
+        .prepared(&fixture.resolved("zai").await, None, None)
+        .await
+        .unwrap()
+        .config;
+    let child = fixture.start_native_child(config).await;
+    child.ensure_rollout_materialized().await;
+    child.session.flush_rollout().await.unwrap();
+    let saved = child.read_thread(true, true).await.unwrap();
+    child.shutdown_and_wait().await.unwrap();
+    fixture
+        .manager
+        .remove_thread(&child.session.thread_id)
+        .await
+        .unwrap();
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    let other = fixture
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(fixture.config.clone()),
+            runtime.control(fixture.parent.session.session_id()),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        other.thread.session.session_id(),
+        fixture.parent.session.session_id()
+    );
+    let mut items = saved.history.unwrap().items;
+    for item in &mut items {
+        if let codex_history::RolloutItem::SessionMeta(meta) = item {
+            meta.meta.session_id = other.thread.session.session_id();
+        }
+    }
+    let history = codex_history::InitialHistory::Resumed(codex_history::ResumedHistory {
+        history_revision: None,
+        conversation_id: child.session.thread_id,
+        history: Arc::new(items),
+        rollout_path: saved.rollout_path,
+    });
+    let turn = other.thread.session.new_default_turn().await;
+    let mut candidate = build_agent_resume_config(&turn).unwrap();
+    candidate.model_provider_id = saved.model_provider;
+    candidate.model = saved.model;
+    candidate.model_reasoning_effort = saved.reasoning_effort;
+    let caller = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+        &other.thread.session,
+        &other.thread.session_source,
+    )
+    .await;
+    let error = crate::agent::child_provider_authorization::ChildResumePermit::prepare(
+        runtime,
+        Arc::clone(&other.thread),
+        caller,
+        &mut candidate,
+        &history,
+        &child.session_source,
+        Some(fixture.parent.session.thread_id),
+        &saved.permission_profile,
+        saved.approval_mode,
+        codex_protocol::protocol::MultiAgentVersion::V1,
+        &mut None,
+        None,
+    )
+    .await
+    .err()
+    .expect("mutable saved metadata cannot replace actual host root ownership");
+    assert!(
+        error.to_string().contains("another actual host root"),
+        "{error}"
+    );
+    assert!(
+        fixture
+            .manager
+            .get_thread(child.session.thread_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.manager.list_thread_ids().await.len(), 2);
 }
