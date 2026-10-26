@@ -167,7 +167,7 @@ mod test {
     use tracing_test::traced_test;
 
     fn provider_config(dir_name: &str) -> ProviderConfig {
-        let fs = Fs::from_test_dir(format!("test-data/profile-provider/{}/fs", dir_name), "/");
+        let fs = Fs::from_test_dir(format!("test-data/profile-provider/{dir_name}/fs"), "/");
         let env = Env::from_slice(&[("HOME", "/home")]);
         ProviderConfig::empty()
             .with_fs(fs)

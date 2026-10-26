@@ -81,7 +81,7 @@ mod test {
                         )
                         .build(),
                 ),
-                None,
+                /*profile_name_override*/ None,
             )
             .with_fs(Fs::from_slice(&[(
                 "conf",
@@ -108,7 +108,7 @@ mod test {
                         )
                         .build(),
                 ),
-                None,
+                /*profile_name_override*/ None,
             )
             .with_fs(Fs::from_slice(&[(
                 "conf",

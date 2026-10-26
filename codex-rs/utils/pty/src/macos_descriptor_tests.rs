@@ -143,6 +143,12 @@ async fn high_stdio_descriptors_use_compatible_fallback() -> anyhow::Result<()> 
             ])
             .env("CODEX_TEST_HIGH_STDIO_FDS", "1")
             .output()?;
+        let stderr = &output.stderr[..output.stderr.len().min(8 * 1024)];
+        eprintln!(
+            "high-fd isolated child status={} stderr (at most 8192 bytes):\n{}",
+            output.status,
+            String::from_utf8_lossy(stderr)
+        );
         assert!(output.status.success(), "{output:?}");
         return Ok(());
     }
@@ -152,21 +158,114 @@ async fn high_stdio_descriptors_use_compatible_fallback() -> anyhow::Result<()> 
     // subprocess raises its soft limit; the test runner and host are unchanged.
     assert_eq!(
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
-        0
+        0,
+        "high-fd phase=original-limit errno={:?}",
+        io::Error::last_os_error().raw_os_error()
     );
     let mut limit = unsafe { limit.assume_init() };
+    eprintln!(
+        "high-fd phase=original-limit pid={} soft={} hard={}",
+        std::process::id(),
+        limit.rlim_cur,
+        limit.rlim_max
+    );
     limit.rlim_cur = limit.rlim_cur.max(16_384);
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
+        0,
+        "high-fd phase=set-limit requested_soft={} requested_hard={} errno={:?}",
+        limit.rlim_cur,
+        limit.rlim_max,
+        io::Error::last_os_error().raw_os_error()
+    );
+    let mut readback = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes writable storage without changing limits.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, readback.as_mut_ptr()) },
+        0,
+        "high-fd phase=limit-readback errno={:?}",
+        io::Error::last_os_error().raw_os_error()
+    );
+    let readback = unsafe { readback.assume_init() };
+    eprintln!(
+        "high-fd phase=limit-readback requested_soft={} requested_hard={} soft={} hard={}",
+        limit.rlim_cur, limit.rlim_max, readback.rlim_cur, readback.rlim_max
+    );
+    // This fixed, read-only query finishes before descriptor exhaustion. Its
+    // availability is diagnostic only and does not affect the test assertions.
+    match std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.maxfiles", "kern.maxfilesperproc"])
+        .output()
+    {
+        Ok(output) => {
+            let values = std::str::from_utf8(&output.stdout)
+                .ok()
+                .filter(|_| output.stdout.len() <= 128)
+                .and_then(|text| {
+                    let mut lines = text.split_whitespace();
+                    let maxfiles = lines.next()?.parse::<u64>().ok()?;
+                    let maxfilesperproc = lines.next()?.parse::<u64>().ok()?;
+                    lines
+                        .next()
+                        .is_none()
+                        .then_some((maxfiles, maxfilesperproc))
+                });
+            if output.status.success()
+                && let Some((maxfiles, maxfilesperproc)) = values
+            {
+                eprintln!(
+                    "high-fd phase=kernel-limits kern.maxfiles={maxfiles} kern.maxfilesperproc={maxfilesperproc} status={}",
+                    output.status
+                );
+            } else {
+                eprintln!(
+                    "high-fd phase=kernel-limits unavailable status={} stdout_bytes={} stderr_bytes={} numeric_pair={}",
+                    output.status,
+                    output.stdout.len(),
+                    output.stderr.len(),
+                    values.is_some()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "high-fd phase=kernel-limits unavailable errno={:?} error={error}",
+            error.raw_os_error()
+        ),
+    }
+    let diagnostic = |phase: &str, count: usize, highest: i32, error: io::Error| {
+        let context = format!(
+            "high-fd phase={phase} allocated={count} highest_fd={highest} soft={} hard={} errno={:?}",
+            readback.rlim_cur,
+            readback.rlim_max,
+            error.raw_os_error()
+        );
+        anyhow::Error::new(error).context(context)
+    };
 
-    let file = fs::File::open("/dev/null")?;
+    let file =
+        fs::File::open("/dev/null").map_err(|error| diagnostic("open-dev-null", 0, -1, error))?;
     // SAFETY: Create a new inheritable descriptor to check fallback isolation.
     let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 3) };
-    anyhow::ensure!(raw >= 3, "{}", io::Error::last_os_error());
+    anyhow::ensure!(
+        raw >= 3,
+        "{}",
+        diagnostic(
+            "sentinel-dup",
+            0,
+            file.as_raw_fd(),
+            io::Error::last_os_error()
+        )
+    );
     let sentinel = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut occupied = Vec::new();
+    let mut highest = file.as_raw_fd().max(sentinel.as_raw_fd());
+    eprintln!("high-fd phase=before-allocation allocated=0 highest_fd={highest}");
     loop {
-        let descriptor = file.try_clone()?;
+        let descriptor = file
+            .try_clone()
+            .map_err(|error| diagnostic("allocate", occupied.len(), highest, error))?;
         let raw = descriptor.as_raw_fd();
+        highest = highest.max(raw);
         occupied.push(descriptor);
         // Darwin's spawn file actions reject valid descriptors >= OPEN_MAX
         // (10240), even when RLIMIT_NOFILE allows the descriptor to be opened.
@@ -177,13 +276,27 @@ async fn high_stdio_descriptors_use_compatible_fallback() -> anyhow::Result<()> 
 
     let mut strict = Command::new("/usr/bin/true");
     strict.fallback(SpawnFallback::ReturnError);
+    eprintln!(
+        "high-fd phase=before-strict-spawn allocated={} highest_fd={highest}",
+        occupied.len()
+    );
     let error = strict
         .spawn()
         .err()
         .expect("native high-fd action must fail");
+    eprintln!(
+        "high-fd phase=strict-spawn-result allocated={} highest_fd={highest} errno={:?}",
+        occupied.len(),
+        error.raw_os_error()
+    );
     assert_eq!(error.raw_os_error(), Some(libc::EBADF));
 
     for mode in [ProcessMode::NewGroup, ProcessMode::NewSession] {
+        let mode_name = match mode {
+            ProcessMode::NewGroup => "new-group",
+            ProcessMode::NewSession => "new-session",
+            ProcessMode::Inherit => unreachable!("only isolated process modes are tested"),
+        };
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", &format!(
@@ -192,7 +305,18 @@ async fn high_stdio_descriptors_use_compatible_fallback() -> anyhow::Result<()> 
             )])
             .descriptor_policy(DescriptorPolicy::Explicit)
             .process_mode(mode);
-        let mut child = command.spawn()?;
+        eprintln!(
+            "high-fd phase=before-fallback-spawn mode={mode_name} allocated={} highest_fd={highest}",
+            occupied.len()
+        );
+        let mut child = command.spawn().map_err(|error| {
+            diagnostic(
+                &format!("fallback-spawn-{mode_name}"),
+                occupied.len(),
+                highest,
+                error,
+            )
+        })?;
         assert!(matches!(child.inner, ChildKind::Tokio(_)));
         let pid = child.id().expect("live child") as libc::pid_t;
         // SAFETY: The child waits for input and still owns this PID.
@@ -202,8 +326,23 @@ async fn high_stdio_descriptors_use_compatible_fallback() -> anyhow::Result<()> 
             .take()
             .expect("piped stdin")
             .write_all(b"round trip\n")
-            .await?;
-        let output = child.wait_with_output().await?;
+            .await
+            .map_err(|error| {
+                diagnostic(
+                    &format!("fallback-write-{mode_name}"),
+                    occupied.len(),
+                    highest,
+                    error,
+                )
+            })?;
+        let output = child.wait_with_output().await.map_err(|error| {
+            diagnostic(
+                &format!("fallback-wait-{mode_name}"),
+                occupied.len(),
+                highest,
+                error,
+            )
+        })?;
         assert_eq!(
             (output.status.code(), output.stdout, output.stderr),
             (Some(23), b"round trip".to_vec(), b"diagnostic".to_vec())
