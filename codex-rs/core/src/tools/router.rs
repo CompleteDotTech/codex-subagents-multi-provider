@@ -406,7 +406,24 @@ impl ToolRouter {
                     "this provider must use function tool calls".to_string(),
                 ));
             };
-            if matches!(&*registered.spec(), ToolSpec::Freeform(_)) {
+            let spec = registered.spec();
+            let freeform = match &*spec {
+                ToolSpec::Freeform(_) => true,
+                ToolSpec::Namespace(namespace) => {
+                    namespace.name
+                        == call
+                            .tool_name
+                            .namespace
+                            .as_deref()
+                            .unwrap_or(codex_protocol::DEFAULT_FUNCTION_NAMESPACE)
+                        && namespace.tools.iter().any(|tool| {
+                            matches!(tool,
+                        ResponsesApiNamespaceTool::Custom(tool) if tool.name == call.tool_name.name)
+                        })
+                }
+                _ => false,
+            };
+            if freeform {
                 call.payload = ToolPayload::Custom {
                     input: crate::client::responses_compatibility::decode_freeform(arguments)
                         .map_err(FunctionCallError::RespondToModel)?,

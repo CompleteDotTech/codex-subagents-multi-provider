@@ -77,6 +77,10 @@ async fn stateless_code_mode_keeps_nested_freeform_and_namespaced_function_calls
     extensions.tool_contributor(Arc::new(NamespacedEcho {
         calls: calls.clone(),
     }));
+    extensions.tool_contributor(Arc::new(NamespacedCustomTool {
+        generation: 0,
+        generations: Arc::new(AtomicUsize::new(0)),
+    }));
     let base_url = format!("{}/v1", server.uri());
     let mut builder = test_codex()
         .with_model("portable-code-mode")
@@ -117,6 +121,15 @@ text(JSON.stringify({{ echo, denied, patchCompleted:true }}));
     let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
+            sse(vec![
+                ev_response_created("direct-editor"),
+                responses::ev_function_call(
+                    "editor-direct",
+                    "editor__apply_patch",
+                    &serde_json::json!({"input":"direct raw patch\n"}).to_string(),
+                ),
+                ev_completed("direct-editor"),
+            ]),
             sse(vec![
                 ev_response_created("cell"),
                 responses::ev_function_call(
@@ -163,8 +176,16 @@ text(JSON.stringify({{ echo, denied, patchCompleted:true }}));
         "only validated native invocation executes"
     );
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 2);
-    let body = requests[1].body_json();
+    assert_eq!(requests.len(), 3);
+    let direct: Value = serde_json::from_str(
+        &requests[1]
+            .function_call_output_text("editor-direct")
+            .expect("bridged namespaced custom output"),
+    )?;
+    assert_eq!(direct["namespace"], "editor");
+    assert_eq!(direct["name"], "apply_patch");
+    assert_eq!(direct["input"], "direct raw patch\n");
+    let body = requests[2].body_json();
     assert!(body.get("previous_response_id").is_none());
     assert!(
         body["tools"]
@@ -173,7 +194,7 @@ text(JSON.stringify({{ echo, denied, patchCompleted:true }}));
             .iter()
             .all(|tool| tool["type"] == "function")
     );
-    let output = requests[1]
+    let output = requests[2]
         .function_call_output_text("cell-call")
         .expect("portable Code Mode result");
     let items: Vec<Value> = serde_json::from_str(&output)?;
