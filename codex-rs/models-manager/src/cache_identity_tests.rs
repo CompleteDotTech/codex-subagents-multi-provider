@@ -46,7 +46,7 @@ impl ModelsEndpointClient for ObservedEndpoint {
                 *self.persisted.lock().unwrap() = Some("grant-b".into());
             }
             Ok(ModelsEndpointResponse {
-                models: vec![remote_model("shared", "Grant A", 0)],
+                models: vec![remote_model("shared", "Grant A", /*priority*/ 0)],
                 etag: None,
                 identity,
             })
@@ -110,8 +110,12 @@ async fn persisted_identity_changes_during_fetch_or_cache_write_cannot_publish_s
             replace_during_store: !during_fetch,
             entry: Mutex::new(None),
         });
-        let manager = OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
-            .with_provider_catalog();
+        let manager = OpenAiModelsManager::new_with_cache(
+            cache.clone(),
+            endpoint.clone(),
+            /*auth_manager*/ None,
+        )
+        .with_provider_catalog();
         assert!(
             manager
                 .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
@@ -147,7 +151,8 @@ async fn metadata_reads_observe_persisted_identity_changes_without_catalog_refre
         replace_during_fetch: false,
     });
     let manager =
-        OpenAiModelsManager::new_without_cache(endpoint.clone(), None).with_provider_catalog();
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), /*auth_manager*/ None)
+            .with_provider_catalog();
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
@@ -179,9 +184,9 @@ async fn partitioned_files_preserve_same_slug_metadata_for_each_provider_and_ten
     let path = home.path().join(MODEL_CACHE_FILE);
     let cache = FileModelsCache::partitioned(path.clone(), DEFAULT_MODEL_CACHE_TTL);
     let version = crate::client_version_to_whole();
-    let mut first = remote_model("shared", "OpenAI", 0);
+    let mut first = remote_model("shared", "OpenAI", /*priority*/ 0);
     first.context_window = Some(128_000);
-    let mut second = remote_model("shared", "GLM", 0);
+    let mut second = remote_model("shared", "GLM", /*priority*/ 0);
     second.context_window = Some(32_000);
     second.default_reasoning_level = Some(ReasoningEffort::Low);
     let entry = |identity: &str, model| ModelsCacheEntry {
@@ -340,14 +345,14 @@ impl ModelsEndpointClient for RejectedAttemptEndpoint {
             if self.reject.swap(false, Ordering::SeqCst) {
                 // The actual rejected B request differs from preflight/current A.
                 return Err(ModelsEndpointError {
-                    error: catalog_http_error(403),
+                    error: catalog_http_error(/*status*/ 403),
                     identity: Some("grant-b".into()),
                 });
             }
             Ok(ModelsEndpointResponse {
                 identity: self.identity().unwrap(),
                 etag: None,
-                models: vec![remote_model("shared", "fresh", 0)],
+                models: vec![remote_model("shared", "fresh", /*priority*/ 0)],
             })
         })
     }
@@ -356,7 +361,7 @@ impl ModelsEndpointClient for RejectedAttemptEndpoint {
 #[tokio::test]
 async fn rejection_survives_account_switches_when_persistent_invalidation_fails() {
     for load_error in [false, true] {
-        let stale = vec![remote_model("shared", "stale B", 0)];
+        let stale = vec![remote_model("shared", "stale B", /*priority*/ 0)];
         let cache = Arc::new(TestModelsCache {
             entry: Mutex::new(Some(ModelsCacheEntry {
                 fetched_at: Utc::now(),
@@ -373,8 +378,12 @@ async fn rejection_survives_account_switches_when_persistent_invalidation_fails(
             observed: Mutex::new("grant-a".into()),
             reject: std::sync::atomic::AtomicBool::new(true),
         });
-        let manager = OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
-            .with_provider_catalog();
+        let manager = OpenAiModelsManager::new_with_cache(
+            cache.clone(),
+            endpoint.clone(),
+            /*auth_manager*/ None,
+        )
+        .with_provider_catalog();
         assert!(
             manager
                 .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)

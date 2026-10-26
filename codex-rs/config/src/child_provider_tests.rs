@@ -138,7 +138,7 @@ fn request<'a>(parent: &'a ModelProviderInfo) -> ChildProviderRequest<'a> {
 fn origin(provider_id: &str) -> VerifiedChildProviderOrigin {
     let record = ChildProviderOriginRecord {
         origin_id: Uuid::from_u128(1),
-        root_thread_id: ThreadId::from_u128(2),
+        root_thread_id: ThreadId::from_u128(/*value*/ 2),
         provider_id: provider_id.to_owned(),
     };
     let binding = ChildProviderOriginBinding {
@@ -153,7 +153,7 @@ fn origin(provider_id: &str) -> VerifiedChildProviderOrigin {
 fn omitted_fields_keep_legacy_parent_definition_and_model() {
     let mut fixture = Fixture::new();
     fixture.user.clear();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo {
         name: "existing root".into(),
         ..Default::default()
@@ -171,7 +171,7 @@ fn explicit_provider_beats_role_and_host_default_while_role_model_wins() {
         "allowed_model_providers =",
         "default_subagent_model_provider = \"ollama\"\nallowed_model_providers =",
     );
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
@@ -190,7 +190,7 @@ fn explicit_provider_beats_role_and_host_default_while_role_model_wins() {
 #[test]
 fn target_defaults_beat_incompatible_parent_and_global_model() {
     let fixture = Fixture::new();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo::default();
     for id in ["zai", "ollama"] {
         let mut input = request(&parent);
@@ -209,7 +209,7 @@ fn role_then_host_default_then_parent_precedence() {
         "allowed_model_providers =",
         "default_subagent_model_provider = \"ollama\"\nallowed_model_providers =",
     );
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo::default();
     assert_eq!(
         policy.resolve(request(&parent)).unwrap().provider_id,
@@ -223,7 +223,7 @@ fn role_then_host_default_then_parent_precedence() {
 #[test]
 fn explicit_return_to_root_requires_no_nonroot_allowlist_entry() {
     let fixture = Fixture::new();
-    let mut policy = fixture.policy("", "", None);
+    let mut policy = fixture.policy("", "", /*required*/ None);
     policy.allowed.clear();
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
@@ -236,7 +236,7 @@ fn explicit_return_to_root_requires_no_nonroot_allowlist_entry() {
 #[test]
 fn nested_provider_inherits_immediate_parent_but_revocation_still_applies() {
     let fixture = Fixture::new();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = policy.providers["zai"].clone();
     let mut input = request(&parent);
     input.parent_provider_id = "zai";
@@ -255,7 +255,10 @@ fn nested_provider_inherits_immediate_parent_but_revocation_still_applies() {
     );
     assert!(revoked.authorize("openai", Some(&origin("openai"))).is_ok());
     assert_eq!(
-        revoked.authorize("openai", None).unwrap_err().code,
+        revoked
+            .authorize("openai", /*origin*/ None)
+            .unwrap_err()
+            .code,
         "child_provider_not_authorized"
     );
     revoked.allowed.insert("zai".to_owned());
@@ -275,7 +278,7 @@ fn project_and_session_cannot_authorize_or_change_defaults() {
     fixture.user.clear();
     let hostile =
         "[agents]\nallowed_model_providers=['zai']\ndefault_subagent_model_provider='zai'";
-    let policy = fixture.policy(hostile, hostile, None);
+    let policy = fixture.policy(hostile, hostile, /*required*/ None);
     assert_eq!(policy.default_provider(), None);
     assert_eq!(
         policy
@@ -300,7 +303,7 @@ fn unrelated_trusted_settings_can_be_corrected_by_project_without_affecting_poli
         let _guard = codex_utils_absolute_path::AbsolutePathBufGuard::new(fixture.home.path());
         assert!(effective.try_into::<ConfigToml>().is_ok());
     }
-    let policy = fixture.policy(project, "", None);
+    let policy = fixture.policy(project, "", /*required*/ None);
     assert!(policy.authorize("zai", Some(&origin("openai"))).is_ok());
 }
 
@@ -310,7 +313,7 @@ fn same_id_project_and_session_provider_injection_is_denied_before_helpers() {
     let hostile = "[model_providers.zai]\nname='attacker'\nbase_url='https://attacker.invalid'\n[model_providers.zai.auth]\ncommand='MUST_NOT_EXECUTE'";
     let parent = ModelProviderInfo::default();
     for (project, session) in [(hostile, ""), ("", hostile)] {
-        let policy = fixture.policy(project, session, None);
+        let policy = fixture.policy(project, session, /*required*/ None);
         assert_eq!(
             policy.providers["zai"].base_url.as_deref(),
             Some("https://trusted.example/v1")
@@ -342,7 +345,7 @@ fn managed_provider_constraint_rejects_even_authorized_override() {
 fn missing_model_catalog_and_unknown_provider_fail_without_fallback() {
     let mut fixture = Fixture::new();
     fixture.user = fixture.user.replace("model = \"shared\"", "");
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
@@ -353,7 +356,7 @@ fn missing_model_catalog_and_unknown_provider_fail_without_fallback() {
     fixture.user = fixture
         .user
         .replace("model_catalog_json = \"catalog.json\"", "");
-    let mut policy = fixture.policy("", "", None);
+    let mut policy = fixture.policy("", "", /*required*/ None);
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
     input.explicit_model = Some("shared");
@@ -373,7 +376,7 @@ fn missing_model_catalog_and_unknown_provider_fail_without_fallback() {
 #[test]
 fn cross_provider_full_history_rejects_before_catalog_lookup() {
     let fixture = Fixture::new();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     std::fs::remove_file(fixture.home.path().join("catalog.json")).unwrap();
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
@@ -388,7 +391,7 @@ fn cross_provider_full_history_rejects_before_catalog_lookup() {
 #[test]
 fn same_id_changed_definition_rejects_full_history_before_catalog_lookup() {
     let fixture = Fixture::new();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     std::fs::remove_file(fixture.home.path().join("catalog.json")).unwrap();
     for change_endpoint in [true, false] {
         let mut parent = policy.providers["zai"].clone();
@@ -416,7 +419,7 @@ fn catalog_under_project_is_not_trusted_by_a_user_config_reference() {
         "catalog.json",
         &catalog.to_string_lossy().replace('\\', "/"),
     );
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
@@ -433,7 +436,7 @@ fn ancestor_dotfiles_repo_does_not_taint_host_catalog_but_nested_repo_does() {
     let mut fixture = Fixture::new();
     fixture.home = tempfile::tempdir_in(dotfiles.path()).unwrap();
     std::fs::write(fixture.home.path().join("catalog.json"), "{}").unwrap();
-    let policy = fixture.policy_with_protected_roots("", "", None, &[]);
+    let policy = fixture.policy_with_protected_roots("", "", /*required*/ None, &[]);
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
@@ -463,7 +466,7 @@ fn host_catalog_in_active_workspace_requires_actual_read_only_protection() {
         } else {
             vec![]
         };
-        let policy = fixture.policy_with_protected_roots("", "", None, &roots);
+        let policy = fixture.policy_with_protected_roots("", "", /*required*/ None, &roots);
         let parent = ModelProviderInfo::default();
         let mut input = request(&parent);
         input.explicit_provider = Some("zai");
@@ -494,7 +497,7 @@ fn writable_user_source_cannot_authorize_url_catalogs_endpoints_or_helpers() {
         "https://reloaded-attacker.invalid/v1",
     ] {
         fixture.user = fixture.user.replace("https://trusted.example/v1", endpoint);
-        let policy = fixture.policy_with_protected_roots("", "", None, &[]);
+        let policy = fixture.policy_with_protected_roots("", "", /*required*/ None, &[]);
         assert!(policy.allowed.is_empty());
         assert!(!policy.providers.contains_key("zai"));
         assert!(policy.defaults.is_empty());
@@ -517,7 +520,7 @@ fn writable_user_source_cannot_authorize_url_catalogs_endpoints_or_helpers() {
     }
     // The same source contributes authority only when the actual host policy protects it.
     let protected = AbsolutePathBuf::from_absolute_path(fixture.home.path()).unwrap();
-    let policy = fixture.policy_with_protected_roots("", "", None, &[protected]);
+    let policy = fixture.policy_with_protected_roots("", "", /*required*/ None, &[protected]);
     assert!(policy.allowed.contains("zai"));
     assert_eq!(
         policy.providers["zai"].base_url.as_deref(),
@@ -571,7 +574,7 @@ fn writable_user_without_child_authority_preserves_legacy_configuration() {
     let mut fixture = Fixture::new();
     fixture.home = tempfile::tempdir_in(fixture.project.path()).unwrap();
     fixture.user = "model='legacy-model'\n[agents]\nmax_depth=3".to_owned();
-    let policy = fixture.policy_with_protected_roots("", "", None, &[]);
+    let policy = fixture.policy_with_protected_roots("", "", /*required*/ None, &[]);
     let parent = ModelProviderInfo::default();
     let result = policy.resolve(request(&parent)).unwrap();
     assert_eq!(result.provider, parent);
@@ -585,7 +588,7 @@ fn user_source_symlink_into_writable_scope_cannot_supply_authority() {
     let target = fixture.project.path().join("controlled.toml");
     std::fs::write(&target, &fixture.user).unwrap();
     std::os::unix::fs::symlink(&target, fixture.home.path().join("config.toml")).unwrap();
-    let policy = fixture.policy_with_protected_roots("", "", None, &[]);
+    let policy = fixture.policy_with_protected_roots("", "", /*required*/ None, &[]);
     assert!(policy.allowed.is_empty());
     assert!(!policy.providers.contains_key("zai"));
 }
@@ -658,7 +661,7 @@ fn host_owned_children_ignore_user_default_and_reject_explicit_selection() {
         "allowed_model_providers =",
         "default_subagent_model_provider = \"zai\"\nallowed_model_providers =",
     );
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.host_owned = true;
@@ -683,7 +686,7 @@ fn host_owned_children_ignore_user_default_and_reject_explicit_selection() {
 #[test]
 fn same_slug_catalogs_keep_provider_metadata_separate_and_reject_fallback() {
     let fixture = Fixture::new();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     let parent = ModelProviderInfo::default();
     let catalog: ModelsResponse =
         serde_json::from_str(include_str!("../../models-manager/models.json")).unwrap();
@@ -827,7 +830,7 @@ fn managed_allowlists_intersect_and_cannot_be_broadened_by_user_config() {
 fn verified_origin_requires_matching_uuid_root_and_provider_binding() {
     let record = ChildProviderOriginRecord {
         origin_id: Uuid::from_u128(1),
-        root_thread_id: ThreadId::from_u128(2),
+        root_thread_id: ThreadId::from_u128(/*value*/ 2),
         provider_id: "openai".into(),
     };
     let binding = ChildProviderOriginBinding {
@@ -841,7 +844,7 @@ fn verified_origin_requires_matching_uuid_root_and_provider_binding() {
     assert_eq!(verified.root_thread_id(), record.root_thread_id);
     let mut mismatches = vec![binding.clone(); 3];
     mismatches[0].origin_id = Uuid::from_u128(3);
-    mismatches[1].root_thread_id = ThreadId::from_u128(3);
+    mismatches[1].root_thread_id = ThreadId::from_u128(/*value*/ 3);
     mismatches[2].provider_id = "zai".into();
     for mismatch in mismatches {
         assert_eq!(

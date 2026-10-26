@@ -85,7 +85,7 @@ impl VerifiedChildProviderOrigin {
         binding: &ChildProviderOriginBinding,
     ) -> Result<Self, ChildProviderError> {
         if record.origin_id.is_nil()
-            || record.root_thread_id == ThreadId::from_u128(0)
+            || record.root_thread_id == ThreadId::from_u128(/*value*/ 0)
             || !valid_id(&record.provider_id)
             || record.origin_id != binding.origin_id
             || record.root_thread_id != binding.root_thread_id
