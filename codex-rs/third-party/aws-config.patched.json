@@ -9,6 +9,6 @@
     "rustfmt.toml": "7dfcb9b8b47ed0e4d068feb4505a14bbd0980651ccfdf0b606b8892635787fe7"
   },
   "integration": {
-    "BUILD.bazel": "e4f1bb53f0af6272c01696ec2c35984644550cbc6c94182a77508cd6d29a57d9"
+    "BUILD.bazel": "6bb8d77b93580d628b1b2665a4096630306278c8676699a1826d99b6e9143765"
   }
 }

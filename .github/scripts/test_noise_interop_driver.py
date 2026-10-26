@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Fast failure-path checks; these tests never invoke Cargo or crypto builds."""
+
 import importlib.util
 import io
 import json
@@ -20,7 +21,9 @@ class DriverFailureTests(unittest.TestCase):
     def test_second_start_failure_reaps_first_endpoint(self):
         child = mock.Mock()
         child.poll.return_value = None
-        with mock.patch.object(DRIVER.subprocess, "Popen", side_effect=[child, OSError("second failed")]):
+        with mock.patch.object(
+            DRIVER.subprocess, "Popen", side_effect=[child, OSError("second failed")]
+        ):
             with self.assertRaisesRegex(OSError, "second failed"):
                 DRIVER.exchange(Path("old"), Path("missing"))
         child.kill.assert_called_once()
@@ -32,12 +35,22 @@ class DriverFailureTests(unittest.TestCase):
             actual = root / "configured target with spaces" / "host" / "endpoint"
             actual.parent.mkdir(parents=True)
             actual.write_bytes(b"test artifact")
-            result = subprocess.CompletedProcess([], 0, stdout=json.dumps({
-                "reason": "compiler-artifact", "target": {"name": "noise-interop-new"},
-                "executable": str(actual),
-            }) + "\n")
+            result = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps(
+                    {
+                        "reason": "compiler-artifact",
+                        "target": {"name": "noise-interop-new"},
+                        "executable": str(actual),
+                    }
+                )
+                + "\n",
+            )
             with mock.patch.object(DRIVER.subprocess, "run", return_value=result):
-                self.assertEqual(DRIVER.project(root, "new", "unused-cargo"), actual.resolve())
+                self.assertEqual(
+                    DRIVER.project(root, "new", "unused-cargo"), actual.resolve()
+                )
 
     def test_missing_cargo_artifact_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:

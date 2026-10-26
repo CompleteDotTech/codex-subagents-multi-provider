@@ -41,9 +41,9 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
-    if check:
-        args.append("--check")
+    args = [sys.executable, str(REPO_ROOT / ".github/scripts/check_rust_format.py")]
+    if not check:
+        args.append("--write")
     command = Command(tuple(args), REPO_ROOT / "codex-rs")
     return FormatterGroup("Rust", (command,))
 
