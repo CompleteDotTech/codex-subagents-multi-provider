@@ -375,7 +375,21 @@ class InstallShTest(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stderr)
             oldest = releases / f"{versions[0]}-{target}"
             helper = oldest / "bin/codex-code-mode-host"
-            shutil.copy("/bin/sleep", helper)
+            if system.sysname == "Linux":
+                # Multicall /bin/sleep may dispatch from the executable's real
+                # filename even when argv[0] is sleep. A standalone binary keeps
+                # /proc/PID/exe inside this release without applet dispatch.
+                compiler = shutil.which("cc")
+                self.assertIsNotNone(compiler, "Linux retention fixture requires cc")
+                compiled = subprocess.run(
+                    [compiler, "-x", "c", "-o", str(helper), "-"],
+                    input="#include <unistd.h>\nint main(void) { sleep(300); return 0; }\n",
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            else:
+                shutil.copy("/bin/sleep", helper)
             if system.sysname == "Darwin":
                 # A copied macOS system binary cannot run with its platform signature.
                 subprocess.run(
@@ -384,10 +398,13 @@ class InstallShTest(unittest.TestCase):
                     capture_output=True,
                 )
             # A helper can outlive its parent CLI; retain its whole release.
-            # Keep the sleep applet name for multicall coreutils, while executing
-            # the staged helper so process-executable retention is still tested.
-            with subprocess.Popen(["sleep", "300"], executable=str(helper)) as running:
+            with subprocess.Popen([str(helper), "300"]) as running:
                 try:
+                    self.assertIsNone(running.poll(), "staged helper exited at startup")
+                    if system.sysname == "Linux":
+                        self.assertEqual(
+                            Path(f"/proc/{running.pid}/exe").resolve(), helper.resolve()
+                        )
                     second, _ = run_installer_in(
                         root, versions[1], **install_options[versions[1]]
                     )
@@ -501,10 +518,17 @@ class InstallShTest(unittest.TestCase):
                             readable, "installer did not attempt retirement"
                         )
                         self.assertEqual(os.read(ready_fd, 128), b"ready\n")
-                        with subprocess.Popen(
-                            ["sleep", "300"], executable=str(helper)
-                        ) as late_helper:
+                        with subprocess.Popen([str(helper), "300"]) as late_helper:
                             try:
+                                self.assertIsNone(
+                                    late_helper.poll(),
+                                    "staged helper exited at startup",
+                                )
+                                if system.sysname == "Linux":
+                                    self.assertEqual(
+                                        Path(f"/proc/{late_helper.pid}/exe").resolve(),
+                                        helper.resolve(),
+                                    )
                                 os.write(resume_fd, b"continue\n")
                                 raced, _ = installing.result(timeout=30)
                                 self.assertEqual(raced.returncode, 0, raced.stderr)
