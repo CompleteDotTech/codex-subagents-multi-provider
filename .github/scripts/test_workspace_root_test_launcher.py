@@ -28,7 +28,9 @@ class Target:
         self.label = label
 
     def __getitem__(self, _provider):
-        return SimpleNamespace(default_runfiles=Runfiles(), files=SimpleNamespace(to_list=lambda: []))
+        return SimpleNamespace(
+            default_runfiles=Runfiles(), files=SimpleNamespace(to_list=lambda: [])
+        )
 
 
 class LabelDict(dict):
@@ -41,11 +43,21 @@ def expand_launcher(output, windows, custom_marker):
     # of their substitutions. No Bazel analysis, compiler, or build is launched.
     source = ast.parse((ROOT / "defs.bzl").read_text())
     names = {
-        "_workspace_root_test_impl", "_bash_runfile_env_exports",
-        "_windows_runfile_env_exports", "_runfile_logical_path",
-        "_bash_workspace_root_setup", "_windows_workspace_root_setup",
+        "_workspace_root_test_impl",
+        "_bash_runfile_env_exports",
+        "_windows_runfile_env_exports",
+        "_runfile_logical_path",
+        "_bash_workspace_root_setup",
+        "_windows_workspace_root_setup",
     }
-    selected = ast.Module(body=[node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names], type_ignores=[])
+    selected = ast.Module(
+        body=[
+            node
+            for node in source.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ],
+        type_ignores=[],
+    )
     namespace = {
         "DefaultInfo": lambda **kwargs: SimpleNamespace(**kwargs),
         "RunEnvironmentInfo": lambda **kwargs: SimpleNamespace(**kwargs),
@@ -53,9 +65,17 @@ def expand_launcher(output, windows, custom_marker):
         "depset": list,
     }
     exec(compile(selected, str(ROOT / "defs.bzl"), "exec"), namespace)
-    marker = SimpleNamespace(short_path="codex-rs/third-party/aws-config/Cargo.toml") if custom_marker else None
-    workspace_marker = SimpleNamespace(short_path="codex-rs/utils/cargo-bin/repo_root.marker")
-    test_bin = SimpleNamespace(short_path="bin/observer.exe" if windows else "bin/observer")
+    marker = (
+        SimpleNamespace(short_path="codex-rs/third-party/aws-config/Cargo.toml")
+        if custom_marker
+        else None
+    )
+    workspace_marker = SimpleNamespace(
+        short_path="codex-rs/utils/cargo-bin/repo_root.marker"
+    )
+    test_bin = SimpleNamespace(
+        short_path="bin/observer.exe" if windows else "bin/observer"
+    )
 
     def expand_template(*, template, output, substitutions, **_kwargs):
         text = template.read_bytes().decode()
@@ -67,17 +87,26 @@ def expand_launcher(output, windows, custom_marker):
 
     ctx = SimpleNamespace(
         label=SimpleNamespace(name="launcher"),
-        actions=SimpleNamespace(declare_file=lambda _: output, expand_template=expand_template),
+        actions=SimpleNamespace(
+            declare_file=lambda _: output, expand_template=expand_template
+        ),
         executable=SimpleNamespace(test_bin=test_bin),
         file=SimpleNamespace(
-            workspace_root_marker=workspace_marker, working_directory_marker=marker,
+            workspace_root_marker=workspace_marker,
+            working_directory_marker=marker,
             _windows_launcher_template=ROOT / "workspace_root_test_launcher.bat.tpl",
             _bash_launcher_template=ROOT / "workspace_root_test_launcher.sh.tpl",
         ),
         attr=SimpleNamespace(
-            _windows_constraint=Target("windows"), data=[], runfile_env=LabelDict(), env={},
-            env_inherit=[], test_threads=0, chdir_workspace_root=True,
-            test_bin=Target("test"), workspace_root_marker=Target("root"),
+            _windows_constraint=Target("windows"),
+            data=[],
+            runfile_env=LabelDict(),
+            env={},
+            env_inherit=[],
+            test_threads=0,
+            chdir_workspace_root=True,
+            test_bin=Target("test"),
+            workspace_root_marker=Target("root"),
         ),
         target_platform_has_constraint=lambda _: windows,
         runfiles=lambda files: Runfiles(files),
@@ -86,7 +115,11 @@ def expand_launcher(output, windows, custom_marker):
     results = namespace["_workspace_root_test_impl"](ctx)
     if marker is not None and marker not in results[0].runfiles.files:
         raise AssertionError("custom marker missing from declared runfiles")
-    return test_bin.short_path, workspace_marker.short_path, marker.short_path if marker else ""
+    return (
+        test_bin.short_path,
+        workspace_marker.short_path,
+        marker.short_path if marker else "",
+    )
 
 
 class WorkspaceRootLauncherTests(unittest.TestCase):
@@ -95,8 +128,12 @@ class WorkspaceRootLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="workspace launcher ") as temporary:
             root = Path(temporary)
             launcher = root / ("launch.bat" if windows else "launch.sh")
-            binary_key, workspace_key, custom_key = expand_launcher(launcher, windows, custom)
-            physical = root / ("physical files with spaces" if manifest else "runfiles tree/workspace")
+            binary_key, workspace_key, custom_key = expand_launcher(
+                launcher, windows, custom
+            )
+            physical = root / (
+                "physical files with spaces" if manifest else "runfiles tree/workspace"
+            )
             workspace = physical / "codex-rs"
             crate = workspace / "third-party/aws-config"
             (workspace / "utils/cargo-bin").mkdir(parents=True)
@@ -123,29 +160,49 @@ class WorkspaceRootLauncherTests(unittest.TestCase):
             )
             env = os.environ.copy()
             for name in list(env):
-                if name.startswith(("RUNFILES", "TEST_", "RULES_RUST_TEST_")) or name in ("TESTBRIDGE_TEST_ONLY", "CODEX_BAZEL_TEST_SKIP_FILTERS"):
+                if name.startswith(
+                    ("RUNFILES", "TEST_", "RULES_RUST_TEST_")
+                ) or name in ("TESTBRIDGE_TEST_ONLY", "CODEX_BAZEL_TEST_SKIP_FILTERS"):
                     env.pop(name)
             env["TEST_WORKSPACE"] = "workspace"
             env["PYTHONHOME"] = sys.base_prefix
-            env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+            env["PATH"] = (
+                str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+            )
             if manifest:
-                entries = [(binary_key, binary), (workspace_key, physical / workspace_key)]
+                entries = [
+                    (binary_key, binary),
+                    (workspace_key, physical / workspace_key),
+                ]
                 if custom:
                     entries.append((custom_key, physical / custom_key))
                 manifest_path = root / "runfiles manifest"
-                manifest_path.write_text("".join(f"workspace/{key} {path}\n" for key, path in entries))
+                manifest_path.write_text(
+                    "".join(f"workspace/{key} {path}\n" for key, path in entries)
+                )
                 env["RUNFILES_MANIFEST_FILE"] = str(manifest_path)
             else:
                 env["RUNFILES_DIR"] = str(root / "runfiles tree")
             command = (
-                'cmd.exe /d /s /c "' + subprocess.list2cmdline([str(launcher), str(probe), str(result)]) + '"'
-                if windows else ["/bin/bash", str(launcher), str(probe), str(result)]
+                'cmd.exe /d /s /c "'
+                + subprocess.list2cmdline([str(launcher), str(probe), str(result)])
+                + '"'
+                if windows
+                else ["/bin/bash", str(launcher), str(probe), str(result)]
             )
-            process = subprocess.run(command, env=env, text=True, capture_output=True, timeout=20)
+            process = subprocess.run(
+                command, env=env, text=True, capture_output=True, timeout=20
+            )
             if missing:
-                self.assertNotEqual(process.returncode, 0, process.stdout + process.stderr)
-                self.assertFalse(result.exists(), "test binary ran despite missing cwd marker")
-                self.assertIn("cargo.toml", process.stderr.lower() + process.stdout.lower())
+                self.assertNotEqual(
+                    process.returncode, 0, process.stdout + process.stderr
+                )
+                self.assertFalse(
+                    result.exists(), "test binary ran despite missing cwd marker"
+                )
+                self.assertIn(
+                    "cargo.toml", process.stderr.lower() + process.stdout.lower()
+                )
             else:
                 self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
                 observed = json.loads(result.read_text())

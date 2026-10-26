@@ -27,7 +27,6 @@ UTILITY_NAME_EXCEPTIONS = {
     "path-utils": "codex-utils-path",
 }
 MANIFEST_FEATURE_EXCEPTIONS = {
-    "codex-rs/code-mode/Cargo.toml": {"sandbox": ("v8/v8_enable_sandbox",)},
     "codex-rs/v8-poc/Cargo.toml": {"sandbox": ("v8/v8_enable_sandbox",)},
 }
 OPTIONAL_DEPENDENCY_EXCEPTIONS = set()
@@ -42,7 +41,9 @@ def verified_vendor_manifests() -> set[Path]:
         [sys.executable, str(verifier)], text=True, capture_output=True, check=False
     )
     if result.returncode != 0:
-        raise ValueError("AWS vendor integrity check failed: " + result.stdout + result.stderr)
+        raise ValueError(
+            "AWS vendor integrity check failed: " + result.stdout + result.stderr
+        )
     return {(ROOT / VERIFIED_VENDOR_MANIFEST).resolve()}
 
 
@@ -190,7 +191,11 @@ def manifest_errors(
                     )
 
             if not is_internal_dependency(
-                path, dependency_name, dependency, internal_package_names, external_manifests
+                path,
+                dependency_name,
+                dependency,
+                internal_package_names,
+                external_manifests,
             ):
                 continue
 

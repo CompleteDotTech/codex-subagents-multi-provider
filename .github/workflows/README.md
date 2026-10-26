@@ -12,12 +12,17 @@ The workflows in this directory are split so that pull requests get fast, review
   including the generated Rust test binaries needed to lint inline `#[cfg(test)]`
   code.
 - `rust-ci.yml` keeps the Cargo-native PR checks intentionally small:
-  - `cargo fmt --check`
+  - integrity-aware Rust formatting via `.github/scripts/check_rust_format.py`
   - `cargo shear`
   - `argument-comment-lint` on Linux, macOS, and Windows
   - `tools/argument-comment-lint` package tests when the lint or its workflow wiring changes
 
 ## Post-Merge On `main`
+
+Both Rust workflows use the same formatting helper. It verifies the pinned AWS
+vendor snapshot before checking first-party packages with strict import grouping
+and the verified vendor package with its preserved import grouping. Integrity or
+format failures fail the job; the helper does not rewrite the vendor snapshot.
 
 - `bazel.yml` also runs on pushes to `main`.
   This re-verifies the merged Bazel path and helps keep the BuildBuddy caches warm.
@@ -35,3 +40,49 @@ The workflows in this directory are split so that pull requests get fast, review
 - If a build/test/clippy check can be expressed in Bazel, prefer putting the PR-time version in `bazel.yml`.
 - Keep `rust-ci.yml` fast enough that it usually does not dominate PR latency.
 - Reserve `rust-ci-full.yml` for heavyweight Cargo-native coverage that Bazel does not replace yet.
+
+## Fork runner selection
+
+The blocking CI family and full Cargo workflows retain the upstream runner
+selection for `openai/codex`. In other repositories, their `runs-on` expressions
+use standard GitHub-hosted runners instead of the upstream private runner groups
+and larger macOS runners:
+
+| Upstream runner     | Fork runner        | Architecture |
+| ------------------- | ------------------ | ------------ |
+| Linux x64 group     | `ubuntu-24.04`     | x64          |
+| Linux ARM64 group   | `ubuntu-24.04-arm` | ARM64        |
+| Windows x64 group   | `windows-2025`     | x64          |
+| Windows ARM64 group | `windows-11-arm`   | ARM64        |
+| `macos-15-xlarge`   | `macos-15`         | ARM64        |
+
+The matrix names and cache identities remain upstream logical identifiers; the
+workflow's runner setup log identifies the actual hosted image. The macOS x64
+target retains its existing cross-build on an ARM64 host. Windows ARM64 nextest
+archives still build on x64 and execute on native ARM64 shards. Test commands,
+matrix targets, toolchains, actions, and required-result jobs are unchanged.
+
+These mappings require neither a BuildBuddy key nor private runner provisioning;
+the existing Bazel wrapper falls back to local execution without that key.
+Standard hosted machines have fewer resources than upstream's private/larger
+runners, so startup alone does not establish build success or native test
+coverage. Record actual job results and artifact source identities.
+
+GitHub documents the labels and architecture under
+[standard hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+This mapping does not change release workflows or billing settings.
+
+Fork cold builds have reached the existing job limits while still compiling:
+the [Linux Bazel run](https://github.com/CompleteDotTech/codex-subagents-multi-provider/actions/runs/40311299734/job/121532855302)
+ended after about 30 minutes, and the [SDK run](https://github.com/CompleteDotTech/codex-subagents-multi-provider/actions/runs/40311299734/job/121532855353)
+after about 20 minutes. The fork therefore allows 90 minutes for the heavy PR
+Bazel test, Clippy, release-build and argument-comment-lint jobs, and 60 minutes
+for the SDK build/test job. These are bounded cold-build budgets, not evidence
+that a run passed. `openai/codex` retains its existing job and matrix timeouts;
+the short Python installation job and native-main Windows job are unchanged.
+Individual target/test deadlines, commands, required-result gates and licensing
+checks remain unchanged.
+
+Windows-capable CI jobs set Git `core.longpaths=true` before checkout. This
+includes both reusable nextest archive and shard jobs: configuring Git after
+checkout cannot recover a checkout rejected for long snapshot paths.
