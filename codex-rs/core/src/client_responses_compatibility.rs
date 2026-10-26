@@ -47,7 +47,11 @@ pub(crate) fn function_tools(tools: &[ToolSpec]) -> Result<Vec<Value>, CodexErr>
         }
         let name = tool["name"]
             .as_str()
-            .ok_or_else(|| unsupported("only function and bridged freeform tools are supported"))?;
+            .ok_or_else(|| {
+                unsupported(&format!(
+                    "tool type {kind:?} is unsupported; only function and bridged freeform tools are supported"
+                ))
+            })?;
         let name = wire_tool_name(namespace, name);
         if name.is_empty()
             || name.len() > 64
