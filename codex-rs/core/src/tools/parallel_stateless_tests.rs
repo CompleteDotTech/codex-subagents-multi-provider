@@ -14,10 +14,12 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::ResponsesCompatibility;
 use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
+use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -29,21 +31,21 @@ struct Gates {
     cancelled: Notify,
     finish: Notify,
     terminal: AtomicBool,
+    executions: AtomicUsize,
 }
 
 struct NamespacedRuntime {
+    name: ToolName,
     gates: Arc<Gates>,
     finishes: bool,
 }
 impl ToolExecutor<ToolInvocation> for NamespacedRuntime {
     fn tool_name(&self) -> ToolName {
-        ToolName::namespaced("client", "lookup")
+        self.name.clone()
     }
     fn spec(&self) -> codex_tools::ToolSpec {
-        codex_tools::ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
-            name:"client".into(), description:"Lifecycle fixture namespace".into(),
-            tools:vec![codex_tools::ResponsesApiNamespaceTool::Function(codex_tools::ResponsesApiTool {
-            name: "lookup".into(),
+        let function = codex_tools::ResponsesApiTool {
+            name: self.name.name.clone(),
             description: "Lifecycle fixture".into(),
             strict: true,
             defer_loading: None,
@@ -52,8 +54,17 @@ impl ToolExecutor<ToolInvocation> for NamespacedRuntime {
             )
             .unwrap(),
             output_schema: None,
-            })],
-        })
+        };
+        match &self.name.namespace {
+            Some(namespace) => {
+                codex_tools::ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+                    name: namespace.clone(),
+                    description: "Lifecycle fixture namespace".into(),
+                    tools: vec![codex_tools::ResponsesApiNamespaceTool::Function(function)],
+                })
+            }
+            None => codex_tools::ToolSpec::Function(function),
+        }
     }
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
     where
@@ -65,6 +76,7 @@ impl ToolExecutor<ToolInvocation> for NamespacedRuntime {
                 matches!(&invocation.payload,ToolPayload::Function{arguments} if arguments=="{}")
             );
             self.gates.entered.notify_one();
+            self.gates.executions.fetch_add(1, Ordering::SeqCst);
             if self.finishes {
                 invocation.cancellation_token.cancelled().await;
                 self.gates.cancelled.notify_one();
@@ -118,6 +130,7 @@ async fn fixture(finishes: bool) -> (ToolCallRuntime, Arc<Gates>, Arc<Observer>)
     session.services.extensions = Arc::new(extensions.build());
     let gates = Arc::new(Gates::default());
     let handler = Arc::new(NamespacedRuntime {
+        name: ToolName::namespaced("client", "lookup"),
         gates: gates.clone(),
         finishes,
     }) as Arc<dyn CoreToolRuntime>;
@@ -148,6 +161,146 @@ fn wire_call() -> ToolCall {
         },
         encrypted_function_args: None,
     }
+}
+
+async fn shadow_fixture(
+    exposure: crate::tools::registry::ToolExposure,
+    advertise_both: bool,
+    finishes: bool,
+) -> (
+    ToolCallRuntime,
+    Arc<Gates>,
+    Arc<Gates>,
+    Arc<Observer>,
+    Vec<codex_tools::ToolSpec>,
+) {
+    let (mut runtime, _, observer) = fixture(false).await;
+    let visible_gates = Arc::new(Gates::default());
+    let hidden_gates = Arc::new(Gates::default());
+    let visible = Arc::new(NamespacedRuntime {
+        name: ToolName::plain("a__b"),
+        gates: visible_gates.clone(),
+        finishes,
+    }) as Arc<dyn CoreToolRuntime>;
+    let hidden = Arc::new(NamespacedRuntime {
+        name: ToolName::namespaced("a", "b"),
+        gates: hidden_gates.clone(),
+        finishes: false,
+    }) as Arc<dyn CoreToolRuntime>;
+    let mut specs = vec![visible.spec()];
+    if advertise_both {
+        specs.push(hidden.spec());
+    }
+    let mut registry = ToolRegistry::default();
+    registry.register_trusted_with_exposure(visible, crate::tools::registry::ToolExposure::Direct);
+    registry.register_trusted_with_exposure(hidden, exposure);
+    let router = Arc::new(ToolRouter::from_parts(
+        registry,
+        specs.clone(),
+        ToolMode::Direct,
+        BTreeMap::new(),
+        None,
+        &[],
+    ));
+    runtime.step_context = runtime.step_context.with_tool_router_for_test(router);
+    (runtime, visible_gates, hidden_gates, observer, specs)
+}
+
+fn shadow_call() -> ToolCall {
+    ToolCall {
+        tool_name: ToolName::plain("a__b"),
+        ..wire_call()
+    }
+}
+
+#[tokio::test]
+async fn advertised_plain_alias_dispatches_without_hidden_shadow_and_keeps_runtime_lifecycle() {
+    for exposure in [
+        crate::tools::registry::ToolExposure::Hidden,
+        crate::tools::registry::ToolExposure::CodeModeOnly,
+    ] {
+        for finishes in [false, true] {
+            let (runtime, visible, hidden, observer, specs) =
+                shadow_fixture(exposure, false, finishes).await;
+            let wire = crate::client::responses_compatibility::function_tools(&specs).unwrap();
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["name"], "a__b");
+            assert!(
+                runtime
+                    .step_context
+                    .tool_router
+                    .normalize_wire_call(
+                        ToolCall {
+                            tool_name: ToolName::namespaced("a", "b"),
+                            ..wire_call()
+                        },
+                        &ToolCallSource::Direct,
+                        true
+                    )
+                    .is_err()
+            );
+            let cancellation = CancellationToken::new();
+            let mut task =
+                tokio::spawn(runtime.handle_tool_call(shadow_call(), cancellation.clone()));
+            tokio::time::timeout(Duration::from_secs(2), visible.waiting.notified())
+                .await
+                .unwrap();
+            assert_eq!(visible.executions.load(Ordering::SeqCst), 0);
+            assert_eq!(hidden.executions.load(Ordering::SeqCst), 0);
+            assert!(
+                !task.is_finished(),
+                "advertised handler must retain readiness"
+            );
+            visible.ready.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), visible.entered.notified())
+                .await
+                .unwrap();
+            if finishes {
+                cancellation.cancel();
+                tokio::time::timeout(Duration::from_secs(2), visible.cancelled.notified())
+                    .await
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut task)
+                        .await
+                        .is_err()
+                );
+                visible.finish.notify_one();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&result.item, codex_protocol::models::ResponseItem::FunctionCallOutput { output, .. }
+                if matches!(&output.body, codex_protocol::models::FunctionCallOutputBody::Text(text) if text == "terminal native result"))
+            );
+            assert_eq!(visible.executions.load(Ordering::SeqCst), 1);
+            assert_eq!(hidden.executions.load(Ordering::SeqCst), 0);
+            assert_eq!(*observer.0.lock().unwrap(), vec![ToolName::plain("a__b")]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn genuinely_advertised_alias_collision_fails_preflight_and_before_runtime_side_effects() {
+    let (runtime, visible, other, observer, specs) =
+        shadow_fixture(crate::tools::registry::ToolExposure::Direct, true, false).await;
+    assert!(crate::client::responses_compatibility::function_tools(&specs).is_err());
+    let result = runtime
+        .handle_tool_call(shadow_call(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&result.item, codex_protocol::models::ResponseItem::FunctionCallOutput { output, .. }
+        if matches!(&output.body, codex_protocol::models::FunctionCallOutputBody::Text(text) if text.contains("ambiguous")))
+    );
+    assert_eq!(visible.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(other.executions.load(Ordering::SeqCst), 0);
+    assert!(observer.0.lock().unwrap().is_empty());
+    assert!(visible.waiting.notified().now_or_never().is_none());
+    assert!(other.waiting.notified().now_or_never().is_none());
 }
 
 #[tokio::test]

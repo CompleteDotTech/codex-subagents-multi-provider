@@ -258,14 +258,35 @@ impl ToolRouter {
         &self,
         wire_name: &ToolName,
     ) -> Result<(&RegisteredTool, bool), FunctionCallError> {
-        let mut candidates = self.registry.entries().filter(|registered| {
-            let name = registered.runtime.tool_name();
-            crate::client::responses_compatibility::wire_tool_name(
-                name.namespace.as_deref(),
-                &name.name,
-            ) == wire_name.name
-        });
-        let registered = candidates.next().ok_or_else(|| {
+        // Resolve the advertised identity before touching the runtime registry.
+        // A hidden/nested runtime may share the flattened alias of a visible
+        // plain tool, but must neither shadow it nor gain direct admission.
+        let mut candidates = self
+            .model_visible_specs
+            .iter()
+            .flat_map(|spec| match spec {
+                ToolSpec::Function(tool) => vec![ToolName::plain(tool.name.clone())],
+                ToolSpec::Freeform(tool) => vec![ToolName::plain(tool.name.clone())],
+                ToolSpec::Namespace(namespace) => namespace
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        let name = match tool {
+                            ResponsesApiNamespaceTool::Function(tool) => &tool.name,
+                            ResponsesApiNamespaceTool::Custom(tool) => &tool.name,
+                        };
+                        ToolName::namespaced(namespace.name.clone(), name.clone())
+                    })
+                    .collect(),
+                ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => Vec::new(),
+            })
+            .filter(|name| {
+                crate::client::responses_compatibility::wire_tool_name(
+                    name.namespace.as_deref(),
+                    &name.name,
+                ) == wire_name.name
+            });
+        let name = candidates.next().ok_or_else(|| {
             FunctionCallError::RespondToModel("unsupported function tool name".to_string())
         })?;
         if candidates.next().is_some()
@@ -278,25 +299,9 @@ impl ToolRouter {
                 "unsupported or ambiguous function tool name".to_string(),
             ));
         }
-        let name = registered.runtime.tool_name();
-        let advertised = self.model_visible_specs.iter().any(|spec| match spec {
-            ToolSpec::Function(_) | ToolSpec::Freeform(_) => {
-                name.is_default_namespace() && spec.name() == name.name
-            }
-            ToolSpec::Namespace(namespace) => {
-                name.namespace.as_deref() == Some(namespace.name.as_str())
-                    && namespace.tools.iter().any(|tool| match tool {
-                        ResponsesApiNamespaceTool::Function(tool) => tool.name == name.name,
-                        ResponsesApiNamespaceTool::Custom(tool) => tool.name == name.name,
-                    })
-            }
-            ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => false,
-        });
-        if !advertised {
-            return Err(FunctionCallError::RespondToModel(
-                "function tool is not advertised for direct invocation".to_string(),
-            ));
-        }
+        let registered = self.registry.registered_tool(&name).ok_or_else(|| {
+            FunctionCallError::RespondToModel("unsupported function tool name".to_string())
+        })?;
         let spec = registered.spec();
         let freeform = match &*spec {
             ToolSpec::Freeform(_) => true,
