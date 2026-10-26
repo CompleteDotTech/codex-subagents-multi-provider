@@ -253,6 +253,68 @@ impl ToolRouter {
         self.registry.registered_tool(tool_name)
     }
 
+    /// Resolve only an existing registered runtime, never a model-defined handler.
+    pub(crate) fn resolve_wire_tool(
+        &self,
+        wire_name: &ToolName,
+    ) -> Result<(&RegisteredTool, bool), FunctionCallError> {
+        let mut candidates = self.registry.entries().filter(|registered| {
+            let name = registered.runtime.tool_name();
+            crate::client::responses_compatibility::wire_tool_name(
+                name.namespace.as_deref(),
+                &name.name,
+            ) == wire_name.name
+        });
+        let registered = candidates.next().ok_or_else(|| {
+            FunctionCallError::RespondToModel("unsupported function tool name".to_string())
+        })?;
+        if candidates.next().is_some()
+            || wire_name
+                .namespace
+                .as_deref()
+                .is_some_and(|namespace| namespace != codex_protocol::DEFAULT_FUNCTION_NAMESPACE)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "unsupported or ambiguous function tool name".to_string(),
+            ));
+        }
+        let name = registered.runtime.tool_name();
+        let spec = registered.spec();
+        let freeform = match &*spec {
+            ToolSpec::Freeform(_) => true,
+            ToolSpec::Namespace(namespace) => namespace.name == name.namespace.as_deref().unwrap_or(codex_protocol::DEFAULT_FUNCTION_NAMESPACE)
+                && namespace.tools.iter().any(|tool| matches!(tool, ResponsesApiNamespaceTool::Custom(tool) if tool.name == name.name)),
+            _ => false,
+        };
+        Ok((registered, freeform))
+    }
+
+    /// Normalize external wire calls before recording, readiness or scheduling.
+    /// Native Code Mode/plaintext calls already carry canonical names and payloads.
+    pub(crate) fn normalize_wire_call(
+        &self,
+        mut call: ToolCall,
+        source: &ToolCallSource,
+        stateless: bool,
+    ) -> Result<ToolCall, FunctionCallError> {
+        if matches!(source, ToolCallSource::Direct) && stateless {
+            let (registered, freeform) = self.resolve_wire_tool(&call.tool_name)?;
+            call.tool_name = registered.runtime.tool_name();
+            let ToolPayload::Function { arguments } = &call.payload else {
+                return Err(FunctionCallError::RespondToModel(
+                    "this provider must use function tool calls".to_string(),
+                ));
+            };
+            if freeform {
+                call.payload = ToolPayload::Custom {
+                    input: crate::client::responses_compatibility::decode_freeform(arguments)
+                        .map_err(FunctionCallError::RespondToModel)?,
+                };
+            }
+        }
+        Ok(call)
+    }
+
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
         match item {
@@ -366,70 +428,6 @@ impl ToolRouter {
         source: ToolCallSource,
         call_state: Option<Arc<ToolCallState>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        let mut call = call;
-        if matches!(&source, ToolCallSource::Direct)
-            && step_context.turn.provider.capabilities().responses
-                == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
-        {
-            // Code Mode and host-native plaintext calls already carry canonical
-            // names/payloads. Only decode incoming Responses wire calls here.
-            // Only the exact registered runtime can interpret a flattened wire
-            // name. No model-provided name can create a new handler or grant.
-            let candidates: Vec<_> = self
-                .registry
-                .entries()
-                .filter(|registered| {
-                    let name = registered.runtime.tool_name();
-                    crate::client::responses_compatibility::wire_tool_name(
-                        name.namespace.as_deref(),
-                        &name.name,
-                    ) == call.tool_name.name
-                })
-                .collect();
-            if candidates.len() != 1
-                || call
-                    .tool_name
-                    .namespace
-                    .as_deref()
-                    .is_some_and(|namespace| {
-                        namespace != codex_protocol::DEFAULT_FUNCTION_NAMESPACE
-                    })
-            {
-                return Err(FunctionCallError::RespondToModel(
-                    "unsupported or ambiguous function tool name".to_string(),
-                ));
-            }
-            let registered = candidates[0];
-            call.tool_name = registered.runtime.tool_name();
-            let ToolPayload::Function { arguments } = &call.payload else {
-                return Err(FunctionCallError::RespondToModel(
-                    "this provider must use function tool calls".to_string(),
-                ));
-            };
-            let spec = registered.spec();
-            let freeform = match &*spec {
-                ToolSpec::Freeform(_) => true,
-                ToolSpec::Namespace(namespace) => {
-                    namespace.name
-                        == call
-                            .tool_name
-                            .namespace
-                            .as_deref()
-                            .unwrap_or(codex_protocol::DEFAULT_FUNCTION_NAMESPACE)
-                        && namespace.tools.iter().any(|tool| {
-                            matches!(tool,
-                        ResponsesApiNamespaceTool::Custom(tool) if tool.name == call.tool_name.name)
-                        })
-                }
-                _ => false,
-            };
-            if freeform {
-                call.payload = ToolPayload::Custom {
-                    input: crate::client::responses_compatibility::decode_freeform(arguments)
-                        .map_err(FunctionCallError::RespondToModel)?,
-                };
-            }
-        }
         let ToolCall {
             tool_name,
             call_id,
