@@ -757,7 +757,6 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "base64-simd",
- "bytes",
  "fastrand",
  "futures-util",
  "hex",

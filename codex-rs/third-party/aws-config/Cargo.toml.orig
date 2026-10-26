@@ -34,7 +34,6 @@ test-util = ["aws-runtime/test-util"]
 allow-compilation = []
 
 [dependencies]
-bytes = "1.1.0"
 http = "1"
 url = "2.5.4"
 fastrand = "2.3.0"

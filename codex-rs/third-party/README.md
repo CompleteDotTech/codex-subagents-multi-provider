@@ -6,7 +6,7 @@ original file. `aws-config.test-data.json` pins 235 fixtures restored from that
 crate's recorded upstream Git revision f031610a8cbb4ac2dac3229bfaeaa88182787ab4.
 The fixtures contain public upstream test credentials, not operational secrets.
 
-Only Cargo.toml, Cargo.toml.orig and src/login/dpop.rs differ from the archive.
+Only Cargo.toml, Cargo.toml.orig, src/login/dpop.rs and src/lib.rs differ from the archive.
 `aws-config.patch` exposes their complete zero-context delta; apply it with
 `git apply --unidiff-zero`. `aws-config.patched.json` pins
 those reviewed results. The source patch moves P-256 to maintained 0.14 and its
@@ -15,7 +15,13 @@ RNG to compatible rand 0.10, retaining SEC1 keys, ES256, JWK coordinates and raw
 The dev-test runtime minimum is 1.15.0, whose maintained test-util feature
 no longer enables the obsolete HTTP/2 0.3 connector; the full provider suite
 remains enabled. Tokio 1.53.3 addresses the separately discovered I/O-safety
-advisory. No signing arithmetic is implemented here. Remove this override when upstream
+advisory. The crate root declares only five inherited upstream Clippy allowances: expect_used,
+unwrap_used, redundant_closure_for_method_calls, result_large_err and
+useless_borrows_in_formatting. Bazel retains -Dwarnings and all other lint gates;
+first-party policy is unchanged. The BUILD integration and local Rustfmt style
+are also hash-pinned by the integrity verifier. The unused direct bytes dependency
+is removed from both manifests; no runtime code depended on it.
+No signing arithmetic is implemented here. Remove this override when upstream
 aws-config provides the maintained P-256 path without losing credentials-login.
 
 The local package is a workspace member so its original provider tests and new

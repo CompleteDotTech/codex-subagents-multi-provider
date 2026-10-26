@@ -1,30 +1,49 @@
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -170 +170 @@
+@@ -156,3 +155,0 @@
+-[dependencies.bytes]
+-version = "1.1.0"
+-
+@@ -170 +167 @@
 -version = "0.13.2"
 +version = "0.14"
-@@ -174 +174 @@
+@@ -174 +171 @@
 -version = "0.8.5"
 +version = "0.10"
-@@ -177,0 +178 @@
+@@ -177,0 +175 @@
 +    "sys_rng",
-@@ -227 +228 @@
+@@ -227 +225 @@
 -version = "1.9.5"
 +version = "1.15.0"
 --- a/Cargo.toml.orig
 +++ b/Cargo.toml.orig
-@@ -122 +122 @@
+@@ -37 +36,0 @@
+-bytes = "1.1.0"
+@@ -122 +121 @@
 -version = "0.13.2"
 +version = "0.14"
-@@ -144 +144 @@
+@@ -144 +143 @@
 -version = "0.8.5"
 +version = "0.10"
-@@ -146 +146 @@
+@@ -146 +145 @@
 -features = ["std", "std_rng"]
 +features = ["std", "std_rng", "sys_rng"]
-@@ -166 +166 @@
+@@ -166 +165 @@
 -version = "1.9.5"
 +version = "1.15.0"
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,0 +10,10 @@
++// Retain the audited upstream snapshot under the strict Bazel lint command.
++// These five inherited categories are recorded in the verified vendor patch;
++// all other lints and first-party crates retain the workspace deny policy.
++#![allow(
++    clippy::expect_used,
++    clippy::unwrap_used,
++    clippy::redundant_closure_for_method_calls,
++    clippy::result_large_err,
++    clippy::useless_borrows_in_formatting
++)]
 --- a/src/login/dpop.rs
 +++ b/src/login/dpop.rs
 @@ -23 +23 @@

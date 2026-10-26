@@ -11,6 +11,7 @@ Checks:
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -31,10 +32,27 @@ MANIFEST_FEATURE_EXCEPTIONS = {
 }
 OPTIONAL_DEPENDENCY_EXCEPTIONS = set()
 INTERNAL_DEPENDENCY_FEATURE_EXCEPTIONS = {}
+VERIFIED_VENDOR_MANIFEST = "codex-rs/third-party/aws-config/Cargo.toml"
+
+
+def verified_vendor_manifests() -> set[Path]:
+    """Allow only the exact external snapshot after its integrity guard succeeds."""
+    verifier = ROOT / "codex-rs/third-party/verify_aws_config.py"
+    result = subprocess.run(
+        [sys.executable, str(verifier)], text=True, capture_output=True, check=False
+    )
+    if result.returncode != 0:
+        raise ValueError("AWS vendor integrity check failed: " + result.stdout + result.stderr)
+    return {(ROOT / VERIFIED_VENDOR_MANIFEST).resolve()}
 
 
 def main() -> int:
-    internal_package_names = workspace_package_names()
+    try:
+        external_manifests = verified_vendor_manifests()
+    except ValueError as error:
+        print(error)
+        return 1
+    internal_package_names = workspace_package_names(external_manifests)
     used_manifest_feature_exceptions: set[str] = set()
     used_optional_dependency_exceptions: set[tuple[str, str, str]] = set()
     used_internal_dependency_feature_exceptions: set[tuple[str, str, str]] = set()
@@ -47,6 +65,7 @@ def main() -> int:
             used_manifest_feature_exceptions,
             used_optional_dependency_exceptions,
             used_internal_dependency_feature_exceptions,
+            external_manifests,
         ):
             failures_by_path[manifest_key(path)] = errors
 
@@ -108,8 +127,11 @@ def manifest_errors(
     used_manifest_feature_exceptions: set[str],
     used_optional_dependency_exceptions: set[tuple[str, str, str]],
     used_internal_dependency_feature_exceptions: set[tuple[str, str, str]],
+    external_manifests: set[Path] = frozenset(),
 ) -> list[str]:
     manifest = load_manifest(path)
+    if path.resolve() in external_manifests:
+        return []
     package = manifest.get("package")
     if not isinstance(package, dict) and path != CARGO_RS_ROOT / "Cargo.toml":
         return []
@@ -168,7 +190,7 @@ def manifest_errors(
                     )
 
             if not is_internal_dependency(
-                path, dependency_name, dependency, internal_package_names
+                path, dependency_name, dependency, internal_package_names, external_manifests
             ):
                 continue
 
@@ -227,7 +249,7 @@ def is_workspace_reference(value: object) -> bool:
 
 
 def manifest_key(path: Path) -> str:
-    return str(path.relative_to(ROOT))
+    return path.relative_to(ROOT).as_posix()
 
 
 def normalize_feature_mapping(value: object) -> dict[str, tuple[str, ...]] | None:
@@ -299,6 +321,7 @@ def is_internal_dependency(
     dependency_name: str,
     dependency: dict,
     internal_package_names: set[str],
+    external_manifests: set[Path] = frozenset(),
 ) -> bool:
     package_name = dependency.get("package", dependency_name)
     if isinstance(package_name, str) and package_name in internal_package_names:
@@ -309,6 +332,8 @@ def is_internal_dependency(
         return False
 
     resolved_dependency_path = (manifest_path.parent / dependency_path).resolve()
+    if resolved_dependency_path / "Cargo.toml" in external_manifests:
+        return False
     try:
         resolved_dependency_path.relative_to(CARGO_RS_ROOT)
     except ValueError:
@@ -362,9 +387,11 @@ def add_failure(
     failures_by_path.setdefault(path_key, []).append(error)
 
 
-def workspace_package_names() -> set[str]:
+def workspace_package_names(external_manifests: set[Path] = frozenset()) -> set[str]:
     package_names = set()
     for path in cargo_manifests():
+        if path.resolve() in external_manifests:
+            continue
         manifest = load_manifest(path)
         package = manifest.get("package")
         if not isinstance(package, dict):
