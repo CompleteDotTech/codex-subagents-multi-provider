@@ -26,6 +26,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use http::HeaderMap;
 use http::HeaderValue;
 use std::sync::Arc;
@@ -130,9 +131,11 @@ async fn successful_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
             text_elements: vec![],
         }]))
         .await?;
-    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
     .await
     else {
         unreachable!("predicate requires turn completion");
@@ -152,12 +155,16 @@ async fn failed_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<ErrorEven
         }]))
         .await?;
     let mut emitted_error = None;
-    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
-        if let EventMsg::Error(error) = event {
-            emitted_error = Some(error.clone());
-        }
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            if let EventMsg::Error(error) = event {
+                emitted_error = Some(error.clone());
+            }
+            matches!(event, EventMsg::TurnComplete(_))
+        },
+        Duration::from_secs(30),
+    )
     .await
     else {
         unreachable!("predicate requires turn completion");
