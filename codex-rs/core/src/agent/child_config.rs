@@ -198,7 +198,7 @@ pub(crate) async fn prepare_agent_spawn_config(
             let tier = codex_protocol::config_types::ServiceTier::from_request_value(tier)
                 .map(|tier| tier.request_value().to_string())
                 .unwrap_or_else(|| tier.to_owned());
-            if config.service_tier.is_none() {
+            if config.service_tier.is_none() || !config.features.service_tier_enabled(&tier) {
                 return Err(format!(
                     "child_provider_capability_unsupported: service tier `{tier}` is disabled"
                 ));

@@ -34,6 +34,10 @@ impl Fixture {
             .thread
     }
     async fn new() -> Self {
+        Self::with_fast_mode(None).await
+    }
+
+    async fn with_fast_mode(fast_mode: Option<bool>) -> Self {
         let host = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -80,7 +84,7 @@ request_max_retries = 0
             "model_reasoning_effort = 'low'\n",
         )
         .unwrap();
-        let config = ConfigBuilder::without_managed_config_for_tests()
+        let mut config = ConfigBuilder::without_managed_config_for_tests()
             .codex_home(host.path().to_path_buf())
             .harness_overrides(ConfigOverrides {
                 cwd: Some(project.path().to_path_buf()),
@@ -89,6 +93,13 @@ request_max_retries = 0
             .build()
             .await
             .unwrap();
+        if let Some(enabled) = fast_mode {
+            if enabled {
+                config.features.enable(Feature::FastMode).unwrap();
+            } else {
+                config.features.disable(Feature::FastMode).unwrap();
+            }
+        }
         for role in ["tier", "reasoning", "default_tier"] {
             assert!(
                 config.agent_roles.contains_key(role),
@@ -382,6 +393,50 @@ async fn explicit_role_tier_is_validated_even_when_equal_to_inherited_value() {
         default.config.service_tier,
         Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.into())
     );
+}
+
+#[tokio::test]
+async fn advertised_custom_role_tier_requires_the_same_feature_gate_as_runtime() {
+    for enabled in [false, true] {
+        let fixture = Fixture::with_fast_mode(Some(enabled)).await;
+        std::fs::write(
+            fixture._host.path().join("tier.toml"),
+            "service_tier = 'custom'\n",
+        )
+        .unwrap();
+        let resolved = fixture.resolved("zai").await;
+        let path = resolved.model_catalog_json.as_ref().unwrap();
+        let mut catalog: ModelsResponse =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        catalog.models[0]
+            .service_tiers
+            .push(codex_protocol::openai_models::ModelServiceTier {
+                id: "custom".into(),
+                name: "Custom".into(),
+                description: "fixture".into(),
+            });
+        std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let result = fixture.prepared(&resolved, Some("tier"), None).await;
+        if !enabled {
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .contains("child_provider_capability_unsupported")
+            );
+        } else {
+            let prepared = result.unwrap();
+            assert_eq!(prepared.config.service_tier.as_deref(), Some("custom"));
+            let child = fixture.start_native_child(prepared.config).await;
+            let turn = child.session.new_default_turn().await;
+            let step = child
+                .session
+                .capture_step_context(turn, &tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(step.settings.service_tier.as_deref(), Some("custom"));
+        }
+    }
 }
 
 #[tokio::test]
