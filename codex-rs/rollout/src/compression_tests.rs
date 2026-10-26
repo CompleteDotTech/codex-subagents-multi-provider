@@ -293,8 +293,11 @@ async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> an
     write_rollout(&rollout_path, thread_id, "targeted search term")?;
     compress_now(&rollout_path)?;
 
+    // An explicit missing path reliably yields NotFound even when inherited PATH
+    // contains inaccessible Windows directories under WSL.
+    let missing_ripgrep = home.path().join("missing-rg-for-test");
     let matches = search_rollout_matches(
-        std::path::Path::new("missing-rg-for-test"),
+        &missing_ripgrep,
         home.path(),
         /*archived*/ false,
         "search term",
