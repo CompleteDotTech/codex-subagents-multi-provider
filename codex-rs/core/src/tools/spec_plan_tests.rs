@@ -367,7 +367,7 @@ async fn stateless_provider_exposes_deferred_handlers_without_server_tool_search
                             }),
                             ..Default::default()
                         },
-                        None,
+                        /*auth_manager*/ None,
                     );
                 },
                 ToolPlanInputs {

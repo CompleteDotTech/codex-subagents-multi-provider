@@ -859,7 +859,9 @@ describe("Codex", () => {
 
     try {
       const thread = client.startThread();
-      await expect(thread.run("fail")).rejects.toThrow("stream disconnected before completion:");
+      const result = thread.run("fail");
+      await expect(result).rejects.toBeInstanceOf(Error);
+      await expect(result).rejects.toThrow(new Error("rate limit exceeded: rate limit exceeded"));
     } finally {
       cleanup();
       await close();

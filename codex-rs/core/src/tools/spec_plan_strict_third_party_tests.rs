@@ -37,13 +37,17 @@ async fn stateless_strict_policy_keeps_third_party_tools_nested_and_rejects_wire
                 }),
                 ..Default::default()
             },
-            None,
+            /*auth_manager*/ None,
         );
         let router = plan_with_model(
             &turn,
             turn.model_info(),
             ToolPlanInputs {
-                dynamic_tools: vec![dynamic_tool(Some("client"), "reserved", false)],
+                dynamic_tools: vec![dynamic_tool(
+                    Some("client"),
+                    "reserved",
+                    /*defer_loading*/ false,
+                )],
                 ..Default::default()
             },
         );
@@ -87,7 +91,7 @@ async fn stateless_strict_policy_keeps_third_party_tools_nested_and_rejects_wire
                         cell_id: "cell".into(),
                         runtime_tool_call_id: "nested".into()
                     },
-                    true
+                    /*stateless*/ true
                 )
                 .unwrap(),
             native_call

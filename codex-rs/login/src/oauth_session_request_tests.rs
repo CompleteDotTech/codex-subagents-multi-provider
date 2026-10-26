@@ -70,7 +70,10 @@ async fn derived_cache_scope_is_unknown_for_busy_pending_rejected_expired_or_mis
     }
     assert_eq!(manager.observe_credential_identity().await.unwrap(), None);
     manager.state.cached_token.lock().await.login_required = None;
-    manager.publish_status(super::super::OAuthSessionStatus::Started, None);
+    manager.publish_status(
+        super::super::OAuthSessionStatus::Started,
+        /*credential*/ None,
+    );
     assert_eq!(manager.observe_credential_identity().await.unwrap(), None);
     manager.publish_status(super::super::OAuthSessionStatus::Succeeded, Some(&token));
     manager
