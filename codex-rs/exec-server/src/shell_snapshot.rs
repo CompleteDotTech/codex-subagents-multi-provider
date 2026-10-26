@@ -370,6 +370,13 @@ impl ShellSnapshotCache {
                 params.argv[2]
             )
         };
+        if shell_type == ShellType::Bash {
+            // Bash also reads .bashrc for noninteractive remote shells when stdin
+            // is a socket. Privileged mode alone does not suppress that startup.
+            prepared
+                .command
+                .insert(shell_start + 1, "--norc".to_string());
+        }
 
         telemetry.shell_snapshot_command(wait, availability, "used");
         Ok(reader)
