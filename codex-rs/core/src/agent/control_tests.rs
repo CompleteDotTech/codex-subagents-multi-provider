@@ -6403,14 +6403,21 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
         spawn_v2_reload_test_child(&control, harness.config.clone(), &parent, "worker").await;
     let thread = harness.manager.get_thread(child.thread_id).await.unwrap();
     persist_thread_for_tree_resume(&thread, "saved child security fixture").await;
-    let stored = thread.read_thread(true, true).await.unwrap();
-    let history = Arc::new(stored.history.expect("recorded saved history").items);
+    let stored = thread.read_thread(true, false).await.unwrap();
+    let state = control.runtime.upgrade().unwrap();
+    let context = state
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child.thread_id,
+            include_archived: true,
+        })
+        .await
+        .unwrap();
+    let history = Arc::new(context.items);
     let source = thread.session_source.clone();
     assert_eq!(
         harness.manager.try_evict_v2_thread(thread).await.unwrap(),
         ThreadEvictionOutcome::Evicted
     );
-    let state = control.runtime.upgrade().unwrap();
     for requested_source in [source, SessionSource::Exec] {
         let error = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {

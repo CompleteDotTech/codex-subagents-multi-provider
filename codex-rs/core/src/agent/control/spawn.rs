@@ -359,12 +359,6 @@ impl LocalAgentControl {
     ) -> CodexResult<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
         let state = self.runtime.upgrade()?;
         let caller = state.get_thread(caller_id).await?;
-        let caller_epoch =
-            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
-                &caller.session,
-                &caller.session_source,
-            )
-            .await;
         // A caller-supplied Config carries no authority. Project from the actual
         // registered host Session, then restore only host-read target metadata.
         let caller_turn = caller
@@ -373,6 +367,25 @@ impl LocalAgentControl {
             .await;
         let mut config =
             build_agent_resume_config(&caller_turn).map_err(CodexErr::InvalidRequest)?;
+        let caller_epoch =
+            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                &caller.session,
+                &caller.session_source,
+            )
+            .await;
+        if caller_epoch.config.config_layer_stack != config.config_layer_stack
+            || caller_epoch.settings.approval_policy != config.permissions.approval_policy.value()
+            || caller_epoch.settings.approvals_reviewer != config.approvals_reviewer
+            || caller_epoch.scope
+                != crate::agent::child_provider_authorization::ChildProviderScope::from_step(
+                    &config,
+                    &caller_turn.initial_environments,
+                )
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "actual caller changed while materializing its current execution environment",
+            ));
+        }
         let owner_thread_id = parent.as_ref().map(|parent| parent.session.thread_id);
         if let Some(parent) = &parent {
             let parent_thread_id = parent.session.thread_id;

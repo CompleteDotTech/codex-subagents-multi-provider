@@ -195,7 +195,8 @@ impl ChildProviderScope {
     }
 }
 
-/// Conservative config-only scope for non-executing discovery/caller compatibility.
+/// Config-only policy probe for managed-binding tests; executing paths use captured scopes.
+#[cfg(test)]
 pub(crate) fn current_policy(config: &Config) -> std::io::Result<ChildProviderPolicy> {
     current_policy_in_scope(
         config,
@@ -532,9 +533,14 @@ impl ChildResumePermit {
             || source.parent_thread_id() != parent
             || meta.model_provider.as_deref() != Some(config.model_provider_id.as_str())
         {
-            return Err(invalid(
-                "saved runtime identity, provider or ownership is inconsistent",
-            ));
+            return Err(invalid(&format!(
+                "saved runtime identity, provider or ownership is inconsistent (target={}, session={}, parent={}, source_parent={}, provider={})",
+                meta.id == saved.conversation_id,
+                meta.session_id == caller.session.session_id(),
+                meta.parent_thread_id == parent,
+                source.parent_thread_id() == parent,
+                meta.model_provider.as_deref() == Some(config.model_provider_id.as_str())
+            )));
         }
         let target = saved.conversation_id;
         let ceiling = runtime.retained_authority(target);

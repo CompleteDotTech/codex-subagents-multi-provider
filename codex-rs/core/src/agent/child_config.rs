@@ -127,11 +127,6 @@ pub(crate) async fn prepare_agent_spawn_config(
     if parent_base.config_layer_stack != config.config_layer_stack
         || parent_settings.approval_policy != config.permissions.approval_policy.value()
         || parent_settings.approvals_reviewer != config.approvals_reviewer
-        || parent_settings.cwd != config.cwd
-        || parent_settings
-            .runtime_workspace_roots
-            .as_ref()
-            .is_some_and(|roots| roots != &config.workspace_roots)
     {
         return Err(
             "child_provider_policy_conflict: invoking runtime scope changed before preparation"
