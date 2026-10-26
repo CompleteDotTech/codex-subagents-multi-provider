@@ -15,6 +15,19 @@ pub struct ModelProviderCapabilities {
     pub external_web_access: Option<bool>,
     /// Remote context-compaction protocol; omission preserves provider defaults.
     pub remote_compaction: Option<RemoteCompactionSupport>,
+    /// Responses request/history dialect. This cannot grant tool or filesystem authority.
+    pub responses: Option<ResponsesCompatibility>,
+}
+
+/// Wire compatibility for Responses endpoints, independent of provider or model names.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesCompatibility {
+    /// Full Responses protocol, preserving the existing OpenAI-compatible behavior.
+    #[default]
+    Full,
+    /// Stateless HTTP requests with portable history and function tools only.
+    StatelessFunctions,
 }
 
 /// Remote context-compaction protocols supported by a model provider.

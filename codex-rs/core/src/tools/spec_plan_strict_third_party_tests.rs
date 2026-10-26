@@ -5,6 +5,95 @@ use codex_extension_api::ToolPolicy;
 use pretty_assertions::assert_eq;
 use tracing_test::internal::MockWriter;
 
+#[tokio::test]
+async fn stateless_strict_policy_keeps_third_party_tools_nested_and_rejects_wire_aliases() {
+    use crate::tools::context::{ToolCallSource, ToolPayload};
+    use crate::tools::router::ToolCall;
+    for name in ["configured-strict-a", "configured-strict-b"] {
+        let (_, mut turn) = make_session_and_context().await;
+        set_features(
+            &mut turn,
+            &[
+                Feature::CodeMode,
+                Feature::CodeModeOnly,
+                Feature::CodeModeOnlyStrictThirdPartyTools,
+            ],
+        );
+        turn.code_mode_available = true;
+        update_turn_settings_for_test(&mut turn, |settings| {
+            let model = Arc::make_mut(&mut settings.model_info);
+            model.tool_mode = Some(ToolMode::CodeModeOnly);
+            model.supports_search_tool = true;
+        });
+        turn.provider = create_model_provider(
+            ModelProviderInfo {
+                name: name.into(),
+                capabilities: Some(codex_model_provider_info::ModelProviderCapabilities {
+                    responses: Some(
+                        codex_model_provider_info::ResponsesCompatibility::StatelessFunctions,
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        let router = plan_with_model(
+            &turn,
+            turn.model_info(),
+            ToolPlanInputs {
+                dynamic_tools: vec![dynamic_tool(Some("client"), "reserved", false)],
+                ..Default::default()
+            },
+        );
+        let native_name = ToolName::namespaced("client", "reserved");
+        assert!(
+            router
+                .code_mode_tool_names()
+                .values()
+                .any(|name| name == &native_name)
+        );
+        assert!(
+            !router
+                .model_visible_specs()
+                .iter()
+                .any(|spec| spec.name() == "client")
+        );
+        assert!(
+            router
+                .resolve_wire_tool(&ToolName::plain("client__reserved"))
+                .is_err()
+        );
+        assert!(
+            router
+                .resolve_wire_tool(&ToolName::plain("invented__alias"))
+                .is_err()
+        );
+        assert!(router.resolve_wire_tool(&ToolName::plain("exec")).is_ok());
+        let native_call = ToolCall {
+            tool_name: native_name,
+            call_id: "native-reserved".into(),
+            payload: ToolPayload::Function {
+                arguments: "{}".into(),
+            },
+            encrypted_function_args: None,
+        };
+        assert_eq!(
+            router
+                .normalize_wire_call(
+                    native_call.clone(),
+                    &ToolCallSource::CodeMode {
+                        cell_id: "cell".into(),
+                        runtime_tool_call_id: "nested".into()
+                    },
+                    true
+                )
+                .unwrap(),
+            native_call
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn strict_defers_third_party_tools_despite_caller_settings_and_logs_overrides() {
     let buffer: &'static std::sync::Mutex<Vec<u8>> =
