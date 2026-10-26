@@ -7,7 +7,8 @@ use tracing_test::internal::MockWriter;
 
 #[tokio::test]
 async fn stateless_strict_policy_keeps_third_party_tools_nested_and_rejects_wire_aliases() {
-    use crate::tools::context::{ToolCallSource, ToolPayload};
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolPayload;
     use crate::tools::router::ToolCall;
     for name in ["configured-strict-a", "configured-strict-b"] {
         let (_, mut turn) = make_session_and_context().await;
