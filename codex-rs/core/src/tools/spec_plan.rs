@@ -160,7 +160,7 @@ pub(crate) fn build_tool_router(
         &turn_context.config,
         apps_enabled,
         &mcp.config().mcp_server_catalog,
-        model_info.supports_search_tool,
+        supports_tool_search(turn_context, model_info),
         session.services.mcp_manager.shared_definitions(),
         &mut registry,
     );
@@ -193,6 +193,13 @@ pub(crate) fn build_tool_router(
     )
 }
 
+// Deferred loading is a provider protocol capability as well as a model feature.
+// Function-only endpoints advertise native handlers directly instead.
+fn supports_tool_search(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
+    model_info.supports_search_tool
+        && turn_context.provider.capabilities().responses
+            == codex_model_provider_info::ResponsesCompatibility::Full
+}
 /// Use the effective mode because the model can override the thread's configured mode.
 fn code_mode_only_strict_3p_tools(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
     effective_tool_mode(turn_context, model_info) == ToolMode::CodeModeOnly
@@ -270,7 +277,7 @@ fn apply_mcp_tool_exposure_policy(
             exposures = exposures.difference(ToolExposures::DEFERRED | ToolExposures::CODE_MODE);
         }
 
-        exposures = if model_info.supports_search_tool
+        exposures = if supports_tool_search(turn_context, model_info)
             && exposures.contains(ToolExposures::DEFERRED)
             && (effective_tool_mode(turn_context, model_info) != ToolMode::CodeModeOnly
                 || exposures.contains(ToolExposures::CODE_MODE))
@@ -384,6 +391,15 @@ pub(crate) fn finalize_tool_router(
     let model_messages = ResolvedModelMessages::from_model(model_info);
     hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
+    if turn_context.provider.capabilities().responses
+        == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
+    {
+        for tool in registry.entries_mut() {
+            if tool.exposure == ToolExposure::Deferred {
+                tool.exposure = ToolExposure::Direct;
+            }
+        }
+    }
     enforce_strict_3p_tools(turn_context, model_info, &mut registry);
     let tool_mode = effective_tool_mode(turn_context, model_info);
     let code_mode_enabled = matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly);
@@ -398,7 +414,7 @@ pub(crate) fn finalize_tool_router(
         }
     }
     let tool_search_name = ToolName::plain(TOOL_SEARCH_TOOL_NAME);
-    let search_exposure = if model_info.supports_search_tool
+    let search_exposure = if supports_tool_search(turn_context, model_info)
         && registry.tool_policy.allows(&tool_search_name)
         && registry.entries().any(|tool| {
             tool.runtime.tool_name() != tool_search_name
@@ -1034,7 +1050,7 @@ fn register_code_mode_executors(
     let mut exec_prompt_tool_specs = Vec::new();
     let mut deferred_exec_prompt_tool_specs = Vec::new();
     let mut included_deferred_mcp_output_schema = false;
-    let deferred_tools_guidance_enabled = model_info.supports_search_tool;
+    let deferred_tools_guidance_enabled = supports_tool_search(turn_context, model_info);
     for (name, spec, tool) in code_mode_tools(turn_context, model_info, registry) {
         code_mode_tool_names.insert(name, tool.runtime.tool_name());
         let exposure = tool.exposure;
@@ -1556,7 +1572,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
         } else {
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);
-            let exposure = if context.model_info.supports_search_tool {
+            let exposure = if supports_tool_search(turn_context, context.model_info) {
                 ToolExposure::Deferred
             } else {
                 ToolExposure::Direct

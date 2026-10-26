@@ -36,6 +36,7 @@ mod gateway_oauth;
 mod oauth_session;
 pub use capabilities::ModelProviderCapabilities;
 pub use capabilities::RemoteCompactionSupport;
+pub use capabilities::ResponsesCompatibility;
 pub use gateway_oauth::GatewayOAuthConfig;
 pub use gateway_oauth::GatewayOAuthDelivery;
 pub use oauth_session::OAuthSessionConfig;
@@ -681,7 +682,13 @@ pub fn built_in_model_providers(
         ),
         (
             OLLAMA_OSS_PROVIDER_ID,
-            create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
+            ModelProviderInfo {
+                capabilities: Some(ModelProviderCapabilities {
+                    responses: Some(ResponsesCompatibility::StatelessFunctions),
+                    ..Default::default()
+                }),
+                ..create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses)
+            },
         ),
         (
             LMSTUDIO_OSS_PROVIDER_ID,
