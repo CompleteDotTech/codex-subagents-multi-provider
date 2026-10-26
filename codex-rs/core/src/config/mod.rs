@@ -671,6 +671,12 @@ pub struct Config {
     /// Info needed to make an API request to the model.
     pub model_provider: ModelProviderInfo,
 
+    /// Host-only provider definitions and authorization for user-delegated children.
+    pub child_provider_policy: codex_config::child_provider::ChildProviderPolicy,
+
+    /// Bounded role selector consumed by child resolution, never a provider definition.
+    pub agent_role_model_provider: Option<String>,
+
     /// Deprecated: `friendly` and `pragmatic` no longer select a style.
     pub personality: Option<Personality>,
 
@@ -3969,6 +3975,12 @@ impl Config {
             .clone()
             .filter(|value| !value.is_empty());
 
+        let child_provider_policy =
+            codex_config::child_provider::ChildProviderPolicy::from_config_layers(
+                &config_layer_stack,
+                &resolved_cwd,
+                &workspace_roots,
+            )?;
         let model_providers =
             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
@@ -4466,6 +4478,8 @@ impl Config {
             async_compaction_threshold_percent,
             model_provider_id,
             model_provider,
+            child_provider_policy,
+            agent_role_model_provider: None,
             cwd: resolved_cwd,
             workspace_roots: workspace_roots.clone(),
             workspace_roots_explicit,

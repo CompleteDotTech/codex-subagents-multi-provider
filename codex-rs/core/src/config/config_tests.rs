@@ -8777,6 +8777,9 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
     let missing_path = codex_home.path().join("agents").join("researcher.toml");
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
+            allowed_model_providers: None,
+            default_subagent_model_provider: None,
+            provider_defaults: BTreeMap::new(),
             enabled: None,
             max_concurrent_threads_per_session: None,
             max_depth: None,
@@ -9792,6 +9795,9 @@ async fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Res
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
+            allowed_model_providers: None,
+            default_subagent_model_provider: None,
+            provider_defaults: BTreeMap::new(),
             enabled: None,
             max_concurrent_threads_per_session: None,
             max_depth: None,
@@ -9838,6 +9844,9 @@ async fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
+            allowed_model_providers: None,
+            default_subagent_model_provider: None,
+            provider_defaults: BTreeMap::new(),
             enabled: None,
             max_concurrent_threads_per_session: None,
             max_depth: None,
@@ -9878,6 +9887,9 @@ async fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
+            allowed_model_providers: None,
+            default_subagent_model_provider: None,
+            provider_defaults: BTreeMap::new(),
             enabled: None,
             max_concurrent_threads_per_session: None,
             max_depth: None,
@@ -9918,6 +9930,9 @@ async fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io:
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
+            allowed_model_providers: None,
+            default_subagent_model_provider: None,
+            provider_defaults: BTreeMap::new(),
             enabled: None,
             max_concurrent_threads_per_session: None,
             max_depth: None,
