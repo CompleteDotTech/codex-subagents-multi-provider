@@ -2,5 +2,6 @@
 # Ref: https://github.com/codespell-project/codespell#using-a-config-file
 skip = .git*,vendor,*-lock.yaml,*.lock,.codespellrc,*test.ts,*.jsonl,frame*.txt,*.snap,*.snap.new
 check-hidden = true
-ignore-regex = ^\s*"image/\S+": ".*|\b(afterAll)\b
+# WRONLY is a POSIX open flag; \oint and its Rust symbol-table key are LaTeX.
+ignore-regex = ^\s*"image/\S+": ".*|\b(afterAll)\b|\bWRONLY\b|\\oint\b|"oint"(?=\s*=>\s*"\u222e")
 ignore-words-list = ratatui,ser,iTerm,iterm2,iterm,te,TE,PASE,SEH

@@ -66,3 +66,7 @@ coverage. Record actual job results and artifact source identities.
 GitHub documents the labels and architecture under
 [standard hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 This mapping does not change release workflows or billing settings.
+
+Windows-capable CI jobs set Git `core.longpaths=true` before checkout. This
+includes both reusable nextest archive and shard jobs: configuring Git after
+checkout cannot recover a checkout rejected for long snapshot paths.
