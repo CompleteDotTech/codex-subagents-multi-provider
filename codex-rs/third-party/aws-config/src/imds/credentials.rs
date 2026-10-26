@@ -306,8 +306,8 @@ mod test {
     async fn profile_is_not_cached() {
         let http_client = StaticReplayClient::new(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/meta-data/iam/security-credentials/", TOKEN_A),
@@ -342,8 +342,8 @@ mod test {
     async fn credentials_not_stale_should_be_used_as_they_are() {
         let http_client = StaticReplayClient::new(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/meta-data/iam/security-credentials/", TOKEN_A),
@@ -387,8 +387,8 @@ mod test {
     async fn expired_credentials_should_be_extended() {
         let http_client = StaticReplayClient::new(vec![
                 ReplayEvent::new(
-                    token_request("http://169.254.169.254", 21600),
-                    token_response(21600, TOKEN_A),
+                    token_request("http://169.254.169.254", /*ttl*/ 21600),
+                    token_response(/*ttl*/ 21600, TOKEN_A),
                 ),
                 ReplayEvent::new(
                     imds_request("http://169.254.169.254/latest/meta-data/iam/security-credentials/", TOKEN_A),
@@ -503,8 +503,8 @@ mod test {
                 // The next three request/response pairs will correspond to the first call to `provide_credentials`.
                 // During the call, it populates last_retrieved_credentials.
                 ReplayEvent::new(
-                    token_request("http://169.254.169.254", 21600),
-                    token_response(21600, TOKEN_A),
+                    token_request("http://169.254.169.254", /*ttl*/ 21600),
+                    token_response(/*ttl*/ 21600, TOKEN_A),
                 ),
                 ReplayEvent::new(
                     imds_request("http://169.254.169.254/latest/meta-data/iam/security-credentials/", TOKEN_A),
@@ -537,8 +537,8 @@ mod test {
     async fn credentials_feature() {
         let http_client = StaticReplayClient::new(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/meta-data/iam/security-credentials/", TOKEN_A),
