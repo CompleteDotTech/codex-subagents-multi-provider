@@ -5,6 +5,7 @@
 
 use crate::agent::control::LocalAgentRuntime;
 use crate::config::Config;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::session::Session;
 use codex_config::child_provider::ChildProviderOriginBinding;
 use codex_config::child_provider::ChildProviderOriginRecord;
@@ -13,9 +14,14 @@ use codex_config::child_provider::VerifiedChildProviderOrigin;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -92,8 +98,107 @@ impl ChildProviderOrigins {
     }
 }
 
-/// Refresh provenance against exactly the effective runtime filesystem scope.
+/// Host-captured execution authority, distinct from top-level display/default roots.
+/// No Session/Thread is retained and no caller can deserialize or supply this scope.
+#[derive(Clone, PartialEq)]
+pub(crate) struct ChildProviderScope {
+    cwd: AbsolutePathBuf,
+    roots: Vec<AbsolutePathBuf>,
+    profile: PermissionProfile,
+    environments: Vec<(TurnEnvironmentSelection, Option<EnvironmentConfig>)>,
+}
+
+impl ChildProviderScope {
+    pub(crate) fn from_step(config: &Config, environments: &TurnEnvironmentSnapshot) -> Self {
+        Self::capture(config, None, environments)
+    }
+
+    pub(crate) fn from_current(
+        config: &Config,
+        settings: &ThreadSettingsSnapshot,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> Self {
+        Self::capture(config, Some(settings), environments)
+    }
+
+    fn capture(
+        config: &Config,
+        settings: Option<&ThreadSettingsSnapshot>,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> Self {
+        let mut cwd = settings
+            .map(|settings| settings.cwd.clone())
+            .unwrap_or_else(|| config.cwd.clone());
+        let mut roots = settings
+            .and_then(|settings| settings.runtime_workspace_roots.clone())
+            .unwrap_or_else(|| config.workspace_roots.clone());
+        let mut profile = config.permissions.permission_profile().clone();
+        if let Some(local) = environments.local_selection() {
+            if let Ok(local_cwd) = local.cwd.to_abs_path() {
+                cwd = local_cwd;
+            }
+            roots = local
+                .workspace_roots
+                .iter()
+                .filter_map(|root| root.to_abs_path().ok())
+                .collect();
+            profile = if let Some(ready) = environments
+                .turn_environments()
+                .find(|environment| environment.selection.environment_id == local.environment_id)
+            {
+                ready.permission_profile_with_workspace_roots()
+            } else if let EnvironmentConfigState::Ready(owner) = &local.config {
+                owner
+                    .permission_profile
+                    .permission_profile()
+                    .clone()
+                    .materialize_project_roots_with_workspace_roots(&roots)
+            } else {
+                profile.materialize_project_roots_with_workspace_roots(&roots)
+            };
+        } else {
+            profile = profile.materialize_project_roots_with_workspace_roots(&roots);
+        }
+        let bindings = environments
+            .all_selections()
+            .into_iter()
+            .map(|selection| {
+                let ready = environments
+                    .turn_environments()
+                    .find(|environment| {
+                        environment.selection.environment_id == selection.environment_id
+                    })
+                    .map(|environment| environment.config().clone());
+                (selection, ready)
+            })
+            .collect();
+        Self {
+            cwd,
+            roots,
+            profile,
+            environments: bindings,
+        }
+    }
+}
+
+/// Conservative config-only scope for non-executing discovery/caller compatibility.
 pub(crate) fn current_policy(config: &Config) -> std::io::Result<ChildProviderPolicy> {
+    current_policy_in_scope(
+        config,
+        &ChildProviderScope {
+            cwd: config.cwd.clone(),
+            roots: config.workspace_roots.clone(),
+            profile: config.permissions.effective_permission_profile(),
+            environments: Vec::new(),
+        },
+    )
+}
+
+/// Re-establish trust using the actual captured executor's filesystem authority.
+pub(crate) fn current_policy_in_scope(
+    config: &Config,
+    scope: &ChildProviderScope,
+) -> std::io::Result<ChildProviderPolicy> {
     // Retained layer snapshots cannot authorize new launches after the host
     // observes a changed or suspended managed bundle.
     let managed = config
@@ -109,9 +214,9 @@ pub(crate) fn current_policy(config: &Config) -> std::io::Result<ChildProviderPo
             "managed child-provider policy is no longer current",
         ));
     }
-    let filesystem = config.permissions.file_system_sandbox_policy();
-    let writable = filesystem.get_writable_roots_with_cwd(config.cwd.as_path());
-    let mut roots = config.workspace_roots.clone();
+    let filesystem = scope.profile.file_system_sandbox_policy();
+    let writable = filesystem.get_writable_roots_with_cwd(scope.cwd.as_path());
+    let mut roots = scope.roots.clone();
     roots.extend(writable.iter().map(|root| root.root.clone()));
     roots.sort();
     roots.dedup();
@@ -121,7 +226,7 @@ pub(crate) fn current_policy(config: &Config) -> std::io::Result<ChildProviderPo
         .collect::<Vec<_>>();
     ChildProviderPolicy::from_config_layers(
         &config.config_layer_stack,
-        &config.cwd,
+        &scope.cwd,
         &roots,
         &protected,
         &filesystem,
@@ -137,6 +242,7 @@ pub(crate) struct PreparedChildAuthorization {
     role_name: Option<String>,
     parent_settings: ThreadSettingsSnapshot,
     parent_base: Arc<Config>,
+    execution_scope: ChildProviderScope,
     approved: Arc<Config>,
     consumed: Arc<AtomicBool>,
 }
@@ -164,6 +270,7 @@ impl PreparedChildAuthorization {
         parent_settings: ThreadSettingsSnapshot,
         parent_base: Arc<Config>,
         role_name: Option<String>,
+        execution_scope: ChildProviderScope,
     ) -> Self {
         debug_assert!(config.prepared_child_authorization.is_none());
         Self {
@@ -178,6 +285,7 @@ impl PreparedChildAuthorization {
             role_name,
             parent_settings,
             parent_base,
+            execution_scope,
             approved: Arc::new(config.clone()),
             consumed: Arc::new(AtomicBool::new(false)),
         }
@@ -235,6 +343,8 @@ impl PreparedChildAuthorization {
                 return Err(invalid("child task path is outside its actual parent"));
             }
         }
+        let (current, settings, environments) =
+            parent.session.native_agent_authority_snapshot().await;
         if !Arc::ptr_eq(
             &self.origins,
             &parent
@@ -242,13 +352,19 @@ impl PreparedChildAuthorization {
                 .services
                 .local_agent_runtime
                 .child_provider_origins,
-        ) || parent.thread_settings_snapshot().await != self.parent_settings
-            || parent.session.get_config().await.as_ref() != self.parent_base.as_ref()
+        ) || settings != self.parent_settings
+            || current.as_ref() != self.parent_base.as_ref()
             || self.origins.verified(caller) != self.origin
         {
             return Err(invalid("parent authority changed after child preparation"));
         }
-        let policy = current_policy(config)
+        let scope = ChildProviderScope::from_current(&current, &settings, &environments);
+        if scope != self.execution_scope {
+            return Err(invalid(
+                "execution environment authority changed after child preparation",
+            ));
+        }
+        let policy = current_policy_in_scope(config, &scope)
             .map_err(|_| invalid("current child policy cannot be established"))?;
         policy
             .authorize(&config.model_provider_id, self.origin.as_ref())

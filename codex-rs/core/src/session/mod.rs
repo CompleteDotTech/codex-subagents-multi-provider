@@ -2199,6 +2199,23 @@ impl Session {
         state.session_configuration.environments.clone()
     }
 
+    /// Captures one host authority epoch without executor, catalog or transport I/O.
+    pub(crate) async fn native_agent_authority_snapshot(
+        &self,
+    ) -> (Arc<Config>, ThreadSettingsSnapshot, TurnEnvironmentSnapshot) {
+        let state = self.state.lock().await;
+        let configuration = &state.session_configuration;
+        let mut config = configuration.original_config_do_not_use.as_ref().clone();
+        // Preserve the selected raw profile, whose ProjectRoots placeholders must
+        // be materialized against the captured executor rather than display roots.
+        configuration.apply_permission_profile_to_permissions(&mut config.permissions);
+        (
+            Arc::new(config),
+            configuration.thread_settings_snapshot(&configuration.environments),
+            self.services.turn_environments.snapshot_now(),
+        )
+    }
+
     pub(crate) async fn thread_settings_snapshot(&self) -> ThreadSettingsSnapshot {
         let state = self.state.lock().await;
         state

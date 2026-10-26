@@ -1211,3 +1211,57 @@ async fn controller_rejects_transplanted_mutated_and_relabelled_prepared_launche
         .unwrap();
     drop(permit);
 }
+
+#[tokio::test]
+async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_display_roots() {
+    let fixture = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let mut prepared = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    let source = prepared_source(&fixture.parent, &prepared);
+    let before = fixture.parent.thread_settings_snapshot().await;
+    let environments = fixture
+        .parent
+        .session
+        .inherited_environment_snapshot()
+        .await;
+    let ready = environments.primary().expect("fixture local executor");
+    let mut owner = ready.config().clone();
+    owner.allow_login_shell = !owner.allow_login_shell;
+    let mut selection = ready.selection();
+    selection.config = codex_protocol::protocol::EnvironmentConfigState::Ready(owner);
+    fixture
+        .parent
+        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                before.cwd.clone(),
+                vec![selection.into_request()],
+            )),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let after = fixture.parent.thread_settings_snapshot().await;
+    assert_eq!(before.cwd, after.cwd);
+    assert_eq!(
+        before.runtime_workspace_roots,
+        after.runtime_workspace_roots
+    );
+    let result = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &fixture.parent.session.services.local_agent_runtime,
+            fixture.parent.session.thread_id,
+            &prepared,
+            false,
+            &source,
+        )
+        .await;
+    assert!(result.is_err_and(|error| error.to_string().contains("environment authority changed")));
+    assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
+}

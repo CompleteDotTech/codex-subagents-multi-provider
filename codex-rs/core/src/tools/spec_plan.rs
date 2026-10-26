@@ -1462,15 +1462,22 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
 #[instrument(level = "trace", skip_all)]
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     let turn_context = context.turn_context;
+    let execution_scope = crate::agent::child_provider_authorization::ChildProviderScope::from_step(
+        &turn_context.config,
+        context.environments,
+    );
     let allowed_model_providers =
-        crate::agent::child_provider_authorization::current_policy(&turn_context.config)
-            .map(|policy| {
-                policy.selectable_provider_ids(
-                    context.provider_origin,
-                    &turn_context.config.model_provider_id,
-                )
-            })
-            .unwrap_or_default();
+        crate::agent::child_provider_authorization::current_policy_in_scope(
+            &turn_context.config,
+            &execution_scope,
+        )
+        .map(|policy| {
+            policy.selectable_provider_ids(
+                context.provider_origin,
+                &turn_context.config.model_provider_id,
+            )
+        })
+        .unwrap_or_default();
     if collab_tools_enabled(turn_context, context.model_info) {
         if multi_agent_v2_enabled(turn_context) {
             let model_messages = ResolvedModelMessages::from_model(context.model_info);

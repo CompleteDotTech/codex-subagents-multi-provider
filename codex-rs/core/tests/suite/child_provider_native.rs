@@ -42,6 +42,33 @@ fn body(request: &Request) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn advertised_provider_ids(value: &Value) -> Vec<String> {
+    let mut ids = vec![];
+    match value {
+        Value::Object(object) => {
+            if let Some(values) = object
+                .get("model_provider")
+                .and_then(|schema| schema.get("enum"))
+                .and_then(Value::as_array)
+            {
+                ids.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+            for value in object.values() {
+                ids.extend(advertised_provider_ids(value));
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                ids.extend(advertised_provider_ids(value));
+            }
+        }
+        _ => {}
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 fn completion(id: &str) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
@@ -122,6 +149,7 @@ impl Fixture {
         // Exercise native direct tools; deferred tool_search advertisement is
         // covered by the separate Responses capability suites.
         info.supports_search_tool = false;
+        info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
         info.used_fallback_model_metadata = false;
         std::fs::write(
             home.path().join("catalog.json"),
@@ -226,6 +254,7 @@ request_max_retries = 0
             .with_model_info_override("gpt-5.5", move |info| {
                 info.multi_agent_version = Some(version);
                 info.supports_search_tool = false;
+                info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
             })
             .with_config(move |config| {
                 config.features.enable(Feature::Collab).unwrap();
@@ -719,7 +748,8 @@ async fn native_runtime_cwd_and_write_scope_revoke_host_file_authority() -> Resu
                     .expect("mock request recording must be enabled")
                     .iter()
                     .filter(|request| request.method.as_str() == "POST")
-                    .any(|request| body(request)["tools"].to_string().contains("blocked"))
+                    .any(|request| advertised_provider_ids(&body(request)["tools"])
+                        .contains(&"blocked".into()))
             );
             fixture.root.reset().await;
             let mut overrides = codex_protocol::protocol::ThreadSettingsOverrides::default();
@@ -778,6 +808,17 @@ async fn native_runtime_cwd_and_write_scope_revoke_host_file_authority() -> Resu
                     .is_empty()
             );
             assert!(!fixture.home.path().join("helper-marker").exists());
+            assert!(
+                fixture
+                    .root
+                    .received_requests()
+                    .await
+                    .expect("recording enabled")
+                    .iter()
+                    .filter(|request| request.method.as_str() == "POST")
+                    .all(|request| !advertised_provider_ids(&body(request)["tools"])
+                        .contains(&"blocked".into()))
+            );
             assert!(
                 fixture
                     .root

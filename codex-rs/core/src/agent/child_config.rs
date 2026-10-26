@@ -3,8 +3,11 @@
 //! Spawn and reload share live runtime policy; role and model precedence, full-history
 //! inheritance, and validation messages remain the same for each multi-agent version.
 
+use crate::agent::child_provider_authorization::ChildProviderScope;
 use crate::agent::child_provider_authorization::PreparedChildAuthorization;
+#[cfg(test)]
 use crate::agent::child_provider_authorization::current_policy;
+use crate::agent::child_provider_authorization::current_policy_in_scope;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::PreparedAgentRole;
 use crate::agent::role::prepare_role;
@@ -119,13 +122,12 @@ pub(crate) async fn prepare_agent_spawn_config(
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
-    let parent_settings = session.thread_settings_snapshot().await;
-    let parent_base = session.get_config().await;
+    let (parent_base, parent_settings, current_environments) =
+        session.native_agent_authority_snapshot().await;
     if parent_base.config_layer_stack != config.config_layer_stack
         || parent_settings.approval_policy != config.permissions.approval_policy.value()
         || parent_settings.approvals_reviewer != config.approvals_reviewer
         || parent_settings.cwd != config.cwd
-        || parent_settings.permission_profile != config.permissions.effective_permission_profile()
         || parent_settings
             .runtime_workspace_roots
             .as_ref()
@@ -136,6 +138,12 @@ pub(crate) async fn prepare_agent_spawn_config(
                 .into(),
         );
     }
+    let execution_scope = ChildProviderScope::from_step(&config, &step_context.environments);
+    if execution_scope
+        != ChildProviderScope::from_current(&parent_base, &parent_settings, &current_environments)
+    {
+        return Err("child_provider_policy_conflict: invoking execution environment authority changed before preparation".into());
+    }
     let prepared_role = if !options.full_history_fork
         || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
     {
@@ -143,7 +151,25 @@ pub(crate) async fn prepare_agent_spawn_config(
     } else {
         None
     };
-    let policy = current_policy(&config).map_err(|_| {
+    // Role loading is asynchronous. Recheck the actual host scope before any
+    // target catalog/helper work rather than blessing a stale pre-role snapshot.
+    let (current_base, current_settings, current_environments) =
+        session.native_agent_authority_snapshot().await;
+    if current_settings != parent_settings
+        || current_base.as_ref() != parent_base.as_ref()
+        || execution_scope
+            != ChildProviderScope::from_current(
+                &current_base,
+                &current_settings,
+                &current_environments,
+            )
+    {
+        return Err(
+            "child_provider_policy_conflict: host authority changed while loading the child role"
+                .into(),
+        );
+    }
+    let policy = current_policy_in_scope(&config, &execution_scope).map_err(|_| {
         "child_provider_policy_conflict: runtime policy cannot be established".to_owned()
     })?;
     let origin = session
@@ -331,6 +357,7 @@ pub(crate) async fn prepare_agent_spawn_config(
         parent_settings,
         parent_base,
         role_name.clone(),
+        execution_scope,
     ));
     Ok(PreparedSpawnConfig { config, role_name })
 }
@@ -485,7 +512,11 @@ pub(crate) fn build_agent_spawn_config(
     let settings = &step_context.settings;
     apply_step_security_overrides(&mut config, step_context)?;
     config.model = Some(settings.model_info.slug.clone());
-    config.model_reasoning_effort = settings.effective_reasoning_effort();
+    // Retain model-default intent instead of turning an unspecified selection
+    // into the current model's resolved default. Transport/status resolve it
+    // against the selected catalog; changed-provider preparation sets its own
+    // target default and explicit/role overrides still apply below.
+    config.model_reasoning_effort = settings.reasoning_effort().cloned();
     config.model_reasoning_summary = Some(settings.reasoning_summary);
     config.base_instructions = Some(base_instructions.text.clone());
     config.base_instructions_provenance = base_instructions.provenance.clone();

@@ -210,9 +210,20 @@ impl LocalAgentControl {
 }
 
 async fn test_config_with_cli_overrides(
+    cli_overrides: Vec<(String, TomlValue)>,
+) -> (TempDir, Config) {
+    test_config_with_host_configuration(cli_overrides, None).await
+}
+
+async fn test_config_with_host_configuration(
     mut cli_overrides: Vec<(String, TomlValue)>,
+    host_configuration: Option<&str>,
 ) -> (TempDir, Config) {
     let home = TempDir::new().expect("create temp dir");
+    if let Some(contents) = host_configuration {
+        std::fs::write(home.path().join("config.toml"), contents)
+            .expect("write host fixture policy");
+    }
     if !cli_overrides
         .iter()
         .any(|(key, _)| key == "agents.max_depth")
@@ -1825,7 +1836,11 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
     shared: bool,
     nested: bool,
 ) {
-    let (home, mut config) = test_config().await;
+    let (home, mut config) = test_config_with_host_configuration(
+        Vec::new(),
+        Some("[agents]\nallowed_model_providers=['openai']\n"),
+    )
+    .await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
     let harness = AgentControlHarness::new_with_config(home, config).await;
@@ -5072,7 +5087,7 @@ async fn spawn_thread_subagents_persist_parent_originator_across_new_and_full_fo
                 depth: 1,
                 agent_path: None,
                 agent_nickname: None,
-                agent_role: Some("explorer".to_string()),
+                agent_role: None,
             }),
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some("spawn-call-full-history".to_string()),
@@ -5375,21 +5390,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
 #[tokio::test]
 async fn resume_agent_from_rollout_reads_archived_rollout_path() {
     let harness = AgentControlHarness::new().await;
-    let child_thread_id = harness
-        .control
-        .spawn_agent(
-            harness.config.clone(),
-            text_input("hello"),
-            /*session_source*/ None,
-        )
-        .await
-        .expect("child spawn should succeed");
-
-    let child_thread = harness
-        .manager
-        .get_thread(child_thread_id)
-        .await
-        .expect("child thread should exist");
+    let (child_thread_id, child_thread) = harness.start_thread().await;
     persist_thread_for_tree_resume(&child_thread, "persist before archiving").await;
     let _ = harness
         .control
@@ -5464,7 +5465,11 @@ async fn resume_agent_from_paginated_rollout_loads_model_context(disabled_plugin
 
     let resumed_thread_id = harness
         .control
-        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec)
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            child_thread.session_source.clone(),
+        )
         .await
         .expect("resume should load paginated model context");
     assert_eq!(resumed_thread_id, child_thread_id);
