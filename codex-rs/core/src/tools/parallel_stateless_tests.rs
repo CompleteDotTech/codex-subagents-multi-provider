@@ -121,9 +121,10 @@ async fn fixture(finishes: bool) -> (ToolCallRuntime, Arc<Gates>, Arc<Observer>)
         gates: gates.clone(),
         finishes,
     }) as Arc<dyn CoreToolRuntime>;
+    let specs = vec![handler.spec()];
     let router = Arc::new(ToolRouter::from_parts(
         ToolRegistry::from_tools([handler]),
-        Vec::new(),
+        specs,
         ToolMode::Direct,
         BTreeMap::new(),
         None,

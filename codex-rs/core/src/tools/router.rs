@@ -279,6 +279,24 @@ impl ToolRouter {
             ));
         }
         let name = registered.runtime.tool_name();
+        let advertised = self.model_visible_specs.iter().any(|spec| match spec {
+            ToolSpec::Function(_) | ToolSpec::Freeform(_) => {
+                name.is_default_namespace() && spec.name() == name.name
+            }
+            ToolSpec::Namespace(namespace) => {
+                name.namespace.as_deref() == Some(namespace.name.as_str())
+                    && namespace.tools.iter().any(|tool| match tool {
+                        ResponsesApiNamespaceTool::Function(tool) => tool.name == name.name,
+                        ResponsesApiNamespaceTool::Custom(tool) => tool.name == name.name,
+                    })
+            }
+            ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => false,
+        });
+        if !advertised {
+            return Err(FunctionCallError::RespondToModel(
+                "function tool is not advertised for direct invocation".to_string(),
+            ));
+        }
         let spec = registered.spec();
         let freeform = match &*spec {
             ToolSpec::Freeform(_) => true,

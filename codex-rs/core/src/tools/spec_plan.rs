@@ -383,7 +383,6 @@ pub(crate) fn finalize_tool_router(
     let model_messages = ResolvedModelMessages::from_model(model_info);
     hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
-    enforce_strict_3p_tools(turn_context, model_info, &mut registry);
     if turn_context.provider.capabilities().responses
         == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
     {
@@ -393,6 +392,7 @@ pub(crate) fn finalize_tool_router(
             }
         }
     }
+    enforce_strict_3p_tools(turn_context, model_info, &mut registry);
     let tool_mode = effective_tool_mode(turn_context, model_info);
     let code_mode_enabled = matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly);
     if code_mode_enabled {
