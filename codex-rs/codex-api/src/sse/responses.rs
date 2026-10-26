@@ -4,7 +4,6 @@ use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
-use crate::error::parse_flex_unavailable;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
@@ -20,6 +19,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -41,6 +41,16 @@ pub fn spawn_response_stream(
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> ResponseStream {
+    let json_response = stream_response
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        });
     let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
     let models_etag = stream_response
         .headers
@@ -73,6 +83,40 @@ pub fn spawn_response_stream(
     }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
+        if json_response {
+            // Some compatible providers carry structured failures in HTTP 200.
+            // Bound both collection and time; never reinterpret JSON as a
+            // successfully completed streaming response.
+            let failure = timeout(idle_timeout, async {
+                let mut bytes = Vec::new();
+                let mut stream = stream_response.bytes;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(ApiError::Transport)?;
+                    if bytes.len().saturating_add(chunk.len()) > 65_536 {
+                        return Err(ApiError::Stream(
+                            "JSON provider error exceeds size limit".into(),
+                        ));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| ApiError::Stream("invalid JSON provider response".into()))?;
+                if value.get("error").is_some_and(|error| !error.is_null()) {
+                    Ok(parse_failed_response(Some(value)))
+                } else {
+                    Ok(ApiError::Stream(
+                        "expected a streaming Responses response".into(),
+                    ))
+                }
+            })
+            .await;
+            let error = match failure {
+                Ok(Ok(error)) | Ok(Err(error)) => error,
+                Err(_) => ApiError::Stream("idle timeout reading JSON provider error".into()),
+            };
+            let _ = tx_event.send(Err(error)).await;
+            return;
+        }
         if let Some(model) = server_model {
             let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
         }
@@ -164,6 +208,8 @@ pub struct ResponsesStreamEvent {
     metadata: Option<Value>,
     response: Option<Value>,
     error: Option<Value>,
+    code: Option<String>,
+    message: Option<String>,
     item: Option<Value>,
     item_id: Option<String>,
     call_id: Option<String>,
@@ -347,17 +393,25 @@ pub fn process_responses_event(
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "error" => {
-            if let Some(error) = event.error.as_ref().and_then(parse_flex_unavailable) {
-                return Err(ResponsesEventError::Api(error));
-            }
+            let error = event
+                .error
+                .unwrap_or_else(|| serde_json::json!({"code":event.code,"message":event.message}));
+            return Err(ResponsesEventError::Api(parse_failed_response(Some(
+                serde_json::json!({"error": error}),
+            ))));
         }
         "response.output_item.done" => {
             if let Some(item_val) = event.item {
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
                     return Ok(Some(ResponseEvent::OutputItemDone(item)));
                 }
-                debug!("failed to parse ResponseItem from output_item.done");
+                return Err(ResponsesEventError::Api(ApiError::Stream(
+                    "invalid response.output_item.done item".into(),
+                )));
             }
+            return Err(ResponsesEventError::Api(ApiError::Stream(
+                "missing response.output_item.done item".into(),
+            )));
         }
         "response.output_text.delta" => {
             if let Some(delta) = event.delta {
@@ -484,8 +538,13 @@ pub fn process_responses_event(
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
                     return Ok(Some(ResponseEvent::OutputItemAdded(item)));
                 }
-                debug!("failed to parse ResponseItem from output_item.added");
+                return Err(ResponsesEventError::Api(ApiError::Stream(
+                    "invalid response.output_item.added item".into(),
+                )));
             }
+            return Err(ResponsesEventError::Api(ApiError::Stream(
+                "missing response.output_item.added item".into(),
+            )));
         }
         "response.reasoning_summary_part.added" => {
             if let Some(summary_index) = event.summary_index {
@@ -546,7 +605,7 @@ async fn process_sse_with_treatment(
     safety_buffering_treatment: SafetyBufferingTreatment,
 ) {
     let mut stream = stream.eventsource();
-    let mut response_error: Option<ApiError> = None;
+    let mut pending_tool_calls = HashSet::new();
     let mut last_server_model: Option<String> = None;
 
     loop {
@@ -573,9 +632,7 @@ async fn process_sse_with_treatment(
                 return;
             }
             Ok(None) => {
-                let error = response_error.unwrap_or(ApiError::Stream(
-                    "stream closed before response.completed".into(),
-                ));
+                let error = ApiError::Stream("stream closed before response.completed".into());
                 let _ = tx_event.send(Err(error)).await;
                 return;
             }
@@ -589,6 +646,16 @@ async fn process_sse_with_treatment(
 
         trace!("SSE event: {}", &sse.data);
 
+        // A JSON error without an SSE event type is used by some compatible
+        // endpoints. Preserve its quota/rate category rather than retrying an
+        // unclassified parse error until the generic stream budget expires.
+        if let Ok(value) = serde_json::from_str::<Value>(&sse.data)
+            && value.get("type").is_none()
+            && value.get("error").is_some_and(|error| !error.is_null())
+        {
+            let _ = tx_event.send(Err(parse_failed_response(Some(value)))).await;
+            return;
+        }
         let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
             Err(e) => {
@@ -599,7 +666,15 @@ async fn process_sse_with_treatment(
                     payload_bytes = sse.data.len(),
                     "Failed to parse SSE event"
                 );
-                continue;
+                if sse.data.trim().is_empty() || sse.data.trim() == "[DONE]" {
+                    continue;
+                }
+                let _ = tx_event
+                    .send(Err(ApiError::Stream(
+                        "invalid JSON in Responses stream".into(),
+                    )))
+                    .await;
+                return;
             }
         };
         let model_verifications = event.model_verifications();
@@ -646,6 +721,31 @@ async fn process_sse_with_treatment(
         match process_responses_event(event) {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                match &event {
+                    ResponseEvent::OutputItemAdded(
+                        ResponseItem::FunctionCall { call_id, .. }
+                        | ResponseItem::CustomToolCall { call_id, .. },
+                    ) => {
+                        pending_tool_calls.insert(call_id.clone());
+                    }
+                    ResponseEvent::OutputItemDone(
+                        ResponseItem::FunctionCall { call_id, .. }
+                        | ResponseItem::CustomToolCall { call_id, .. },
+                    ) => {
+                        pending_tool_calls.remove(call_id);
+                    }
+                    _ => {}
+                }
+                if is_completed {
+                    if !pending_tool_calls.is_empty() {
+                        let _ = tx_event
+                            .send(Err(ApiError::Stream(
+                                "response completed with unfinished tool calls".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -656,14 +756,8 @@ async fn process_sse_with_treatment(
             Ok(None) => {}
             Err(error) => {
                 let error = error.into_api_error();
-                if matches!(
-                    error,
-                    ApiError::FlexUnavailable | ApiError::ResponseIncomplete(_)
-                ) {
-                    let _ = tx_event.send(Err(error)).await;
-                    return;
-                }
-                response_error = Some(error);
+                let _ = tx_event.send(Err(error)).await;
+                return;
             }
         };
     }
@@ -672,6 +766,10 @@ async fn process_sse_with_treatment(
 #[cfg(test)]
 #[path = "responses_error_tests.rs"]
 mod error_tests;
+
+#[cfg(test)]
+#[path = "responses_compatibility_tests.rs"]
+mod compatibility_tests;
 
 #[cfg(test)]
 mod tests {
