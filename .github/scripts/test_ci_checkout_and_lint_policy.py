@@ -10,6 +10,55 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CheckoutAndLintPolicyTest(unittest.TestCase):
+    def test_fork_cold_build_budgets_preserve_upstream_and_short_jobs(self):
+        policies = {
+            "bazel.yml": {
+                "test": ("30", 90),
+                "test-windows-shard": ("30", 90),
+                "test-windows-native-main": ("40", None),
+                "clippy": ("30", 90),
+                "verify-release-build": ("30", 90),
+            },
+            "rust-ci.yml": {
+                "argument_comment_lint_prebuilt": ("matrix.timeout_minutes", 90),
+            },
+            "sdk.yml": {
+                "python-sdk-installation": ("10", None),
+                "sdks": ("20", 60),
+            },
+        }
+        for filename, jobs in policies.items():
+            source = (ROOT / ".github/workflows" / filename).read_text(encoding="utf-8")
+            actual = {}
+            for job, block in re.findall(
+                r"^  ([a-zA-Z_][\w-]*):\n(.*?)(?=^  [a-zA-Z_][\w-]*:|\Z)",
+                source,
+                re.M | re.S,
+            ):
+                timeout = re.search(r"^    timeout-minutes: (.+)$", block, re.M)
+                if timeout:
+                    actual[job] = timeout.group(1)
+            # Every explicit job timeout is accounted for: short installation
+            # and upstream-only native-main jobs must not grow with the builds.
+            self.assertEqual(set(actual), set(jobs), filename)
+            for job, (upstream, fork) in jobs.items():
+                expected = upstream
+                if fork is not None:
+                    self.assertGreater(
+                        fork, int(upstream) if upstream.isdigit() else 30
+                    )
+                    self.assertLessEqual(fork, 90)
+                    expected = (
+                        "${{ github.repository == 'openai/codex' && "
+                        f"{upstream} || {fork} }}}}"
+                    )
+                self.assertEqual(actual[job], expected, f"{filename}/{job}")
+        matrix = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(
+            re.findall(r"^            timeout_minutes: (\d+)$", matrix, re.M),
+            ["30"] * 3,
+        )
+
     def test_windows_jobs_enable_long_paths_before_checkout(self):
         # Include both reusable nextest jobs: ARM64 shards and x64 archives
         # each check out the repository independently.
