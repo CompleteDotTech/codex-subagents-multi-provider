@@ -25,7 +25,7 @@ jobs:
         with:
           components: rustfmt
       - name: cargo fmt
-        run: cargo fmt -- --config imports_granularity=Item --check
+        run: python3 ../.github/scripts/check_rust_format.py
       - name: Rust benchmark smoke test
         run: just bench-smoke
 

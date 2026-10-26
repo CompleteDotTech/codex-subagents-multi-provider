@@ -12,12 +12,17 @@ The workflows in this directory are split so that pull requests get fast, review
   including the generated Rust test binaries needed to lint inline `#[cfg(test)]`
   code.
 - `rust-ci.yml` keeps the Cargo-native PR checks intentionally small:
-  - `cargo fmt --check`
+  - integrity-aware Rust formatting via `.github/scripts/check_rust_format.py`
   - `cargo shear`
   - `argument-comment-lint` on Linux, macOS, and Windows
   - `tools/argument-comment-lint` package tests when the lint or its workflow wiring changes
 
 ## Post-Merge On `main`
+
+Both Rust workflows use the same formatting helper. It verifies the pinned AWS
+vendor snapshot before checking first-party packages with strict import grouping
+and the verified vendor package with its preserved import grouping. Integrity or
+format failures fail the job; the helper does not rewrite the vendor snapshot.
 
 - `bazel.yml` also runs on pushes to `main`.
   This re-verifies the merged Bazel path and helps keep the BuildBuddy caches warm.

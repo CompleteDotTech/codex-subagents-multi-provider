@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import runpy
 import subprocess
 import unittest
@@ -8,6 +9,31 @@ import check_rust_format as formatting
 
 
 class RustFormatPolicyTests(unittest.TestCase):
+    def test_ci_workflows_use_required_integrity_aware_format_check(self):
+        for filename in ("rust-ci.yml", "rust-ci-full.yml"):
+            with self.subTest(workflow=filename):
+                source = (formatting.ROOT / ".github/workflows" / filename).read_text(
+                    encoding="utf-8"
+                )
+                general = re.search(
+                    r"^  general:\n(.*?)(?=^  [a-zA-Z_][\w-]*:|\Z)",
+                    source,
+                    re.M | re.S,
+                ).group(1)
+                self.assertIn("        working-directory: codex-rs\n", general)
+                step = re.search(
+                    r"^      - name: cargo fmt\n(.*?)(?=^      - |\Z)",
+                    general,
+                    re.M | re.S,
+                ).group(1)
+                self.assertEqual(
+                    step.strip(),
+                    "run: python3 ../.github/scripts/check_rust_format.py",
+                )
+                # The helper owns package selection and fail-closed integrity;
+                # direct whole-workspace formatting must not reappear in CI.
+                self.assertNotRegex(source, r"\brun:\s*cargo\s+fmt\b")
+
     def metadata(self):
         workspace = Path("workspace").resolve()
         packages = [
