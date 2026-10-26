@@ -291,7 +291,7 @@ mod test {
         let error = parse_json_credentials("404: not found").expect_err("no json");
         match error {
             InvalidJsonCredentials::JsonError(_) => {} // ok.
-            err => panic!("incorrect error: {:?}", err),
+            err => panic!("incorrect error: {err:?}"),
         }
     }
 
@@ -340,7 +340,7 @@ mod test {
         }"#;
         let parsed = parse_json_credentials(resp).expect_err("token missing");
         assert_eq!(
-            format!("{}", parsed),
+            format!("{parsed}"),
             "Expected field `Token` in response but it was missing"
         );
     }
@@ -358,7 +358,7 @@ mod test {
         }"#;
         match parse_json_credentials(resp).expect_err("no code") {
             InvalidJsonCredentials::MissingField("AccessKeyId") => {} // ok
-            resp => panic!("incorrect json_credentials response: {:?}", resp),
+            resp => panic!("incorrect json_credentials response: {resp:?}"),
         }
     }
 
@@ -404,8 +404,7 @@ mod test {
                     expiration
                 }) if session_token.starts_with("token") && *expiration == UNIX_EPOCH + Duration::from_secs(1234567890)
             ),
-            "{:?}",
-            parsed
+            "{parsed:?}"
         );
     }
 

@@ -256,7 +256,7 @@ mod test {
         let provider = HttpCredentialProvider::builder()
             .configure(&provider_config)
             .build("test", "http://localhost:1234/", "/some-creds");
-        provider.credentials(None).await
+        provider.credentials(/*auth*/ None).await
     }
 
     fn successful_req_resp() -> ReplayEvent {

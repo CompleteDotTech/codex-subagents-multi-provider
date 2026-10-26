@@ -503,12 +503,7 @@ mod tests {
                 .last_refresh_attempt
                 .lock()
                 .unwrap()
-                .map(|time| {
-                    DateTime::try_from(time)
-                        .unwrap()
-                        .fmt(Format::DateTime)
-                        .unwrap()
-                })
+                .map(|time| DateTime::from(time).fmt(Format::DateTime).unwrap())
         }
     }
 
@@ -640,7 +635,7 @@ mod tests {
             "https://d-123.awsapps.com/start",
             returned_token.start_url.unwrap()
         );
-        assert_eq!("us-west-2", returned_token.region.unwrap().to_string());
+        assert_eq!("us-west-2", returned_token.region.unwrap());
         assert_eq!("clientid", returned_token.client_id.unwrap());
         assert_eq!(
             "YSBzZWNyZXQ=",

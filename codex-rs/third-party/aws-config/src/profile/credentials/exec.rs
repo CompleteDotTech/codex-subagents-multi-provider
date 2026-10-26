@@ -123,7 +123,7 @@ impl ProviderChain {
                 {
                     Arc::new({
                         let builder = LoginCredentialsProvider::builder(*login_session_arn)
-                            .enabled_from_profile(true)
+                            .enabled_from_profile(/*enabled*/ true)
                             .configure(provider_config);
                         builder.build()
                     })
@@ -291,11 +291,10 @@ mod test {
         );
         let err = chain.expect_err("no source by that name");
         assert!(
-            format!("{}", err).contains(
+            format!("{err}").contains(
                 "profile referenced `floozle` provider but that provider is not supported"
             ),
-            "`{}` did not match expected error",
-            err
+            "`{err}` did not match expected error"
         );
     }
 }

@@ -167,7 +167,7 @@ fn parse_cached_token(cached_token_file_contents: &[u8]) -> Result<LoginToken, L
     if !matches!(tokens.next().transpose()?, Some(Token::StartObject { .. })) {
         return Err(Error::other(
             "expected a JSON document starting with `{`",
-            None,
+            /*source*/ None,
         ));
     }
 
@@ -265,7 +265,7 @@ fn parse_cached_token(cached_token_file_contents: &[u8]) -> Result<LoginToken, L
             other => {
                 return Err(Error::other(
                     format!("expected object key, found: {other:?}"),
-                    None,
+                    /*source*/ None,
                 ));
             }
         }
@@ -377,8 +377,7 @@ mod tests {
         let err = parse_cached_token(token).expect_err("missing accessToken");
         assert!(
             matches!(err, LoginTokenError::MissingField("accessKeyId")),
-            "incorrect error: {:?}",
-            err
+            "incorrect error: {err:?}"
         );
 
         // Missing clientId
@@ -396,8 +395,7 @@ mod tests {
         let err = parse_cached_token(token).expect_err("missing clientId");
         assert!(
             matches!(err, LoginTokenError::MissingField("clientId")),
-            "incorrect error: {:?}",
-            err
+            "incorrect error: {err:?}"
         );
 
         // Missing dpopKey
@@ -415,8 +413,7 @@ mod tests {
         let err = parse_cached_token(token).expect_err("missing dpopKey");
         assert!(
             matches!(err, LoginTokenError::MissingField("dpopKey")),
-            "incorrect error: {:?}",
-            err
+            "incorrect error: {err:?}"
         );
     }
 
@@ -470,8 +467,7 @@ mod tests {
         .expect_err("should fail, file is missing");
         assert!(
             matches!(err, LoginTokenError::IoError { .. }),
-            "should be io error, got {:?}",
-            err
+            "should be io error, got {err:?}"
         );
     }
 }
