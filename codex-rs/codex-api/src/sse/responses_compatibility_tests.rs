@@ -67,15 +67,28 @@ async fn sse_errors_cannot_be_overridden_by_a_later_success_event() {
             "text/event-stream",
         )
         .await;
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Err(ApiError::QuotaExceeded)));
+        // The normal header parser emits its empty rate-limit snapshot before
+        // SSE data. It must not be confused with successful response completion.
+        assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
+        assert!(matches!(events.last(), Some(Err(ApiError::QuotaExceeded))));
+        assert!(events.iter().all(|event| matches!(
+            event,
+            Ok(ResponseEvent::RateLimits(_)) | Err(ApiError::QuotaExceeded)
+        )));
     }
 }
 
 #[tokio::test]
 async fn malformed_sse_and_unfinished_tool_calls_never_complete_successfully() {
     let malformed=events("data: {invalid\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"bad\"}}\n\n".into(),"text/event-stream").await;
-    assert!(matches!(malformed.as_slice(), [Err(ApiError::Stream(_))]));
+    assert_eq!(malformed.iter().filter(|event| event.is_err()).count(), 1);
+    assert!(
+        matches!(malformed.last(),Some(Err(ApiError::Stream(message))) if message=="invalid JSON in Responses stream")
+    );
+    assert!(malformed.iter().all(|event| matches!(
+        event,
+        Ok(ResponseEvent::RateLimits(_)) | Err(ApiError::Stream(_))
+    )));
     let unfinished=events(sse(vec![
         json!({"type":"response.output_item.added","item":{"type":"function_call","id":"fc1","call_id":"call1","name":"exec_command","arguments":""}}),
         json!({"type":"response.function_call_arguments.delta","item_id":"fc1","delta":"{\"cmd\":"}),
