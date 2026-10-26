@@ -23,6 +23,52 @@ use super::*;
 use crate::OutboundProxyPolicy;
 use crate::request_draft::RequestDraft;
 
+pub(super) fn isolate_native_tls_test(test_module: &str, test_name: &str) -> bool {
+    const CHILD_TEST_ENV: &str = "CODEX_HTTP_CLIENT_NATIVE_TLS_FIXTURE";
+    const CA_ENV: [&str; 3] = ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "SSL_CERT_DIR"];
+    let test_module = test_module
+        .split_once("::")
+        .expect("test module should include the crate name")
+        .1;
+    let test_name = format!("{test_module}::{test_name}");
+    if std::env::var(CHILD_TEST_ENV).as_deref() == Ok(test_name.as_str()) {
+        for name in CA_ENV {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "isolated fixture inherited {name}"
+            );
+        }
+        return false;
+    }
+
+    // Cargo can inject CA paths that select the custom-CA Rustls policy. These
+    // fixtures must exercise native TLS; never mutate the concurrent parent env.
+    let mut command = std::process::Command::new(
+        std::env::current_exe().expect("test executable should be available"),
+    );
+    command
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_TEST_ENV, &test_name);
+    for name in CA_ENV {
+        command.env_remove(name);
+    }
+    let output = command
+        .output()
+        .expect("native TLS fixture subprocess should finish");
+    assert!(
+        output.status.success(),
+        "native TLS fixture {test_name} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("test {test_name} ... ok")),
+        "isolated native TLS fixture did not execute the exact test: {test_name}"
+    );
+    true
+}
+
 #[tokio::test]
 async fn initial_url_auth_is_built_once_after_routing_and_retained_only_on_same_origin_redirects() {
     let (first_proxy, first_server) = spawn_response_server(vec![
@@ -176,6 +222,12 @@ async fn direct_and_routed_clients_build_equivalent_requests() {
 
 #[tokio::test]
 async fn request_failures_classify_real_untrusted_certificate_handshakes() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "request_failures_classify_real_untrusted_certificate_handshakes",
+    ) {
+        return;
+    }
     codex_utils_rustls_provider::ensure_rustls_crypto_provider();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("self-signed certificate should generate");

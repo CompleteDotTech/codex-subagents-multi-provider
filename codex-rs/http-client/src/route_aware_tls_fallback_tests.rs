@@ -23,6 +23,7 @@ use super::OutboundProxyRoute;
 use super::RouteAwareClientPool;
 use super::RouteAwareRequestError;
 use super::SelectedTlsBackend;
+use super::tests::isolate_native_tls_test;
 use crate::client::RequestLogging;
 use crate::client::TransportClient;
 use crate::tls_backend_fallback::should_retry_with_rustls;
@@ -37,6 +38,12 @@ type SuccessfulTlsFallbackServer = (
 
 #[tokio::test]
 async fn default_pool_does_not_retry_a_native_tls_protocol_failure() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "default_pool_does_not_retry_a_native_tls_protocol_failure",
+    ) {
+        return;
+    }
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -67,6 +74,12 @@ async fn default_pool_does_not_retry_a_native_tls_protocol_failure() {
 
 #[tokio::test]
 async fn retries_a_native_tls_protocol_failure_once_with_rustls() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "retries_a_native_tls_protocol_failure_once_with_rustls",
+    ) {
+        return;
+    }
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -108,6 +121,12 @@ async fn retries_a_native_tls_protocol_failure_once_with_rustls() {
 
 #[tokio::test]
 async fn retries_a_native_tls_failure_after_another_request_caches_rustls() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "retries_a_native_tls_failure_after_another_request_caches_rustls",
+    ) {
+        return;
+    }
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -167,6 +186,12 @@ async fn retries_a_native_tls_failure_after_another_request_caches_rustls() {
 
 #[tokio::test]
 async fn does_not_retry_a_cached_rustls_tls_protocol_failure() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "does_not_retry_a_cached_rustls_tls_protocol_failure",
+    ) {
+        return;
+    }
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -204,6 +229,12 @@ async fn does_not_retry_a_cached_rustls_tls_protocol_failure() {
 
 #[tokio::test]
 async fn successful_rustls_fallback_replays_the_request_and_reuses_the_destination() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "successful_rustls_fallback_replays_the_request_and_reuses_the_destination",
+    ) {
+        return;
+    }
     let (url, trusted_rustls_client, observed_requests) =
         spawn_successful_tls_fallback_server().expect("TLS fallback server should start");
     let pool = RouteAwareClientPool::new(
@@ -268,6 +299,12 @@ async fn successful_rustls_fallback_replays_the_request_and_reuses_the_destinati
 
 #[tokio::test]
 async fn retries_a_tls_protocol_failure_when_request_url_contains_certificate_markers() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "retries_a_tls_protocol_failure_when_request_url_contains_certificate_markers",
+    ) {
+        return;
+    }
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -299,6 +336,12 @@ async fn retries_a_tls_protocol_failure_when_request_url_contains_certificate_ma
 
 #[tokio::test]
 async fn does_not_retry_a_non_replayable_streaming_request() {
+    if isolate_native_tls_test(
+        module_path!(),
+        "does_not_retry_a_non_replayable_streaming_request",
+    ) {
+        return;
+    }
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
