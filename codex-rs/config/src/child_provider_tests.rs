@@ -39,6 +39,21 @@ env_key = "CHILD_PROVIDER_TEST_KEY"
     }
 
     fn policy(&self, project: &str, session: &str, required: Option<&str>) -> ChildProviderPolicy {
+        self.policy_with_protected_roots(
+            project,
+            session,
+            required,
+            &[AbsolutePathBuf::from_absolute_path(self.home.path()).unwrap()],
+        )
+    }
+
+    fn policy_with_protected_roots(
+        &self,
+        project: &str,
+        session: &str,
+        required: Option<&str>,
+        protected_roots: &[AbsolutePathBuf],
+    ) -> ChildProviderPolicy {
         let user = resolve_relative_paths_in_config_toml(
             toml::from_str(&self.user).unwrap(),
             self.home.path(),
@@ -80,6 +95,7 @@ env_key = "CHILD_PROVIDER_TEST_KEY"
             &stack,
             &AbsolutePathBuf::from_absolute_path(self.project.path()).unwrap(),
             &[],
+            protected_roots,
         )
         .unwrap()
     }
@@ -399,7 +415,7 @@ fn ancestor_dotfiles_repo_does_not_taint_host_catalog_but_nested_repo_does() {
     let mut fixture = Fixture::new();
     fixture.home = tempfile::tempdir_in(dotfiles.path()).unwrap();
     std::fs::write(fixture.home.path().join("catalog.json"), "{}").unwrap();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy_with_protected_roots("", "", None, &[]);
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
@@ -411,6 +427,37 @@ fn ancestor_dotfiles_repo_does_not_taint_host_catalog_but_nested_repo_does() {
         policy.resolve(input).unwrap_err().code,
         "child_provider_untrusted_source"
     );
+}
+
+#[test]
+fn host_catalog_in_active_workspace_requires_actual_read_only_protection() {
+    for (directory, protected) in [("host-config", false), (".codex", false), (".codex", true)] {
+        let mut fixture = Fixture::new();
+        if protected {
+            std::fs::create_dir(fixture.project.path().join(".git")).unwrap();
+        }
+        let host_dir = fixture.project.path().join(directory);
+        std::fs::create_dir(&host_dir).unwrap();
+        fixture.home = tempfile::tempdir_in(&host_dir).unwrap();
+        std::fs::write(fixture.home.path().join("catalog.json"), "{}").unwrap();
+        let roots = if protected {
+            vec![AbsolutePathBuf::from_absolute_path(&host_dir).unwrap()]
+        } else {
+            vec![]
+        };
+        let policy = fixture.policy_with_protected_roots("", "", None, &roots);
+        let parent = ModelProviderInfo::default();
+        let mut input = request(&parent);
+        input.explicit_provider = Some("zai");
+        if protected {
+            assert!(policy.resolve(input).is_ok());
+        } else {
+            assert_eq!(
+                policy.resolve(input).unwrap_err().code,
+                "child_provider_untrusted_source"
+            );
+        }
+    }
 }
 
 #[test]
@@ -460,6 +507,7 @@ fn active_cwd_and_explicit_roots_protect_catalogs_without_project_config_or_git(
             &stack,
             &AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap(),
             &[AbsolutePathBuf::from_absolute_path(extra_root.path()).unwrap()],
+            &[],
         )
         .unwrap();
         let parent = ModelProviderInfo::default();
@@ -626,6 +674,7 @@ fn managed_allowlists_intersect_and_cannot_be_broadened_by_user_config() {
         let policy = ChildProviderPolicy::from_config_layers(
             &stack,
             &AbsolutePathBuf::from_absolute_path(fixture.project.path()).unwrap(),
+            &[],
             &[],
         )
         .unwrap();

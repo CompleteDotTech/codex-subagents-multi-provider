@@ -3975,12 +3975,6 @@ impl Config {
             .clone()
             .filter(|value| !value.is_empty());
 
-        let child_provider_policy =
-            codex_config::child_provider::ChildProviderPolicy::from_config_layers(
-                &config_layer_stack,
-                &resolved_cwd,
-                &workspace_roots,
-            )?;
         let model_providers =
             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
@@ -4379,6 +4373,18 @@ impl Config {
         }
         let effective_file_system_sandbox_policy = effective_file_system_sandbox_policy
             .with_additional_readable_roots(resolved_cwd.as_path(), &helper_readable_roots);
+        let protected_catalog_roots: Vec<_> = effective_file_system_sandbox_policy
+            .get_writable_roots_with_cwd(resolved_cwd.as_path())
+            .into_iter()
+            .flat_map(|root| root.read_only_subpaths)
+            .collect();
+        let child_provider_policy =
+            codex_config::child_provider::ChildProviderPolicy::from_config_layers(
+                &config_layer_stack,
+                &resolved_cwd,
+                &workspace_roots,
+                &protected_catalog_roots,
+            )?;
         let effective_permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
             effective_permission_profile.enforcement(),
             &effective_file_system_sandbox_policy,

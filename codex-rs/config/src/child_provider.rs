@@ -31,6 +31,7 @@ pub struct ChildProviderPolicy {
     untrusted_provider_ids: BTreeSet<String>,
     project_roots: Vec<PathBuf>,
     catalog_boundaries: BTreeMap<String, PathBuf>,
+    protected_catalog_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -140,10 +141,13 @@ pub struct ResolvedChildProvider {
 impl ChildProviderPolicy {
     /// Capture only enabled host-owned layers. Project/session authority cannot leak in
     /// through a provider definition, a provider default, or a built-in endpoint override.
+    /// `protected_catalog_roots` must be actual read-only carveouts from the finalized
+    /// host filesystem policy for this cwd, never merely trusted config directories.
     pub fn from_config_layers(
         stack: &ConfigLayerStack,
         cwd: &AbsolutePathBuf,
         workspace_roots: &[AbsolutePathBuf],
+        protected_catalog_roots: &[AbsolutePathBuf],
     ) -> std::io::Result<Self> {
         // Parse only the authority owned by this resolver. Unrelated trusted
         // settings may legitimately be corrected by a higher project layer.
@@ -270,6 +274,10 @@ impl ChildProviderPolicy {
             untrusted_provider_ids,
             project_roots,
             catalog_boundaries,
+            protected_catalog_roots: protected_catalog_roots
+                .iter()
+                .map(|root| root.to_path_buf())
+                .collect(),
         })
     }
 
@@ -454,9 +462,16 @@ impl ChildProviderPolicy {
             .catalog_boundaries
             .get(provider_id)
             .and_then(|boundary| boundary.canonicalize().ok());
-        // A repository above a host config directory (for example a home-directory
-        // dotfiles repository) does not turn that directory into project config.
-        // Repositories at/below that trusted boundary, and outside it, still do.
+        let protected_boundary = boundary.as_ref().is_some_and(|boundary| {
+            self.protected_catalog_roots.iter().any(|root| {
+                root.canonicalize()
+                    .is_ok_and(|root| boundary.starts_with(root))
+            })
+        });
+        // An incidental ancestor repository does not turn a declaring host directory
+        // into project configuration. Active workspace roots are stricter: the host
+        // directory must have an actual read-only permission carveout. Repositories
+        // at/below the declaring directory still count as project controlled.
         let controls_catalog = |root: &Path| {
             canonical.starts_with(root)
                 && !boundary.as_ref().is_some_and(|boundary| {
@@ -466,8 +481,9 @@ impl ChildProviderPolicy {
                 })
         };
         if self.project_roots.iter().any(|root| {
-            root.canonicalize()
-                .is_ok_and(|root| controls_catalog(&root))
+            root.canonicalize().is_ok_and(|root| {
+                canonical.starts_with(&root) && !(protected_boundary && !controls_catalog(&root))
+            })
         }) || canonical
             .ancestors()
             .any(|ancestor| ancestor.join(".git").exists() && controls_catalog(ancestor))
