@@ -10,8 +10,10 @@ Baseline: `rust-v0.164.0`, commit
 
 Any user-delegated ordinary/default, built-in-role, custom-role, or nested child
 can select a host-authorized configured provider. The OpenAI parent need not
-change profile. The same resolver governs native V1/V2 spawning and supported
-app-server entry points; direct internal spawn/reload paths must not bypass it.
+change profile. The same resolver governs native V1/V2 child spawning and any
+app-server path that operates on an owned native child; direct internal child
+spawn/reload paths must not bypass it. Standalone app-server conversation
+start/fork/resume operations are root APIs, not delegated child spawn APIs.
 Host-owned safety, review, and control agents retain their host policy and cannot
 be rerouted by user-delegated settings. Parent and sibling configuration objects,
 credentials, sessions, catalogs, and caches remain independent.
@@ -76,8 +78,11 @@ Omitting `model` uses the target's trusted provider default when switching
 provider. Existing role selectors remain `agent_type`. App-server request
 fields use the protocol's generated camelCase spelling `modelProvider`; native
 tool arguments and role TOML use `model_provider`. All selectors are optional
-strings containing an ID, never a provider object. Resume selects the persisted
-provider; it does not expose an implicit provider-switch argument.
+strings containing an ID, never a provider object. Owned native child resume
+selects the persisted provider and does not expose an implicit provider switch.
+General app-server `thread/resume` already has `modelProvider`; preserve that
+root-conversation override, subject to existing policy and safe stored-history
+compatibility checks. Do not add a duplicate protocol field.
 
 ## Resolution order
 
@@ -153,7 +158,11 @@ copies it into every descendant's in-memory state and persisted child metadata;
 model input, role files, project settings, and restored child fields cannot
 replace it. Recover it from the root's host-owned thread record and lineage on
 reload; reject inconsistent provenance. The root ID is an authorization origin,
-not the immediate-parent provider used by the selection fallback.
+not the immediate-parent provider used by the selection fallback. Copy this
+origin along delegated ownership edges, not merely `forked_from_thread_id`
+history lineage. A standalone app-server conversation fork creates its own root
+controller and root authorization origin under existing root configuration
+policy; copied history does not make it an owned native child.
 
 A selected provider equal to `provider_authorization_root_id` has the legacy
 allowlist exemption, whether inherited, explicitly selected, or selected on a
@@ -199,12 +208,29 @@ or bypass permission prompts or managed network policy.
 | V2 fresh (`fork_turns: "none"`) | Existing behavior | Supported with resolved target tuple |
 | V2 full (`fork_turns: "all"` / absent) | Existing behavior, including prefix handling | Reject before network: explicitly choose `"none"` |
 | V2 numeric legacy `fork_turns` | Existing full-history alias, not partial history | Same full-history rejection |
-| Partial/selected-turn history | No new partial mode in this change; reject unsupported API modes | Reject unsupported API modes; never pretend a full fork is a partial one |
-| Warm/cold resume, eviction/reload | Restore stored provider/model and revalidate current authority | No implicit switch during resume; explicit migration is unsupported |
+| Native V1/V2 `spawn_agent` partial/selected-turn history | No new partial native spawn mode; reject unsupported native spawn arguments | Same restriction; never pretend a full native spawn fork is a partial one |
+| Owned native child warm/cold resume, eviction/reload | Restore stored provider/model and revalidate current authority | No implicit switch during child resume; explicit child migration is unsupported |
 | Steering, result collection, cancellation | Existing child identity and routing | Route to that child's resolved provider; parent remains unchanged |
 
-Cross-provider full-history rejection is deliberate: foreign response IDs,
-opaque reasoning, tool declarations, and freeform tool records cannot safely be
+The table above governs owned native children. Standalone app-server
+`thread/fork` already accepts `lastTurnId` (inclusive) or `beforeTurnId`
+(exclusive), as well as `modelProvider`; these history boundaries are not native
+V2 numeric `fork_turns`. Preserve existing same-provider partial/full standalone
+fork behavior and its validation, including mutually exclusive boundaries and
+prediction-mode restrictions. A standalone fork creates a separate root agent
+controller with history lineage, not delegated parent/child ownership.
+
+For a standalone cross-provider stored-history fork or root resume override,
+validate the selected provider and stored history compatibility before any
+network request. Permit only a representation proven safe for that target;
+otherwise reject explicitly with `child_provider_history_unsupported` and
+suggest a fresh conversation with a textual task summary. Do not blindly replay
+foreign response IDs, opaque reasoning, or unsupported tool history, and do not
+apply delegated-child allowlists to unrelated root APIs. A valid root provider
+override remains supported; this ADR does not remove that API capability.
+
+Cross-provider full-history rejection for native children is deliberate: foreign
+response IDs, opaque reasoning, tool declarations, and freeform tool records cannot safely be
 replayed merely because the model names match. A fresh child can receive a
 plain-text task summary as user input, not fabricated historical authorization.
 Same-provider Ollama history is still subject to its stateless serializer: send
@@ -308,6 +334,10 @@ Source anchors at the pinned revision: `codex-rs/core/src/agent/child_config.rs`
 (resolution and existing precedence), `agent/role.rs` and `agent/role_tests.rs`
 (bounded projection), `agent/control/spawn.rs` (history/reload),
 `core/src/tools/handlers/multi_agents_v2/spawn.rs` (numeric full-history alias),
+`app-server-protocol/src/protocol/v2/thread.rs` and
+`app-server/src/request_processors/thread_processor.rs` (standalone fork
+boundaries and root resume overrides), `core/src/thread_manager.rs`
+(standalone controller versus delegated ownership),
 `config/src/config_toml.rs` (flattened roles),
 `config/src/model_provider_requirements.rs` (managed definitions), and
 `model-provider-info/src/lib.rs` (built-in IDs and provider authentication).
