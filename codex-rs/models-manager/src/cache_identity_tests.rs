@@ -12,6 +12,12 @@ struct ObservedEndpoint {
 }
 
 impl ModelsEndpointClient for ObservedEndpoint {
+    fn try_pinned_identity(&self) -> Option<PinnedModelsIdentity> {
+        Some(PinnedModelsIdentity {
+            identity: self.observed.try_lock().ok()?.clone()?,
+            uses_api_key_auth: false,
+        })
+    }
     fn identity(&self) -> Option<String> {
         self.observed.lock().unwrap().clone()
     }
@@ -450,6 +456,22 @@ async fn pinned_authority_snapshot_is_nonblocking_and_never_reconciles_or_fetche
         "busy lock must not block"
     );
     drop(held);
+    let rejected = manager.rejected_identities.write().unwrap();
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "busy rejection state must not block"
+    );
+    drop(rejected);
+    let identity_guard = endpoint.observed.lock().unwrap();
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "busy identity cache must not block"
+    );
+    drop(identity_guard);
     *endpoint.observed.lock().unwrap() = Some("grant-b".into());
     assert!(
         manager

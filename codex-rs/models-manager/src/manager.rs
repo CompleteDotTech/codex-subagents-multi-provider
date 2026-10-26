@@ -37,6 +37,13 @@ use tracing::info;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// Nonblocking in-memory provider identity; never an authority-record payload.
+#[derive(Clone, Debug)]
+pub struct PinnedModelsIdentity {
+    pub identity: String,
+    pub uses_api_key_auth: bool,
+}
+
 /// Remote endpoint used by the OpenAI-compatible model manager.
 ///
 /// Implementations own provider-specific auth and transport details. The model
@@ -47,6 +54,11 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
     /// metadata. Ordinary providers retain the cheap existing identity path.
     fn reconcile_identity(&self) -> ModelsEndpointFuture<'_, ()> {
         Box::pin(std::future::ready(()))
+    }
+
+    /// Unknown implementations cannot establish pure authority snapshots.
+    fn try_pinned_identity(&self) -> Option<PinnedModelsIdentity> {
+        None
     }
 
     /// Synchronous metadata readers cannot perform the required store observation.
@@ -506,18 +518,31 @@ impl ModelsManager for OpenAiModelsManager {
         model: &str,
         config: &ModelsManagerConfig,
     ) -> Option<ModelInfo> {
+        let identity = self.endpoint_client.try_pinned_identity()?;
         let entry = self.remote_models.try_read().ok()?;
+        let rejected = self.rejected_identities.try_read().ok()?;
         if entry.fetched_at == chrono::DateTime::<Utc>::MIN_UTC
             || entry.client_version.as_deref() != Some(crate::client_version_to_whole().as_str())
+            || entry
+                .identity
+                .as_ref()
+                .is_some_and(|id| rejected.contains(id))
         {
             return None;
         }
-        if self.endpoint_client.requires_identity_reconciliation()
-            && (entry.identity.is_none() || entry.identity != self.endpoint_client.identity())
+        let discovery_disabled = identity.uses_api_key_auth
+            && !self.endpoint_client.has_command_auth()
+            && (!self.endpoint_client.supports_api_key_models()
+                || !self.api_key_model_discovery_enabled.load(Ordering::SeqCst));
+        let catalog = if !discovery_disabled
+            && entry.identity.as_deref() == Some(identity.identity.as_str())
         {
+            Cow::Borrowed(entry.models.as_slice())
+        } else if matches!(self.catalog_source, CatalogSource::Default) {
+            Cow::Owned(self.catalog_source.fallback_models()?)
+        } else {
             return None;
-        }
-        let catalog = self.models_for_entry(&entry);
+        };
         let selected = construct_model_info_from_candidates(model, &catalog, config);
         (!selected.used_fallback_model_metadata).then_some(selected)
     }

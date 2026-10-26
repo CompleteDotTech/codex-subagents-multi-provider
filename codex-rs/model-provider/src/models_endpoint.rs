@@ -231,6 +231,33 @@ impl OpenAiModelsEndpoint {
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn try_pinned_identity(&self) -> Option<codex_models_manager::manager::PinnedModelsIdentity> {
+        let _reconciliation = self.gateway_reconciliation.try_lock().ok()?;
+        let auth = match &self.auth_manager {
+            Some(manager) => manager.try_auth_cached()?,
+            None => None,
+        };
+        // Other auth variants own mutable nested token state. Until they expose
+        // a pure snapshot, declining a cold receipt is safer than blocking here.
+        if auth
+            .as_ref()
+            .is_some_and(|auth| !matches!(auth, CodexAuth::ApiKey(_)))
+        {
+            return None;
+        }
+        let mut identity =
+            crate::models_identity::identity(&self.provider_info, auth.as_ref()).ok()?;
+        if self.provider_info.gateway_oauth.is_some() {
+            let scope = self.gateway_scope.try_read().ok()?;
+            identity = crate::models_identity::with_gateway_scope(identity, scope.as_deref()?);
+        }
+        Some(codex_models_manager::manager::PinnedModelsIdentity {
+            identity,
+            uses_api_key_auth: self.has_provider_api_key()
+                || matches!(auth, Some(CodexAuth::ApiKey(_))),
+        })
+    }
+
     fn requires_identity_reconciliation(&self) -> bool {
         self.provider_info.gateway_oauth.is_some()
     }

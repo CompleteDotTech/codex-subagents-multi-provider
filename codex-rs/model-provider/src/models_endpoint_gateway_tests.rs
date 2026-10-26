@@ -463,3 +463,41 @@ async fn rejected_catalog_invalidates_the_sent_grant_after_a_preflight_account_s
         );
     }
 }
+
+#[tokio::test]
+async fn pinned_identity_snapshot_uses_only_cached_gateway_state_without_http_or_reconciliation() {
+    let server = MockServer::start().await;
+    let endpoint = OpenAiModelsEndpoint::new(
+        info(&server),
+        Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+            "synthetic",
+        ))),
+        None,
+    );
+    assert!(
+        endpoint.try_pinned_identity().is_none(),
+        "unobserved gateway scope is unavailable"
+    );
+    *endpoint.gateway_scope.write().unwrap() = Some("already-validated-scope".into());
+    assert!(endpoint.try_pinned_identity().is_some());
+    let reconciliation = endpoint.gateway_reconciliation.try_lock().unwrap();
+    assert!(
+        endpoint.try_pinned_identity().is_none(),
+        "active reconciliation cannot block capture"
+    );
+    drop(reconciliation);
+    let scope_writer = endpoint.gateway_scope.write().unwrap();
+    assert!(
+        endpoint.try_pinned_identity().is_none(),
+        "busy cached scope cannot block capture"
+    );
+    drop(scope_writer);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("request recording enabled")
+            .len(),
+        0
+    );
+}

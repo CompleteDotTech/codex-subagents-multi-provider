@@ -59,11 +59,11 @@ impl NativeAuthorityReceipt {
 fn epoch_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<NativeAuthorityEpoch> {
     let epoch = NativeAuthorityEpoch {
         version: u32::try_from(row.try_get::<i64, _>("version")?)?,
-        thread_id: row.try_get::<String, _>("thread_id")?.parse()?,
-        root_thread_id: row.try_get::<String, _>("root_thread_id")?.parse()?,
+        thread_id: ThreadId::from_string(&row.try_get::<String, _>("thread_id")?)?,
+        root_thread_id: ThreadId::from_string(&row.try_get::<String, _>("root_thread_id")?)?,
         parent_thread_id: row
             .try_get::<Option<String>, _>("parent_thread_id")?
-            .map(|id| id.parse())
+            .map(|id| ThreadId::from_string(&id))
             .transpose()?,
         generation: row.try_get::<String, _>("generation")?.parse()?,
     };

@@ -689,7 +689,7 @@ impl CodexAuth {
     }
 
     /// Account-facing plan classification derived from the current auth.
-    /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/…)
+    /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/Ã¢â‚¬Â¦)
     /// for UI or product decisions based on the user's subscription.
     pub fn account_plan_type(&self) -> Option<AccountPlanType> {
         if matches!(self, Self::Headers(_)) {
@@ -2119,7 +2119,7 @@ impl UnauthorizedRecovery {
 ///
 /// External modifications to stored credentials will NOT be observed until
 /// `reload()` is called explicitly. This matches the design goal of avoiding
-/// different parts of the program seeing inconsistent auth data mid‑run.
+/// different parts of the program seeing inconsistent auth data midÃ¢â‚¬â€˜run.
 pub struct AuthManager {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
@@ -2442,6 +2442,13 @@ impl AuthManager {
             .read()
             .ok()
             .and_then(|cached| cached.auth.clone())
+    }
+
+    /// Nonblocking cache-only observation. `None` means the lock is busy or
+    /// poisoned; `Some(None)` means a readable cache without authentication.
+    /// No refresh, helper, disk or network operation is attempted.
+    pub fn try_auth_cached(&self) -> Option<Option<CodexAuth>> {
+        Some(self.inner.try_read().ok()?.auth.clone())
     }
 
     /// Current revisions if the selected credential still belongs to this manager's source.
@@ -3451,3 +3458,24 @@ mod account_user_id_tests;
 #[cfg(test)]
 #[path = "source_tests.rs"]
 mod source_tests;
+
+#[cfg(test)]
+mod native_authority_cache_tests {
+    use super::*;
+
+    #[test]
+    fn authority_auth_cache_snapshot_never_waits_for_a_busy_writer() {
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic"));
+        assert!(matches!(
+            manager.try_auth_cached(),
+            Some(Some(CodexAuth::ApiKey(_)))
+        ));
+        let writer = manager.inner.write().unwrap();
+        assert!(
+            manager.try_auth_cached().is_none(),
+            "busy auth cache must not block authority capture"
+        );
+        drop(writer);
+        assert!(manager.try_auth_cached().is_some());
+    }
+}
