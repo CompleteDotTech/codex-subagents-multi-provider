@@ -125,8 +125,76 @@ impl PersistContext {
     }
 }
 
+/// Actual host-store provenance, never derived from thread/model metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeAuthorityStorage {
+    Local {
+        directory: std::path::PathBuf,
+        database: std::path::PathBuf,
+    },
+    InMemory {
+        allocation: usize,
+    },
+}
+
 /// Storage-neutral thread persistence boundary.
 pub trait ThreadStore: Any + Send + Sync {
+    /// Unknown stores cannot provide native cold authority proof.
+    fn native_authority_storage(&self) -> Option<NativeAuthorityStorage> {
+        None
+    }
+    fn begin_native_authority_epoch(
+        &self,
+        _epoch: crate::NativeAuthorityEpoch,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "native_authority",
+            })
+        })
+    }
+    fn invalidate_native_authority_receipt(
+        &self,
+        _thread: ThreadId,
+        _fence: uuid::Uuid,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "native_authority",
+            })
+        })
+    }
+    fn seal_native_authority_receipt(
+        &self,
+        _receipt: crate::NativeAuthorityReceipt,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "native_authority",
+            })
+        })
+    }
+    fn read_native_authority_epoch(
+        &self,
+        _thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityEpoch>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "native_authority",
+            })
+        })
+    }
+    fn read_native_authority_receipt(
+        &self,
+        _thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityReceipt>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "native_authority",
+            })
+        })
+    }
+
     /// Return this store as [`Any`] for implementation-owned escape hatches.
     fn as_any(&self) -> &dyn Any;
 

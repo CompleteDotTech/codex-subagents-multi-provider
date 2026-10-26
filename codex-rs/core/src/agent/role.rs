@@ -98,6 +98,7 @@ pub(crate) async fn prepare_role(
 
 /// Only the embedded no-op default can be reconstructed without a retained
 /// role ceiling. A same-named user declaration never receives this treatment.
+#[cfg(test)]
 pub(crate) fn is_unmodified_builtin_default(config: &Config, role: Option<&str>) -> bool {
     let role = role.unwrap_or(DEFAULT_ROLE_NAME);
     role == DEFAULT_ROLE_NAME

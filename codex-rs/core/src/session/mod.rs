@@ -2206,6 +2206,16 @@ impl Session {
         let state = self.state.lock().await;
         let configuration = &state.session_configuration;
         let mut config = configuration.original_config_do_not_use.as_ref().clone();
+        config.model = Some(
+            configuration
+                .step_settings
+                .collaboration_mode
+                .model()
+                .to_string(),
+        );
+        config.permissions.approval_policy = configuration.step_settings.approval_policy.clone();
+        config.approvals_reviewer = configuration.step_settings.approvals_reviewer;
+        config.permissions.allow_login_shell = configuration.allow_login_shell;
         // Preserve the selected raw profile, whose ProjectRoots placeholders must
         // be materialized against the captured executor rather than display roots.
         configuration.apply_permission_profile_to_permissions(&mut config.permissions);

@@ -205,6 +205,17 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Returns an error if the internal lock cannot be acquired.
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError>;
 
+    /// Pure snapshot of already validated in-memory metadata for host authority
+    /// receipts. Never reconciles credentials, loads disk, or refreshes transport.
+    /// Missing/busy/stale/fallback metadata cannot establish an authority receipt.
+    fn try_pinned_authority_model(
+        &self,
+        _model: &str,
+        _config: &ModelsManagerConfig,
+    ) -> Option<ModelInfo> {
+        None
+    }
+
     /// Return the auth manager used for picker filtering.
     fn auth_manager(&self) -> Option<&AuthManager>;
 
@@ -488,6 +499,27 @@ impl ModelsManager for OpenAiModelsManager {
 
     fn auth_manager(&self) -> Option<&AuthManager> {
         self.auth_manager.as_deref()
+    }
+
+    fn try_pinned_authority_model(
+        &self,
+        model: &str,
+        config: &ModelsManagerConfig,
+    ) -> Option<ModelInfo> {
+        let entry = self.remote_models.try_read().ok()?;
+        if entry.fetched_at == chrono::DateTime::<Utc>::MIN_UTC
+            || entry.client_version.as_deref() != Some(crate::client_version_to_whole().as_str())
+        {
+            return None;
+        }
+        if self.endpoint_client.requires_identity_reconciliation()
+            && (entry.identity.is_none() || entry.identity != self.endpoint_client.identity())
+        {
+            return None;
+        }
+        let catalog = self.models_for_entry(&entry);
+        let selected = construct_model_info_from_candidates(model, &catalog, config);
+        (!selected.used_fallback_model_metadata).then_some(selected)
     }
 
     #[tracing::instrument(skip_all, fields(model = model))]
@@ -868,6 +900,15 @@ impl OpenAiModelsManager {
 }
 
 impl ModelsManager for StaticModelsManager {
+    fn try_pinned_authority_model(
+        &self,
+        model: &str,
+        config: &ModelsManagerConfig,
+    ) -> Option<ModelInfo> {
+        let selected = construct_model_info_from_candidates(model, &self.remote_models, config);
+        (!selected.used_fallback_model_metadata).then_some(selected)
+    }
+
     #[tracing::instrument(skip_all, fields(model = model))]
     fn get_model_info<'a>(
         &'a self,

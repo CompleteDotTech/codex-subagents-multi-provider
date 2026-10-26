@@ -510,6 +510,124 @@ impl LocalThreadStore {
 }
 
 impl ThreadStore for LocalThreadStore {
+    fn native_authority_storage(&self) -> Option<crate::NativeAuthorityStorage> {
+        let actual = self.state_db.as_ref()?.sqlite();
+        if actual != &self.config.sqlite {
+            return None;
+        }
+        Some(crate::NativeAuthorityStorage::Local {
+            directory: actual.home().to_path_buf(),
+            database: actual.state_db_path(),
+        })
+    }
+    fn begin_native_authority_epoch(
+        &self,
+        epoch: crate::NativeAuthorityEpoch,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .begin_native_authority_epoch(&epoch)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority epoch could not be committed".into(),
+                })
+        })
+    }
+    fn invalidate_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+        fence: uuid::Uuid,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            if self.state_db.is_none()
+                && tokio::fs::try_exists(self.config.sqlite.state_db_path())
+                    .await
+                    .map_err(|_| ThreadStoreError::Internal {
+                        message: "host authority store availability is unknown".into(),
+                    })?
+            {
+                return Err(ThreadStoreError::Internal {
+                    message: "existing host authority requires its actual state-store owner".into(),
+                });
+            }
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .invalidate_native_authority_receipt(thread, fence)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority receipt could not be invalidated".into(),
+                })
+        })
+    }
+    fn seal_native_authority_receipt(
+        &self,
+        receipt: crate::NativeAuthorityReceipt,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .seal_native_authority_receipt(&receipt)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority receipt could not be committed".into(),
+                })
+        })
+    }
+    fn read_native_authority_epoch(
+        &self,
+        thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityEpoch>> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .read_native_authority_epoch(thread)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority ownership could not be verified".into(),
+                })
+        })
+    }
+    fn read_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityReceipt>> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .read_native_authority_receipt(thread)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority receipt could not be verified".into(),
+                })
+        })
+    }
+
     fn default_history_mode(&self) -> ThreadHistoryMode {
         ThreadHistoryMode::Paginated
     }

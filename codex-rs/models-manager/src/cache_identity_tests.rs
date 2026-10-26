@@ -416,3 +416,75 @@ async fn rejection_survives_account_switches_when_persistent_invalidation_fails(
         assert!(!manager.identity_rejected("grant-b"));
     }
 }
+
+#[tokio::test]
+async fn pinned_authority_snapshot_is_nonblocking_and_never_reconciles_or_fetches() {
+    let endpoint = Arc::new(ObservedEndpoint {
+        persisted: Mutex::new(Some("grant-b".into())),
+        observed: Mutex::new(Some("grant-a".into())),
+        replace_during_fetch: false,
+    });
+    let manager =
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), None).with_provider_catalog();
+    manager.remote_models.write().await.models = vec![remote_model("shared", "Pinned grant A", 0)];
+    let config = ModelsManagerConfig::default();
+    let info = manager
+        .try_pinned_authority_model("shared", &config)
+        .expect("validated pinned catalog");
+    assert_eq!(info.display_name, "Pinned grant A");
+    assert_eq!(
+        endpoint.identity().as_deref(),
+        Some("grant-a"),
+        "snapshot must not execute credential reconciliation"
+    );
+    assert!(
+        manager
+            .try_pinned_authority_model("missing", &config)
+            .is_none()
+    );
+    let held = manager.remote_models.write().await;
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "busy lock must not block"
+    );
+    drop(held);
+    *endpoint.observed.lock().unwrap() = Some("grant-b".into());
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "known cached identity mismatch"
+    );
+    *endpoint.observed.lock().unwrap() = Some("grant-a".into());
+    manager.remote_models.write().await.fetched_at = chrono::DateTime::<Utc>::MIN_UTC;
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "invalidated metadata is not proof"
+    );
+}
+
+#[test]
+fn pinned_static_authority_snapshot_uses_only_immutable_available_metadata() {
+    let manager = StaticModelsManager::new(
+        None,
+        ModelsResponse {
+            models: vec![remote_model("static", "Static", 0)],
+        },
+    );
+    assert_eq!(
+        manager
+            .try_pinned_authority_model("static", &Default::default())
+            .unwrap()
+            .slug,
+        "static"
+    );
+    assert!(
+        manager
+            .try_pinned_authority_model("missing", &Default::default())
+            .is_none()
+    );
+}

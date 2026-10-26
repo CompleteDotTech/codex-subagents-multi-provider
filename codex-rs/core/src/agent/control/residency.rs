@@ -93,6 +93,9 @@ impl ThreadManagerState {
                     &thread.session_source,
                 )
                 .await;
+            if let Err(error) = crate::agent::child_provider_authorization::durable::seal_stopped(&manager, &thread, &authority).await {
+                tracing::warn!(%error, "evicted native authority remains unavailable for cold reload");
+            }
             let mut threads = manager.threads.write().await;
             if threads
                 .get(&thread_id)

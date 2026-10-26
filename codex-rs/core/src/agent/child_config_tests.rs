@@ -1265,3 +1265,69 @@ async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_displ
     assert!(result.is_err_and(|error| error.to_string().contains("environment authority changed")));
     assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
 }
+
+#[tokio::test]
+async fn private_native_permit_prevents_forged_controller_root_identity_from_entering_child_metadata()
+ {
+    let fixture = Fixture::new().await;
+    let config = fixture
+        .prepared(&fixture.resolved("zai").await, None, None)
+        .await
+        .unwrap()
+        .config;
+    let source = prepared_source(&fixture.parent, &config);
+    let mut config = config;
+    let permit = config
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &fixture.parent.session.services.local_agent_runtime,
+            fixture.parent.session.thread_id,
+            &config,
+            false,
+            &source,
+        )
+        .await
+        .unwrap();
+    let forged = codex_protocol::SessionId::new();
+    assert_ne!(forged, fixture.parent.session.session_id());
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    let child = runtime
+        .upgrade()
+        .unwrap()
+        .spawn_child_thread(
+            StartThreadOptions {
+                session_source: Some(source),
+                ..StartThreadOptions::new(config)
+            },
+            runtime.control(forged),
+            Some(fixture.parent.session.thread_id),
+            None,
+            permit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        child.thread.session.session_id(),
+        fixture.parent.session.session_id()
+    );
+    assert_ne!(child.thread.session.session_id(), forged);
+    child.thread.ensure_rollout_materialized().await;
+    let stored = child.thread.read_thread(true, true).await.unwrap();
+    let meta = stored
+        .history
+        .unwrap()
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            codex_history::RolloutItem::SessionMeta(meta) => Some(meta.meta),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(meta.session_id, fixture.parent.session.session_id());
+    assert_eq!(
+        meta.parent_thread_id,
+        Some(fixture.parent.session.thread_id)
+    );
+}

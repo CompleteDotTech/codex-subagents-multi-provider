@@ -536,6 +536,13 @@ struct InMemoryThreadStoreState {
     section_entered_at: HashMap<ThreadId, DateTime<Utc>>,
     names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
+    native_authority: HashMap<
+        ThreadId,
+        (
+            crate::NativeAuthorityEpoch,
+            Option<crate::NativeAuthorityReceipt>,
+        ),
+    >,
 }
 
 impl InMemoryThreadStore {
@@ -897,6 +904,7 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         let existed = state.histories.remove(&params.thread_id).is_some();
         state.created_threads.remove(&params.thread_id);
+        state.native_authority.remove(&params.thread_id);
         state.names.remove(&params.thread_id);
         state.metadata_updates.remove(&params.thread_id);
         state.sections.remove(&params.thread_id);
@@ -916,6 +924,102 @@ impl InMemoryThreadStore {
 }
 
 impl ThreadStore for InMemoryThreadStore {
+    fn native_authority_storage(&self) -> Option<crate::NativeAuthorityStorage> {
+        Some(crate::NativeAuthorityStorage::InMemory {
+            allocation: Arc::as_ptr(&self.state) as usize,
+        })
+    }
+    fn begin_native_authority_epoch(
+        &self,
+        epoch: crate::NativeAuthorityEpoch,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            epoch
+                .validate()
+                .map_err(|_| ThreadStoreError::InvalidRequest {
+                    message: "invalid native authority epoch".into(),
+                })?;
+            let mut state = self.state.lock().await;
+            if let Some((old, _)) = state.native_authority.get(&epoch.thread_id)
+                && (old.root_thread_id != epoch.root_thread_id
+                    || old.parent_thread_id != epoch.parent_thread_id)
+            {
+                return Err(ThreadStoreError::Conflict {
+                    message: "native authority host ownership changed".into(),
+                });
+            }
+            state
+                .native_authority
+                .insert(epoch.thread_id, (epoch, None));
+            Ok(())
+        })
+    }
+    fn invalidate_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+        fence: uuid::Uuid,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some((epoch, receipt)) =
+                self.state.lock().await.native_authority.get_mut(&thread)
+            {
+                epoch.generation = fence;
+                *receipt = None;
+            }
+            Ok(())
+        })
+    }
+    fn seal_native_authority_receipt(
+        &self,
+        receipt: crate::NativeAuthorityReceipt,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(async move {
+            receipt
+                .validate()
+                .map_err(|_| ThreadStoreError::InvalidRequest {
+                    message: "invalid native authority receipt".into(),
+                })?;
+            let mut state = self.state.lock().await;
+            let Some((epoch, sealed)) = state.native_authority.get_mut(&receipt.epoch.thread_id)
+            else {
+                return Ok(false);
+            };
+            if epoch != &receipt.epoch {
+                return Ok(false);
+            }
+            *sealed = Some(receipt);
+            Ok(true)
+        })
+    }
+    fn read_native_authority_epoch(
+        &self,
+        thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityEpoch>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .await
+                .native_authority
+                .get(&thread)
+                .map(|(epoch, _)| epoch.clone()))
+        })
+    }
+    fn read_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityReceipt>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .await
+                .native_authority
+                .get(&thread)
+                .and_then(|(_, sealed)| sealed.clone()))
+        })
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

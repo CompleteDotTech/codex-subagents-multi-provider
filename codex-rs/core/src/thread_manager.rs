@@ -1466,6 +1466,15 @@ impl ThreadManager {
                 &current.session_source,
             )
             .await;
+        if let Err(error) = crate::agent::child_provider_authorization::durable::seal_stopped(
+            &self.state,
+            &current,
+            &authority,
+        )
+        .await
+        {
+            warn!(%error, "stopped native authority remains unavailable for cold reload");
+        }
         let mut threads = self.state.threads.write().await;
         if !threads
             .get(thread_id)
@@ -1498,6 +1507,15 @@ impl ThreadManager {
                 &expected.session_source,
             )
             .await;
+        if let Err(error) = crate::agent::child_provider_authorization::durable::seal_stopped(
+            &self.state,
+            expected,
+            &authority,
+        )
+        .await
+        {
+            warn!(%error, "stopped native authority remains unavailable for cold reload");
+        }
         let mut threads = self.state.threads.write().await;
         if !threads
             .get(thread_id)
@@ -1559,6 +1577,16 @@ impl ThreadManager {
                         &thread.session_source,
                     )
                     .await;
+                if let Err(error) =
+                    crate::agent::child_provider_authorization::durable::seal_stopped(
+                        &self.state,
+                        &thread,
+                        &authority,
+                    )
+                    .await
+                {
+                    warn!(%error, "shutdown native authority remains unavailable for cold reload");
+                }
                 completed_authority.push((thread, authority));
             }
         }
@@ -1884,6 +1912,69 @@ impl ThreadManagerState {
         }
     }
 
+    pub(crate) fn native_authority_storage(
+        &self,
+    ) -> Option<codex_thread_store::NativeAuthorityStorage> {
+        self.thread_store.native_authority_storage()
+    }
+
+    pub(crate) async fn read_native_authority_epoch(
+        &self,
+        thread: ThreadId,
+    ) -> CodexResult<Option<codex_thread_store::NativeAuthorityEpoch>> {
+        self.thread_store
+            .read_native_authority_epoch(thread)
+            .await
+            .map_err(|_| {
+                crate::agent::child_provider_authorization::invalid(
+                    "protected host authority ownership could not be read",
+                )
+            })
+    }
+
+    pub(crate) async fn read_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+    ) -> CodexResult<Option<codex_thread_store::NativeAuthorityReceipt>> {
+        self.thread_store
+            .read_native_authority_receipt(thread)
+            .await
+            .map_err(|_| {
+                crate::agent::child_provider_authorization::invalid(
+                    "protected host authority receipt could not be read",
+                )
+            })
+    }
+
+    pub(crate) async fn begin_native_authority_epoch(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+    ) -> CodexResult<()> {
+        match self.thread_store.begin_native_authority_epoch(epoch).await {
+            Ok(()) | Err(ThreadStoreError::Unsupported { .. }) => Ok(()),
+            Err(_) => Err(crate::agent::child_provider_authorization::invalid(
+                "host authority epoch could not be fenced",
+            )),
+        }
+    }
+
+    pub(crate) async fn seal_native_authority_receipt(
+        &self,
+        receipt: codex_thread_store::NativeAuthorityReceipt,
+    ) -> CodexResult<bool> {
+        match self
+            .thread_store
+            .seal_native_authority_receipt(receipt)
+            .await
+        {
+            Ok(sealed) => Ok(sealed),
+            Err(ThreadStoreError::Unsupported { .. }) => Ok(false),
+            Err(_) => Err(crate::agent::child_provider_authorization::invalid(
+                "host authority ceiling could not be sealed",
+            )),
+        }
+    }
+
     pub(crate) async fn read_stored_thread(
         &self,
         params: ReadThreadParams,
@@ -1975,6 +2066,13 @@ impl ThreadManagerState {
                 &current.session_source,
             )
             .await;
+        if let Err(error) = crate::agent::child_provider_authorization::durable::seal_stopped(
+            self, &current, &authority,
+        )
+        .await
+        {
+            warn!(%error, "stopped native authority remains unavailable for cold reload");
+        }
         let mut threads = self.threads.write().await;
         if !threads
             .get(thread_id)
@@ -2151,8 +2249,9 @@ impl ThreadManagerState {
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         launch_permit: crate::agent::child_provider_authorization::ChildLaunchPermit,
     ) -> CodexResult<NewThread> {
-        let origin =
+        let (origin, session_id) =
             launch_permit.consume(&agent_control.runtime, parent_thread_id, &options.config)?;
+        let agent_control = agent_control.runtime.control(session_id);
         (options.client_mcp_extensions, options.prompt_cache_key) =
             self.inherited_child_settings(parent_thread_id).await;
         let forked = matches!(options.initial_history, InitialHistory::Forked(_));
@@ -2470,6 +2569,16 @@ impl ThreadManagerState {
             } else {
                 None
             };
+            if let (Some(thread), Some(authority)) = (&stopped, &stopped_authority) {
+                if let Err(error) =
+                    crate::agent::child_provider_authorization::durable::seal_stopped(
+                        self, thread, authority,
+                    )
+                    .await
+                {
+                    warn!(%error, "replaced native authority remains unavailable for cold reload");
+                }
+            }
             let mut threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                 if thread.is_running() {
@@ -2520,6 +2629,20 @@ impl ThreadManagerState {
                 }
                 threads.remove(&resumed.conversation_id);
                 thread.session.services.mcp_runtime.revoke_ema();
+            }
+        }
+        if let InitialHistory::Resumed(saved) = &initial_history {
+            match self
+                .thread_store
+                .invalidate_native_authority_receipt(saved.conversation_id, uuid::Uuid::now_v7())
+                .await
+            {
+                Ok(()) | Err(ThreadStoreError::Unsupported { .. }) => {}
+                Err(_) => {
+                    return Err(crate::agent::child_provider_authorization::invalid(
+                        "saved authority could not be invalidated before runtime startup",
+                    ));
+                }
             }
         }
         let agent_control = match (&self.agent_control_factory, agent_control) {
@@ -2809,6 +2932,22 @@ impl ThreadManagerState {
                 &session_source,
             )
             .await;
+        if !session_source.is_non_root_agent()
+            || matches!(
+                session_source,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+            )
+        {
+            if let Err(error) = self
+                .begin_native_authority_epoch(retained_authority.epoch(&session))
+                .await
+            {
+                if let Err(shutdown_error) = io.shutdown_and_wait().await {
+                    warn!(%shutdown_error, "failed to stop runtime after authority-store fencing failure");
+                }
+                return Err(error);
+            }
+        }
         let ema_cancellation = session
             .get_config()
             .await

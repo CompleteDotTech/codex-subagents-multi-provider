@@ -257,13 +257,25 @@ pub(crate) struct RetainedAgentAuthority {
     pub(crate) settings: ThreadSettingsSnapshot,
     pub(crate) scope: ChildProviderScope,
     pub(crate) source: SessionSource,
+    registration_id: Uuid,
+    session_allocation: usize,
 }
 
 impl RetainedAgentAuthority {
     pub(crate) async fn capture(session: &Session, source: &SessionSource) -> Arc<Self> {
         let (config, settings, environments) = session.native_agent_authority_snapshot().await;
         let scope = ChildProviderScope::from_current(&config, &settings, &environments);
+        let session_allocation = session as *const Session as usize;
+        let registration_id = session
+            .services
+            .local_agent_runtime
+            .retained_authority(session.thread_id)
+            .filter(|old| old.session_allocation == session_allocation)
+            .map(|old| old.registration_id)
+            .unwrap_or_else(Uuid::now_v7);
         Arc::new(Self {
+            registration_id,
+            session_allocation,
             thread_id: session.thread_id,
             config,
             settings,
@@ -417,6 +429,7 @@ impl PreparedChildAuthorization {
             return Err(invalid("prepared child authorization was already consumed"));
         }
         Ok(ChildLaunchPermit {
+            session_id: parent.session.session_id(),
             caller,
             origins: self.origins,
             origin: self.origin,
@@ -427,6 +440,7 @@ impl PreparedChildAuthorization {
 
 /// Non-cloneable proof consumed by the lower native thread creation boundary.
 pub(crate) struct ChildLaunchPermit {
+    session_id: codex_protocol::SessionId,
     caller: ThreadId,
     origins: Arc<ChildProviderOrigins>,
     origin: Option<VerifiedChildProviderOrigin>,
@@ -439,7 +453,10 @@ impl ChildLaunchPermit {
         runtime: &LocalAgentRuntime,
         parent: Option<ThreadId>,
         config: &Config,
-    ) -> Result<Option<VerifiedChildProviderOrigin>> {
+    ) -> Result<(
+        Option<VerifiedChildProviderOrigin>,
+        codex_protocol::SessionId,
+    )> {
         if parent != Some(self.caller)
             || !Arc::ptr_eq(&self.origins, &runtime.child_provider_origins)
             || self.approved.as_ref() != config
@@ -448,7 +465,7 @@ impl ChildLaunchPermit {
                 "native child launch authority does not match its configuration",
             ));
         }
-        Ok(self.origin)
+        Ok((self.origin, self.session_id))
     }
 }
 
@@ -467,6 +484,10 @@ pub(crate) struct ChildResumePermit {
     target_ceiling: Option<Arc<RetainedAgentAuthority>>,
     origin: Option<VerifiedChildProviderOrigin>,
     authorization_origin: Option<VerifiedChildProviderOrigin>,
+    cold_receipt: Option<(
+        codex_thread_store::NativeAuthorityStorage,
+        codex_thread_store::NativeAuthorityReceipt,
+    )>,
     environment_selections: Option<Vec<TurnEnvironmentSelection>>,
     inherited_scope: Option<ChildProviderScope>,
     approved: Arc<Config>,
@@ -577,16 +598,8 @@ impl ChildResumePermit {
                     })?;
                 }
             }
-        } else if !crate::agent::role::is_unmodified_builtin_default(
-            &current.config,
-            source.get_agent_role().as_deref(),
-        ) {
-            // Durable role ceilings are issue15. A missing snapshot cannot restore
-            // unknown historical role grants under a different caller.
-            return Err(invalid(
-                "cold role authority cannot be reconstructed safely",
-            ));
         }
+
         if stored_approval != current.settings.approval_policy {
             return Err(invalid(
                 "stored approval mode differs from the current caller",
@@ -661,6 +674,57 @@ impl ChildResumePermit {
         // is only a ceiling and never bypasses current managed/file/allowlist checks.
         let policy = current_policy_in_scope(&current.config, &current.scope)
             .map_err(|_| invalid("current resume policy cannot be established"))?;
+        let cold_receipt = if ceiling.is_none() {
+            let storage = manager
+                .native_authority_storage()
+                .ok_or_else(|| invalid("cold effective authority has no trusted host store"))?;
+            if !durable::protected_storage(&storage, &current.scope) {
+                return Err(invalid(
+                    "cold authority metadata is writable by the current executor",
+                ));
+            }
+            let receipt = manager
+                .read_native_authority_receipt(target)
+                .await?
+                .ok_or_else(|| invalid("cold effective authority is unsealed or unavailable"))?;
+            if receipt.epoch.thread_id != target {
+                return Err(invalid("cold authority receipt names another target"));
+            }
+            durable::verify_cold_lineage(
+                &manager,
+                &receipt,
+                caller.session.session_id().into(),
+                parent,
+            )
+            .await?;
+            if history
+                .get_dynamic_tools()
+                .is_some_and(|tools| !tools.is_empty())
+                || caller
+                    .session
+                    .services
+                    .client_mcp_extensions
+                    .iter()
+                    .next()
+                    .is_some()
+            {
+                return Err(invalid(
+                    "cold dynamic tool or extension authority is not supported",
+                ));
+            }
+            let exec = caller.session.services.exec_policy.current();
+            if !exec.rules().is_empty()
+                || !exec.network_rules().is_empty()
+                || !exec.host_executables().is_empty()
+            {
+                return Err(invalid(
+                    "cold custom execution-policy authority is not supported",
+                ));
+            }
+            Some((storage, receipt))
+        } else {
+            None
+        };
         let origin = runtime.child_provider_origins.verified(target);
         let caller_origin = runtime
             .child_provider_origins
@@ -728,15 +792,51 @@ impl ChildResumePermit {
             config,
             &resolved,
             None,
-            effort,
+            effort.clone(),
         )
         .await
         .map_err(CodexErr::InvalidRequest)?;
+        // A saved runtime restores its selected effort, including None meaning
+        // model default. Fresh-child provider defaults must not materialize it.
+        config.model_reasoning_effort = effort;
         crate::agent::child_config::validate_resolved_child_model(
             &manager, config, &resolved, version,
         )
         .await
         .map_err(CodexErr::InvalidRequest)?;
+        if let Some((storage, receipt)) = &cold_receipt {
+            let model = manager
+                .try_pinned_authority_model(&resolved.model, &config.to_models_manager_config())
+                .ok_or_else(|| invalid("cold selected model authority is not pinned"))?;
+            let candidate_scope = durable::candidate_scope(config, selections.as_deref());
+            if !durable::protected_storage(storage, &candidate_scope) {
+                return Err(invalid(
+                    "cold restored executor can write its authority metadata",
+                ));
+            }
+            let disabled = saved
+                .history
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    RolloutItem::TurnContext(context) => context.disabled_plugin_ids.clone(),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let fingerprint = durable::fingerprint(
+                config,
+                &candidate_scope,
+                &model,
+                &meta.selected_capability_roots,
+                &disabled,
+            )
+            .ok_or_else(|| invalid("cold effective authority cannot be reconstructed"))?;
+            if fingerprint != receipt.fingerprint {
+                return Err(invalid(
+                    "cold effective authority differs from its sealed host ceiling",
+                ));
+            }
+        }
         Ok(Self {
             caller,
             caller_epoch,
@@ -748,6 +848,7 @@ impl ChildResumePermit {
             history_revision: saved.history_revision.clone(),
             rollout_path: saved.rollout_path.clone(),
             target_ceiling: ceiling,
+            cold_receipt,
             origin,
             authorization_origin,
             environment_selections: selections.clone(),
@@ -795,6 +896,36 @@ impl ChildResumePermit {
         } {
             return Err(invalid("target authority changed after resume preparation"));
         }
+        if runtime
+            .retained_authority(self.caller.session.thread_id)
+            .is_none_or(|registered| {
+                registered.registration_id != self.caller_epoch.registration_id
+            })
+        {
+            return Err(invalid(
+                "actual caller runtime was replaced before admission",
+            ));
+        }
+        if let Some((storage, receipt)) = &self.cold_receipt {
+            let manager = runtime.upgrade()?;
+            if manager.native_authority_storage().as_ref() != Some(storage)
+                || !durable::protected_storage(storage, &self.caller_epoch.scope)
+                || manager
+                    .read_native_authority_receipt(self.target)
+                    .await?
+                    .as_ref()
+                    != Some(receipt)
+            {
+                return Err(invalid("sealed cold authority changed before admission"));
+            }
+            durable::verify_cold_lineage(
+                &manager,
+                receipt,
+                self.caller.session.session_id().into(),
+                self.parent,
+            )
+            .await?;
+        }
         // This actual caller may have been evicted by our own residency reservation.
         // Validate the held host Session epoch, never re-fetch an absent ancestor.
         let current =
@@ -820,6 +951,8 @@ impl ChildResumePermit {
 pub(crate) fn invalid(message: &str) -> CodexErr {
     CodexErr::InvalidRequest(format!("child_provider_policy_conflict: {message}"))
 }
+
+pub(crate) mod durable;
 
 #[cfg(test)]
 mod tests {

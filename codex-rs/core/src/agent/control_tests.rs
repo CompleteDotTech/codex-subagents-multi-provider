@@ -6469,3 +6469,249 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
     assert!(harness.manager.get_thread(child.thread_id).await.is_ok());
     drop(pin);
 }
+
+#[test_case::test_case(false; "removed custom default")]
+#[test_case::test_case(true; "default grandchild under restrictive ancestor")]
+#[tokio::test]
+async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool) {
+    let role = if nested { "restricted" } else { "default" };
+    let host = format!(
+        "[agents]\nallowed_model_providers=['openai']\n[agents.{role}]\nconfig_file='restricted.toml'\n"
+    );
+    let (home, mut config) = test_config_with_host_configuration(Vec::new(), Some(&host)).await;
+    std::fs::write(home.path().join("restricted.toml"), "[features]\nshell_tool=false\n[skills]\ninclude_instructions=false\nbundled={enabled=false}\n").unwrap();
+    for feature in [Feature::Sqlite, Feature::MultiAgentV2, Feature::ShellTool] {
+        config.features.enable(feature).unwrap();
+    }
+    config.model = Some("gpt-5.6-sol".into());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let root = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .unwrap();
+    let control = root
+        .thread
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.thread.session.session_id());
+    let source = thread_spawn_source(
+        root.thread_id,
+        &root.thread.session_source,
+        1,
+        nested.then_some("restricted".into()),
+        Some("worker".into()),
+    )
+    .unwrap();
+    let worker = control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("worker"),
+            source,
+            SpawnAgentOptions {
+                parent_thread_id: Some(root.thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let worker_thread = harness.manager.get_thread(worker.thread_id).await.unwrap();
+    let target = if nested {
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &worker_thread, "child")
+            .await
+            .thread_id
+    } else {
+        worker.thread_id
+    };
+    let target_thread = harness.manager.get_thread(target).await.unwrap();
+    let old = target_thread.session.get_config().await;
+    assert!(!old.features.enabled(Feature::ShellTool));
+    assert!(!old.include_skill_instructions);
+    assert!(!old.bundled_skills_enabled());
+    persist_thread_for_tree_resume(&root.thread, "root receipt fixture").await;
+    persist_thread_for_tree_resume(&worker_thread, "worker receipt fixture").await;
+    if nested {
+        persist_thread_for_tree_resume(&target_thread, "target receipt fixture").await;
+    }
+    wait_for_live_thread_spawn_children(&control, root.thread_id, &[worker.thread_id]).await;
+    if nested {
+        wait_for_live_thread_spawn_children(&control, worker.thread_id, &[target]).await;
+    }
+    let stored = root.thread.read_thread(true, true).await.unwrap();
+    let initial = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: root.thread_id,
+        history: Arc::new(stored.history.unwrap().items),
+        rollout_path: stored.rollout_path,
+    });
+    let state = control.runtime.upgrade().unwrap();
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.timed_out.is_empty());
+    assert!(
+        state
+            .read_native_authority_receipt(target)
+            .await
+            .unwrap()
+            .is_some(),
+        "actual clean shutdown must seal the restrictive target"
+    );
+    std::fs::write(
+        harness.config.codex_home.join("config.toml"),
+        "[agents]\nallowed_model_providers=['openai']\n",
+    )
+    .unwrap();
+    let mut fresh = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(harness.config.codex_home.to_path_buf())
+        .cli_overrides(vec![
+            ("model".into(), TomlValue::String("gpt-5.6-sol".into())),
+            ("agents.max_depth".into(), TomlValue::Integer(8)),
+        ])
+        .build()
+        .await
+        .unwrap();
+    for feature in [Feature::Sqlite, Feature::MultiAgentV2, Feature::ShellTool] {
+        fresh.features.enable(feature).unwrap();
+    }
+    assert!(!fresh.agent_roles.contains_key(role));
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        fresh.model_provider.clone(),
+        fresh.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        harness.state_db.clone(),
+    );
+    let resumed = manager
+        .start_thread(StartThreadOptions {
+            initial_history: initial,
+            session_source: Some(SessionSource::Exec),
+            ..StartThreadOptions::new(fresh.clone())
+        })
+        .await
+        .unwrap();
+    assert!(
+        resumed
+            .thread
+            .session
+            .get_config()
+            .await
+            .features
+            .enabled(Feature::ShellTool)
+    );
+    let error = resumed
+        .thread
+        .session
+        .services
+        .agent_control
+        .send(SendRequest {
+            caller: root.thread_id,
+            target: AgentTarget::Id(target),
+            resume_config: fresh,
+            input: AgentInput::Message {
+                message: AgentMessage::Plaintext("cold retry".into()),
+                mode: MessageDeliveryMode::QueueOnly,
+            },
+            start_options: Default::default(),
+        })
+        .await
+        .err()
+        .expect("current builtin default must not erase old inherited restrictions");
+    assert!(error.to_string().contains("sealed host ceiling"), "{error}");
+    assert_eq!(manager.list_thread_ids().await, vec![root.thread_id]);
+    assert_thread_not_loaded(&manager, target).await;
+    if nested {
+        assert_thread_not_loaded(&manager, worker.thread_id).await;
+    }
+}
+
+#[tokio::test]
+async fn failed_saved_authority_invalidation_prevents_runtime_and_auth_helper_startup() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::Sqlite).unwrap();
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "sealed root before unavailable store").await;
+    let stored = thread.read_thread(true, true).await.unwrap();
+    let initial = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: id,
+        history: Arc::new(stored.history.unwrap().items),
+        rollout_path: stored.rollout_path,
+    });
+    let state = thread
+        .session
+        .services
+        .local_agent_runtime
+        .control(thread.session.session_id())
+        .runtime
+        .upgrade()
+        .unwrap();
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.timed_out.is_empty());
+    assert!(
+        state
+            .read_native_authority_receipt(id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let db = harness.state_db.as_ref().unwrap();
+    db.close().await;
+    let script = harness.config.codex_home.join(if cfg!(windows) {
+        "blocked-reload.cmd"
+    } else {
+        "blocked-reload.sh"
+    });
+    std::fs::write(
+        &script,
+        if cfg!(windows) {
+            "@echo off\r\necho invoked>blocked-reload-marker\r\necho synthetic\r\n"
+        } else {
+            "touch blocked-reload-marker\nprintf synthetic\n"
+        },
+    )
+    .unwrap();
+    let mut requested = harness.config.clone();
+    let auth = if cfg!(windows) {
+        serde_json::json!({"command":"cmd.exe","args":["/D","/C",script],"cwd":harness.config.codex_home,"timeout_ms":5000,"refresh_interval_ms":0})
+    } else {
+        serde_json::json!({"command":"sh","args":[script],"cwd":harness.config.codex_home,"timeout_ms":5000,"refresh_interval_ms":0})
+    };
+    requested.model_provider.auth = Some(serde_json::from_value(auth).unwrap());
+    let error = harness
+        .manager
+        .start_thread(StartThreadOptions {
+            initial_history: initial,
+            session_source: Some(SessionSource::Exec),
+            ..StartThreadOptions::new(requested)
+        })
+        .await
+        .err()
+        .expect("failed fence cannot execute or publish a reopened runtime");
+    assert!(
+        error
+            .to_string()
+            .contains("could not be invalidated before runtime startup"),
+        "{error}"
+    );
+    assert!(
+        !harness
+            .config
+            .codex_home
+            .join("blocked-reload-marker")
+            .exists()
+    );
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}

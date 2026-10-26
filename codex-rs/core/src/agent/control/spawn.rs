@@ -705,6 +705,11 @@ impl LocalAgentControl {
             };
         // Reserving a slot can evict an idle nested parent. Capture its instructions and
         // analytics metadata alongside its authority before the live parent can disappear.
+        if environment_selections.is_none() {
+            environment_selections = inherited_environments
+                .as_ref()
+                .map(TurnEnvironmentSnapshot::inheritable_selections);
+        }
         let authorization = crate::agent::child_provider_authorization::ChildResumePermit::prepare(
             &self.runtime,
             caller,
