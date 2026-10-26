@@ -36,6 +36,8 @@ notify = ["foreign-program"]
 web_search = "live"
 cli_auth_credentials_store = "keyring"
 mcp_oauth_credentials_store = "auto"
+[tools.update_plan]
+enabled = false
 [model_providers.foreign]
 name = "Foreign"
 base_url = "https://foreign.invalid/v1"
@@ -114,6 +116,11 @@ respect_system_proxy = true
     assert_eq!(config.features.get(), &expected_features);
     assert_eq!(config.sqlite.home(), home.path());
     assert_eq!(config.log_dir, home.path().join("log"));
+    assert_eq!(
+        config.sqlite.logs_db_path(),
+        codex_state::SqliteConfig::from_sqlite_home(config.codex_home.clone()).logs_db_path()
+    );
+    assert!(config.update_plan_enabled);
     assert!(!config.include_permissions_instructions);
     assert!(!config.include_skill_instructions);
     assert!(!config.cloud_skill_enabled);

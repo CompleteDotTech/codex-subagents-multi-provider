@@ -60,7 +60,6 @@ impl Config {
         let cfg = ConfigToml {
             // Explicit state roots prevent ambient CODEX_SQLITE_HOME selection.
             sqlite_home: Some(options.codex_home.clone()),
-            log_dir: Some(options.codex_home.join("log")),
             mcp_optional_startup_grace_ms: Some(1000),
             include_permissions_instructions: Some(false),
             include_apps_instructions: Some(false),
@@ -100,6 +99,7 @@ impl Config {
         config.check_for_update_on_startup = false;
         config.analytics_enabled = Some(false);
         config.feedback_enabled = false;
+        config.update_plan_enabled = true;
         // The ordinary loader coerces secure stores to File for version0.0.0.
         // Embedded cargo-run hosts retain their validated bootstrap selection.
         config.cli_auth_credentials_store_mode = auth.auth_credentials_store_mode;

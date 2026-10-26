@@ -300,6 +300,8 @@ sandbox_mode = "danger-full-access"
 cli_auth_credentials_store = "keyring"
 mcp_oauth_credentials_store = "auto"
 notify = ["foreign-program"]
+[tools.update_plan]
+enabled = false
 [features]
 secret_auth_storage = true
 [mcp_servers.foreign]
@@ -336,6 +338,13 @@ command = "foreign-program"
                 .is_none()
         );
         assert_eq!(config.sqlite.home(), home.path());
+        assert_eq!(config.log_dir, home.path().join("log"));
+        assert_eq!(
+            config.sqlite.logs_db_path(),
+            codex_core_api::SqliteConfig::from_sqlite_home(config.codex_home.clone())
+                .logs_db_path()
+        );
+        assert!(config.update_plan_enabled);
         assert_eq!(
             config.cli_auth_credentials_store_mode,
             codex_core_api::AuthCredentialsStoreMode::Keyring
