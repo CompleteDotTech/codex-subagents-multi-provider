@@ -332,7 +332,7 @@ pub type ModelProviderFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 /// Shared runtime model provider handle.
 pub type SharedModelProvider = Arc<dyn ModelProvider>;
 
-fn provider_uses_first_party_auth_path(provider: &ModelProviderInfo) -> bool {
+pub(crate) fn provider_uses_first_party_auth_path(provider: &ModelProviderInfo) -> bool {
     provider.requires_openai_auth
         && provider.env_key.is_none()
         && provider.experimental_bearer_token.is_none()
@@ -357,6 +357,8 @@ pub fn create_model_provider(
             .gateway_auth(config, &manager.runtime_config())
             .map_err(|_| "failed to create provider OAuth HTTP client".to_string())
     });
+    // Gateway setup may use host runtime configuration, but inference must not
+    // retain that host's account/recovery state for an independently authed provider.
     let auth_manager = auth_manager_for_provider(auth_manager, &provider_info);
     Arc::new(ConfiguredModelProvider::new(
         provider_info,
@@ -581,6 +583,10 @@ impl ModelProvider for ConfiguredModelProvider {
         self.create_models_manager(config_model_catalog, ModelsCacheConfig::Custom(cache))
     }
 }
+
+#[cfg(test)]
+#[path = "child_auth_tests.rs"]
+mod child_auth_tests;
 
 #[cfg(test)]
 mod tests {

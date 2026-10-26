@@ -230,16 +230,21 @@ pub fn unauthenticated_auth_provider() -> SharedAuthProvider {
     Arc::new(UnauthenticatedAuthProvider)
 }
 
-/// Returns the provider-scoped auth manager when this provider uses command-backed auth.
-///
-/// Providers without custom auth continue using the caller-supplied base manager, when present.
+/// Keeps inference authentication and recovery within the selected provider's policy.
+/// Retains the manager for first-party inference and Bedrock's managed auth path.
 pub(crate) fn auth_manager_for_provider(
     auth_manager: Option<Arc<AuthManager>>,
     provider: &ModelProviderInfo,
 ) -> Option<Arc<AuthManager>> {
     match provider.auth.clone() {
         Some(config) => Some(AuthManager::external_bearer_only(config)),
-        None => auth_manager,
+        None
+            if provider.is_amazon_bedrock()
+                || crate::provider::provider_uses_first_party_auth_path(provider) =>
+        {
+            auth_manager
+        }
+        None => None,
     }
 }
 
