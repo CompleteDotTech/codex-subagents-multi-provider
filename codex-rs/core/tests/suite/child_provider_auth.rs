@@ -10,7 +10,10 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_completed;
@@ -28,6 +31,8 @@ use http::HeaderValue;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tracing_test::traced_test;
 use wiremock::Mock;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::header;
@@ -136,6 +141,202 @@ async fn successful_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
         completed.error.is_none(),
         "synthetic turn must complete successfully"
     );
+    Ok(())
+}
+
+async fn failed_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<ErrorEvent> {
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: prompt.into(),
+            text_elements: vec![],
+        }]))
+        .await?;
+    let mut emitted_error = None;
+    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
+        if let EventMsg::Error(error) = event {
+            emitted_error = Some(error.clone());
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await
+    else {
+        unreachable!("predicate requires turn completion");
+    };
+    let error = completed
+        .error
+        .expect("rejected request must fail the turn");
+    assert_eq!(Some(error.clone()), emitted_error);
+    let diagnostic = serde_json::to_string(&error)?;
+    for secret in [
+        "synthetic-parent-token",
+        "synthetic-child-token",
+        "parent-account",
+        "parent-actor",
+    ] {
+        assert!(
+            !diagnostic.contains(secret),
+            "terminal failure must omit credentials and foreign identity"
+        );
+    }
+    Ok(error)
+}
+
+fn blocking_helper(refresh: bool) -> anyhow::Result<(tempfile::TempDir, ModelProviderAuthInfo)> {
+    let home = tempfile::tempdir()?;
+    let mode = if refresh { "refresh" } else { "loading" };
+    #[cfg(unix)]
+    let (command, args) = {
+        let script = home.path().join("blocking.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                "if [ \"$1\" = loading ] || [ -f invoked ]; then\n",
+                "touch started\nwhile [ ! -f release ]; do sleep 0.01; done\nfi\n",
+                "touch invoked\nprintf synthetic-blocking-key\n",
+            ),
+        )?;
+        (
+            "sh",
+            vec![script.to_string_lossy().into_owned(), mode.to_string()],
+        )
+    };
+    #[cfg(windows)]
+    let (command, args) = {
+        let script = home.path().join("blocking.cmd");
+        std::fs::write(
+            &script,
+            concat!(
+                "@echo off\r\nif \"%~1\"==\"loading\" goto wait\r\nif exist invoked goto wait\r\ngoto token\r\n",
+                ":wait\r\necho started>started\r\n:poll\r\nif not exist release goto poll\r\n",
+                ":token\r\necho invoked>invoked\r\necho synthetic-blocking-key\r\n",
+            ),
+        )?;
+        (
+            "cmd.exe",
+            vec![
+                "/D".into(),
+                "/C".into(),
+                script.to_string_lossy().into_owned(),
+                mode.to_string(),
+            ],
+        )
+    };
+    let auth = serde_json::from_value(serde_json::json!({
+        "command": command, "args": args, "cwd": home.path(),
+        "timeout_ms": 30_000, "refresh_interval_ms": 0,
+    }))?;
+    Ok((home, auth))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_during_helper_loading_and_refresh_sends_no_post_cancel_request()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    for refresh in [false, true] {
+        let parent_server = start_mock_server().await;
+        let child_server = start_mock_server().await;
+        let completion = || sse(vec![ev_response_created("r"), ev_completed("r")]);
+        let parent_requests = mount_sse_sequence(&parent_server, vec![completion()]).await;
+        if refresh {
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(401))
+                .with_priority(1)
+                .up_to_n_times(2)
+                .mount(&child_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(completion()),
+            )
+            .mount(&child_server)
+            .await;
+        let host = shared_host();
+        let manager = AuthManager::from_auth_for_testing(host.auth.clone());
+        manager.set_external_auth(host.clone()).await?;
+        let mut parent_builder = test_codex().with_auth_manager(manager.clone());
+        let parent = parent_builder.build_with_auto_env(&parent_server).await?;
+        let (helper_home, auth) = blocking_helper(refresh)?;
+        let base_url = format!("{}/v1", child_server.uri());
+        let mut child_builder = test_codex()
+            .with_auth_manager(manager.clone())
+            .with_models_manager(static_models())
+            .with_config(move |config| {
+                config.model_provider_id = "cancellable-command-child".into();
+                config.model_provider = ModelProviderInfo {
+                    name: "cancellable-command-child".into(),
+                    base_url: Some(base_url),
+                    auth: Some(auth),
+                    requires_openai_auth: false,
+                    wire_api: WireApi::Responses,
+                    request_max_retries: Some(0),
+                    stream_max_retries: Some(0),
+                    ..Default::default()
+                };
+            });
+        let child = child_builder.build_with_auto_env(&child_server).await?;
+        child
+            .codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "wait in credential helper".into(),
+                text_elements: vec![],
+            }]))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !helper_home.path().join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let expected_before_retry = usize::from(refresh);
+        assert_eq!(
+            child_server.received_requests().await.unwrap().len(),
+            expected_before_retry
+        );
+        child.codex.submit(Op::Interrupt).await?;
+        let aborted = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_event(&child.codex, |event| {
+                matches!(event, EventMsg::TurnAborted(_))
+            }),
+        )
+        .await?;
+        let EventMsg::TurnAborted(aborted) = aborted else {
+            unreachable!()
+        };
+        assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
+        assert!(aborted.error.is_none());
+        std::fs::write(helper_home.path().join("release"), [])?;
+        successful_turn(&parent, "parent remains usable after child cancellation").await?;
+        assert_eq!(
+            child_server.received_requests().await.unwrap().len(),
+            expected_before_retry
+        );
+        // A later turn must not remain stuck behind the cancelled helper's cache/refresh locks.
+        // In the refresh case it receives another 401 and must perform a fresh recovery.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            successful_turn(&child, "child resumes after cancellation"),
+        )
+        .await??;
+        assert_eq!(
+            child_server.received_requests().await.unwrap().len(),
+            expected_before_retry + if refresh { 2 } else { 1 }
+        );
+        assert_eq!(
+            child.session_configured.model_provider_id,
+            "cancellable-command-child"
+        );
+        assert_eq!(parent_requests.requests().len(), 1);
+        assert_eq!(host.refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.auth().await, Some(host.auth.clone()));
+        parent.codex.shutdown_and_wait().await?;
+        child.codex.shutdown_and_wait().await?;
+    }
     Ok(())
 }
 
@@ -383,6 +584,7 @@ async fn websocket_child_reconnect_keeps_parent_and_local_connections_isolated()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[traced_test]
 async fn shared_host_auth_remains_usable_after_independent_session_failures() -> anyhow::Result<()>
 {
     skip_if_no_network!(Ok(()));
@@ -454,11 +656,23 @@ async fn shared_host_auth_remains_usable_after_independent_session_failures() ->
     let local = local_builder.build_with_auto_env(&local_server).await?;
     let (a, b, c) = tokio::join!(
         successful_turn(&parent, "parent"),
-        child.submit_turn("child rejection"),
+        failed_turn(&child, "child rejection"),
         successful_turn(&local, "local")
     );
     a?;
-    b?;
+    let unauthorized = b?;
+    assert_eq!(
+        unauthorized.codex_error_info,
+        Some(
+            codex_protocol::protocol::CodexErrorInfo::HttpConnectionFailed {
+                http_status_code: Some(401)
+            }
+        )
+    );
+    assert_eq!(
+        child.session_configured.model_provider_id,
+        "independent-keyed"
+    );
     c?;
     let mut child_requests = child_server.received_requests().await.unwrap();
     assert_eq!(child_requests.len(), 1);
@@ -467,11 +681,19 @@ async fn shared_host_auth_remains_usable_after_independent_session_failures() ->
         .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_json(serde_json::json!({"error": {"message": "synthetic quota"}})),
+                .set_body_json(serde_json::json!({"error": {"type": "insufficient_quota", "message": "synthetic quota"}})),
         )
         .mount(&child_server)
         .await;
-    child.submit_turn("child quota").await?;
+    let quota = failed_turn(&child, "child quota").await?;
+    assert_eq!(
+        quota.codex_error_info,
+        Some(codex_protocol::protocol::CodexErrorInfo::UsageLimitExceeded)
+    );
+    assert_eq!(
+        child.session_configured.model_provider_id,
+        "independent-keyed"
+    );
     successful_turn(&parent, "parent still works").await?;
     successful_turn(&local, "local still works").await?;
     assert_eq!(host_auth.refreshes.load(Ordering::SeqCst), 0);
@@ -505,5 +727,18 @@ async fn shared_host_auth_remains_usable_after_independent_session_failures() ->
         assert!(!request.headers.contains_key("chatgpt-account-id"));
         assert!(!request.headers.contains_key("x-openai-actor-id"));
     }
+    logs_assert(|lines: &[&str]| {
+        if lines.is_empty() {
+            return Err("request-failure fixture must capture runtime diagnostics".into());
+        }
+        for secret in ["synthetic-parent-token", "synthetic-child-token"] {
+            if lines.iter().any(|line| line.contains(secret)) {
+                return Err(
+                    "request diagnostics exposed a synthetic credential or foreign identity".into(),
+                );
+            }
+        }
+        Ok(())
+    });
     Ok(())
 }

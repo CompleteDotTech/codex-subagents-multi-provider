@@ -171,6 +171,21 @@ fn resolve_provider_auth_program(command: &str, cwd: &Path) -> io::Result<PathBu
 mod tests {
     use super::*;
     use serde_json::json;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn helper(home: &Path, mode: &str) -> ModelProviderAuthInfo {
         #[cfg(unix)]
@@ -239,6 +254,27 @@ esac
             assert!(!error.to_string().contains("synthetic-helper-secret"));
             assert!(!format!("{error:?}").contains("synthetic-helper-secret"));
         }
+    }
+
+    #[tokio::test]
+    async fn helper_manager_failure_logs_neither_stdout_nor_stderr_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let manager = super::super::manager::AuthManager::external_bearer_only(helper(
+            home.path(),
+            "failure",
+        ));
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = LogBuffer(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        assert!(manager.auth().with_subscriber(subscriber).await.is_none());
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        // Prove that the real manager's diagnostic was captured, not merely an empty buffer.
+        assert!(logs.contains("Failed to resolve external auth"));
+        assert!(logs.contains("exited with status"));
+        assert!(!logs.contains("synthetic-helper-secret"));
     }
 
     #[tokio::test]
