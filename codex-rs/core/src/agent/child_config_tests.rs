@@ -954,10 +954,31 @@ async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenan
         .unwrap();
     let resolved = fixture.resolved("zai").await;
     let result = fixture.prepared(&resolved, None, None).await;
+    let error = result.err();
+    let turn = fixture.parent.session.new_default_turn().await;
+    let step = StepContext::for_test(turn);
+    let runtime =
+        build_agent_spawn_config(&fixture.parent.session.get_base_instructions().await, &step)
+            .unwrap();
+    let current = fixture.parent.thread_settings_snapshot().await;
+    let filesystem = runtime.permissions.file_system_sandbox_policy();
+    let host_config = fixture._host.path().join("config.toml");
+    let host_catalog = fixture._host.path().join("zai.json");
     assert!(
-        result.is_err_and(|error| error.contains("child_provider_untrusted_source")
-            || error.contains("child_provider_not_authorized")),
-        "a writable host definition/catalog cannot retain its old trust exemption"
+        error
+            .as_ref()
+            .is_some_and(|error| error.contains("child_provider_untrusted_source")
+                || error.contains("child_provider_not_authorized")),
+        "writable host authority must be rejected: error={error:?}, config_writable={}, catalog_writable={}, cwd_matches={}, profile_matches={}, roots_match={}, layers_match={}",
+        filesystem.can_write_local_path_with_cwd(&host_config, runtime.cwd.as_path()),
+        filesystem.can_write_local_path_with_cwd(&host_catalog, runtime.cwd.as_path()),
+        current.cwd == runtime.cwd,
+        current.permission_profile == runtime.permissions.effective_permission_profile(),
+        current
+            .runtime_workspace_roots
+            .as_ref()
+            .is_none_or(|roots| roots == &runtime.workspace_roots),
+        fixture.parent.session.get_config().await.config_layer_stack == runtime.config_layer_stack,
     );
     assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
 }
