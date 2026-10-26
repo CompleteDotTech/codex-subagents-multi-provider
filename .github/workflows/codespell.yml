@@ -20,6 +20,8 @@ jobs:
           persist-credentials: false
       - name: Annotate locations with typos
         uses: codespell-project/codespell-problem-matcher@b80729f885d32f78a716c2f107b4db1025001c42 # v1.1.0
+      - name: Verify frozen AWS snapshot before vendor spelling exclusion
+        run: python3 codex-rs/third-party/verify_aws_config.py
       - name: Codespell
         uses: codespell-project/actions-codespell@8f01853be192eb0f849a5c7d721450e7a467c579 # v2.2
         with:

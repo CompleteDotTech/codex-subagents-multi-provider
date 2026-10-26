@@ -21,6 +21,10 @@ if not defined test_bin (
 
 __WORKSPACE_ROOT_SETUP__
 
+set "working_directory_marker_logical=__WORKING_DIRECTORY_MARKER__"
+call :change_test_working_directory
+if errorlevel 1 exit /b 1
+
 set "TOTAL_SHARDS=%RULES_RUST_TEST_TOTAL_SHARDS%"
 if not defined TOTAL_SHARDS set "TOTAL_SHARDS=%TEST_TOTAL_SHARDS%"
 if defined TESTBRIDGE_TEST_ONLY if "%~1"=="" (
@@ -38,6 +42,19 @@ if defined TOTAL_SHARDS if not "%TOTAL_SHARDS%"=="0" (
 
 "%test_bin%" %*
 exit /b %ERRORLEVEL%
+
+:change_test_working_directory
+if not defined working_directory_marker_logical exit /b 0
+call :resolve_runfile "!working_directory_marker_logical!"
+if errorlevel 1 exit /b 1
+set "working_directory_marker=!resolve_runfile_result!"
+if not exist "!working_directory_marker!" (
+  >&2 echo working directory marker does not exist: !working_directory_marker!
+  exit /b 1
+)
+for %%I in ("!working_directory_marker!") do set "test_working_directory=%%~dpI"
+cd /d "!test_working_directory!"
+exit /b !ERRORLEVEL!
 
 :run_selected_libtest
 if defined TEST_SHARD_STATUS_FILE if defined TEST_TOTAL_SHARDS if not "%TEST_TOTAL_SHARDS%"=="0" (
