@@ -326,6 +326,7 @@ impl MemoryStartupContext {
             Some(Arc::clone(&self.auth_manager)),
             AgentIdentityAuthPolicy::JwtOnly,
             self.thread_id,
+            config.model_provider_id.clone(),
             config.model_provider.clone(),
             session_source.clone(),
             config_snapshot.originator,

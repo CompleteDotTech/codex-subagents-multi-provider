@@ -17,7 +17,7 @@ use codex_secrets::SecretScope;
 use codex_secrets::SecretsBackendKind;
 use codex_secrets::SecretsManager;
 
-pub(super) async fn lock_credentials(codex_home: &Path) -> io::Result<File> {
+fn open_credential_lock(codex_home: &Path) -> io::Result<File> {
     let directory = codex_home.join("secrets");
     std::fs::create_dir_all(&directory)?;
     // Configurations have separate credential entries but rewrite the same encrypted file.
@@ -29,6 +29,21 @@ pub(super) async fn lock_credentials(codex_home: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)?;
+    Ok(file)
+}
+
+/// Observations must fail closed promptly instead of waiting behind token exchanges.
+pub(super) fn try_lock_credentials(codex_home: &Path) -> io::Result<Option<File>> {
+    let file = open_credential_lock(codex_home)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+pub(super) async fn lock_credentials(codex_home: &Path) -> io::Result<File> {
+    let file = open_credential_lock(codex_home)?;
     tokio::time::timeout(Duration::from_secs(/*secs*/ 60), async {
         loop {
             match file.try_lock() {

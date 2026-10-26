@@ -99,6 +99,7 @@ async fn handle_spawn_agent(
         &session,
         step_context.as_ref(),
         SpawnConfigOptions {
+            resolved_provider: None,
             version: SpawnConfigVersion::V1,
             full_history_fork: args.fork_context,
             role_name,
