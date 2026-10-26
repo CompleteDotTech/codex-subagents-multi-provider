@@ -116,6 +116,25 @@ fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn model_grants(model: &ModelInfo) -> serde_json::Value {
+    json!({
+        "shell":model.shell_type,"patch":model.apply_patch_tool_type,"search":model.web_search_tool_type,
+        "experimental_tools":model.experimental_supported_tools,"supports_search":model.supports_search_tool,
+        "node_disabled":model.node_repl_disabled,"node_review":model.node_repl_auto_review_required,
+        "tool_mode":model.tool_mode,"multi_agent":model.multi_agent_version,"guardian":model.guardian,
+        "review_model":model.auto_review_model_override,
+        "guardian_v2":model.model_messages.as_ref().and_then(|messages| messages.guardian_v2.as_ref()),
+    })
+}
+
+pub(crate) fn model_fingerprint(model: &ModelInfo) -> Option<String> {
+    if model.used_fallback_model_metadata {
+        return None;
+    }
+    let bytes = serde_json::to_vec(&canonical_json(model_grants(model))).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
 /// Grant-only projection. No provider/auth definition, transport, environment
 /// value, prompt text or credential-derived hash enters this value.
 pub(crate) fn fingerprint(
@@ -218,14 +237,7 @@ pub(crate) fn fingerprint(
         "update_plan":config.update_plan_enabled,"tool_registry":config.tool_registry,"code_mode":config.code_mode,
         "capability_roots":roots,"executors":grants,
         "provider_tool_capabilities":config.model_provider.capabilities,
-        "model_capabilities":{
-            "shell":model.shell_type,"patch":model.apply_patch_tool_type,"search":model.web_search_tool_type,
-            "experimental_tools":model.experimental_supported_tools,"supports_search":model.supports_search_tool,
-            "node_disabled":model.node_repl_disabled,"node_review":model.node_repl_auto_review_required,
-            "tool_mode":model.tool_mode,"multi_agent":model.multi_agent_version,"guardian":model.guardian,
-            "review_model":model.auto_review_model_override,
-            "guardian_v2":model.model_messages.as_ref().and_then(|messages| messages.guardian_v2.as_ref()),
-        }
+        "model_capabilities":model_grants(model),
     });
     let bytes = serde_json::to_vec(&canonical_json(projection)).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))

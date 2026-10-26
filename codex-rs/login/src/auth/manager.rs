@@ -689,7 +689,7 @@ impl CodexAuth {
     }
 
     /// Account-facing plan classification derived from the current auth.
-    /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/Ã¢â‚¬Â¦)
+    /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦)
     /// for UI or product decisions based on the user's subscription.
     pub fn account_plan_type(&self) -> Option<AccountPlanType> {
         if matches!(self, Self::Headers(_)) {
@@ -2119,7 +2119,7 @@ impl UnauthorizedRecovery {
 ///
 /// External modifications to stored credentials will NOT be observed until
 /// `reload()` is called explicitly. This matches the design goal of avoiding
-/// different parts of the program seeing inconsistent auth data midÃ¢â‚¬â€˜run.
+/// different parts of the program seeing inconsistent auth data midÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Ëœrun.
 pub struct AuthManager {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
@@ -2448,7 +2448,23 @@ impl AuthManager {
     /// poisoned; `Some(None)` means a readable cache without authentication.
     /// No refresh, helper, disk or network operation is attempted.
     pub fn try_auth_cached(&self) -> Option<Option<CodexAuth>> {
-        Some(self.inner.try_read().ok()?.auth.clone())
+        let cached = self.inner.try_read().ok()?;
+        let snapshot = match cached.auth.as_ref() {
+            Some(CodexAuth::Chatgpt(auth)) => {
+                let tokens = auth.state.auth_dot_json.try_lock().ok()?.clone();
+                let mut snapshot = auth.clone();
+                snapshot.state.auth_dot_json = Arc::new(Mutex::new(tokens));
+                Some(CodexAuth::Chatgpt(snapshot))
+            }
+            Some(CodexAuth::ChatgptAuthTokens(auth)) => {
+                let tokens = auth.state.auth_dot_json.try_lock().ok()?.clone();
+                let mut snapshot = auth.clone();
+                snapshot.state.auth_dot_json = Arc::new(Mutex::new(tokens));
+                Some(CodexAuth::ChatgptAuthTokens(snapshot))
+            }
+            other => other.cloned(),
+        };
+        Some(snapshot)
     }
 
     /// Current revisions if the selected credential still belongs to this manager's source.
@@ -3477,5 +3493,28 @@ mod native_authority_cache_tests {
         );
         drop(writer);
         assert!(manager.try_auth_cached().is_some());
+    }
+
+    #[test]
+    fn authority_auth_cache_snapshot_pins_nested_tokens_without_waiting_or_changing_auth_kind() {
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let manager = AuthManager::from_auth_for_testing(auth.clone());
+        let snapshot = manager.try_auth_cached().unwrap().unwrap();
+        assert_eq!(snapshot.api_auth_mode(), auth.api_auth_mode());
+        let state = match &auth {
+            CodexAuth::Chatgpt(auth) => &auth.state,
+            CodexAuth::ChatgptAuthTokens(auth) => &auth.state,
+            _ => panic!("token fixture"),
+        };
+        let token_writer = state.auth_dot_json.lock().unwrap();
+        assert!(
+            manager.try_auth_cached().is_none(),
+            "busy nested token state must not block capture"
+        );
+        assert!(
+            snapshot.get_token_data().is_ok(),
+            "private immutable token copy is independent of the busy live owner"
+        );
+        drop(token_writer);
     }
 }

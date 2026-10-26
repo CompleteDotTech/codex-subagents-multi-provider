@@ -237,14 +237,8 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
             Some(manager) => manager.try_auth_cached()?,
             None => None,
         };
-        // Other auth variants own mutable nested token state. Until they expose
-        // a pure snapshot, declining a cold receipt is safer than blocking here.
-        if auth
-            .as_ref()
-            .is_some_and(|auth| !matches!(auth, CodexAuth::ApiKey(_)))
-        {
-            return None;
-        }
+        // The cached snapshot pins nested token state with try-locks; all
+        // identity helpers below read only this private immutable auth copy.
         let mut identity =
             crate::models_identity::identity(&self.provider_info, auth.as_ref()).ok()?;
         if self.provider_info.gateway_oauth.is_some() {

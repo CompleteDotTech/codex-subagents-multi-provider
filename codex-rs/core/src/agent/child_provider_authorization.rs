@@ -257,6 +257,7 @@ pub(crate) struct RetainedAgentAuthority {
     pub(crate) settings: ThreadSettingsSnapshot,
     pub(crate) scope: ChildProviderScope,
     pub(crate) source: SessionSource,
+    model_authority: Option<String>,
     registration_id: Uuid,
     session_allocation: usize,
 }
@@ -273,7 +274,14 @@ impl RetainedAgentAuthority {
             .filter(|old| old.session_allocation == session_allocation)
             .map(|old| old.registration_id)
             .unwrap_or_else(Uuid::now_v7);
+        let model_authority = session
+            .services
+            .models_manager
+            .try_pinned_authority_model(&settings.model, &config.to_models_manager_config())
+            .as_ref()
+            .and_then(durable::model_fingerprint);
         Arc::new(Self {
+            model_authority,
             registration_id,
             session_allocation,
             thread_id: session.thread_id,
@@ -532,6 +540,7 @@ impl ChildResumePermit {
             || current.config.as_ref() != caller_epoch.config.as_ref()
             || current.settings != caller_epoch.settings
             || current.scope != caller_epoch.scope
+            || current.model_authority != caller_epoch.model_authority
         {
             return Err(invalid(
                 "resume caller authority changed during preparation",
@@ -804,6 +813,17 @@ impl ChildResumePermit {
         )
         .await
         .map_err(CodexErr::InvalidRequest)?;
+        if let Some(ceiling) = &ceiling {
+            let selected = manager
+                .try_pinned_authority_model(&resolved.model, &config.to_models_manager_config())
+                .as_ref()
+                .and_then(durable::model_fingerprint);
+            if selected.is_none() || selected != ceiling.model_authority {
+                return Err(invalid(
+                    "saved selected model tool authority changed or is unavailable",
+                ));
+            }
+        }
         if let Some((storage, receipt)) = &cold_receipt {
             let model = manager
                 .try_pinned_authority_model(&resolved.model, &config.to_models_manager_config())
@@ -934,6 +954,7 @@ impl ChildResumePermit {
         if current.config.as_ref() != self.caller_epoch.config.as_ref()
             || current.settings != self.caller_epoch.settings
             || current.scope != self.caller_epoch.scope
+            || current.model_authority != self.caller_epoch.model_authority
         {
             return Err(invalid("resume caller authority changed before admission"));
         }

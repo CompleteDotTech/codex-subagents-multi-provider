@@ -1331,3 +1331,67 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
         Some(fixture.parent.session.thread_id)
     );
 }
+
+#[tokio::test]
+async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
+    let fixture = Fixture::new().await;
+    let resolved = fixture.resolved("zai").await;
+    let config = fixture
+        .prepared(&resolved, None, None)
+        .await
+        .unwrap()
+        .config;
+    let child = fixture.start_native_child(config).await;
+    child.inject_response_items(vec![serde_json::from_value(serde_json::json!({
+        "type":"message","role":"user","content":[{"type":"input_text","text":"persist warm authority"}]
+    })).unwrap()]).await.unwrap();
+    child.ensure_rollout_materialized().await;
+    child.session.flush_rollout().await.unwrap();
+    child.shutdown_and_wait().await.unwrap();
+    fixture
+        .manager
+        .remove_thread(&child.session.thread_id)
+        .await
+        .unwrap();
+    let path = fixture._host.path().join("zai.json");
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let model = catalog["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["slug"] == "shared")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    let before = model
+        .get("node_repl_disabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    model.insert(
+        "node_repl_disabled".into(),
+        serde_json::Value::Bool(!before),
+    );
+    std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let runtime = &fixture.parent.session.services.local_agent_runtime;
+    let error = runtime
+        .control(fixture.parent.session.session_id())
+        .resume_agent_from_rollout(
+            fixture.config.clone(),
+            child.session.thread_id,
+            child.session_source.clone(),
+        )
+        .await
+        .err()
+        .expect("changed selected model grants must not bypass the warm ceiling");
+    assert!(
+        error
+            .to_string()
+            .contains("selected model tool authority changed"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.manager.list_thread_ids().await,
+        vec![fixture.parent.session.thread_id]
+    );
+}

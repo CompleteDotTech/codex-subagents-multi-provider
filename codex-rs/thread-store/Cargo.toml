@@ -36,9 +36,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }
 
+uuid = { workspace = true }
+
 [dev-dependencies]
 codex-utils-absolute-path = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-uuid = { workspace = true }
