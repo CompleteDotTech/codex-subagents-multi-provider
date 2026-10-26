@@ -316,6 +316,8 @@ required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
 allow-git = [
+    # Maintained ML-KEM API compatibility; Cargo pins an immutable revision.
+    "https://github.com/jmlepisto/clatter",
     # age/age-core maintained crypto migration; Cargo pins an immutable revision.
     "https://github.com/str4d/rage",
     "https://github.com/dzbarsky/rules_rust",

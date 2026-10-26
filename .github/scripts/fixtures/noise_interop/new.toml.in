@@ -1,0 +1,9 @@
+[package]
+name = "noise-interop-new"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+clatter = { git = "https://github.com/jmlepisto/clatter", rev = "9a8d15c4f80d5911ca0403aa22e0de99ea59df08", default-features = false, features = ["alloc", "getrandom", "use-25519", "use-aes-gcm", "use-rust-crypto-ml-kem", "use-sha"] }
+serde_json = "=1.0.149"
