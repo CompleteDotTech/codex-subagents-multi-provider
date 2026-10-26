@@ -44,8 +44,49 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
     args = [sys.executable, str(REPO_ROOT / ".github/scripts/check_rust_format.py")]
     if not check:
         args.append("--write")
-    command = Command(tuple(args), REPO_ROOT / "codex-rs")
-    return FormatterGroup("Rust", (command,))
+    workspace = REPO_ROOT / "codex-rs"
+    commands = [Command(tuple(args), workspace)]
+    # Cargo follows modules, whereas Git also finds standalone and untracked
+    # sources. Run the integrity-aware helper first: no Rust writer may run if
+    # the pinned vendor tree fails verification. Never send vendor files to the
+    # strict first-party writer, even when Git discovers untracked vendor files.
+    repository_files = subprocess.check_output(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.rs",
+        ],
+        cwd=REPO_ROOT,
+    ).split(b"\0")
+    vendor = Path("codex-rs/third-party/aws-config")
+    rust_files = sorted(
+        {
+            os.path.relpath(REPO_ROOT / path, workspace)
+            for encoded in repository_files
+            if encoded
+            for path in [Path(os.fsdecode(encoded))]
+            if not path.is_relative_to(vendor) and (REPO_ROOT / path).is_file()
+        }
+    )
+    if rust_files:
+        rustfmt_args = [
+            "rustfmt",
+            "--edition",
+            "2024",
+            "--config-path",
+            str(workspace / "rustfmt.toml"),
+            "--config",
+            "imports_granularity=Item,skip_children=true",
+        ]
+        if check:
+            rustfmt_args.append("--check")
+        commands.append(Command(tuple([*rustfmt_args, *rust_files]), workspace))
+    return FormatterGroup("Rust", tuple(commands))
 
 
 def buildifier_formatter_group(*, check: bool) -> FormatterGroup:

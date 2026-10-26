@@ -148,6 +148,8 @@ def test_root_format_driver_covers_all_formatter_groups(
         "bazel/rules/example.rs",
         "codex-rs/src/lib.rs",
         "codex-rs/new file.rs",
+        "tools/argument-comment-lint/orphan.rs",
+        "codex-rs/third-party/aws-config/src/lib.rs",
     ):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,6 +170,8 @@ def test_root_format_driver_covers_all_formatter_groups(
             return (
                 b"codex-rs/src/lib.rs\0bazel/rules/example.rs\0"
                 b"codex-rs/new file.rs\0codex-rs/deleted.rs\0"
+                b"tools/argument-comment-lint/orphan.rs\0"
+                b"codex-rs/third-party/aws-config/src/lib.rs\0"
             )
         assert args == git_ls_files_args
         return b"MODULE.bazel\0README.md\0third_party/v8/libcxx.BUILD.bazel\0"
@@ -185,7 +189,7 @@ def test_root_format_driver_covers_all_formatter_groups(
         "Python scripts",
     ]
     assert [group.name for group in checks] == [group.name for group in formatters]
-    assert [len(group.commands) for group in formatters] == [1, 1, 1, 2, 1]
+    assert [len(group.commands) for group in formatters] == [1, 2, 1, 2, 1]
     assert [len(group.commands) for group in checks] == [
         len(group.commands) for group in formatters
     ]
@@ -241,13 +245,22 @@ def test_root_format_driver_covers_all_formatter_groups(
     )
     rust_files = (
         os.path.join("..", "bazel", "rules", "example.rs"),
+        os.path.join("..", "tools", "argument-comment-lint", "orphan.rs"),
         "new file.rs",
         os.path.join("src", "lib.rs"),
     )
     assert formatters[1].commands == (
+        script.Command(
+            (sys.executable, str(tmp_path / ".github/scripts/check_rust_format.py"), "--write"),
+            tmp_path / "codex-rs",
+        ),
         script.Command(rustfmt_args + rust_files, tmp_path / "codex-rs"),
     )
     assert checks[1].commands == (
+        script.Command(
+            (sys.executable, str(tmp_path / ".github/scripts/check_rust_format.py")),
+            tmp_path / "codex-rs",
+        ),
         script.Command(rustfmt_args + ("--check",) + rust_files, tmp_path / "codex-rs"),
     )
     format_buildifier_args = formatters[2].commands[-1].args
@@ -1462,3 +1475,63 @@ def test_sdk_release_matches_runtime(
         ],
     }
     assert (script.sdk_root() / "pyproject.toml").read_text() == source_pyproject
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_root_rust_integrity_failure_stops_before_file_formatter(monkeypatch, tmp_path, check):
+    """An unknown vendor pin must block the subsequent first-party writer."""
+    script = _load_root_format_script_module()
+    (tmp_path / "orphan.rs").write_text("fn main() {}")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(script.subprocess, "check_output", lambda *a, **kw: b"orphan.rs\0")
+    calls = []
+
+    def reject_integrity(args, **kwargs):
+        calls.append(args)
+        assert args[1] == str(tmp_path / ".github/scripts/check_rust_format.py")
+        return subprocess.CompletedProcess(args, 1, "vendor integrity mismatch\n")
+
+    monkeypatch.setattr(script.subprocess, "run", reject_integrity)
+    result = script.run_formatter_group(script.rust_formatter_group(check=check))
+    assert result.returncode == 1
+    assert "vendor integrity mismatch" in result.output
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("check", [False, True])
+@pytest.mark.parametrize("writer_status", [0, 2])
+def test_root_rust_file_formatter_runs_after_verified_helper(
+    monkeypatch, tmp_path, check, writer_status
+):
+    script = _load_root_format_script_module()
+    sources = [
+        "codex-rs/src/lib.rs",
+        "outside orphan.rs",
+        "codex-rs/third-party/aws-config/src/lib.rs",
+    ]
+    for source in sources:
+        path = tmp_path / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fn main() {}")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    discovered = "\0".join([*sources, "deleted.rs", sources[0]]) + "\0"
+    monkeypatch.setattr(script.subprocess, "check_output", lambda *a, **kw: discovered.encode())
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            assert args[1] == str(tmp_path / ".github/scripts/check_rust_format.py")
+            return subprocess.CompletedProcess(args, 0, "verified\n")
+        assert args[0] == "rustfmt"
+        assert ("--check" in args) == check
+        assert args.count(str(Path("src/lib.rs"))) == 1
+        assert os.path.join("..", "outside orphan.rs") in args
+        assert not any("aws-config" in arg or "deleted.rs" in arg for arg in args)
+        return subprocess.CompletedProcess(args, writer_status, "file formatting result\n")
+
+    monkeypatch.setattr(script.subprocess, "run", run)
+    result = script.run_formatter_group(script.rust_formatter_group(check=check))
+    assert len(calls) == 2
+    assert result.returncode == writer_status
+    assert ("file formatting result" in result.output) == bool(writer_status)
