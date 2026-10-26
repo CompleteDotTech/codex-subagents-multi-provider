@@ -35,11 +35,12 @@ async fn start_prepared_child(
         .consume(runtime, parent.session.thread_id, &config, false, &source)
         .await
         .unwrap();
-    runtime
+    let child = runtime
         .upgrade()
         .unwrap()
         .spawn_child_thread(
             StartThreadOptions {
+                history_mode: Some(codex_protocol::ThreadHistoryMode::Legacy),
                 session_source: Some(source),
                 ..StartThreadOptions::new(config)
             },
@@ -50,7 +51,14 @@ async fn start_prepared_child(
         )
         .await
         .unwrap()
-        .thread
+        .thread;
+    let step = StepContext::for_test(child.session.new_default_turn().await);
+    child
+        .session
+        .record_context_updates_and_set_reference_context_item(&step)
+        .await
+        .unwrap();
+    child
 }
 
 struct Fixture {
@@ -77,6 +85,14 @@ impl Fixture {
         fast_mode: Option<bool>,
         binding: Option<codex_config::CloudConfigBundleBinding>,
     ) -> Self {
+        Self::with_binding_and_guardian(fast_mode, binding, None).await
+    }
+
+    async fn with_binding_and_guardian(
+        fast_mode: Option<bool>,
+        binding: Option<codex_config::CloudConfigBundleBinding>,
+        guardian_threshold: Option<f64>,
+    ) -> Self {
         let host = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -94,9 +110,6 @@ model = "gpt-5.5"
 [agents.provider_defaults.ollama]
 model = "shared"
 model_catalog_json = "ollama.json"
-[agents.guardian]
-description = "Typed Guardian ceiling fixture"
-config_file = "guardian.toml"
 [agents.tier]
 description = "Select an explicit service tier"
 config_file = "tier.toml"
@@ -128,11 +141,14 @@ request_max_retries = 0
             "model_reasoning_effort = 'low'\n",
         )
         .unwrap();
-        std::fs::write(
-            host.path().join("guardian.toml"),
-            "[features.guardianv2]\nreview_threshold=0.25\n",
-        )
-        .unwrap();
+        if let Some(threshold) = guardian_threshold {
+            let path = host.path().join("config.toml");
+            let mut contents = std::fs::read_to_string(&path).unwrap();
+            contents.push_str(&format!(
+                "\n[features.guardianv2]\nreview_threshold={threshold}\n"
+            ));
+            std::fs::write(path, contents).unwrap();
+        }
         let mut config = ConfigBuilder::without_managed_config_for_tests()
             .codex_home(host.path().to_path_buf())
             .harness_overrides(ConfigOverrides {
@@ -952,14 +968,51 @@ async fn direct_controller_cannot_start_forged_config_or_run_its_auth_helper() {
 #[tokio::test]
 async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenance() {
     let fixture = Fixture::new().await;
+    let environments = fixture
+        .parent
+        .session
+        .inherited_environment_snapshot()
+        .await;
+    let ready = environments.primary().expect("actual local executor");
+    let mut owner = ready.config().clone();
+    owner.permission_profile = codex_protocol::PermissionProfileSnapshot::legacy(
+        codex_protocol::models::PermissionProfile::Disabled,
+    );
+    let mut selection = ready.selection();
+    selection.config = codex_protocol::protocol::EnvironmentConfigState::Ready(owner);
     fixture
         .parent
         .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
             permission_profile: Some(codex_protocol::models::PermissionProfile::Disabled),
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                fixture.parent.thread_settings_snapshot().await.cwd,
+                vec![selection.into_request()],
+            )),
             ..Default::default()
         })
         .await
         .unwrap();
+    let _current_turn = fixture.parent.session.new_default_turn().await;
+    let actual = fixture
+        .parent
+        .session
+        .inherited_environment_snapshot()
+        .await;
+    let ready = actual.primary().expect("updated actual executor");
+    for path in [
+        fixture._host.path().join("config.toml"),
+        fixture._host.path().join("zai.json"),
+    ] {
+        assert!(
+            ready
+                .config()
+                .permission_profile
+                .permission_profile()
+                .file_system_sandbox_policy()
+                .can_write_local_path_with_cwd(&path, fixture._project.path()),
+            "actual executor must exercise writable host authority"
+        );
+    }
     let resolved = fixture.resolved("zai").await;
     let result = fixture.prepared(&resolved, None, None).await;
     let error = result.err();
@@ -1252,6 +1305,16 @@ async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_displ
         })
         .await
         .unwrap();
+    let _current_turn = fixture.parent.session.new_default_turn().await;
+    let updated = fixture
+        .parent
+        .session
+        .inherited_environment_snapshot()
+        .await;
+    assert_ne!(
+        ready.config().allow_login_shell,
+        updated.primary().unwrap().config().allow_login_shell
+    );
     let after = fixture.parent.thread_settings_snapshot().await;
     assert_eq!(before.cwd, after.cwd);
     assert_eq!(
@@ -1270,7 +1333,13 @@ async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_displ
             &source,
         )
         .await;
-    assert!(result.is_err_and(|error| error.to_string().contains("environment authority changed")));
+    let error = result
+        .err()
+        .expect("changed executor authority must revoke prepared proof");
+    assert!(
+        error.to_string().contains("parent authority changed"),
+        "{error}"
+    );
     assert_eq!(fixture.manager.list_thread_ids().await.len(), 1);
 }
 
@@ -1419,10 +1488,10 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
 
 #[tokio::test]
 async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::with_binding_and_guardian(None, None, Some(0.25)).await;
     let resolved = fixture.resolved("zai").await;
     let config = fixture
-        .prepared(&resolved, Some("guardian"), None)
+        .prepared(&resolved, None, None)
         .await
         .unwrap()
         .config;
@@ -1430,6 +1499,12 @@ async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
     child.inject_response_items(vec![serde_json::from_value(serde_json::json!({
         "type":"message","role":"user","content":[{"type":"input_text","text":"persist typed Guardian ceiling"}]
     })).unwrap()]).await.unwrap();
+    let actual = child.session.get_config().await;
+    assert_eq!(
+        actual.config_layer_stack.effective_config()["features"]["guardianv2"]["review_threshold"]
+            .as_float(),
+        Some(0.25)
+    );
     child.ensure_rollout_materialized().await;
     child.session.flush_rollout().await.unwrap();
     child.shutdown_and_wait().await.unwrap();
@@ -1438,11 +1513,40 @@ async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
         .remove_thread(&child.session.thread_id)
         .await
         .unwrap();
-    std::fs::write(
-        fixture._host.path().join("guardian.toml"),
-        "[features.guardianv2]\nreview_threshold=0.75\n",
-    )
-    .unwrap();
+    let host_path = fixture._host.path().join("config.toml");
+    let contents = std::fs::read_to_string(&host_path)
+        .unwrap()
+        .replace("review_threshold=0.25", "review_threshold=0.75");
+    std::fs::write(&host_path, contents).unwrap();
+    let next = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(fixture._host.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(fixture._project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    let current = fixture.parent.session.get_config().await;
+    assert!(matches!(
+        fixture
+            .parent
+            .session
+            .refresh_runtime_config(current, next)
+            .await,
+        crate::ConfigRefreshOutcome::Published
+    ));
+    assert_eq!(
+        fixture
+            .parent
+            .session
+            .get_config()
+            .await
+            .config_layer_stack
+            .effective_config()["features"]["guardianv2"]["review_threshold"]
+            .as_float(),
+        Some(0.75)
+    );
     let runtime = &fixture.parent.session.services.local_agent_runtime;
     let error = runtime
         .control(fixture.parent.session.session_id())
