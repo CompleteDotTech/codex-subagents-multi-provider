@@ -303,31 +303,38 @@ async fn malformed_freeform_wrappers_and_invalid_patches_use_original_validation
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn structured_http_200_quota_and_interrupted_streams_fail_the_turn() -> anyhow::Result<()> {
-    for (content_type, body) in [
+    for (content_type, body, quota) in [
         (
             "application/json",
             json!({"error":{"code":"insufficient_quota","message":"quota"}}).to_string(),
+            true,
         ),
         (
             "text/event-stream",
             sse(vec![
                 json!({"type":"response.incomplete","response":{"id":"partial","incomplete_details":{"reason":"interrupted"}}}),
             ]),
+            false,
         ),
     ] {
         let server = start_mock_server().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", content_type)
-                    .set_body_string(body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, content_type))
             .mount(&server)
             .await;
         let mut builder = compatible("configured-errors", format!("{}/v1", server.uri()), 0);
         let test = builder.build_with_auto_env(&server).await?;
-        assert!(turn(&test, "report a failure").await?.is_some());
+        let error = turn(&test, "report a failure").await?.expect("failed turn");
+        if quota {
+            assert_eq!(
+                error.codex_error_info,
+                Some(codex_protocol::protocol::CodexErrorInfo::UsageLimitExceeded),
+                "structured quota must retain its typed category: {error:?}"
+            );
+        } else {
+            assert!(error.message.contains("interrupted"), "{error:?}");
+        }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
     Ok(())
