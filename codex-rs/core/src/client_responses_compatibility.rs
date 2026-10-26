@@ -6,6 +6,8 @@
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ToolSpec;
 use serde_json::Value;
@@ -177,12 +179,12 @@ pub(crate) fn portable_history(input: Vec<ResponseItem>) -> Result<Vec<ResponseI
             ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
             } => {
-                if !calls.remove(call_id) || !matches!(output.body, FunctionCallOutputBody::Text(_))
-                {
+                if !calls.remove(call_id) {
                     return Err(unsupported(
                         "unpaired or non-text tool result cannot be replayed",
                     ));
                 }
+                portable_output(output)?;
                 completed.insert(call_id.clone());
                 item = ResponseItem::FunctionCallOutput {
                     id: None,
@@ -203,12 +205,12 @@ pub(crate) fn portable_history(input: Vec<ResponseItem>) -> Result<Vec<ResponseI
                 let Some(call_id) = call_id else {
                     return Err(unsupported("tool result requires a call_id"));
                 };
-                if !calls.remove(call_id) || !matches!(output.body, FunctionCallOutputBody::Text(_))
-                {
+                if !calls.remove(call_id) {
                     return Err(unsupported(
                         "unpaired or non-text tool result cannot be replayed",
                     ));
                 }
+                portable_output(output)?;
                 completed.insert(call_id.clone());
                 *name = None;
                 *namespace = None;
@@ -225,6 +227,27 @@ pub(crate) fn portable_history(input: Vec<ResponseItem>) -> Result<Vec<ResponseI
         return Err(unsupported("tool history is incomplete"));
     }
     Ok(result)
+}
+
+fn portable_output(output: &mut FunctionCallOutputPayload) -> Result<(), CodexErr> {
+    if let FunctionCallOutputBody::ContentItems(items) = &output.body {
+        if !items
+            .iter()
+            .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+        {
+            return Err(unsupported(
+                "non-text tool results cannot be replayed as function output",
+            ));
+        }
+        let text = match items.as_slice() {
+            [FunctionCallOutputContentItem::InputText { text }] => text.clone(),
+            // Preserve ordering, boundaries and exact strings rather than
+            // silently joining multiple chunks or dropping content.
+            _ => serde_json::to_string(items).map_err(|_| unsupported("invalid tool output"))?,
+        };
+        output.body = FunctionCallOutputBody::Text(text);
+    }
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]

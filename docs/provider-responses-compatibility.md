@@ -27,7 +27,10 @@ required string `input`. The exact raw string reaches its original registered
 handler before normal hooks, argument checks, sandboxing and approvals. Extra,
 missing or incorrectly typed wrapper fields are rejected. Tool calls and results
 are replayed as paired function items; incomplete pairs and unsupported non-text
-tool results fail explicitly. The adapter modifies request copies, not stored
+tool results fail explicitly. Text-only content arrays retain an exact single
+text string or an ordered JSON array of all original text chunks. Native Code
+Mode calls keep their registered names and payloads; only external wire calls use
+alias and wrapper decoding. The adapter modifies request copies, not stored
 history, registrations or another session's configuration.
 
 Malformed SSE, unfinished streamed tool calls, structured errors carried in HTTP

@@ -644,6 +644,17 @@ async fn stateless_unsupported_history_and_tools_fail_before_auth_or_transport()
     use codex_model_provider_info::ResponsesCompatibility;
     for prompt in [
         Prompt {
+            input: vec![
+                serde_json::from_value(
+                    json!({"type":"function_call","name":"f","call_id":"c","arguments":"{}"}),
+                )?,
+                serde_json::from_value(
+                    json!({"type":"function_call_output","call_id":"c","output":[{"type":"encrypted_content","encrypted_content":"foreign"}]}),
+                )?,
+            ],
+            ..Default::default()
+        },
+        Prompt {
             input: vec![serde_json::from_value(
                 json!({"type":"compaction","encrypted_content":"foreign"}),
             )?],

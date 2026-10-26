@@ -127,3 +127,31 @@ fn function_tools_reject_hosted_tools_and_ambiguous_namespace_aliases() {
     conflicting.name = "group__x".into();
     assert!(function_tools(&[namespace, ToolSpec::Function(conflicting)]).is_err());
 }
+
+#[test]
+fn text_content_outputs_are_lossless_and_nontext_outputs_still_fail() {
+    let single = json!([{"type":"input_text","text":"exact\n雪"}]);
+    let mut output: FunctionCallOutputPayload = serde_json::from_value(single).unwrap();
+    portable_output(&mut output).unwrap();
+    assert_eq!(output.text_content(), Some("exact\n雪"));
+
+    let multiple =
+        json!([{"type":"input_text","text":"first\n"},{"type":"input_text","text":" second\""}]);
+    let mut output: FunctionCallOutputPayload = serde_json::from_value(multiple.clone()).unwrap();
+    portable_output(&mut output).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(output.text_content().unwrap()).unwrap(),
+        multiple
+    );
+
+    for nontext in [
+        json!([{"type":"input_image","image_url":"https://example.invalid/image"}]),
+        json!([{"type":"input_audio","audio_url":"data:audio/wav;base64,"}]),
+        json!([{"type":"encrypted_content","encrypted_content":"foreign"}]),
+    ] {
+        let mut output: FunctionCallOutputPayload = serde_json::from_value(nontext).unwrap();
+        let original = output.clone();
+        assert!(portable_output(&mut output).is_err());
+        assert_eq!(output, original);
+    }
+}

@@ -367,9 +367,12 @@ impl ToolRouter {
         call_state: Option<Arc<ToolCallState>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let mut call = call;
-        if step_context.turn.provider.capabilities().responses
-            == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
+        if matches!(&source, ToolCallSource::Direct)
+            && step_context.turn.provider.capabilities().responses
+                == codex_model_provider_info::ResponsesCompatibility::StatelessFunctions
         {
+            // Code Mode and host-native plaintext calls already carry canonical
+            // names/payloads. Only decode incoming Responses wire calls here.
             // Only the exact registered runtime can interpret a flattened wire
             // name. No model-provided name can create a new handler or grant.
             let candidates: Vec<_> = self
