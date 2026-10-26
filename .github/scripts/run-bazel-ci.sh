@@ -95,13 +95,21 @@ print_bazel_test_log_tails() {
     # MSVC host platform under `local_windows_msvc-fastbuild`.
     bazel_info_args+=("--config=${ci_config}")
   fi
+  if [[ $windows_native_fallback -eq 1 ]]; then
+    if [[ -n "$requested_target_platform" ]]; then
+      bazel_info_args+=("--platforms=${requested_target_platform}")
+    fi
+    if [[ -n "$requested_host_platform" ]]; then
+      bazel_info_args+=("--host_platform=${requested_host_platform}")
+    fi
+  fi
 
   # Only pass flags that affect Bazel's output-root selection or repository
   # lookup. Test/build-only flags such as execution logs or remote download
   # mode can make `bazel info` fail, which would hide the real test log path.
   for arg in "${post_config_bazel_args[@]}"; do
     case "$arg" in
-      --host_platform=* | --repo_contents_cache=* | --repository_cache=*)
+      --host_platform=* | --platforms=* | --repo_contents_cache=* | --repository_cache=*)
         bazel_info_args+=("$arg")
         ;;
     esac
@@ -255,14 +263,60 @@ if [[ ${#bazel_args[@]} -eq 0 || ${#bazel_targets[@]} -eq 0 ]]; then
   exit 1
 fi
 
+windows_native_fallback=0
 if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
-  # Windows cross-compilation depends on authenticated RBE. Preserve the local
-  # Windows build shape when credentials are unavailable.
+  # Without authenticated RBE this is a native MSVC build, not GNU cross coverage.
   ci_config=ci-windows
   windows_msvc_host_platform=1
+  windows_native_fallback=1
 fi
 
 post_config_bazel_args=()
+if [[ $windows_native_fallback -eq 1 ]]; then
+  requested_target_platform=""
+  requested_host_platform=""
+  for ((i = 0; i < ${#bazel_args[@]}; i++)); do
+    case "${bazel_args[$i]}" in
+      --platforms=* | --host_platform=*)
+        platform_option="${bazel_args[$i]%%=*}"
+        platform_value="${bazel_args[$i]#*=}"
+        ;;
+      --platforms | --host_platform)
+        platform_option="${bazel_args[$i]}"
+        if ((i + 1 >= ${#bazel_args[@]})); then
+          echo "${platform_option} requires a platform value." >&2
+          exit 1
+        fi
+        i=$((i + 1))
+        platform_value="${bazel_args[$i]}"
+        ;;
+      *) continue ;;
+    esac
+    case "$platform_value" in
+      //:local_windows_msvc | //:windows_x86_64_msvc) ;;
+      *)
+        echo "Windows without authenticated RBE supports only the native MSVC fallback; unsupported ${platform_option}=${platform_value}." >&2
+        exit 1
+        ;;
+    esac
+    if [[ "$platform_option" == --platforms ]]; then
+      requested_target_platform="$platform_value"
+    else
+      requested_host_platform="$platform_value"
+    fi
+  done
+  # An MSVC Rust platform alone still selects hermetic GNU C/C++ by default.
+  # Reuse the native SDK toolchain recipe for both target and host dependencies.
+  post_config_bazel_args+=(--config=ci-windows-msvc)
+  if [[ -z "$requested_target_platform" ]]; then
+    post_config_bazel_args+=(--platforms=//:windows_x86_64_msvc)
+  fi
+  if [[ -z "$requested_host_platform" ]]; then
+    post_config_bazel_args+=(--host_platform=//:local_windows_msvc)
+  fi
+  echo "Windows fallback: native x86_64-pc-windows-msvc target and SDK; GNU cross compilation is not exercised."
+fi
+
 if [[ "${RUNNER_OS:-}" == "Windows" && $windows_msvc_host_platform -eq 1 ]]; then
   has_host_platform_override=0
   for arg in "${bazel_args[@]}"; do
@@ -272,12 +326,35 @@ if [[ "${RUNNER_OS:-}" == "Windows" && $windows_msvc_host_platform -eq 1 ]]; the
     fi
   done
 
-  if [[ $has_host_platform_override -eq 0 ]]; then
+  if [[ $has_host_platform_override -eq 0 && $windows_native_fallback -eq 0 ]]; then
     # Use the MSVC Windows platform for jobs that need helper binaries like
     # Rust test wrappers and V8 generators to resolve a compatible toolchain.
     # Callers that need a different Windows target platform should pass an
     # explicit `--platforms=...` flag.
     post_config_bazel_args+=("--host_platform=//:local_windows_msvc")
+  fi
+fi
+
+if [[ "${RUNNER_OS:-}" == "Windows" && "${GITHUB_ACTIONS:-}" == "true" && "${GITHUB_REPOSITORY:-}" == "CompleteDotTech/codex-subagents-multi-provider" ]]; then
+  # Authorized for this fork's Windows CI only, never a machine-wide declaration.
+  # An explicit caller declaration (including an opt-out) remains authoritative.
+  has_msvc_license_declaration=0
+  for ((i = 0; i < ${#bazel_args[@]}; i++)); do
+    case "${bazel_args[$i]}" in
+      --repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA | --repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=*)
+        has_msvc_license_declaration=1
+        ;;
+      --repo_env)
+        case "${bazel_args[$((i + 1))]:-}" in
+          BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA | BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=*)
+            has_msvc_license_declaration=1
+            ;;
+        esac
+        ;;
+    esac
+  done
+  if [[ $has_msvc_license_declaration -eq 0 ]]; then
+    post_config_bazel_args+=(--repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1)
   fi
 fi
 
