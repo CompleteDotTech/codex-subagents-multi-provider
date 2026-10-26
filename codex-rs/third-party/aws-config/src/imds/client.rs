@@ -692,7 +692,7 @@ pub(crate) mod test {
     /// Create a simple token request
     pub(crate) fn token_request(base: &str, ttl: u32) -> HttpRequest {
         http::Request::builder()
-            .uri(format!("{}/latest/api/token", base))
+            .uri(format!("{base}/latest/api/token"))
             .header("x-aws-ec2-metadata-token-ttl-seconds", ttl)
             .method("PUT")
             .body(SdkBody::empty())
@@ -758,8 +758,8 @@ pub(crate) mod test {
     async fn client_caches_token() {
         let (client, http_client) = mock_imds_client(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_A),
@@ -783,16 +783,16 @@ pub(crate) mod test {
     async fn token_can_expire() {
         let (_, http_client) = mock_imds_client(vec![
             ReplayEvent::new(
-                token_request("http://[fd00:ec2::254]", 600),
-                token_response(600, TOKEN_A),
+                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
+                token_response(/*ttl*/ 600, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://[fd00:ec2::254]/latest/metadata", TOKEN_A),
                 imds_response(r#"test-imds-output1"#),
             ),
             ReplayEvent::new(
-                token_request("http://[fd00:ec2::254]", 600),
-                token_response(600, TOKEN_B),
+                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
+                token_response(/*ttl*/ 600, TOKEN_B),
             ),
             ReplayEvent::new(
                 imds_request("http://[fd00:ec2::254]/latest/metadata", TOKEN_B),
@@ -826,8 +826,8 @@ pub(crate) mod test {
         let _logs = capture_test_logs();
         let (_, http_client) = mock_imds_client(vec![
             ReplayEvent::new(
-                token_request("http://[fd00:ec2::254]", 600),
-                token_response(600, TOKEN_A),
+                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
+                token_response(/*ttl*/ 600, TOKEN_A),
             ),
             // t = 0
             ReplayEvent::new(
@@ -841,8 +841,8 @@ pub(crate) mod test {
             ),
             // t = 550 (within buffer)
             ReplayEvent::new(
-                token_request("http://[fd00:ec2::254]", 600),
-                token_response(600, TOKEN_B),
+                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
+                token_response(/*ttl*/ 600, TOKEN_B),
             ),
             ReplayEvent::new(
                 imds_request("http://[fd00:ec2::254]/latest/metadata", TOKEN_B),
@@ -882,8 +882,8 @@ pub(crate) mod test {
     async fn retry_500() {
         let (client, http_client) = mock_imds_client(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_A),
@@ -919,15 +919,15 @@ pub(crate) mod test {
     async fn retry_token_failure() {
         let (client, http_client) = mock_imds_client(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
                 http::Response::builder()
                     .status(500)
                     .body(SdkBody::empty())
                     .unwrap(),
             ),
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_A),
@@ -951,8 +951,8 @@ pub(crate) mod test {
     async fn retry_metadata_401() {
         let (client, http_client) = mock_imds_client(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(0, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 0, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_A),
@@ -962,8 +962,8 @@ pub(crate) mod test {
                     .unwrap(),
             ),
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_B),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_B),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_B),
@@ -986,7 +986,7 @@ pub(crate) mod test {
     #[traced_test]
     async fn no_403_retry() {
         let (client, http_client) = mock_imds_client(vec![ReplayEvent::new(
-            token_request("http://169.254.169.254", 21600),
+            token_request("http://169.254.169.254", /*ttl*/ 21600),
             http::Response::builder()
                 .status(403)
                 .body(SdkBody::empty())
@@ -1039,8 +1039,8 @@ pub(crate) mod test {
 
         let events = vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(0, TOKEN_A),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 0, TOKEN_A),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_A),
@@ -1050,8 +1050,8 @@ pub(crate) mod test {
                     .unwrap(),
             ),
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_B),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_B),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_B),
@@ -1083,8 +1083,8 @@ pub(crate) mod test {
     #[tokio::test]
     async fn invalid_token() {
         let (client, http_client) = mock_imds_client(vec![ReplayEvent::new(
-            token_request("http://169.254.169.254", 21600),
-            token_response(21600, "invalid\nheader\nvalue\0"),
+            token_request("http://169.254.169.254", /*ttl*/ 21600),
+            token_response(/*ttl*/ 21600, "invalid\nheader\nvalue\0"),
         )]);
         let err = client.get("/latest/metadata").await.expect_err("no token");
         assert_full_error_contains!(err, "invalid token");
@@ -1095,8 +1095,8 @@ pub(crate) mod test {
     async fn non_utf8_response() {
         let (client, http_client) = mock_imds_client(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, TOKEN_A).map(SdkBody::from),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, TOKEN_A).map(SdkBody::from),
             ),
             ReplayEvent::new(
                 imds_request("http://169.254.169.254/latest/metadata", TOKEN_A),
@@ -1139,13 +1139,11 @@ pub(crate) mod test {
         let time_elapsed = now.elapsed().unwrap();
         assert!(
             time_elapsed > Duration::from_secs(1),
-            "time_elapsed should be greater than 1s but was {:?}",
-            time_elapsed
+            "time_elapsed should be greater than 1s but was {time_elapsed:?}"
         );
         assert!(
             time_elapsed < Duration::from_secs(2),
-            "time_elapsed should be less than 2s but was {:?}",
-            time_elapsed
+            "time_elapsed should be less than 2s but was {time_elapsed:?}"
         );
     }
 
@@ -1155,7 +1153,8 @@ pub(crate) mod test {
         let http_client = StaticReplayClient::new(vec![]);
         let imds_client = super::Client::builder()
             .retry_classifier(SharedRetryClassifier::new(
-                ImdsResponseRetryClassifier::default().with_retry_connect_timeouts(true),
+                ImdsResponseRetryClassifier::default()
+                    .with_retry_connect_timeouts(/*retry_connect_timeouts*/ true),
             ))
             .configure(&ProviderConfig::no_configuration().with_http_client(http_client.clone()))
             .operation_timeout(Duration::from_secs(1))
@@ -1172,14 +1171,12 @@ pub(crate) mod test {
 
         assert!(
             time_elapsed > Duration::from_secs(1),
-            "time_elapsed should be greater than 1s but was {:?}",
-            time_elapsed
+            "time_elapsed should be greater than 1s but was {time_elapsed:?}"
         );
 
         assert!(
             time_elapsed < Duration::from_secs(2),
-            "time_elapsed should be less than 2s but was {:?}",
-            time_elapsed
+            "time_elapsed should be less than 2s but was {time_elapsed:?}"
         );
     }
 

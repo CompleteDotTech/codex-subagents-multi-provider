@@ -71,12 +71,12 @@ fn header(private_key: &SecretKey) -> Result<Header, LoginTokenError> {
     let public_key = private_key.public_key();
     let point = public_key.to_sec1_point(false);
 
-    let x_bytes = point
-        .x()
-        .ok_or_else(|| LoginTokenError::other("invalid private key: x coordinate", None))?;
-    let y_bytes = point
-        .y()
-        .ok_or_else(|| LoginTokenError::other("invalid private key: y coordinate", None))?;
+    let x_bytes = point.x().ok_or_else(|| {
+        LoginTokenError::other("invalid private key: x coordinate", /*source*/ None)
+    })?;
+    let y_bytes = point.y().ok_or_else(|| {
+        LoginTokenError::other("invalid private key: y coordinate", /*source*/ None)
+    })?;
 
     Ok(Header {
         x_b64: base64_simd::URL_SAFE_NO_PAD.encode_to_string(x_bytes),
@@ -278,7 +278,7 @@ mod tests {
         };
         let p = payload(
             "test-jti".to_string(),
-            1651516560,
+            /*iat*/ 1651516560,
             "https://example.com/token",
         );
         let message = build_message(&h, &p);
@@ -314,8 +314,7 @@ mod tests {
         assert!(result.is_ok());
 
         let dpop = result.unwrap();
-        let parts: Vec<&str> = dpop.split('.').collect();
-        assert_eq!(parts.len(), 3);
+        assert_eq!(dpop.split('.').count(), 3);
     }
 
     #[test]

@@ -375,7 +375,7 @@ mod tests {
             registration_expires_at: Some(SystemTime::now()),
             start_url: Some("starturl".into()),
         };
-        let debug_str = format!("{:?}", token);
+        let debug_str = format!("{token:?}");
         assert!(!debug_str.contains("!!SENSITIVE!!"), "The `Debug` impl for `CachedSsoToken` isn't properly redacting sensitive fields: {debug_str}");
     }
 
@@ -479,8 +479,7 @@ mod tests {
         let err = parse_cached_token(token).expect_err("missing akid");
         assert!(
             matches!(err, CachedSsoTokenError::MissingField("accessToken")),
-            "incorrect error: {:?}",
-            err
+            "incorrect error: {err:?}"
         );
 
         // Token missing expiresAt field
@@ -493,8 +492,7 @@ mod tests {
         let err = parse_cached_token(token).expect_err("missing expiry");
         assert!(
             matches!(err, CachedSsoTokenError::MissingField("expiresAt")),
-            "incorrect error: {:?}",
-            err
+            "incorrect error: {err:?}"
         );
     }
 
@@ -509,8 +507,7 @@ mod tests {
         .expect_err("should fail, file is missing");
         assert!(
             matches!(err, CachedSsoTokenError::IoError { .. }),
-            "should be io error, got {}",
-            err
+            "should be io error, got {err}"
         );
     }
 

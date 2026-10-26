@@ -6,8 +6,15 @@ original file. `aws-config.test-data.json` pins 235 fixtures restored from that
 crate's recorded upstream Git revision f031610a8cbb4ac2dac3229bfaeaa88182787ab4.
 The fixtures contain public upstream test credentials, not operational secrets.
 
-Only Cargo.toml, Cargo.toml.orig, src/login/dpop.rs and src/lib.rs differ from the archive.
-`aws-config.patch` exposes their complete zero-context delta; apply it with
+The reviewed patch covers the two manifests and 30 Rust source files. The
+original functional changes are confined to Cargo.toml, Cargo.toml.orig,
+src/login/dpop.rs and src/lib.rs. The additional source changes name literal
+arguments, capture format variables, reuse an existing future type alias, and
+apply equivalent test-only Clippy simplifications. Test fixture helper enums
+and their Deserialize import use the same test-util condition as their existing
+consumers; no tests or assertions are removed. Production additions are argument
+comments and formatting only. All strict lint gates remain enabled.
+`aws-config.patch` exposes the complete zero-context delta; apply it with
 `git apply --unidiff-zero`. `aws-config.patched.json` pins
 those reviewed results. The source patch moves P-256 to maintained 0.14 and its
 RNG to compatible rand 0.10, retaining SEC1 keys, ES256, JWK coordinates and raw
@@ -56,4 +63,4 @@ crypto-bigint 0.5; fixing only one would leave the other paths. The resolved
 lock uses crypto-bigint 0.7.10 and ctutils 0.4.6. Source trust still requires
 immutable revisions and allows only the specific upstream rage repository.
 
-Refs #31.
+Refs #31 and #51.

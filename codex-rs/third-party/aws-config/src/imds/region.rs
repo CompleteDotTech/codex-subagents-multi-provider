@@ -129,8 +129,8 @@ mod test {
     async fn load_region() {
         let http_client = StaticReplayClient::new(vec![
             ReplayEvent::new(
-                token_request("http://169.254.169.254", 21600),
-                token_response(21600, "token"),
+                token_request("http://169.254.169.254", /*ttl*/ 21600),
+                token_response(/*ttl*/ 21600, "token"),
             ),
             ReplayEvent::new(
                 imds_request(
@@ -157,7 +157,7 @@ mod test {
     #[tokio::test]
     async fn no_region_imds_disabled() {
         let http_client = StaticReplayClient::new(vec![ReplayEvent::new(
-            token_request("http://169.254.169.254", 21600),
+            token_request("http://169.254.169.254", /*ttl*/ 21600),
             http::Response::builder()
                 .status(403)
                 .body(SdkBody::empty())

@@ -31,6 +31,330 @@
 @@ -166 +165 @@
 -version = "1.9.5"
 +version = "1.15.0"
+--- a/src/credential_process.rs
++++ b/src/credential_process.rs
+@@ -291,7 +291,4 @@
+-            Some(
+-                SystemTime::try_from(
+-                    OffsetDateTime::parse("2022-05-02T18:36:00+00:00", &Rfc3339)
+-                        .expect("static datetime")
+-                )
+-                .expect("static datetime")
+-            )
++            Some(SystemTime::from(
++                OffsetDateTime::parse("2022-05-02T18:36:00+00:00", &Rfc3339)
++                    .expect("static datetime")
++            ))
+--- a/src/default_provider/account_id_endpoint_mode.rs
++++ b/src/default_provider/account_id_endpoint_mode.rs
+@@ -81 +81 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/auth_scheme_preference.rs
++++ b/src/default_provider/auth_scheme_preference.rs
+@@ -132 +132 @@
+-                None,
++                /*profile_name_override*/ None,
+@@ -164 +164 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/checksums.rs
++++ b/src/default_provider/checksums.rs
+@@ -126 +126 @@
+-                None,
++                /*profile_name_override*/ None,
+@@ -153 +153 @@
+-                None,
++                /*profile_name_override*/ None,
+@@ -211 +211 @@
+-                None,
++                /*profile_name_override*/ None,
+@@ -238 +238 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/credentials.rs
++++ b/src/default_provider/credentials.rs
+@@ -378,2 +378 @@
+-            "should be NotLoaded: {:?}",
+-            creds
++            "should be NotLoaded: {creds:?}"
+--- a/src/default_provider/disable_request_compression.rs
++++ b/src/default_provider/disable_request_compression.rs
+@@ -84 +84 @@
+-                None,
++                /*profile_name_override*/ None,
+@@ -111 +111 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/endpoint_url.rs
++++ b/src/default_provider/endpoint_url.rs
+@@ -100 +100 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/ignore_configured_endpoint_urls.rs
++++ b/src/default_provider/ignore_configured_endpoint_urls.rs
+@@ -85 +85 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/request_min_compression_size_bytes.rs
++++ b/src/default_provider/request_min_compression_size_bytes.rs
+@@ -89 +89 @@
+-                None,
++                /*profile_name_override*/ None,
+@@ -116 +116 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/retry_config.rs
++++ b/src/default_provider/retry_config.rs
+@@ -337 +337 @@
+-                kind: RetryConfigErrorKind::MaxAttemptsMustNotBeZero { .. }
++                kind: RetryConfigErrorKind::MaxAttemptsMustNotBeZero
+--- a/src/default_provider/use_dual_stack.rs
++++ b/src/default_provider/use_dual_stack.rs
+@@ -77 +77 @@
+-                None,
++                /*profile_name_override*/ None,
+@@ -101 +101 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/default_provider/use_fips.rs
++++ b/src/default_provider/use_fips.rs
+@@ -77 +77 @@
+-                None,
++                /*profile_name_override*/ None,
+--- a/src/ecs.rs
++++ b/src/ecs.rs
+@@ -568 +568 @@
+-            validate_full_uri("https://amazon.com", None)
++            validate_full_uri("https://amazon.com", /*dns*/ None)
+@@ -582 +582 @@
+-        let no_dns_error = validate_full_uri("http://amazon.com", None)
++        let no_dns_error = validate_full_uri("http://amazon.com", /*dns*/ None)
+@@ -593,2 +593 @@
+-            "expected no dns service, got: {}",
+-            no_dns_error
++            "expected no dns service, got: {no_dns_error}"
+@@ -601 +600 @@
+-            validate_full_uri("http://127.0.0.1:8080/get-credentials", None)
++            validate_full_uri("http://127.0.0.1:8080/get-credentials", /*dns*/ None)
+@@ -608 +607 @@
+-        let err = validate_full_uri("http://192.168.10.120/creds", None)
++        let err = validate_full_uri("http://192.168.10.120/creds", /*dns*/ None)
+@@ -623,4 +622,7 @@
+-            validate_full_uri("http://169.254.170.2:8080/get-credentials", None)
+-                .now_or_never()
+-                .unwrap()
+-                .expect("valid uri"),
++            validate_full_uri(
++                "http://169.254.170.2:8080/get-credentials",
++                /*dns*/ None
++            )
++            .now_or_never()
++            .unwrap()
++            .expect("valid uri"),
+@@ -630,4 +632,7 @@
+-            validate_full_uri("http://169.254.170.23:8080/get-credentials", None)
+-                .now_or_never()
+-                .unwrap()
+-                .expect("valid uri"),
++            validate_full_uri(
++                "http://169.254.170.23:8080/get-credentials",
++                /*dns*/ None
++            )
++            .now_or_never()
++            .unwrap()
++            .expect("valid uri"),
+@@ -637,4 +642,7 @@
+-            validate_full_uri("http://[fd00:ec2::23]:8080/get-credentials", None)
+-                .now_or_never()
+-                .unwrap()
+-                .expect("valid uri"),
++            validate_full_uri(
++                "http://[fd00:ec2::23]:8080/get-credentials",
++                /*dns*/ None
++            )
++            .now_or_never()
++            .unwrap()
++            .expect("valid uri"),
+@@ -644 +652 @@
+-        let err = validate_full_uri("http://169.254.171.23/creds", None)
++        let err = validate_full_uri("http://169.254.171.23/creds", /*dns*/ None)
+@@ -655 +663 @@
+-        let err = validate_full_uri("http://[fd00:ec2::2]/creds", None)
++        let err = validate_full_uri("http://[fd00:ec2::2]/creds", /*dns*/ None)
+@@ -681 +689 @@
+-        assert!(resp.is_ok(), "Should be valid: {:?}", resp);
++        assert!(resp.is_ok(), "Should be valid: {resp:?}");
+@@ -703,2 +711 @@
+-            "Should be invalid: {:?}",
+-            resp
++            "Should be invalid: {resp:?}"
+@@ -896 +903 @@
+-                creds_request("http://169.254.170.2/credentials", None),
++                creds_request("http://169.254.170.2/credentials", /*auth*/ None),
+@@ -903 +910 @@
+-                creds_request("http://169.254.170.2/credentials", None),
++                creds_request("http://169.254.170.2/credentials", /*auth*/ None),
+@@ -920 +927 @@
+-            creds_request("http://169.254.170.2/credentials", None),
++            creds_request("http://169.254.170.2/credentials", /*auth*/ None),
+@@ -953,2 +960 @@
+-            "{:?}",
+-            err
++            "{err:?}"
+--- a/src/http_credential_provider.rs
++++ b/src/http_credential_provider.rs
+@@ -259 +259 @@
+-        provider.credentials(None).await
++        provider.credentials(/*auth*/ None).await
+--- a/src/imds/client.rs
++++ b/src/imds/client.rs
+@@ -695 +695 @@
+-            .uri(format!("{}/latest/api/token", base))
++            .uri(format!("{base}/latest/api/token"))
+@@ -761,2 +761,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_A),
+@@ -786,2 +786,2 @@
+-                token_request("http://[fd00:ec2::254]", 600),
+-                token_response(600, TOKEN_A),
++                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
++                token_response(/*ttl*/ 600, TOKEN_A),
+@@ -794,2 +794,2 @@
+-                token_request("http://[fd00:ec2::254]", 600),
+-                token_response(600, TOKEN_B),
++                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
++                token_response(/*ttl*/ 600, TOKEN_B),
+@@ -829,2 +829,2 @@
+-                token_request("http://[fd00:ec2::254]", 600),
+-                token_response(600, TOKEN_A),
++                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
++                token_response(/*ttl*/ 600, TOKEN_A),
+@@ -844,2 +844,2 @@
+-                token_request("http://[fd00:ec2::254]", 600),
+-                token_response(600, TOKEN_B),
++                token_request("http://[fd00:ec2::254]", /*ttl*/ 600),
++                token_response(/*ttl*/ 600, TOKEN_B),
+@@ -885,2 +885,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_A),
+@@ -922 +922 @@
+-                token_request("http://169.254.169.254", 21600),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
+@@ -929,2 +929,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_A),
+@@ -954,2 +954,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(0, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 0, TOKEN_A),
+@@ -965,2 +965,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_B),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_B),
+@@ -989 +989 @@
+-            token_request("http://169.254.169.254", 21600),
++            token_request("http://169.254.169.254", /*ttl*/ 21600),
+@@ -1042,2 +1042,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(0, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 0, TOKEN_A),
+@@ -1053,2 +1053,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_B),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_B),
+@@ -1086,2 +1086,2 @@
+-            token_request("http://169.254.169.254", 21600),
+-            token_response(21600, "invalid\nheader\nvalue\0"),
++            token_request("http://169.254.169.254", /*ttl*/ 21600),
++            token_response(/*ttl*/ 21600, "invalid\nheader\nvalue\0"),
+@@ -1098,2 +1098,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_A).map(SdkBody::from),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_A).map(SdkBody::from),
+@@ -1142,2 +1142 @@
+-            "time_elapsed should be greater than 1s but was {:?}",
+-            time_elapsed
++            "time_elapsed should be greater than 1s but was {time_elapsed:?}"
+@@ -1147,2 +1146 @@
+-            "time_elapsed should be less than 2s but was {:?}",
+-            time_elapsed
++            "time_elapsed should be less than 2s but was {time_elapsed:?}"
+@@ -1158 +1156,2 @@
+-                ImdsResponseRetryClassifier::default().with_retry_connect_timeouts(true),
++                ImdsResponseRetryClassifier::default()
++                    .with_retry_connect_timeouts(/*retry_connect_timeouts*/ true),
+@@ -1175,2 +1174 @@
+-            "time_elapsed should be greater than 1s but was {:?}",
+-            time_elapsed
++            "time_elapsed should be greater than 1s but was {time_elapsed:?}"
+@@ -1181,2 +1179 @@
+-            "time_elapsed should be less than 2s but was {:?}",
+-            time_elapsed
++            "time_elapsed should be less than 2s but was {time_elapsed:?}"
+--- a/src/imds/credentials.rs
++++ b/src/imds/credentials.rs
+@@ -309,2 +309,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_A),
+@@ -345,2 +345,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_A),
+@@ -390,2 +390,2 @@
+-                    token_request("http://169.254.169.254", 21600),
+-                    token_response(21600, TOKEN_A),
++                    token_request("http://169.254.169.254", /*ttl*/ 21600),
++                    token_response(/*ttl*/ 21600, TOKEN_A),
+@@ -506,2 +506,2 @@
+-                    token_request("http://169.254.169.254", 21600),
+-                    token_response(21600, TOKEN_A),
++                    token_request("http://169.254.169.254", /*ttl*/ 21600),
++                    token_response(/*ttl*/ 21600, TOKEN_A),
+@@ -540,2 +540,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, TOKEN_A),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, TOKEN_A),
+--- a/src/imds/region.rs
++++ b/src/imds/region.rs
+@@ -132,2 +132,2 @@
+-                token_request("http://169.254.169.254", 21600),
+-                token_response(21600, "token"),
++                token_request("http://169.254.169.254", /*ttl*/ 21600),
++                token_response(/*ttl*/ 21600, "token"),
+@@ -160 +160 @@
+-            token_request("http://169.254.169.254", 21600),
++            token_request("http://169.254.169.254", /*ttl*/ 21600),
+--- a/src/json_credentials.rs
++++ b/src/json_credentials.rs
+@@ -294 +294 @@
+-            err => panic!("incorrect error: {:?}", err),
++            err => panic!("incorrect error: {err:?}"),
+@@ -343 +343 @@
+-            format!("{}", parsed),
++            format!("{parsed}"),
+@@ -361 +361 @@
+-            resp => panic!("incorrect json_credentials response: {:?}", resp),
++            resp => panic!("incorrect json_credentials response: {resp:?}"),
+@@ -407,2 +407 @@
+-            "{:?}",
+-            parsed
++            "{parsed:?}"
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -9,0 +10,10 @@
@@ -44,14 +368,61 @@
 +    clippy::result_large_err,
 +    clippy::useless_borrows_in_formatting
 +)]
+@@ -1217 +1227 @@
+-                .request_min_compression_size_bytes(99)
++                .request_min_compression_size_bytes(/*size*/ 99)
+--- a/src/login/cache.rs
++++ b/src/login/cache.rs
+@@ -170 +170 @@
+-            None,
++            /*source*/ None,
+@@ -268 +268 @@
+-                    None,
++                    /*source*/ None,
+@@ -380,2 +380 @@
+-            "incorrect error: {:?}",
+-            err
++            "incorrect error: {err:?}"
+@@ -399,2 +398 @@
+-            "incorrect error: {:?}",
+-            err
++            "incorrect error: {err:?}"
+@@ -418,2 +416 @@
+-            "incorrect error: {:?}",
+-            err
++            "incorrect error: {err:?}"
+@@ -473,5 +470,4 @@
+-            "should be io error, got {:?}",
+-            err
+-        );
+-    }
+-}
++            "should be io error, got {err:?}"
++        );
++    }
++}
 --- a/src/login/dpop.rs
 +++ b/src/login/dpop.rs
 @@ -23 +23 @@
 -use p256::elliptic_curve::sec1::ToEncodedPoint;
 +use p256::elliptic_curve::sec1::ToSec1Point;
-@@ -72 +72 @@
+@@ -72,8 +72,8 @@
 -    let point = public_key.to_encoded_point(false);
+-
+-    let x_bytes = point
+-        .x()
+-        .ok_or_else(|| LoginTokenError::other("invalid private key: x coordinate", None))?;
+-    let y_bytes = point
+-        .y()
+-        .ok_or_else(|| LoginTokenError::other("invalid private key: y coordinate", None))?;
 +    let point = public_key.to_sec1_point(false);
++
++    let x_bytes = point.x().ok_or_else(|| {
++        LoginTokenError::other("invalid private key: x coordinate", /*source*/ None)
++    })?;
++    let y_bytes = point.y().ok_or_else(|| {
++        LoginTokenError::other("invalid private key: y coordinate", /*source*/ None)
++    })?;
 @@ -106,2 +106,6 @@
 -    let mut rng = rand::rngs::StdRng::from_entropy();
 -    let signature: Signature = signing_key.sign_with_rng(&mut rng, message.as_bytes());
@@ -61,7 +432,14 @@
 +    let signature: Signature = signing_key
 +        .try_sign_with_rng(&mut rng, message.as_bytes())
 +        .map_err(|e| LoginTokenError::other("could not sign DPoP proof", Some(e.into())))?;
-@@ -326 +330,67 @@
+@@ -277 +281 @@
+-            1651516560,
++            /*iat*/ 1651516560,
+@@ -313,2 +317 @@
+-        let parts: Vec<&str> = dpop.split('.').collect();
+-        assert_eq!(parts.len(), 3);
++        assert_eq!(dpop.split('.').count(), 3);
+@@ -326 +329,67 @@
 -}
 +    #[test]
 +    fn dpop_proof_preserves_es256_wire_format_and_rejects_tampering() {
@@ -130,3 +508,110 @@
 +        .is_err());
 +    }
 +}
+--- a/src/login.rs
++++ b/src/login.rs
+@@ -368 +368 @@
+-                let path = format!("/home/user/.aws/login/cache/{}", filename);
++                let path = format!("/home/user/.aws/login/cache/{filename}");
+@@ -429 +429 @@
+-                            let path = format!("/home/user/.aws/login/cache/{}", filename);
++                            let path = format!("/home/user/.aws/login/cache/{filename}");
+@@ -437,2 +437 @@
+-                                "accessToken mismatch for {}",
+-                                filename
++                                "accessToken mismatch for {filename}"
+@@ -443,2 +442 @@
+-                                "refreshToken mismatch for {}",
+-                                filename
++                                "refreshToken mismatch for {filename}"
+--- a/src/meta/region.rs
++++ b/src/meta/region.rs
+@@ -182 +182,2 @@
+-        let chain = RegionProviderChain::first_try(None).or_else(None);
++        let chain =
++            RegionProviderChain::first_try(/*provider*/ None).or_else(/*fallback*/ None);
+--- a/src/profile/credentials/exec.rs
++++ b/src/profile/credentials/exec.rs
+@@ -126 +126 @@
+-                            .enabled_from_profile(true)
++                            .enabled_from_profile(/*enabled*/ true)
+@@ -294 +294 @@
+-            format!("{}", err).contains(
++            format!("{err}").contains(
+@@ -297,2 +297 @@
+-            "`{}` did not match expected error",
+-            err
++            "`{err}` did not match expected error"
+--- a/src/profile/credentials/repr.rs
++++ b/src/profile/credentials/repr.rs
+@@ -512,0 +513 @@
++    #[cfg(feature = "test-util")]
+@@ -633,0 +635 @@
++    #[cfg(feature = "test-util")]
+@@ -639,0 +642 @@
++    #[cfg(feature = "test-util")]
+--- a/src/profile/region.rs
++++ b/src/profile/region.rs
+@@ -170 +170 @@
+-        let fs = Fs::from_test_dir(format!("test-data/profile-provider/{}/fs", dir_name), "/");
++        let fs = Fs::from_test_dir(format!("test-data/profile-provider/{dir_name}/fs"), "/");
+--- a/src/sso/cache.rs
++++ b/src/sso/cache.rs
+@@ -378 +378 @@
+-        let debug_str = format!("{:?}", token);
++        let debug_str = format!("{token:?}");
+@@ -482,2 +482 @@
+-            "incorrect error: {:?}",
+-            err
++            "incorrect error: {err:?}"
+@@ -496,2 +495 @@
+-            "incorrect error: {:?}",
+-            err
++            "incorrect error: {err:?}"
+@@ -512,2 +510 @@
+-            "should be io error, got {}",
+-            err
++            "should be io error, got {err}"
+--- a/src/sso/token.rs
++++ b/src/sso/token.rs
+@@ -506,6 +506 @@
+-                .map(|time| {
+-                    DateTime::try_from(time)
+-                        .unwrap()
+-                        .fmt(Format::DateTime)
+-                        .unwrap()
+-                })
++                .map(|time| DateTime::from(time).fmt(Format::DateTime).unwrap())
+@@ -643 +638 @@
+-        assert_eq!("us-west-2", returned_token.region.unwrap().to_string());
++        assert_eq!("us-west-2", returned_token.region.unwrap());
+--- a/src/test_case.rs
++++ b/src/test_case.rs
+@@ -162,2 +162 @@
+-                "expected an error containing: `{}`, but a result was returned: {:?}",
+-                substr, output
++                "expected an error containing: `{substr}`, but a result was returned: {output:?}"
+@@ -183 +182 @@
+-    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + 'static>>;
++    ) -> ResultFuture<Self::Output, Self::Error>;
+@@ -210 +209 @@
+-    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + 'static>> {
++    ) -> ResultFuture<Self::Output, Self::Error> {
+@@ -267 +266 @@
+-            .map_err(|e| format!("failed to load env: {}", e))?;
++            .map_err(|e| format!("failed to load env: {e}"))?;
+@@ -269 +268 @@
+-            serde_json::from_str(&env).map_err(|e| format!("failed to parse env: {}", e))?;
++            serde_json::from_str(&env).map_err(|e| format!("failed to parse env: {e}"))?;
+@@ -273 +272 @@
+-            .map_err(|e| format!("failed to load http traffic: {}", e))?;
++            .map_err(|e| format!("failed to load http traffic: {e}"))?;
+@@ -279 +278 @@
+-                .map_err(|e| format!("failed to load test case: {}", e))?,
++                .map_err(|e| format!("failed to load test case: {e}"))?,
+--- a/src/web_identity_token.rs
++++ b/src/web_identity_token.rs
+@@ -339,2 +339 @@
+-            "`{}` did not contain expected string",
+-            err
++            "`{err}` did not contain expected string"

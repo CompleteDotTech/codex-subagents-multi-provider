@@ -336,8 +336,7 @@ mod test {
             .expect_err("should fail, provider not loaded");
         assert!(
             format!("{}", DisplayErrorContext(&err)).contains("AWS_ROLE_ARN"),
-            "`{}` did not contain expected string",
-            err
+            "`{err}` did not contain expected string"
         );
         match err {
             CredentialsError::InvalidConfiguration { .. } => { /* ok */ }

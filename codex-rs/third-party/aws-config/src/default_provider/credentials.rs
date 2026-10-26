@@ -375,8 +375,7 @@ mod test {
             .expect_err("no providers enabled");
         assert!(
             matches!(creds, CredentialsError::CredentialsNotLoaded { .. }),
-            "should be NotLoaded: {:?}",
-            creds
+            "should be NotLoaded: {creds:?}"
         )
     }
 }

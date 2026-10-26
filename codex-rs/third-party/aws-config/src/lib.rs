@@ -1224,7 +1224,7 @@ mod loader {
         #[tokio::test]
         async fn load_request_min_compression_size_bytes() {
             let conf = base_conf()
-                .request_min_compression_size_bytes(99)
+                .request_min_compression_size_bytes(/*size*/ 99)
                 .load()
                 .await;
             assert_eq!(Some(99), conf.request_min_compression_size_bytes());

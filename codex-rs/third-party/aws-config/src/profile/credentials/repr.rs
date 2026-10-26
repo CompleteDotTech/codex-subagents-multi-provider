@@ -510,6 +510,7 @@ mod tests {
     use super::ProfileChain;
     use crate::profile::credentials::repr::BaseProvider;
     use crate::sensitive_command::CommandWithSensitiveArgs;
+    #[cfg(feature = "test-util")]
     use serde::Deserialize;
     #[cfg(feature = "test-util")]
     use std::collections::HashMap;
@@ -631,12 +632,14 @@ mod tests {
         output
     }
 
+    #[cfg(feature = "test-util")]
     #[derive(Deserialize, Debug, PartialEq, Eq)]
     enum TestOutput {
         ProfileChain(Vec<Provider>),
         Error(String),
     }
 
+    #[cfg(feature = "test-util")]
     #[derive(Deserialize, Debug, Eq, PartialEq)]
     enum Provider {
         AssumeRole {

@@ -159,8 +159,7 @@ where
                 )
             }
             (Ok(output), GenericTestResult::ErrorContains(substr)) => panic!(
-                "expected an error containing: `{}`, but a result was returned: {:?}",
-                substr, output
+                "expected an error containing: `{substr}`, but a result was returned: {output:?}"
             ),
         }
     }
@@ -180,7 +179,7 @@ pub(crate) trait RunTestProvider {
     fn run_provider(
         &self,
         provider_config: ProviderConfig,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + 'static>>;
+    ) -> ResultFuture<Self::Output, Self::Error>;
 }
 
 type ResultFuture<O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send + 'static>>;
@@ -207,7 +206,7 @@ where
     fn run_provider(
         &self,
         provider_config: ProviderConfig,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + 'static>> {
+    ) -> ResultFuture<Self::Output, Self::Error> {
         (self.run_provider_fn)(provider_config)
     }
 }
@@ -264,19 +263,19 @@ where
     ) -> Result<Self, BoxError> {
         let dir = dir.as_ref();
         let env = std::fs::read_to_string(dir.join("env.json"))
-            .map_err(|e| format!("failed to load env: {}", e))?;
+            .map_err(|e| format!("failed to load env: {e}"))?;
         let env: HashMap<String, String> =
-            serde_json::from_str(&env).map_err(|e| format!("failed to parse env: {}", e))?;
+            serde_json::from_str(&env).map_err(|e| format!("failed to parse env: {e}"))?;
         let env = Env::from(env);
         let fs = Fs::from_test_dir(dir.join("fs"), "/");
         let network_traffic = std::fs::read_to_string(dir.join("http-traffic.json"))
-            .map_err(|e| format!("failed to load http traffic: {}", e))?;
+            .map_err(|e| format!("failed to load http traffic: {e}"))?;
         let mut network_traffic: NetworkTraffic = serde_json::from_str(&network_traffic)?;
         network_traffic.correct_content_lengths();
 
         let metadata: Metadata<O> = serde_json::from_str(
             &std::fs::read_to_string(dir.join("test-case.json"))
-                .map_err(|e| format!("failed to load test case: {}", e))?,
+                .map_err(|e| format!("failed to load test case: {e}"))?,
         )?;
         let http_client = ReplayingClient::new(network_traffic.events().clone());
         let provider_config = ProviderConfig::empty()

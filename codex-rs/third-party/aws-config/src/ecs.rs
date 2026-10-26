@@ -565,7 +565,7 @@ mod test {
         // over HTTPs, any URI is fine
         let dns = Some(NeverDns.into_shared());
         assert_eq!(
-            validate_full_uri("https://amazon.com", None)
+            validate_full_uri("https://amazon.com", /*dns*/ None)
                 .now_or_never()
                 .unwrap()
                 .expect("valid"),
@@ -579,7 +579,7 @@ mod test {
             "DNS lookup should occur, but it will never return"
         );
 
-        let no_dns_error = validate_full_uri("http://amazon.com", None)
+        let no_dns_error = validate_full_uri("http://amazon.com", /*dns*/ None)
             .now_or_never()
             .unwrap()
             .expect_err("DNS service is required");
@@ -590,22 +590,21 @@ mod test {
                     kind: InvalidFullUriErrorKind::NoDnsResolver
                 }
             ),
-            "expected no dns service, got: {}",
-            no_dns_error
+            "expected no dns service, got: {no_dns_error}"
         );
     }
 
     #[test]
     fn valid_uri_loopback() {
         assert_eq!(
-            validate_full_uri("http://127.0.0.1:8080/get-credentials", None)
+            validate_full_uri("http://127.0.0.1:8080/get-credentials", /*dns*/ None)
                 .now_or_never()
                 .unwrap()
                 .expect("valid uri"),
             Uri::from_static("http://127.0.0.1:8080/get-credentials")
         );
 
-        let err = validate_full_uri("http://192.168.10.120/creds", None)
+        let err = validate_full_uri("http://192.168.10.120/creds", /*dns*/ None)
             .now_or_never()
             .unwrap()
             .expect_err("not a loopback");
@@ -620,28 +619,37 @@ mod test {
     #[test]
     fn valid_uri_ecs_eks() {
         assert_eq!(
-            validate_full_uri("http://169.254.170.2:8080/get-credentials", None)
-                .now_or_never()
-                .unwrap()
-                .expect("valid uri"),
+            validate_full_uri(
+                "http://169.254.170.2:8080/get-credentials",
+                /*dns*/ None
+            )
+            .now_or_never()
+            .unwrap()
+            .expect("valid uri"),
             Uri::from_static("http://169.254.170.2:8080/get-credentials")
         );
         assert_eq!(
-            validate_full_uri("http://169.254.170.23:8080/get-credentials", None)
-                .now_or_never()
-                .unwrap()
-                .expect("valid uri"),
+            validate_full_uri(
+                "http://169.254.170.23:8080/get-credentials",
+                /*dns*/ None
+            )
+            .now_or_never()
+            .unwrap()
+            .expect("valid uri"),
             Uri::from_static("http://169.254.170.23:8080/get-credentials")
         );
         assert_eq!(
-            validate_full_uri("http://[fd00:ec2::23]:8080/get-credentials", None)
-                .now_or_never()
-                .unwrap()
-                .expect("valid uri"),
+            validate_full_uri(
+                "http://[fd00:ec2::23]:8080/get-credentials",
+                /*dns*/ None
+            )
+            .now_or_never()
+            .unwrap()
+            .expect("valid uri"),
             Uri::from_static("http://[fd00:ec2::23]:8080/get-credentials")
         );
 
-        let err = validate_full_uri("http://169.254.171.23/creds", None)
+        let err = validate_full_uri("http://169.254.171.23/creds", /*dns*/ None)
             .now_or_never()
             .unwrap()
             .expect_err("not an ecs/eks container address");
@@ -652,7 +660,7 @@ mod test {
             }
         ));
 
-        let err = validate_full_uri("http://[fd00:ec2::2]/creds", None)
+        let err = validate_full_uri("http://[fd00:ec2::2]/creds", /*dns*/ None)
             .now_or_never()
             .unwrap()
             .expect_err("not an ecs/eks container address");
@@ -678,7 +686,7 @@ mod test {
         let resp = validate_full_uri("http://localhost:8888", dns)
             .now_or_never()
             .unwrap();
-        assert!(resp.is_ok(), "Should be valid: {:?}", resp);
+        assert!(resp.is_ok(), "Should be valid: {resp:?}");
     }
 
     #[test]
@@ -700,8 +708,7 @@ mod test {
                     kind: InvalidFullUriErrorKind::DisallowedIP
                 })
             ),
-            "Should be invalid: {:?}",
-            resp
+            "Should be invalid: {resp:?}"
         );
     }
 
@@ -893,14 +900,14 @@ mod test {
         let env = Env::from_slice(&[("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/credentials")]);
         let http_client = StaticReplayClient::new(vec![
             ReplayEvent::new(
-                creds_request("http://169.254.170.2/credentials", None),
+                creds_request("http://169.254.170.2/credentials", /*auth*/ None),
                 http::Response::builder()
                     .status(500)
                     .body(SdkBody::empty())
                     .unwrap(),
             ),
             ReplayEvent::new(
-                creds_request("http://169.254.170.2/credentials", None),
+                creds_request("http://169.254.170.2/credentials", /*auth*/ None),
                 ok_creds_response(),
             ),
         ]);
@@ -917,7 +924,7 @@ mod test {
     async fn load_valid_creds_no_auth() {
         let env = Env::from_slice(&[("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/credentials")]);
         let http_client = StaticReplayClient::new(vec![ReplayEvent::new(
-            creds_request("http://169.254.170.2/credentials", None),
+            creds_request("http://169.254.170.2/credentials", /*auth*/ None),
             ok_creds_response(),
         )]);
         let provider = provider(env, Fs::default(), http_client.clone());
@@ -950,8 +957,7 @@ mod test {
                     kind: InvalidFullUriErrorKind::DisallowedIP
                 }
             ),
-            "{:?}",
-            err
+            "{err:?}"
         );
         assert!(logs_contain("Address does not resolve to an allowed IP"));
         validate_full_uri("http://localhost:8888/creds", dns.clone())
