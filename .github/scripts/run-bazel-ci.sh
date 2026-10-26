@@ -305,9 +305,66 @@ if [[ $windows_native_fallback -eq 1 ]]; then
       requested_host_platform="$platform_value"
     fi
   done
+  for required_input in VOICE_WINDOWS_SYSTEM_ROOT VOICE_WINDOWS_HOST_ARCH VOICE_WINDOWS_BAZEL_REPOSITORY; do
+    if [[ -z "${!required_input:-}" ]]; then
+      echo "Native Windows fallback requires ${required_input} from the pinned Windows build-input setup." >&2
+      exit 1
+    fi
+  done
+  actual_system_root="${SystemRoot:-${SYSTEMROOT:-}}"
+  actual_host_arch="${PROCESSOR_ARCHITEW6432:-${PROCESSOR_ARCHITECTURE:-}}"
+  if [[ -z "$actual_system_root" || "$VOICE_WINDOWS_SYSTEM_ROOT" != "$actual_system_root" || "$actual_host_arch" != AMD64 || "$VOICE_WINDOWS_HOST_ARCH" != "$actual_host_arch" ]]; then
+    echo "Native Windows fallback inputs must match the actual SystemRoot and AMD64 host architecture." >&2
+    exit 1
+  fi
+  if [[ ! -f "$VOICE_WINDOWS_BAZEL_REPOSITORY/voice-tools.json" || ! -d "$VOICE_WINDOWS_BAZEL_REPOSITORY/cygwin" || ! -d "$VOICE_WINDOWS_BAZEL_REPOSITORY/pkgconf-image" ]]; then
+    echo "Native Windows fallback requires the complete provisioned Cygwin/pkgconf repository." >&2
+    exit 1
+  fi
+  for ((i = 0; i < ${#bazel_args[@]}; i++)); do
+    case "${bazel_args[$i]}" in
+      --action_env=* | --host_action_env=* | --inject_repository=* | --//third_party/voice:windows_installed_tools=*)
+        native_option="${bazel_args[$i]%%=*}"
+        native_value="${bazel_args[$i]#*=}"
+        ;;
+      --action_env | --host_action_env | --inject_repository | --//third_party/voice:windows_installed_tools)
+        native_option="${bazel_args[$i]}"
+        native_value="${bazel_args[$((i + 1))]:-}"
+        ;;
+      *) continue ;;
+    esac
+    native_input_override=0
+    case "$native_option" in
+      --action_env | --host_action_env)
+        native_env_name="${native_value%%=*}"
+        case "${native_env_name^^}" in
+          SYSTEMROOT | PROCESSOR_ARCHITECTURE) native_input_override=1 ;;
+        esac
+        ;;
+      --inject_repository)
+        case "$native_value" in
+          voice_windows_tools=*) native_input_override=1 ;;
+        esac
+        ;;
+      --//third_party/voice:windows_installed_tools) native_input_override=1 ;;
+    esac
+    if [[ $native_input_override -eq 1 ]]; then
+      echo "Native Windows fallback owns ${native_option} for its verified build inputs; use the pinned setup's VOICE_WINDOWS values instead of overriding them." >&2
+      exit 1
+    fi
+  done
   # An MSVC Rust platform alone still selects hermetic GNU C/C++ by default.
   # Reuse the native SDK toolchain recipe for both target and host dependencies.
-  post_config_bazel_args+=(--config=ci-windows-msvc)
+  post_config_bazel_args+=(
+    --config=ci-windows-msvc
+    --extra_toolchains=//third_party/voice:windows_pkg_config_toolchain,//third_party/voice:windows_cmake_toolchain
+    "--inject_repository=voice_windows_tools=${VOICE_WINDOWS_BAZEL_REPOSITORY}"
+    --//third_party/voice:windows_installed_tools=@voice_windows_tools//:tools
+    "--action_env=SystemRoot=${VOICE_WINDOWS_SYSTEM_ROOT}"
+    "--host_action_env=SystemRoot=${VOICE_WINDOWS_SYSTEM_ROOT}"
+    "--action_env=PROCESSOR_ARCHITECTURE=${VOICE_WINDOWS_HOST_ARCH}"
+    "--host_action_env=PROCESSOR_ARCHITECTURE=${VOICE_WINDOWS_HOST_ARCH}"
+  )
   if [[ -z "$requested_target_platform" ]]; then
     post_config_bazel_args+=(--platforms=//:windows_x86_64_msvc)
   fi
