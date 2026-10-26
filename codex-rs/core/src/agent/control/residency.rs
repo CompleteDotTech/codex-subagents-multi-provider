@@ -87,6 +87,12 @@ impl ThreadManagerState {
                     .turn_environments
                     .configured_snapshot_now(),
             };
+            let authority =
+                crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                    &thread.session,
+                    &thread.session_source,
+                )
+                .await;
             let mut threads = manager.threads.write().await;
             if threads
                 .get(&thread_id)
@@ -99,6 +105,9 @@ impl ThreadManagerState {
                 .registry
                 .save_evicted_environments(thread_id, environments);
             let removed = threads.remove(&thread_id).is_some();
+            if removed {
+                runtime.registry.retain_authority(authority);
+            }
             runtime.residency.remove(thread_id);
             teardown.complete();
             Ok(if removed {

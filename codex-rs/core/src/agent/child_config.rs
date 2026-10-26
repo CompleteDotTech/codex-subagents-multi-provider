@@ -362,7 +362,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     Ok(PreparedSpawnConfig { config, role_name })
 }
 
-async fn prepare_resolved_child_models(
+pub(crate) async fn prepare_resolved_child_models(
     session: &Session,
     config: &mut Config,
     resolved: &ResolvedChildProvider,
@@ -460,7 +460,7 @@ async fn prepare_resolved_child_models(
     Ok(manager)
 }
 
-async fn validate_resolved_child_model(
+pub(crate) async fn validate_resolved_child_model(
     manager: &SharedModelsManager,
     config: &Config,
     resolved: &ResolvedChildProvider,

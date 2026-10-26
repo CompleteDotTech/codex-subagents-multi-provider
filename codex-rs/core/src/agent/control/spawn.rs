@@ -352,12 +352,27 @@ impl LocalAgentControl {
     /// Keep the returned residency pin until the caller has submitted its input.
     pub(crate) async fn ensure_v2_agent_loaded(
         &self,
-        mut config: Config,
+        _config: Config,
         thread_id: ThreadId,
+        caller_id: ThreadId,
         parent: Option<Arc<CodexThread>>,
     ) -> CodexResult<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
-        let membership = self.runtime.admit_start()?;
         let state = self.runtime.upgrade()?;
+        let caller = state.get_thread(caller_id).await?;
+        let caller_epoch =
+            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                &caller.session,
+                &caller.session_source,
+            )
+            .await;
+        // A caller-supplied Config carries no authority. Project from the actual
+        // registered host Session, then restore only host-read target metadata.
+        let caller_turn = caller
+            .session
+            .new_turn_with_default_settings(Uuid::now_v7().to_string(), Default::default())
+            .await;
+        let mut config =
+            build_agent_resume_config(&caller_turn).map_err(CodexErr::InvalidRequest)?;
         let owner_thread_id = parent.as_ref().map(|parent| parent.session.thread_id);
         if let Some(parent) = &parent {
             let parent_thread_id = parent.session.thread_id;
@@ -403,6 +418,8 @@ impl LocalAgentControl {
                 include_history: false,
             })
             .await?;
+        let stored_permissions = stored_thread.permission_profile.clone();
+        let stored_approval = stored_thread.approval_mode;
         let stored_model = stored_thread.model.clone();
         let stored_model_provider = stored_thread.model_provider.clone();
         let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
@@ -675,12 +692,29 @@ impl LocalAgentControl {
             };
         // Reserving a slot can evict an idle nested parent. Capture its instructions and
         // analytics metadata alongside its authority before the live parent can disappear.
+        let authorization = crate::agent::child_provider_authorization::ChildResumePermit::prepare(
+            &self.runtime,
+            caller,
+            caller_epoch,
+            &mut config,
+            &initial_history,
+            &session_source,
+            parent_thread_id,
+            &stored_permissions,
+            stored_approval,
+            MultiAgentVersion::V2,
+            &mut environment_selections,
+            inherited_environments.as_ref(),
+        )
+        .await?;
+        let membership = self.runtime.admit_start()?;
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, &membership, Some(thread_id))
             .await?;
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                authorization: Some(authorization),
                 config,
                 prompt_cache_key,
                 initial_history,
@@ -1532,7 +1566,7 @@ impl LocalAgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1571,46 +1605,91 @@ impl LocalAgentControl {
                 &config,
             )
             .await;
-        let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
-        let mut reservation = self
-            .runtime
-            .registry
-            .reserve_spawn_slot(agent_max_threads)?;
-        let (session_source, agent_metadata) = match session_source {
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth,
-                agent_path,
-                agent_role: _,
-                agent_nickname: _,
-            }) => self.prepare_thread_spawn(
-                &mut reservation,
-                &config,
-                parent_thread_id,
-                depth,
-                agent_path.or(resumed_agent_path),
-                resumed_agent_role,
-                resumed_agent_nickname,
-            )?,
-            other => (other, AgentMetadata::default()),
-        };
-        let notification_source = session_source.clone();
+        let saved_source = initial_history
+            .get_resumed_session_sources()
+            .map(|(source, _)| source)
+            .unwrap_or_else(|| stored_thread.source.clone());
+        if saved_source.parent_thread_id() != session_source.parent_thread_id()
+            || saved_source.parent_thread_id() != parent_thread_id
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "saved runtime source cannot be relabeled by the resume request",
+            ));
+        }
+        let session_source = saved_source;
         let inherited_environments = self
             .inherited_environments_for_source(&state, Some(&session_source))
             .await;
+        let mut environment_selections = inherited_environments
+            .as_ref()
+            .map(TurnEnvironmentSnapshot::all_selections);
+        let authorization = if let Some(owner) = parent_thread_id {
+            let caller = state.get_thread(owner).await?;
+            let epoch =
+                crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                    &caller.session,
+                    &caller.session_source,
+                )
+                .await;
+            let turn = caller
+                .session
+                .new_turn_with_default_settings(Uuid::now_v7().to_string(), Default::default())
+                .await;
+            config = build_agent_resume_config(&turn).map_err(CodexErr::InvalidRequest)?;
+            if let Some(role) = session_source.get_agent_role() {
+                apply_role_to_config(&mut config, Some(&role))
+                    .await
+                    .map_err(CodexErr::InvalidRequest)?;
+            }
+            config.model = stored_thread.model.clone();
+            config.model_provider_id = stored_thread.model_provider.clone();
+            config.model_reasoning_effort = stored_thread.reasoning_effort.clone();
+            Some(
+                crate::agent::child_provider_authorization::ChildResumePermit::prepare(
+                    &self.runtime,
+                    caller,
+                    epoch,
+                    &mut config,
+                    &initial_history,
+                    &session_source,
+                    parent_thread_id,
+                    &stored_thread.permission_profile,
+                    stored_thread.approval_mode,
+                    multi_agent_version,
+                    &mut environment_selections,
+                    inherited_environments.as_ref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
+        let reservation = self
+            .runtime
+            .registry
+            .reserve_spawn_slot(agent_max_threads)?;
+        let agent_metadata = AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: resumed_agent_path,
+            agent_nickname: resumed_agent_nickname,
+            agent_role: resumed_agent_role,
+        };
+        let notification_source = session_source.clone();
         let inherited_exec_policy = self
             .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
             .await;
 
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                authorization,
                 config: config.clone(),
                 prompt_cache_key: None,
                 initial_history,
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
-                environment_selections: None,
+                environment_selections,
                 inherited_environments,
                 inherited_instructions: None,
                 inherited_exec_policy,

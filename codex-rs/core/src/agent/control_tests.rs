@@ -1535,7 +1535,12 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     let mut parent_turn = parent_thread.session.new_default_turn().await;
     let residency_pin = match route {
         V2ReloadRoute::Sender => control
-            .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id, /*parent*/ None)
+            .ensure_v2_agent_loaded(
+                sender_config,
+                spawned_agent.thread_id,
+                parent_thread_id,
+                /*parent*/ None,
+            )
             .await
             .expect("known v2 agent should reload"),
         V2ReloadRoute::NestedParent => {
@@ -6378,4 +6383,82 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .shutdown_agent_tree(parent_thread_id)
         .await
         .expect("tree shutdown after partial subtree resume should succeed");
+}
+
+#[tokio::test]
+async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_without_capacity_loss()
+{
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_paginated_thread().await;
+    let control = parent
+        .session
+        .services
+        .local_agent_runtime
+        .control(parent.session.session_id());
+    let child =
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &parent, "worker").await;
+    let thread = harness.manager.get_thread(child.thread_id).await.unwrap();
+    persist_thread_for_tree_resume(&thread, "saved child security fixture").await;
+    let stored = thread.read_thread(true, true).await.unwrap();
+    let history = Arc::new(stored.history.expect("recorded saved history").items);
+    let source = thread.session_source.clone();
+    assert_eq!(
+        harness.manager.try_evict_v2_thread(thread).await.unwrap(),
+        ThreadEvictionOutcome::Evicted
+    );
+    let state = control.runtime.upgrade().unwrap();
+    for requested_source in [source, SessionSource::Exec] {
+        let error = state
+            .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                authorization: None,
+                config: harness.config.clone(),
+                prompt_cache_key: None,
+                initial_history: InitialHistory::Resumed(ResumedHistory {
+                    history_revision: None,
+                    conversation_id: child.thread_id,
+                    history: Arc::clone(&history),
+                    rollout_path: stored.rollout_path.clone(),
+                }),
+                agent_control: control.clone(),
+                session_source: requested_source,
+                parent_thread_id: Some(parent_id),
+                environment_selections: None,
+                inherited_environments: None,
+                inherited_instructions: None,
+                inherited_exec_policy: None,
+                client_mcp_extensions: None,
+            })
+            .await
+            .err()
+            .expect("raw saved history/source cannot classify a trusted child launch");
+        assert!(
+            error
+                .to_string()
+                .contains("private host resume authorization"),
+            "{error}"
+        );
+        assert_thread_not_loaded(&harness.manager, child.thread_id).await;
+        assert!(harness.manager.get_thread(parent_id).await.is_ok());
+    }
+    let absent_caller = ThreadId::new();
+    let error = control
+        .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, absent_caller, None)
+        .await
+        .err()
+        .expect("invented sender must fail before reservation");
+    assert!(
+        matches!(error.details(), CodexErrorDetails::ThreadNotFound(id) if *id == absent_caller)
+    );
+    assert_thread_not_loaded(&harness.manager, child.thread_id).await;
+    let pin = control
+        .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, parent_id, None)
+        .await
+        .expect("real caller reload uses the one available child slot");
+    assert!(harness.manager.get_thread(parent_id).await.is_ok());
+    assert!(harness.manager.get_thread(child.thread_id).await.is_ok());
+    drop(pin);
 }

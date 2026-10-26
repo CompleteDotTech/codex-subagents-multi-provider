@@ -96,6 +96,57 @@ pub(crate) async fn prepare_role(
         })
 }
 
+/// Only the embedded no-op default can be reconstructed without a retained
+/// role ceiling. A same-named user declaration never receives this treatment.
+pub(crate) fn is_unmodified_builtin_default(config: &Config, role: Option<&str>) -> bool {
+    let role = role.unwrap_or(DEFAULT_ROLE_NAME);
+    role == DEFAULT_ROLE_NAME
+        && !config.agent_roles.contains_key(role)
+        && built_in::configs()
+            .get(role)
+            .is_some_and(|role| role.config_file.is_none())
+}
+
+/// Project only restrictive retained role settings onto the fresh caller-derived
+/// config. These old layers never supply provider or managed authorization.
+pub(crate) fn preserve_retained_role_restrictions(
+    config: &mut Config,
+    retained: &Config,
+) -> Result<(), String> {
+    let mut skills = SkillsConfig::default();
+    for layer in retained.config_layer_stack.all_layers_low_to_high() {
+        if let Some(value) = layer.config.get("skills") {
+            let old: SkillsConfig = value
+                .clone()
+                .try_into()
+                .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+            skills
+                .config
+                .extend(old.config.into_iter().filter(|skill| !skill.enabled));
+        }
+    }
+    if !retained.bundled_skills_enabled() {
+        skills.bundled = Some(codex_config::BundledSkillsConfig { enabled: false });
+    }
+    if !retained.include_skill_instructions {
+        skills.include_instructions = Some(false);
+    }
+    if !skills.config.is_empty()
+        || skills.bundled.is_some()
+        || skills.include_instructions.is_some()
+    {
+        let overrides = AgentRoleOverrides {
+            skills: Some(skills),
+            ..Default::default()
+        };
+        let layer = TomlValue::try_from(&overrides)
+            .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+        *config = role_overrides::build_next_config(config, layer, &overrides)
+            .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+    }
+    Ok(())
+}
+
 async fn prepare_role_inner(
     config: &Config,
     role_name: &str,

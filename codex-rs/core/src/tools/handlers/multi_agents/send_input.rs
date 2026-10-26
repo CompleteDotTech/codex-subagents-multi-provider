@@ -58,7 +58,12 @@ impl Handler {
             let resume_config = build_agent_resume_config(turn.as_ref())
                 .map_err(FunctionCallError::RespondToModel)?;
             local_agent_control
-                .ensure_v2_agent_loaded(resume_config, receiver_thread_id, /*parent*/ None)
+                .ensure_v2_agent_loaded(
+                    resume_config,
+                    receiver_thread_id,
+                    session.thread_id,
+                    /*parent*/ None,
+                )
                 .await
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?
         } else {

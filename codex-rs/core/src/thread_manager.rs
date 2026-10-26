@@ -425,6 +425,7 @@ fn effective_originator_value(
 }
 
 pub(crate) struct ResumeThreadWithHistoryOptions {
+    pub(crate) authorization: Option<crate::agent::child_provider_authorization::ChildResumePermit>,
     pub(crate) config: Config,
     pub(crate) prompt_cache_key: Option<PromptCacheKey>,
     pub(crate) initial_history: InitialHistory,
@@ -1451,18 +1452,36 @@ impl ThreadManager {
         &self,
         thread_id: &ThreadId,
     ) -> CodexResult<Option<Arc<CodexThread>>> {
-        let mut threads = self.state.threads.write().await;
-        if threads
-            .get(thread_id)
-            .is_some_and(|thread| thread.session_source.is_internal())
-        {
+        let Some(current) = self.state.threads.read().await.get(thread_id).cloned() else {
+            return Ok(None);
+        };
+        if current.session_source.is_internal() {
             return Err(CodexErr::InvalidRequest(
-                "live internal threads can only be removed by their owner".to_owned(),
+                "live internal threads can only be removed by their owner".into(),
             ));
         }
-        Ok(threads.remove(thread_id).inspect(|thread| {
-            thread.session.services.mcp_runtime.revoke_ema();
-        }))
+        let authority =
+            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                &current.session,
+                &current.session_source,
+            )
+            .await;
+        let mut threads = self.state.threads.write().await;
+        if !threads
+            .get(thread_id)
+            .is_some_and(|thread| Arc::ptr_eq(thread, &current))
+        {
+            return Ok(None);
+        }
+        current
+            .session
+            .services
+            .local_agent_runtime
+            .registry
+            .retain_authority(authority);
+        Ok(threads
+            .remove(thread_id)
+            .inspect(|thread| thread.session.services.mcp_runtime.revoke_ema()))
     }
 
     /// Removes a thread only if `thread_id` still maps to `expected`.
@@ -1474,17 +1493,28 @@ impl ThreadManager {
         thread_id: &ThreadId,
         expected: &Arc<CodexThread>,
     ) -> Option<Arc<CodexThread>> {
+        let authority =
+            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                &expected.session,
+                &expected.session_source,
+            )
+            .await;
         let mut threads = self.state.threads.write().await;
-        if threads
+        if !threads
             .get(thread_id)
             .is_some_and(|thread| Arc::ptr_eq(thread, expected))
         {
-            threads.remove(thread_id).inspect(|thread| {
-                thread.session.services.mcp_runtime.revoke_ema();
-            })
-        } else {
-            None
+            return None;
         }
+        expected
+            .session
+            .services
+            .local_agent_runtime
+            .registry
+            .retain_authority(authority);
+        threads
+            .remove(thread_id)
+            .inspect(|thread| thread.session.services.mcp_runtime.revoke_ema())
     }
 
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
@@ -1521,7 +1551,33 @@ impl ThreadManager {
             }
         }
 
+        let mut completed_authority = Vec::new();
+        for thread_id in &report.completed {
+            let thread = { self.state.threads.read().await.get(thread_id).cloned() };
+            if let Some(thread) = thread {
+                let authority =
+                    crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                        &thread.session,
+                        &thread.session_source,
+                    )
+                    .await;
+                completed_authority.push((thread, authority));
+            }
+        }
         let mut tracked_threads = self.state.threads.write().await;
+        for (thread, authority) in completed_authority {
+            if tracked_threads
+                .get(&authority.thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &thread))
+            {
+                thread
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .registry
+                    .retain_authority(authority);
+            }
+        }
         for thread_id in &report.completed {
             if let Some(thread) = tracked_threads.remove(thread_id) {
                 thread.session.services.mcp_runtime.revoke_ema();
@@ -1915,13 +1971,29 @@ impl ThreadManagerState {
 
     /// Remove a thread from the manager by ID, returning it when present.
     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.threads
-            .write()
-            .await
+        let current = self.threads.read().await.get(thread_id).cloned()?;
+        let authority =
+            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                &current.session,
+                &current.session_source,
+            )
+            .await;
+        let mut threads = self.threads.write().await;
+        if !threads
+            .get(thread_id)
+            .is_some_and(|thread| Arc::ptr_eq(thread, &current))
+        {
+            return None;
+        }
+        current
+            .session
+            .services
+            .local_agent_runtime
+            .registry
+            .retain_authority(authority);
+        threads
             .remove(thread_id)
-            .inspect(|thread| {
-                thread.session.services.mcp_runtime.revoke_ema();
-            })
+            .inspect(|thread| thread.session.services.mcp_runtime.revoke_ema())
     }
 
     pub(crate) async fn effective_multi_agent_version_for_spawn(
@@ -2106,6 +2178,7 @@ impl ThreadManagerState {
         options: ResumeThreadWithHistoryOptions,
     ) -> CodexResult<NewThread> {
         let ResumeThreadWithHistoryOptions {
+            authorization,
             config,
             prompt_cache_key,
             initial_history,
@@ -2139,81 +2212,26 @@ impl ThreadManagerState {
             }
             _ => None,
         };
-        let provider_origin = if let Some(parent_id) = delegated_parent {
-            let InitialHistory::Resumed(history) = &initial_history else {
-                return Err(crate::agent::child_provider_authorization::invalid(
-                    "private child reload requires resumed host history",
-                ));
-            };
-            let stored_provider = history.history.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta) => meta.meta.model_provider.as_deref(),
-                _ => None,
-            });
-            if stored_provider != Some(config.model_provider_id.as_str()) {
-                return Err(crate::agent::child_provider_authorization::invalid(
-                    "child reload cannot switch its stored provider",
-                ));
-            }
-            let parent = self.get_thread(parent_id).await?;
-            if !Arc::ptr_eq(
-                &parent
-                    .session
-                    .services
-                    .local_agent_runtime
-                    .child_provider_origins,
-                &agent_control.runtime.child_provider_origins,
-            ) {
-                return Err(crate::agent::child_provider_authorization::invalid(
-                    "resumed parent belongs to another host tree",
-                ));
-            }
-            let origin = agent_control
-                .runtime
-                .child_provider_origins
-                .verified(history.conversation_id);
-            let mut current = (*parent.session.get_config().await).clone();
-            let settings = parent.config_snapshot().await;
-            current.cwd = settings.cwd().clone();
-            current.workspace_roots = settings.workspace_roots.clone();
-            current
-                .permissions
-                .set_workspace_roots(settings.workspace_roots);
-            current
-                .permissions
-                .set_permission_profile(settings.permission_profile)
-                .map_err(|_| {
-                    crate::agent::child_provider_authorization::invalid(
-                        "current parent permissions cannot be restored",
-                    )
-                })?;
-            let policy = crate::agent::child_provider_authorization::current_policy(&current)
-                .map_err(|_| {
-                    crate::agent::child_provider_authorization::invalid(
-                        "current resume policy cannot be established",
-                    )
-                })?;
-            let selected = policy
-                .resolve(codex_config::child_provider::ChildProviderRequest {
-                    explicit_provider: Some(&config.model_provider_id),
-                    role_provider: None,
-                    parent_provider_id: &current.model_provider_id,
-                    parent_provider: &current.model_provider,
-                    parent_model: current.model.as_deref().unwrap_or(&settings.model),
-                    authorization_origin: origin.clone(),
-                    explicit_model: config.model.as_deref(),
-                    role_model: None,
-                    default_subagent_model: None,
-                    full_history: false,
-                    host_owned: false,
-                })
-                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-            if selected.provider != config.model_provider {
-                return Err(crate::agent::child_provider_authorization::invalid(
-                    "stored child provider definition changed",
-                ));
-            }
-            origin
+        let provider_origin = if let Some(authorization) = authorization {
+            authorization
+                .consume(
+                    &agent_control.runtime,
+                    &config,
+                    &initial_history,
+                    &session_source,
+                    parent_thread_id,
+                    &environment_selections,
+                    inherited_environments.as_ref(),
+                )
+                .await?
         } else {
+            if delegated_parent.is_some()
+                || initial_history.get_resumed_parent_thread_id().is_some()
+            {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "saved child launch requires private host resume authorization",
+                ));
+            }
             None
         };
         let (parent_client_mcp_extensions, inherited_prompt_cache_key) =
@@ -2437,6 +2455,25 @@ impl ThreadManagerState {
             ));
         }
         if let InitialHistory::Resumed(resumed) = &initial_history {
+            let stopped = {
+                self.threads
+                    .read()
+                    .await
+                    .get(&resumed.conversation_id)
+                    .cloned()
+            }
+            .filter(|thread| !thread.is_running());
+            let stopped_authority = if let Some(thread) = &stopped {
+                Some(
+                    crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                        &thread.session,
+                        &thread.session_source,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
             let mut threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                 if thread.is_running() {
@@ -2469,6 +2506,22 @@ impl ThreadManagerState {
                         session_configured,
                         thread,
                     });
+                }
+                if !stopped
+                    .as_ref()
+                    .is_some_and(|captured| Arc::ptr_eq(captured, &thread))
+                {
+                    return Err(crate::agent::child_provider_authorization::invalid(
+                        "stopped runtime changed while capturing its authority; retry resume",
+                    ));
+                }
+                if let Some(authority) = stopped_authority {
+                    thread
+                        .session
+                        .services
+                        .local_agent_runtime
+                        .registry
+                        .retain_authority(authority);
                 }
                 threads.remove(&resumed.conversation_id);
                 thread.session.services.mcp_runtime.revoke_ema();
@@ -2755,6 +2808,12 @@ impl ThreadManagerState {
             }
         };
 
+        let retained_authority =
+            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                &session,
+                &session_source,
+            )
+            .await;
         let ema_cancellation = session
             .get_config()
             .await
@@ -2776,6 +2835,11 @@ impl ThreadManagerState {
                         .agent_control
                         .propagate_config_update(update);
                 }
+                session
+                    .services
+                    .local_agent_runtime
+                    .registry
+                    .retain_authority(retained_authority);
                 ema_cancellation.publish();
                 let thread = Arc::new(CodexThread::new(
                     session,

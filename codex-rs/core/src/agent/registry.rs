@@ -34,6 +34,10 @@ pub(crate) struct AgentRegistry {
 struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
     thread_paths: HashMap<ThreadId, RegisteredAgent>,
+    // Actual finalized/unloaded Session ceilings only; never serialized, printed,
+    // or sufficient by themselves to authorize provider use.
+    retained_authority:
+        HashMap<ThreadId, Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
 }
@@ -95,6 +99,29 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 }
 
 impl AgentRegistry {
+    pub(crate) fn retain_authority(
+        &self,
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+    ) {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_authority
+            .insert(authority.thread_id, authority);
+    }
+
+    pub(crate) fn retained_authority(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>> {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_authority
+            .get(&thread_id)
+            .cloned()
+    }
+
     pub(crate) fn reserve_spawn_slot(
         self: &Arc<Self>,
         max_threads: Option<usize>,

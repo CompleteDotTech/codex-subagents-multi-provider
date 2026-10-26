@@ -117,8 +117,13 @@ impl AgentControl for LocalAgentControl {
                 AgentInput::UserInput(input) => {
                     let receiver = self.get_agent_metadata(target);
                     let _residency_pin = if receiver.is_some() {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?
+                        self.ensure_v2_agent_loaded(
+                            resume_config,
+                            target,
+                            caller,
+                            /*parent*/ None,
+                        )
+                        .await?
                     } else {
                         None
                     };
@@ -152,8 +157,13 @@ impl AgentControl for LocalAgentControl {
                         || (self.runtime.upgrade()?.get_thread(target).await.is_err()
                             && self.runtime.registry.evicted_environments(target).is_none())
                     {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?
+                        self.ensure_v2_agent_loaded(
+                            resume_config,
+                            target,
+                            caller,
+                            /*parent*/ None,
+                        )
+                        .await?
                     } else {
                         None
                     };
@@ -196,7 +206,7 @@ impl AgentControl for LocalAgentControl {
         Box::pin(async move {
             let parent = self.runtime.upgrade()?.get_thread(parent).await?;
             let config = parent.session.get_config().await.as_ref().clone();
-            self.ensure_v2_agent_loaded(config, child, Some(parent))
+            self.ensure_v2_agent_loaded(config, child, parent.session.thread_id, Some(parent))
                 .await
                 .map(drop)
         })
