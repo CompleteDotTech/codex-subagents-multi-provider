@@ -2974,6 +2974,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid",
  "wildmatch",
  "winapi-util",
  "windows-sys 0.61.2",
