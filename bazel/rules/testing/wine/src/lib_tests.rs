@@ -23,7 +23,37 @@ use tokio::time::timeout;
 use super::WineRuntimePaths;
 use super::WineTestCommand;
 use super::WineTestProcess;
+use super::configure_wine_environment;
 use super::install_powershell_runtime;
+
+#[test]
+fn wine_environment_isolates_host_printing_and_allows_explicit_override() -> Result<()> {
+    let runtime = WineRuntimePaths::from_runfiles()?;
+    let first = TempDir::new()?;
+    let second = TempDir::new()?;
+    for prefix in [first.path(), second.path()] {
+        let mut command = std::process::Command::new(&runtime.wine);
+        command.env("CUPS_SERVER", "host-printer-server");
+        configure_wine_environment(&mut command, &runtime, prefix);
+        let server = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "CUPS_SERVER").then_some(value))
+            .flatten()
+            .context("isolated CUPS server")?;
+        assert_eq!(Path::new(server), prefix.join("cups.sock"));
+        assert!(!Path::new(server).exists());
+
+        command.env("CUPS_SERVER", "explicit-printer-server");
+        assert_eq!(
+            command
+                .get_envs()
+                .find_map(|(key, value)| (key == "CUPS_SERVER").then_some(value))
+                .flatten(),
+            Some(std::ffi::OsStr::new("explicit-printer-server"))
+        );
+    }
+    Ok(())
+}
 
 async fn waiting_smoke_process() -> Result<WineTestProcess> {
     let executable = codex_utils_cargo_bin::cargo_bin("wine-smoke")?;
@@ -323,6 +353,14 @@ async fn pinned_powershell_runs_under_wine_with_a_pty() -> Result<()> {
             prefix.path().to_string_lossy().into_owned(),
         ),
         ("WINEARCH".to_string(), "win64".to_string()),
+        (
+            "CUPS_SERVER".to_string(),
+            prefix
+                .path()
+                .join("cups.sock")
+                .to_string_lossy()
+                .into_owned(),
+        ),
         (
             "WINEPREFIX".to_string(),
             prefix.path().to_string_lossy().into_owned(),
