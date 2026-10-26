@@ -25,6 +25,11 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Provision disposable macOS CI descriptor capacity
+      if: runner.os == 'macOS' && runner.environment == 'github-hosted' && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+      shell: bash
+      run: python3 .github/scripts/provision_macos_ci_descriptors.py
+
     - name: Set up Bazel CI
       id: setup_bazel
       uses: ./.github/actions/setup-bazel-ci

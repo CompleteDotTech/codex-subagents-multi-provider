@@ -365,7 +365,7 @@ mod test {
                 self.config_contents.as_bytes().to_vec(),
             );
             for (filename, contents) in &self.cache_contents {
-                let path = format!("/home/user/.aws/login/cache/{}", filename);
+                let path = format!("/home/user/.aws/login/cache/{filename}");
                 // Add tokenType if missing (required by cache parser)
                 let mut contents = contents.clone();
                 if !contents.as_object().unwrap().contains_key("tokenType") {
@@ -426,7 +426,7 @@ mod test {
                     Outcome::CacheContents(expected_cache) => {
                         // Verify cache was updated after provider call
                         for (filename, expected) in expected_cache {
-                            let path = format!("/home/user/.aws/login/cache/{}", filename);
+                            let path = format!("/home/user/.aws/login/cache/{filename}");
                             let actual = fs.read_to_end(&path).await.expect("cache file exists");
                             let actual: serde_json::Value =
                                 serde_json::from_slice(&actual).expect("valid json");
@@ -434,14 +434,12 @@ mod test {
                             assert_eq!(
                                 expected.get("accessToken"),
                                 actual.get("accessToken"),
-                                "accessToken mismatch for {}",
-                                filename
+                                "accessToken mismatch for {filename}"
                             );
                             assert_eq!(
                                 expected.get("refreshToken"),
                                 actual.get("refreshToken"),
-                                "refreshToken mismatch for {}",
-                                filename
+                                "refreshToken mismatch for {filename}"
                             );
                         }
                     }
