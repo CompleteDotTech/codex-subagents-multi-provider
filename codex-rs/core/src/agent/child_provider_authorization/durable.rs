@@ -398,6 +398,32 @@ pub(crate) fn candidate_scope(
         .map(|selection| {
             let ready = match &selection.config {
                 EnvironmentConfigState::Ready(ready) => Some(ready.clone()),
+                EnvironmentConfigState::FromThread
+                    if selection.environment_id == codex_exec_server::LOCAL_ENVIRONMENT_ID =>
+                {
+                    // Match SessionConfiguration::inferred_environment_config and
+                    // ThreadEnvironmentDefaults::for_selection for a local startup.
+                    Some(EnvironmentConfig {
+                        allow_login_shell: config.permissions.allow_login_shell,
+                        workspace_roots: selection.workspace_roots.clone(),
+                        permission_profile: config
+                            .permissions
+                            .permission_profile_state()
+                            .snapshot(),
+                        shell_environment_policy: config
+                            .permissions
+                            .shell_environment_policy
+                            .clone(),
+                        windows_sandbox_level:
+                            codex_protocol::config_types::WindowsSandboxLevel::from_config(config),
+                        windows_sandbox_type: config.effective_local_windows_sandbox_type(),
+                        use_legacy_landlock: config.features.use_legacy_landlock(),
+                        exec_policy: None,
+                        mcp_policy: None,
+                        network_policy: None,
+                        selected_capability_roots: Vec::new(),
+                    })
+                }
                 _ => None,
             };
             (selection.clone(), ready)
@@ -712,6 +738,70 @@ mod tests {
             },
             &scope
         ));
+    }
+
+    #[tokio::test]
+    async fn local_from_thread_projection_matches_actual_startup_but_unknown_bindings_have_no_proof()
+     {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::read_only())
+            .unwrap();
+        let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+            codex_login::CodexAuth::from_api_key("projection-only"),
+            config.model_provider.clone(),
+            home.path().to_path_buf(),
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        );
+        let root = manager
+            .start_thread(crate::thread_manager::StartThreadOptions::new(config))
+            .await
+            .unwrap()
+            .thread;
+        let (config, settings, environments) = root.session.native_agent_authority_snapshot().await;
+        let actual = ChildProviderScope::from_current(&config, &settings, &environments);
+        let ready = environments
+            .primary()
+            .expect("actual local startup attachment");
+        let mut selection = ready.selection();
+        selection.config = EnvironmentConfigState::FromThread;
+        let projected = candidate_scope(&config, Some(std::slice::from_ref(&selection)));
+        assert!(
+            projected.environments[0].1.as_ref() == Some(ready.config()),
+            "pure FromThread projection must equal actual startup authority"
+        );
+        let model = root
+            .session
+            .new_default_turn()
+            .await
+            .model_info()
+            .as_ref()
+            .clone();
+        assert_eq!(
+            fingerprint(&config, &projected, &model, &[], &[]),
+            fingerprint(&config, &actual, &model, &[], &[])
+        );
+        let storage = NativeAuthorityStorage::Local {
+            directory: home.path().to_path_buf(),
+            database: home.path().join("authority.sqlite"),
+        };
+        assert!(protected_storage(&storage, &projected));
+        assert!(protected_storage(&storage, &actual));
+        selection.environment_id = "unknown-remote".into();
+        let unknown = candidate_scope(&config, Some(std::slice::from_ref(&selection)));
+        assert!(fingerprint(&config, &unknown, &model, &[], &[]).is_none());
+        assert!(!protected_storage(&storage, &unknown));
+        selection.environment_id = codex_exec_server::LOCAL_ENVIRONMENT_ID.into();
+        selection.config = EnvironmentConfigState::Pending;
+        let pending = candidate_scope(&config, Some(&[selection]));
+        assert!(fingerprint(&config, &pending, &model, &[], &[]).is_none());
+        assert!(!protected_storage(&storage, &pending));
     }
 
     #[tokio::test]

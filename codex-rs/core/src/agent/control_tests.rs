@@ -6496,7 +6496,8 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool)
     let host = format!(
         "[agents]\nallowed_model_providers=['openai']\n[agents.{role}]\nconfig_file='restricted.toml'\ndescription='Restricted authority fixture'\n"
     );
-    let (home, _initial_config) = test_config_with_host_configuration(Vec::new(), Some(&host)).await;
+    let (home, _initial_config) =
+        test_config_with_host_configuration(Vec::new(), Some(&host)).await;
     std::fs::write(home.path().join("restricted.toml"), "[features]\nshell_tool=false\n[skills]\ninclude_instructions=false\nbundled={enabled=false}\n").unwrap();
     let mut config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(home.path().to_path_buf())
@@ -6614,6 +6615,10 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool)
     for feature in [Feature::Sqlite, Feature::MultiAgentV2, Feature::ShellTool] {
         fresh.features.enable(feature).unwrap();
     }
+    fresh
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
     assert!(!fresh.agent_roles.contains_key(role));
     let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
         CodexAuth::from_api_key("dummy"),
