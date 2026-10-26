@@ -180,6 +180,15 @@ text(JSON.stringify({{ echo, denied, patchCompleted:true }}));
         "Code Mode turn failed: {:?}",
         completed.error
     );
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let output = requests[2]
+        .function_call_output_text("cell-call")
+        .expect("portable Code Mode result");
+    assert!(
+        test.cwd.path().join("native-code-mode.txt").exists(),
+        "nested patch did not run: {output}"
+    );
     assert_eq!(
         tokio::fs::read_to_string(test.cwd.path().join("native-code-mode.txt")).await?,
         "real nested patch\n"
@@ -189,8 +198,6 @@ text(JSON.stringify({{ echo, denied, patchCompleted:true }}));
         1,
         "only validated native invocation executes"
     );
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 3);
     let direct: Value = serde_json::from_str(
         &requests[1]
             .function_call_output_text("editor-direct")
