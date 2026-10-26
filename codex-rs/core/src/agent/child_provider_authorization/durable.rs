@@ -158,6 +158,44 @@ pub(crate) fn protected_storage(
     true
 }
 
+fn shell_environment_grants(
+    policy: &codex_protocol::config_types::ShellEnvironmentPolicy,
+) -> Option<serde_json::Value> {
+    // Arbitrary injected values can be credentials or alter executable lookup.
+    // Do not serialize, hash, or infer equivalence from those opaque values.
+    if !policy.r#set.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "inherit":policy.inherit,"ignore_default_excludes":policy.ignore_default_excludes,
+        "exclude":policy.exclude,"include_only":policy.include_only,"use_profile":policy.use_profile,
+    }))
+}
+
+pub(crate) fn shell_environment_authority(
+    config: &Config,
+    scope: &ChildProviderScope,
+) -> Option<serde_json::Value> {
+    let grants: Vec<serde_json::Value> = if scope.environments.is_empty() {
+        vec![
+            json!({"environment":codex_exec_server::LOCAL_ENVIRONMENT_ID,"cwd":scope.cwd,
+            "policy":shell_environment_grants(&config.permissions.shell_environment_policy)?}),
+        ]
+    } else {
+        scope.environments.iter().map(|(selection, ready)| {
+            let ready = ready.as_ref()?;
+            Some(json!({"environment":selection.environment_id,"cwd":selection.cwd.to_abs_path().ok()?,
+                "policy":shell_environment_grants(&ready.shell_environment_policy)?}))
+        }).collect::<Option<Vec<_>>>()?
+    };
+    let mut grants = grants
+        .into_iter()
+        .map(|value| serde_json::to_string(&canonical_json(value)).ok())
+        .collect::<Option<Vec<_>>>()?;
+    grants.sort();
+    Some(json!(grants))
+}
+
 fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(object) => {
@@ -380,6 +418,7 @@ pub(crate) fn fingerprint(
         "web_search":config.web_search_mode.value(),"request_user_input":config.experimental_request_user_input_enabled,
         "update_plan":config.update_plan_enabled,"tool_registry":config.tool_registry,"code_mode":config.code_mode,
         "capability_roots":roots,"executors":grants,
+        "shell_environment_access":shell_environment_authority(config,scope)?,
         "provider_tool_capabilities":config.model_provider.capabilities,
         "model_capabilities":model_grants(model)?,"guardian_config":local_guardian_grants(config, model)?,
     });
@@ -741,6 +780,40 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn environment_access_tracks_only_typed_grants_and_declines_secret_values() {
+        use codex_protocol::config_types::ShellEnvironmentPolicy;
+        use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+        let policy = ShellEnvironmentPolicy::default();
+        let baseline = shell_environment_grants(&policy).unwrap();
+        let mut changed = policy.clone();
+        changed.inherit = ShellEnvironmentPolicyInherit::None;
+        assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
+        let mut changed = policy.clone();
+        changed.ignore_default_excludes = !changed.ignore_default_excludes;
+        assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
+        let mut changed = policy.clone();
+        changed.exclude = serde_json::from_value(json!(["PRIVATE_*"])).unwrap();
+        assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
+        let mut changed = policy.clone();
+        changed.include_only = serde_json::from_value(json!(["PUBLIC_*"])).unwrap();
+        assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
+        let mut changed = policy.clone();
+        changed.use_profile = !changed.use_profile;
+        assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
+        for value in ["synthetic-secret-a", "synthetic-secret-b"] {
+            let mut opaque = policy.clone();
+            opaque.r#set.insert("TOKEN".into(), value.into());
+            assert!(
+                shell_environment_grants(&opaque).is_none(),
+                "opaque values must never enter grant serialization or hashing"
+            );
+        }
+        let serialized = serde_json::to_string(&baseline).unwrap();
+        assert!(!serialized.contains("synthetic-secret"));
+        assert!(!serialized.contains("TOKEN"));
+    }
+
     #[tokio::test]
     async fn local_from_thread_projection_matches_actual_startup_but_unknown_bindings_have_no_proof()
      {
@@ -803,6 +876,56 @@ mod tests {
         let pending = candidate_scope(&config, Some(&[selection]));
         assert!(fingerprint(&config, &pending, &model, &[], &[]).is_none());
         assert!(!protected_storage(&storage, &pending));
+        let old_access = shell_environment_authority(&config, &actual).unwrap();
+        let mut changed = ready.selection();
+        let mut owner = ready.config().clone();
+        owner.shell_environment_policy.inherit =
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::None;
+        changed.config = EnvironmentConfigState::Ready(owner);
+        root.update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                settings.cwd.clone(),
+                vec![changed.into_request()],
+            )),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let _activated = root
+            .session
+            .new_turn_with_default_settings(
+                "actual-owner-environment-access".into(),
+                Default::default(),
+            )
+            .await;
+        let (current, current_settings, current_environments) =
+            root.session.native_agent_authority_snapshot().await;
+        assert_eq!(current_settings.cwd, settings.cwd);
+        assert_eq!(
+            current.permissions.shell_environment_policy,
+            config.permissions.shell_environment_policy,
+            "attachment authority changes independently of Config defaults"
+        );
+        assert_eq!(
+            current_environments
+                .primary()
+                .unwrap()
+                .config()
+                .shell_environment_policy
+                .inherit,
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::None
+        );
+        let current_scope =
+            ChildProviderScope::from_current(&current, &current_settings, &current_environments);
+        assert_ne!(
+            shell_environment_authority(&current, &current_scope).unwrap(),
+            old_access,
+            "warm retained scope must detect changed actual owner access"
+        );
+        assert_ne!(
+            fingerprint(&current, &current_scope, &model, &[], &[]),
+            fingerprint(&config, &actual, &model, &[], &[])
+        );
     }
 
     #[tokio::test]

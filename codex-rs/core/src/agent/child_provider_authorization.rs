@@ -843,6 +843,17 @@ impl ChildResumePermit {
                 ));
             }
         }
+        if let Some(ceiling) = &ceiling {
+            let candidate_scope = durable::candidate_scope(config, selections.as_deref());
+            let access = durable::shell_environment_authority(config, &candidate_scope);
+            if access.is_none()
+                || access != durable::shell_environment_authority(&ceiling.config, &ceiling.scope)
+            {
+                return Err(invalid(
+                    "saved executor environment access changed or is unavailable",
+                ));
+            }
+        }
         if let Some((storage, receipt)) = &cold_receipt {
             let model = manager
                 .try_pinned_authority_model(&resolved.model, &config.to_models_manager_config())

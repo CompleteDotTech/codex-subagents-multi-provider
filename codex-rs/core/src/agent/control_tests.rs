@@ -6488,14 +6488,23 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
     drop(pin);
 }
 
-#[test_case::test_case(false; "removed custom default")]
-#[test_case::test_case(true; "default grandchild under restrictive ancestor")]
+#[test_case::test_case(false, false; "removed custom default")]
+#[test_case::test_case(true, false; "default grandchild under restrictive ancestor")]
+#[test_case::test_case(false, true; "cold executor environment access cannot widen")]
 #[tokio::test]
-async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool) {
+async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(
+    nested: bool,
+    environment_access: bool,
+) {
     let role = if nested { "restricted" } else { "default" };
-    let host = format!(
-        "[agents]\nallowed_model_providers=['openai']\n[agents.{role}]\nconfig_file='restricted.toml'\ndescription='Restricted authority fixture'\n"
-    );
+    let host = if environment_access {
+        "[shell_environment_policy]\ninherit='none'\n[agents]\nallowed_model_providers=['openai']\n"
+            .to_owned()
+    } else {
+        format!(
+            "[agents]\nallowed_model_providers=['openai']\n[agents.{role}]\nconfig_file='restricted.toml'\ndescription='Restricted authority fixture'\n"
+        )
+    };
     let (home, _initial_config) =
         test_config_with_host_configuration(Vec::new(), Some(&host)).await;
     std::fs::write(home.path().join("restricted.toml"), "[features]\nshell_tool=false\n[skills]\ninclude_instructions=false\nbundled={enabled=false}\n").unwrap();
@@ -6506,8 +6515,8 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool)
         .await
         .unwrap();
     assert!(
-        config.agent_roles.contains_key(role),
-        "host role must load before runtime startup"
+        config.agent_roles.contains_key(role) != environment_access,
+        "host role authority must match the fixture before runtime startup"
     );
     for feature in [Feature::Sqlite, Feature::MultiAgentV2, Feature::ShellTool] {
         config.features.enable(feature).unwrap();
@@ -6565,9 +6574,25 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool)
     };
     let target_thread = harness.manager.get_thread(target).await.unwrap();
     let old = target_thread.session.get_config().await;
-    assert!(!old.features.enabled(Feature::ShellTool));
-    assert!(!old.include_skill_instructions);
-    assert!(!old.bundled_skills_enabled());
+    assert_eq!(old.features.enabled(Feature::ShellTool), environment_access);
+    assert_eq!(old.include_skill_instructions, environment_access);
+    assert_eq!(old.bundled_skills_enabled(), environment_access);
+    if environment_access {
+        assert_eq!(
+            old.permissions.shell_environment_policy.inherit,
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::None
+        );
+        let actual = target_thread.session.inherited_environment_snapshot().await;
+        assert_eq!(
+            actual
+                .primary()
+                .unwrap()
+                .config()
+                .shell_environment_policy
+                .inherit,
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::None
+        );
+    }
     persist_thread_for_tree_resume(&root.thread, "root receipt fixture").await;
     persist_thread_for_tree_resume(&worker_thread, "worker receipt fixture").await;
     if nested {
@@ -6619,6 +6644,15 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool)
         .permissions
         .set_permission_profile(PermissionProfile::read_only())
         .unwrap();
+    if environment_access {
+        assert!(fresh.features.enabled(Feature::ShellTool));
+        assert!(fresh.include_skill_instructions);
+        assert!(fresh.bundled_skills_enabled());
+        assert_eq!(
+            fresh.permissions.shell_environment_policy.inherit,
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::All
+        );
+    }
     assert!(!fresh.agent_roles.contains_key(role));
     let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
         CodexAuth::from_api_key("dummy"),
@@ -6644,6 +6678,35 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(nested: bool)
             .features
             .enabled(Feature::ShellTool)
     );
+    if environment_access {
+        let turn = resumed
+            .thread
+            .session
+            .new_turn_with_default_settings(
+                "cold-current-environment-access".into(),
+                Default::default(),
+            )
+            .await;
+        let candidate = crate::agent::child_config::build_agent_resume_config(&turn).unwrap();
+        assert_eq!(
+            candidate.permissions.shell_environment_policy.inherit,
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::All
+        );
+        let actual = resumed
+            .thread
+            .session
+            .inherited_environment_snapshot()
+            .await;
+        assert_eq!(
+            actual
+                .primary()
+                .unwrap()
+                .config()
+                .shell_environment_policy
+                .inherit,
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::All
+        );
+    }
     let error = resumed
         .thread
         .session
