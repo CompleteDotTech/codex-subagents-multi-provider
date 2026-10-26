@@ -189,7 +189,19 @@ request_max_retries = 0
             b.uri()
         );
         let mut config: toml::Value = toml::from_str(&config)?;
-        config["model_providers"]["blocked"]["auth"] = toml::Value::try_from(helper_auth)?;
+        let blocked = config
+            .get_mut("model_providers")
+            .and_then(toml::Value::as_table_mut)
+            .expect("fixture declares the model_providers table")
+            .get_mut("blocked")
+            .and_then(toml::Value::as_table_mut)
+            .expect("fixture declares the blocked provider table");
+        assert!(
+            blocked
+                .insert("auth".into(), toml::Value::try_from(helper_auth)?)
+                .is_none(),
+            "the helper is configured exactly once"
+        );
         std::fs::write(home.path().join("config.toml"), toml::to_string(&config)?)?;
         let mut builder = test_codex()
             .with_home(home.clone())
