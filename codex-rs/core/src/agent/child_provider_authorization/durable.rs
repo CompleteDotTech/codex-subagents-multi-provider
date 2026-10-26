@@ -166,9 +166,15 @@ fn shell_environment_grants(
     if !policy.r#set.is_empty() {
         return None;
     }
+    let patterns =
+        |values: &[codex_protocol::config_types::EnvironmentVariablePattern]| {
+            values.iter().map(|pattern| json!({
+            "pattern":pattern.pattern(),"case_insensitive":pattern.is_case_insensitive(),
+        })).collect::<Vec<_>>()
+        };
     Some(json!({
         "inherit":policy.inherit,"ignore_default_excludes":policy.ignore_default_excludes,
-        "exclude":policy.exclude,"include_only":policy.include_only,"use_profile":policy.use_profile,
+        "exclude":patterns(&policy.exclude),"include_only":patterns(&policy.include_only),"use_profile":policy.use_profile,
     }))
 }
 
@@ -782,6 +788,7 @@ mod tests {
 
     #[test]
     fn environment_access_tracks_only_typed_grants_and_declines_secret_values() {
+        use codex_protocol::config_types::EnvironmentVariablePattern;
         use codex_protocol::config_types::ShellEnvironmentPolicy;
         use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
         let policy = ShellEnvironmentPolicy::default();
@@ -793,14 +800,29 @@ mod tests {
         changed.ignore_default_excludes = !changed.ignore_default_excludes;
         assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
         let mut changed = policy.clone();
-        changed.exclude = serde_json::from_value(json!(["PRIVATE_*"])).unwrap();
+        changed.exclude = vec![EnvironmentVariablePattern::new_case_insensitive(
+            "PRIVATE_*",
+        )];
         assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
         let mut changed = policy.clone();
-        changed.include_only = serde_json::from_value(json!(["PUBLIC_*"])).unwrap();
+        changed.include_only = vec![EnvironmentVariablePattern::new_case_insensitive("PUBLIC_*")];
         assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
         let mut changed = policy.clone();
         changed.use_profile = !changed.use_profile;
         assert_ne!(shell_environment_grants(&changed).unwrap(), baseline);
+        let mut insensitive = policy.clone();
+        insensitive.exclude = vec![EnvironmentVariablePattern::new_case_insensitive(
+            "PRIVATE_*",
+        )];
+        let mut sensitive = policy.clone();
+        sensitive.exclude = vec![EnvironmentVariablePattern::new("PRIVATE_*")];
+        assert!(insensitive.exclude[0].matches("private_value"));
+        assert!(!sensitive.exclude[0].matches("private_value"));
+        assert_ne!(
+            shell_environment_grants(&insensitive),
+            shell_environment_grants(&sensitive),
+            "different actual access decisions must not share a grant projection"
+        );
         for value in ["synthetic-secret-a", "synthetic-secret-b"] {
             let mut opaque = policy.clone();
             opaque.r#set.insert("TOKEN".into(), value.into());
