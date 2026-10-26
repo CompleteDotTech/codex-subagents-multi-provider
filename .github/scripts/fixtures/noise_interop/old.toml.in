@@ -1,0 +1,10 @@
+[package]
+name = "noise-interop-old"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+clatter = { version = "=2.2.0", default-features = false, features = ["alloc", "getrandom", "use-25519", "use-aes-gcm", "use-rust-crypto-ml-kem", "use-sha"] }
+serde_json = "=1.0.149"
+ml-kem = { version = "=0.2.3", default-features = false }
