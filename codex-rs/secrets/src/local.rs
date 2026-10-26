@@ -446,6 +446,36 @@ mod tests {
     static MCP_OAUTH_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn upstream_legacy_scrypt_ciphertext_remains_readable_and_authenticated() {
+        // age 0.12.1's published testkit `scrypt` vector (MIT/Apache-2.0),
+        // retained before the upstream crypto dependency migration. The payload
+        // digest and public test passphrase are specified by that test vector.
+        let ciphertext = BASE64_STANDARD.decode("YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHNjcnlwdCByRjAvTndibFVISFRwZ1FnUnBlNUNRIDEwCmdVakV5bUZLTVZYUUVLZE1NSEwyNG9ZZXhqRTNUSUMwTzB6R1NxSjJhVVkKLS0tIElPWGlRWVN0a29UMW12WlcydEZPcVpkaFJWdmo1OGVnQUJ4L3NXZlpRYmMKGzXG5ofdANo6w3msn3QsIf0YWhuePe1znRSsappQEk24Ztg=").expect("fixture base64");
+        let passphrase: SecretString = "password".to_owned().into();
+        let plaintext =
+            decrypt_with_passphrase(&ciphertext, &passphrase).expect("legacy ciphertext");
+        let digest = Sha256::digest(&plaintext);
+        assert_eq!(
+            digest.as_slice(),
+            &[
+                0x01, 0x3f, 0x54, 0x40, 0x0c, 0x82, 0xda, 0x08, 0x03, 0x77, 0x59, 0xad, 0xa9, 0x07,
+                0xa8, 0xb8, 0x64, 0xe9, 0x7d, 0xe8, 0x1c, 0x08, 0x8a, 0x18, 0x20, 0x62, 0xc4, 0xb5,
+                0x62, 0x2f, 0xd2, 0xab
+            ]
+        );
+        assert!(decrypt_with_passphrase(&ciphertext, &"wrong-password".to_owned().into()).is_err());
+        let mut damaged = ciphertext.clone();
+        *damaged.last_mut().expect("ciphertext payload") ^= 1;
+        assert!(decrypt_with_passphrase(&damaged, &passphrase).is_err());
+        let fresh =
+            encrypt_with_passphrase(&plaintext, &passphrase).expect("encrypt with maintained age");
+        assert_eq!(
+            decrypt_with_passphrase(&fresh, &passphrase).expect("decrypt fresh ciphertext"),
+            plaintext
+        );
+    }
+
+    #[test]
     fn load_file_rejects_newer_schema_versions() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());

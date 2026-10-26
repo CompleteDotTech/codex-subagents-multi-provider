@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "third-party/aws-config",
     "aws-auth",
     "analytics",
     "agent-graph-store",
@@ -660,6 +661,11 @@ inherits = "test"
 opt-level = 0
 
 [patch.crates-io]
+# Keep authentication behavior while using the maintained P-256 implementation.
+aws-config = { path = "third-party/aws-config" }
+# Upstream age migration, pinned for reproducible review (Refs #31).
+age = { git = "https://github.com/str4d/rage", rev = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f" }
+age-core = { git = "https://github.com/str4d/rage", rev = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f" }
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
 crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "ed1cdab335221515706178d68495bba2aed1924f" }
