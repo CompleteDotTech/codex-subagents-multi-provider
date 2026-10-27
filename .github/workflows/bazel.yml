@@ -626,6 +626,7 @@ jobs:
           "VOICE_DIAGNOSTIC_HEAD=$(git rev-parse HEAD)" >> $env:GITHUB_ENV
           "VOICE_DIAGNOSTIC_TREE=$(git rev-parse 'HEAD^{tree}')" >> $env:GITHUB_ENV
       - name: Observe resources before preparation
+        continue-on-error: true
         shell: pwsh
         run: python .github/scripts/observe_windows_ci_resources.py before-prepare
       - name: Prepare Bazel CI
@@ -636,6 +637,7 @@ jobs:
           windows-resource-observation: true
           cache-scope: bazel-test
       - name: Observe resources after preparation and input installation
+        continue-on-error: true
         if: always() && !cancelled()
         shell: pwsh
         run: python .github/scripts/observe_windows_ci_resources.py after-prepare
@@ -663,6 +665,7 @@ jobs:
             if [[ -f "$file" ]]; then cp "$file" "${RUNNER_TEMP}/voice-runtime-diagnostic/"; fi
           done
       - name: Observe resources after text artifact collection
+        continue-on-error: true
         if: always() && !cancelled()
         shell: pwsh
         run: python .github/scripts/observe_windows_ci_resources.py after-artifacts

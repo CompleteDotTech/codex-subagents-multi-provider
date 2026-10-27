@@ -1,5 +1,5 @@
 # Numeric-only collector. Called by the bounded supervisor, never directly by CI.
-param([int]$OwnedPid = 0, [double]$BuildStart = 0)
+param([int]$OwnedPid = 0, [long]$CreationMicroseconds = 0)
 $ErrorActionPreference = 'Stop'
 $result = [ordered]@{ unavailable = 0; truncated = $false; memory = $null; pagefiles = @(); configured_pagefiles = $null; volumes = @(); processes = @(); process_scope = 'live-owned-descendant-snapshot-only-detached-servers-unobserved'; vhd = $null }
 function Number($Value, [long]$Scale = 1) { if ($null -eq $Value) { return $null }; return [long]$Value * $Scale }
@@ -53,9 +53,13 @@ if ($OwnedPid -gt 0) {
     $queue = [Collections.Generic.Queue[int]]::new()
     $seen = [Collections.Generic.HashSet[int]]::new()
     try {
+        if ($CreationMicroseconds -le 0) { throw 'ownership unavailable' }
         $root = Query Win32_Process "ProcessId=$OwnedPid"
-        $created = ([DateTimeOffset]$root.CreationDate).ToUnixTimeMilliseconds() / 1000.0
-        if (-not $root -or [Math]::Abs($created - $BuildStart) -gt 2) { throw 'ownership unavailable' }
+        # CIM DateTime precision is microseconds; match GetProcessTimes FILETIME
+        # truncated from 100 ns to microseconds since the 1601 UTC epoch.
+        $epochTicks = [datetime]::new(1601, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).Ticks
+        $created = [long][Math]::Floor(($root.CreationDate.ToUniversalTime().Ticks - $epochTicks) / 10D)
+        if (-not $root -or $created -ne $CreationMicroseconds) { throw 'ownership unavailable' }
     } catch { $result.unavailable++; $result | ConvertTo-Json -Depth 5 -Compress; exit 0 }
     $creation = @{ $OwnedPid = $root.CreationDate }
     $queue.Enqueue($OwnedPid)
@@ -65,10 +69,14 @@ if ($OwnedPid -gt 0) {
         try {
             $current = Query Win32_Process "ProcessId=$parent"
             if (-not $current -or $current.CreationDate -ne $creation[$parent]) { $result.unavailable++; continue }
-            foreach ($p in @(Query Win32_Process "ParentProcessId=$parent")) {
+            $children = @(Query Win32_Process "ParentProcessId=$parent")
+            # Fence PID reuse during the child query as well as before it.
+            $after = Query Win32_Process "ProcessId=$parent"
+            if (-not $after -or $after.CreationDate -ne $creation[$parent]) { $result.unavailable++; continue }
+            foreach ($p in $children) {
                 if ($seen.Count + $queue.Count -ge 128) { $result.truncated = $true; break }
                 # A reused PID older than this build cannot be an owned child.
-                if (([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds() / 1000.0 -lt $created) { $result.unavailable++; continue }
+                if ($p.CreationDate -lt $root.CreationDate) { $result.unavailable++; continue }
                 $creation[[int]$p.ProcessId] = $p.CreationDate
                 $queue.Enqueue([int]$p.ProcessId)
                 if ($p.Name -match '^(rustc|link|cl|ninja|cmake|python|python3|bazel|bash)(\.exe)?$') {
