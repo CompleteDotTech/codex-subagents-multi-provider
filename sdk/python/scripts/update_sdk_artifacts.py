@@ -1433,6 +1433,8 @@ def generate_types_from_schema_dir(schema_dir: Path, *, format_output: bool = Tr
         "src/openai_codex/api.py",
     ):
         path = sdk_root() / relative_path
+        if relative_path == "src/openai_codex/api.py" and not path.exists():
+            continue
         path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
 
 
