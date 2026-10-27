@@ -1577,3 +1577,48 @@ def test_root_rust_integrity_failure_blocks_all_batches(monkeypatch, tmp_path):
     monkeypatch.setattr(script.subprocess, "run", reject)
     assert script.run_formatter_group(group).returncode == 1
     assert calls == [group.commands[0].args]
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_root_rust_rejects_hardlink_to_vendor_before_process(monkeypatch, tmp_path, check):
+    script = _load_root_format_script_module()
+    vendor = tmp_path / "codex-rs/third-party/aws-config/src/lib.rs"
+    vendor.parent.mkdir(parents=True)
+    vendor.write_text("vendor bytes")
+    alias = tmp_path / "firstparty-alias.rs"
+    alias.hardlink_to(vendor)
+    assert alias.samefile(vendor)
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        script.subprocess,
+        "check_output",
+        lambda *a, **kw: b"codex-rs/third-party/aws-config/src/lib.rs\0firstparty-alias.rs\0",
+    )
+    monkeypatch.setattr(script.subprocess, "run", lambda *a, **kw: pytest.fail("formatter ran"))
+    with pytest.raises(ValueError, match="aliases protected vendor file; break alias"):
+        script.rust_formatter_group(check=check)
+    assert vendor.read_text() == "vendor bytes"
+
+
+@pytest.mark.parametrize("destination", ["vendor", "outside"])
+def test_root_rust_rejects_resolved_aliases(monkeypatch, tmp_path, destination):
+    script = _load_root_format_script_module()
+    vendor = tmp_path / "codex-rs/third-party/aws-config/src/lib.rs"
+    vendor.parent.mkdir(parents=True)
+    vendor.write_text("vendor bytes")
+    alias = tmp_path / "alias.rs"
+    alias.write_text("ordinary file")
+    target = vendor if destination == "vendor" else tmp_path.parent / "outside.rs"
+    original_resolve = Path.resolve
+
+    # Exercise the resolution boundary on Windows without requiring symlink privilege.
+    def resolve(path, *args, **kwargs):
+        return target if path == alias else original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(script.subprocess, "check_output", lambda *a, **kw: b"alias.rs\0")
+    monkeypatch.setattr(script.subprocess, "run", lambda *a, **kw: pytest.fail("formatter ran"))
+    expected = "aliases protected vendor" if destination == "vendor" else "outside repository"
+    with pytest.raises(ValueError, match=expected):
+        script.rust_formatter_group(check=False)

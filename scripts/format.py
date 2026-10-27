@@ -96,15 +96,34 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
         cwd=REPO_ROOT,
     ).split(b"\0")
     vendor = Path("codex-rs/third-party/aws-config")
-    rust_files = sorted(
-        {
-            os.path.relpath(REPO_ROOT / path, workspace)
-            for encoded in repository_files
-            if encoded
-            for path in [Path(os.fsdecode(encoded))]
-            if not path.is_relative_to(vendor) and (REPO_ROOT / path).is_file()
-        }
-    )
+    protected_tree = (REPO_ROOT / vendor).resolve()
+    protected_identities = {
+        (status.st_dev, status.st_ino)
+        for path in protected_tree.rglob("*")
+        if path.is_file()
+        for status in [path.stat()]
+    }
+    rust_files = set()
+    for encoded in repository_files:
+        if not encoded:
+            continue
+        path = Path(os.fsdecode(encoded))
+        source = REPO_ROOT / path
+        if path.is_relative_to(vendor) or not source.is_file():
+            continue
+        resolved = source.resolve()
+        if not resolved.is_relative_to(REPO_ROOT.resolve()):
+            raise ValueError(f"Rust source resolves outside repository: {path}")
+        status = source.stat()
+        if (
+            resolved.is_relative_to(protected_tree)
+            or (status.st_dev, status.st_ino) in protected_identities
+        ):
+            raise ValueError(
+                f"Rust source aliases protected vendor file; break alias: {path}"
+            )
+        rust_files.add(os.path.relpath(source, workspace))
+    rust_files = sorted(rust_files)
     if rust_files:
         rustfmt_args = [
             "rustfmt",
