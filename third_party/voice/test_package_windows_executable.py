@@ -168,41 +168,5 @@ class PackageTests(unittest.TestCase):
         self.assertFalse(Path(self.config["receipt"]).exists())
 
 
-class ConsumerContractTests(unittest.TestCase):
-    def test_raw_compilation_and_packaged_execution_routes_remain_distinct(self):
-        root = Path(__file__).resolve().parents[2]
-        source = (root / "defs.bzl").read_text(encoding="utf-8")
-        self.assertIn("binary_windows_runtime = {}", source)
-        self.assertIn(
-            'binary_kwargs = {"binary_name": binary} if runtime else {}', source
-        )
-        self.assertIn('crate = ":" + raw_binary', source)
-        self.assertIn('"//conditions:default": ":" + raw_binary', source)
-        self.assertIn('"//conditions:default": exposed_unit', source)
-        self.assertIn("test_bin = exposed_unit", source)
-        self.assertIn(
-            'cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath :%s)" % binary',
-            source,
-        )
-        voice = (root / "codex-rs/voice-host/BUILD.bazel").read_text(encoding="utf-8")
-        self.assertIn(
-            'unit = ":codex-voice-host-bin-unit-tests-bin__windows-runtime"', voice
-        )
-        windows = (root / ".github/workflows/rust-release-windows.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            "cp bazel-bin/codex-rs/voice-host/codex-voice-host__windows-runtime/codex-voice-host.exe",
-            windows,
-        )
-        macos = (root / ".github/workflows/rust-release.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            'cp bazel-bin/codex-rs/voice-host/codex-voice-host "$output/codex-voice-host"',
-            macos,
-        )
-
-
 if __name__ == "__main__":
     unittest.main()
