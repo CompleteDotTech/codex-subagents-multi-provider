@@ -70,7 +70,8 @@ const INTERRUPT_PROMPT: &str = "release the interrupted worker";
 const SIBLING_NAME: &str = "survivor";
 const ROLE_NAME: &str = "durable_worker";
 const ROLE_MODEL: &str = "gpt-5.6-sol";
-const ROLE_MODEL_PROVIDER_ID: &str = "openai";
+// A named synthetic provider keeps the public builtin reserved and the mock SSE-only.
+const ROLE_MODEL_PROVIDER_ID: &str = "cold-fixture-openai";
 const ROLE_DEVELOPER_INSTRUCTIONS: &str = "Keep the durable worker role configuration.";
 const SUBAGENT_DEVELOPER_INSTRUCTIONS: &str = "Use the default durable worker instructions.";
 
@@ -158,7 +159,7 @@ fn managed_cold_provider_loader(server: &wiremock::MockServer) -> Result<CloudCo
     provider.supports_websockets = false;
     Ok(CloudConfigBundleFixture::loader_with_enterprise_config(
         format!(
-            "[agents]\nallowed_model_providers=['openai']\n[model_providers.openai]\n{}",
+            "model_provider='{ROLE_MODEL_PROVIDER_ID}'\n[agents]\nallowed_model_providers=['{ROLE_MODEL_PROVIDER_ID}']\n[model_providers.{ROLE_MODEL_PROVIDER_ID}]\n{}",
             toml::to_string(&provider)?
         ),
     ))
@@ -314,6 +315,10 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         Some(NativeAuthorityStorage::InMemory { .. })
     ));
     let root_thread_id = initial.session_configured.thread_id;
+    assert_eq!(
+        initial.codex.config_snapshot().await.model_provider_id,
+        ROLE_MODEL_PROVIDER_ID
+    );
     let root_session_id = initial.session_configured.session_id;
     initial
         .codex
