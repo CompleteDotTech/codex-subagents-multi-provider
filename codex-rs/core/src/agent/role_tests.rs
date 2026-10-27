@@ -838,7 +838,7 @@ fn built_in_config_file_contents_resolves_explorer_only() {
 #[tokio::test]
 async fn cold_default_requires_the_actual_unmodified_builtin() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    assert!(is_unmodified_builtin_default(&config, None));
+    assert!(is_unmodified_builtin_default(&config, /*role*/ None));
     assert!(is_unmodified_builtin_default(
         &config,
         Some(DEFAULT_ROLE_NAME)
@@ -852,7 +852,7 @@ async fn cold_default_requires_the_actual_unmodified_builtin() {
             nickname_candidates: None,
         },
     );
-    assert!(!is_unmodified_builtin_default(&config, None));
+    assert!(!is_unmodified_builtin_default(&config, /*role*/ None));
     assert!(!is_unmodified_builtin_default(
         &config,
         Some(DEFAULT_ROLE_NAME)

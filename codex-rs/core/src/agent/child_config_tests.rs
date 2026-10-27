@@ -32,7 +32,13 @@ async fn start_prepared_child(
     let source = prepared_source(parent, &config);
     let authorization = config.prepared_child_authorization.take().unwrap();
     let permit = authorization
-        .consume(runtime, parent.session.thread_id, &config, false, &source)
+        .consume(
+            runtime,
+            parent.session.thread_id,
+            &config,
+            /*full_history*/ false,
+            &source,
+        )
         .await
         .unwrap();
     let child = runtime
@@ -46,7 +52,7 @@ async fn start_prepared_child(
             },
             runtime.control(parent.session.services.agent_control.identity()),
             Some(parent.session.thread_id),
-            None,
+            /*inherited_exec_policy*/ None,
             permit,
         )
         .await
@@ -78,14 +84,14 @@ impl Fixture {
     }
 
     async fn with_fast_mode(fast_mode: Option<bool>) -> Self {
-        Self::with_binding(fast_mode, None).await
+        Self::with_binding(fast_mode, /*binding*/ None).await
     }
 
     async fn with_binding(
         fast_mode: Option<bool>,
         binding: Option<codex_config::CloudConfigBundleBinding>,
     ) -> Self {
-        Self::with_binding_and_guardian(fast_mode, binding, None).await
+        Self::with_binding_and_guardian(fast_mode, binding, /*guardian_threshold*/ None).await
     }
 
     async fn with_binding_and_guardian(
@@ -93,7 +99,14 @@ impl Fixture {
         binding: Option<codex_config::CloudConfigBundleBinding>,
         guardian_threshold: Option<f64>,
     ) -> Self {
-        Self::with_admission_setup(fast_mode, binding, guardian_threshold, None, None).await
+        Self::with_admission_setup(
+            fast_mode,
+            binding,
+            guardian_threshold,
+            /*thread_instructions_provider*/ None,
+            /*child_base_url*/ None,
+        )
+        .await
     }
 
     async fn with_admission_setup(
@@ -771,7 +784,7 @@ async fn prepared_launch_rejects_whole_config_mutation_and_clone_replay() {
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
     let prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -799,7 +812,7 @@ async fn prepared_launch_rejects_whole_config_mutation_and_clone_replay() {
                     runtime,
                     fixture.parent.session.thread_id,
                     &changed,
-                    false,
+                    /*full_history*/ false,
                     &prepared_source(&fixture.parent, &fixture.config)
                 )
                 .await
@@ -816,7 +829,7 @@ async fn prepared_launch_rejects_whole_config_mutation_and_clone_replay() {
             runtime,
             fixture.parent.session.thread_id,
             &first,
-            false,
+            /*full_history*/ false,
             &prepared_source(&fixture.parent, &fixture.config),
         )
         .await
@@ -829,7 +842,7 @@ async fn prepared_launch_rejects_whole_config_mutation_and_clone_replay() {
             runtime,
             fixture.parent.session.thread_id,
             &second,
-            false,
+            /*full_history*/ false,
             &prepared_source(&fixture.parent, &fixture.config),
         )
         .await;
@@ -843,7 +856,7 @@ async fn prepared_launch_rejects_wrong_parent_tree_history_and_stale_host_settin
     let other = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
     let prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -902,7 +915,7 @@ async fn prepared_launch_rejects_wrong_parent_tree_history_and_stale_host_settin
                 runtime,
                 fixture.parent.session.thread_id,
                 &changed,
-                false,
+                /*full_history*/ false,
                 &prepared_source(&fixture.parent, &fixture.config)
             )
             .await
@@ -932,7 +945,7 @@ async fn public_root_start_cannot_forge_a_delegated_source_or_reuse_prepared_con
     assert!(forged.is_err_and(|error| error.to_string().contains("private native launch path")));
     let resolved = fixture.resolved("zai").await;
     let prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -1077,7 +1090,9 @@ async fn runtime_permission_change_rechecks_host_catalog_and_definition_provenan
         );
     }
     let resolved = fixture.resolved("zai").await;
-    let result = fixture.prepared(&resolved, None, None).await;
+    let result = fixture
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
+        .await;
     let error = result.err();
     let turn = fixture.parent.session.new_default_turn().await;
     let step = StepContext::for_test(turn);
@@ -1195,7 +1210,7 @@ async fn native_preparation_rejects_stale_step_approval_and_reviewer_before_cata
                 &fixture.parent.session.services.local_agent_runtime,
                 fixture.parent.session.thread_id,
                 &prepared,
-                false,
+                /*full_history*/ false,
                 &source,
             )
             .await;
@@ -1263,7 +1278,7 @@ async fn native_legacy_depth_limit_is_enforced_by_actual_parent_authority() {
             &child.session.services.local_agent_runtime,
             child.session.thread_id,
             &candidate,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await
@@ -1337,9 +1352,9 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
     });
     let base_url = format!("{}/v1", server.uri());
     let fixture = Fixture::with_admission_setup(
-        None,
+        /*fast_mode*/ None,
         snapshot.binding,
-        None,
+        /*guardian_threshold*/ None,
         Some(provider.clone()),
         Some(&base_url),
     )
@@ -1358,7 +1373,7 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
         .await;
     let resolved = fixture.resolved("zai").await;
     let mut prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -1376,7 +1391,7 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
             runtime,
             fixture.parent.session.thread_id,
             &prepared,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await
@@ -1411,7 +1426,7 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
             },
             runtime.control(fixture.parent.session.session_id()),
             Some(fixture.parent.session.thread_id),
-            None,
+            /*inherited_exec_policy*/ None,
             permit,
         )
         .await;
@@ -1478,14 +1493,23 @@ async fn native_managed_resume_keeps_live_binding_through_final_admission(revoke
         armed: std::sync::atomic::AtomicBool::new(false),
         revocations: std::sync::atomic::AtomicUsize::new(0),
     });
-    let fixture =
-        Fixture::with_admission_setup(None, snapshot.binding, None, Some(provider.clone()), None)
-            .await;
+    let fixture = Fixture::with_admission_setup(
+        /*fast_mode*/ None,
+        snapshot.binding,
+        /*guardian_threshold*/ None,
+        Some(provider.clone()),
+        /*child_base_url*/ None,
+    )
+    .await;
     provider
         .sharing
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let config = fixture
-        .prepared(&fixture.resolved("zai").await, None, None)
+        .prepared(
+            &fixture.resolved("zai").await,
+            /*role*/ None,
+            /*effort*/ None,
+        )
         .await
         .unwrap()
         .config;
@@ -1556,10 +1580,10 @@ async fn managed_bundle_revocation_invalidates_retained_preparation_before_admis
         config_server: None,
     };
     policy.publish_snapshot(&mut snapshot);
-    let fixture = Fixture::with_binding(None, snapshot.binding).await;
+    let fixture = Fixture::with_binding(/*fast_mode*/ None, snapshot.binding).await;
     let resolved = fixture.resolved("zai").await;
     let mut prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -1583,7 +1607,7 @@ async fn managed_bundle_revocation_invalidates_retained_preparation_before_admis
             &fixture.parent.session.services.local_agent_runtime,
             fixture.parent.session.thread_id,
             &prepared,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await;
@@ -1601,7 +1625,7 @@ async fn controller_rejects_transplanted_mutated_and_relabelled_prepared_launche
     let other = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
     let prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -1671,7 +1695,7 @@ async fn controller_rejects_transplanted_mutated_and_relabelled_prepared_launche
             &fixture.parent.session.services.local_agent_runtime,
             caller,
             &valid,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await
@@ -1684,7 +1708,7 @@ async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_displ
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
     let mut prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -1739,7 +1763,7 @@ async fn prepared_launch_rejects_changed_executor_authority_with_unchanged_displ
             &fixture.parent.session.services.local_agent_runtime,
             fixture.parent.session.thread_id,
             &prepared,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await;
@@ -1758,7 +1782,11 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
  {
     let fixture = Fixture::new().await;
     let config = fixture
-        .prepared(&fixture.resolved("zai").await, None, None)
+        .prepared(
+            &fixture.resolved("zai").await,
+            /*role*/ None,
+            /*effort*/ None,
+        )
         .await
         .unwrap()
         .config;
@@ -1772,7 +1800,7 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
             &fixture.parent.session.services.local_agent_runtime,
             fixture.parent.session.thread_id,
             &config,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await
@@ -1790,7 +1818,7 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
             },
             runtime.control(forged),
             Some(fixture.parent.session.thread_id),
-            None,
+            /*inherited_exec_policy*/ None,
             permit,
         )
         .await
@@ -1817,14 +1845,23 @@ async fn private_native_permit_prevents_forged_controller_root_identity_from_ent
 async fn sqlite_less_warm_reload_uses_only_the_actual_retained_target_model() {
     let fixture = Fixture::new().await;
     let config = fixture
-        .prepared(&fixture.resolved("zai").await, None, None)
+        .prepared(
+            &fixture.resolved("zai").await,
+            /*role*/ None,
+            /*effort*/ None,
+        )
         .await
         .unwrap()
         .config;
     let child = fixture.start_native_child(config).await;
     child.ensure_rollout_materialized().await;
     child.session.flush_rollout().await.unwrap();
-    let stored = child.read_thread(true, true).await.unwrap();
+    let stored = child
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     assert!(
         stored.model.is_none(),
         "SQLite-less legacy metadata does not claim a selected model"
@@ -1869,7 +1906,7 @@ async fn sqlite_less_warm_reload_uses_only_the_actual_retained_target_model() {
         stored.approval_mode,
         MultiAgentVersion::V1,
         &mut selections,
-        None,
+        /*inherited*/ None,
     )
     .await;
     let error = rejected
@@ -1978,7 +2015,7 @@ async fn sqlite_less_warm_reload_uses_only_the_actual_retained_target_model() {
         stored.approval_mode,
         MultiAgentVersion::V1,
         &mut selections,
-        None,
+        /*inherited*/ None,
     )
     .await;
     let error = rejected
@@ -2009,7 +2046,7 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
     std::fs::write(&catalog_path, serde_json::to_vec(&original).unwrap()).unwrap();
     let resolved = fixture.resolved("zai").await;
     let config = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -2070,10 +2107,15 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
 
 #[tokio::test]
 async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
-    let fixture = Fixture::with_binding_and_guardian(None, None, Some(0.25)).await;
+    let fixture = Fixture::with_binding_and_guardian(
+        /*fast_mode*/ None,
+        /*binding*/ None,
+        Some(0.25),
+    )
+    .await;
     let resolved = fixture.resolved("zai").await;
     let config = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -2166,14 +2208,23 @@ async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
 async fn warm_saved_metadata_cannot_transplant_a_child_between_real_roots_in_one_runtime() {
     let fixture = Fixture::new().await;
     let config = fixture
-        .prepared(&fixture.resolved("zai").await, None, None)
+        .prepared(
+            &fixture.resolved("zai").await,
+            /*role*/ None,
+            /*effort*/ None,
+        )
         .await
         .unwrap()
         .config;
     let child = fixture.start_native_child(config).await;
     child.ensure_rollout_materialized().await;
     child.session.flush_rollout().await.unwrap();
-    let saved = child.read_thread(true, true).await.unwrap();
+    let saved = child
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     child.shutdown_and_wait().await.unwrap();
     fixture
         .manager
@@ -2227,7 +2278,7 @@ async fn warm_saved_metadata_cannot_transplant_a_child_between_real_roots_in_one
         saved.approval_mode,
         codex_protocol::protocol::MultiAgentVersion::V1,
         &mut None,
-        None,
+        /*inherited*/ None,
     )
     .await
     .err()

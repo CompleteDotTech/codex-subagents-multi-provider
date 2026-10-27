@@ -310,7 +310,9 @@ impl LocalAgentControl {
                 })
             }
         };
-        let config = self.prepare_spawn_fixture(&config, &source, false).await?;
+        let config = self
+            .prepare_spawn_fixture(&config, &source, /*full_history*/ false)
+            .await?;
         let caller = source.parent_thread_id().ok_or_else(|| {
             crate::agent::child_provider_authorization::invalid("fixture needs a native parent")
         })?;

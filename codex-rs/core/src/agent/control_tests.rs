@@ -221,7 +221,7 @@ impl LocalAgentControl {
 async fn test_config_with_cli_overrides(
     cli_overrides: Vec<(String, TomlValue)>,
 ) -> (TempDir, Config) {
-    test_config_with_host_configuration(cli_overrides, None).await
+    test_config_with_host_configuration(cli_overrides, /*host_configuration*/ None).await
 }
 
 async fn test_config_with_host_configuration(
@@ -861,7 +861,7 @@ async fn spawn_failure_context_survives_manager_and_fork_errors() {
     });
     let config = harness
         .control
-        .prepare_spawn_fixture(&harness.config, &source, true)
+        .prepare_spawn_fixture(&harness.config, &source, /*full_history*/ true)
         .await
         .expect("prepare genuine child");
     let fork_error = harness
@@ -904,7 +904,7 @@ async fn spawn_failure_context_preserves_shutdown_during_child_startup() {
     });
     let config = harness
         .control
-        .prepare_spawn_fixture(&harness.config, &source, false)
+        .prepare_spawn_fixture(&harness.config, &source, /*full_history*/ false)
         .await
         .expect("prepare genuine child");
     let spawn = harness.control.spawn_agent_internal(
@@ -964,7 +964,7 @@ async fn cancelled_spawn_after_input_admission_discards_child() {
     });
     let prepared = harness
         .control
-        .prepare_spawn_fixture(&harness.config, &source, false)
+        .prepare_spawn_fixture(&harness.config, &source, /*full_history*/ false)
         .await
         .unwrap();
     let mut spawn = harness.control.spawn(SpawnRequest {
@@ -2302,7 +2302,7 @@ async fn v2_spawn_resolves_reported_effort_without_changing_child_selection(
     .expect("child source");
     let prepared = harness
         .control
-        .prepare_spawn_fixture(&harness.config, &source, false)
+        .prepare_spawn_fixture(&harness.config, &source, /*full_history*/ false)
         .await
         .expect("prepare child");
     let (agent, snapshot) = harness
@@ -3377,7 +3377,9 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .multi_agent_v2
         .subagent_developer_instructions = Some(String::new());
     let stored = parent_thread
-        .read_thread(true, true)
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
         .await
         .expect("read parent fixture history");
     let no_hint_parent = harness
@@ -6422,7 +6424,12 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
         spawn_v2_reload_test_child(&control, harness.config.clone(), &parent, "worker").await;
     let thread = harness.manager.get_thread(child.thread_id).await.unwrap();
     persist_thread_for_tree_resume(&thread, "saved child security fixture").await;
-    let stored = thread.read_thread(true, false).await.unwrap();
+    let stored = thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await
+        .unwrap();
     let state = control.runtime.upgrade().unwrap();
     let context = state
         .load_latest_model_context(LoadThreadHistoryParams {
@@ -6472,7 +6479,12 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
     }
     let absent_caller = ThreadId::new();
     let error = control
-        .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, absent_caller, None)
+        .ensure_v2_agent_loaded(
+            harness.config.clone(),
+            child.thread_id,
+            absent_caller,
+            /*parent*/ None,
+        )
         .await
         .err()
         .expect("invented sender must fail before reservation");
@@ -6481,7 +6493,12 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
     );
     assert_thread_not_loaded(&harness.manager, child.thread_id).await;
     let pin = control
-        .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, parent_id, None)
+        .ensure_v2_agent_loaded(
+            harness.config.clone(),
+            child.thread_id,
+            parent_id,
+            /*parent*/ None,
+        )
         .await
         .expect("real caller reload uses the one available child slot");
     assert!(harness.manager.get_thread(parent_id).await.is_ok());
@@ -6548,7 +6565,7 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(
     let source = thread_spawn_source(
         root.thread_id,
         &root.thread.session_source,
-        1,
+        /*depth*/ 1,
         nested.then_some("restricted".into()),
         Some("worker".into()),
     )
@@ -6603,7 +6620,13 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(
     if nested {
         wait_for_live_thread_spawn_children(&control, worker.thread_id, &[target]).await;
     }
-    let stored = root.thread.read_thread(true, true).await.unwrap();
+    let stored = root
+        .thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     let initial = InitialHistory::Resumed(ResumedHistory {
         history_revision: None,
         conversation_id: root.thread_id,
@@ -6752,7 +6775,12 @@ async fn failed_saved_authority_invalidation_prevents_runtime_and_auth_helper_st
         .unwrap();
     let (id, thread) = (started.thread_id, started.thread);
     persist_thread_for_tree_resume(&thread, "sealed root before unavailable store").await;
-    let stored = thread.read_thread(true, true).await.unwrap();
+    let stored = thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     let initial = InitialHistory::Resumed(ResumedHistory {
         history_revision: None,
         conversation_id: id,
@@ -6891,8 +6919,8 @@ async fn denied_final_cold_admission_preserves_receipt_for_a_current_policy_retr
     let source = thread_spawn_source(
         root.thread_id,
         &root.thread.session_source,
-        1,
-        None,
+        /*depth*/ 1,
+        /*agent_role*/ None,
         Some("cold_target".into()),
     )
     .unwrap();
@@ -6922,14 +6950,22 @@ async fn denied_final_cold_admission_preserves_receipt_for_a_current_policy_retr
     target.session.flush_rollout().await.unwrap();
     assert_eq!(
         target
-            .read_thread(false, false)
+            .read_thread(
+                /*include_archived*/ false, /*include_history*/ false
+            )
             .await
             .unwrap()
             .model
             .as_deref(),
         Some("gpt-5.6-sol")
     );
-    let stored_root = root.thread.read_thread(true, true).await.unwrap();
+    let stored_root = root
+        .thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     let root_history = InitialHistory::Resumed(ResumedHistory {
         conversation_id: root.thread_id,
         history_revision: None,

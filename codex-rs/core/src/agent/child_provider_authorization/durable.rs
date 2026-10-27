@@ -633,7 +633,7 @@ mod tests {
             .features
             .enable(codex_features::Feature::ShellTool)
             .unwrap();
-        let scope = candidate_scope(&config, None);
+        let scope = candidate_scope(&config, /*selections*/ None);
         let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.6-sol");
         model.used_fallback_model_metadata = false;
         let baseline = fingerprint(&config, &scope, &model, &[], &[]).unwrap();
@@ -680,7 +680,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let scope = candidate_scope(&config, None);
+        let scope = candidate_scope(&config, /*selections*/ None);
         let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.6-sol");
         model.used_fallback_model_metadata = false;
         let before = fingerprint(&config, &scope, &model, &[], &[]).unwrap();
@@ -775,7 +775,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let mut scope = candidate_scope(&config, None);
+        let mut scope = candidate_scope(&config, /*selections*/ None);
         scope.profile = PermissionProfile::read_only();
         assert!(!protected_storage(
             &NativeAuthorityStorage::Local {
@@ -958,7 +958,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let mut scope = candidate_scope(&config, None);
+        let mut scope = candidate_scope(&config, /*selections*/ None);
         scope.profile = PermissionProfile::read_only();
         let storage = NativeAuthorityStorage::Local {
             directory: home.path().to_path_buf(),

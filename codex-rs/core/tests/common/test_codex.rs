@@ -220,7 +220,9 @@ impl TestEnv {
             "same-workspace restart requires an actual local FromThread fixture"
         );
         Ok(Self {
-            environment: codex_exec_server::Environment::create_for_tests(None)?,
+            environment: codex_exec_server::Environment::create_for_tests(
+                /*exec_server_url*/ None,
+            )?,
             exec_server_url: None,
             cwd: previous.cwd.clone(),
             selection: previous.selection.clone(),
@@ -829,7 +831,7 @@ impl TestCodexBuilder {
         Box::pin(self.build_with_home_and_base_url(
             format!("{}/v1", server.uri()),
             Arc::clone(&previous.home),
-            None,
+            /*resume_from*/ None,
             TestEnv::fresh_local_in_same_workspace(&previous._test_env)?,
             /*include_local_environment*/ false,
         ))

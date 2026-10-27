@@ -504,7 +504,7 @@ async fn pinned_identity_snapshot_uses_only_cached_gateway_state_without_http_or
         Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
             "synthetic",
         ))),
-        None,
+        /*gateway_auth_manager*/ None,
     );
     assert!(
         endpoint.try_pinned_identity().is_none(),

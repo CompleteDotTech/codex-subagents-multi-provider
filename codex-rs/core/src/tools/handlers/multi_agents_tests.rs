@@ -176,7 +176,7 @@ fn thread_manager_with_catalog(config: &crate::config::Config) -> ThreadManager 
         config,
         auth,
         Arc::new(StaticModelsManager::new(
-            None,
+            /*auth_manager*/ None,
             config.model_catalog.clone().expect("fixture catalog"),
         )),
         crate::CodexAppsToolsCache::default(),
@@ -184,13 +184,13 @@ fn thread_manager_with_catalog(config: &crate::config::Config) -> ThreadManager 
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        None,
+        /*analytics_events_client*/ None,
         crate::thread_manager::passthrough_image_store(),
-        thread_store_from_config(config, None),
-        None,
+        thread_store_from_config(config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
         "11111111-1111-4111-8111-111111111111".into(),
-        None,
-        None,
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
     )
 }
 
@@ -690,7 +690,7 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
 #[tokio::test]
 async fn spawn_agent_fork_context_rejects_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn, None).await;
+    let role_name = install_role_with_model_override(&mut turn, /*provider*/ None).await;
     let manager = thread_manager();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
@@ -724,7 +724,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
 #[tokio::test]
 async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
     let (_session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn, None).await;
+    let role_name = install_role_with_model_override(&mut turn, /*provider*/ None).await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -2645,8 +2645,8 @@ async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
             parent.session.thread_id,
             &parent.session_source,
             crate::agent::next_thread_spawn_depth(&parent.session_source),
-            None,
-            None,
+            /*agent_role*/ None,
+            /*task_name*/ None,
         )
         .unwrap();
         let child = control
@@ -3028,9 +3028,9 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
     let source = crate::tools::handlers::multi_agents_common::thread_spawn_source(
         root.thread_id,
         &root.thread.session_source,
-        1,
-        None,
-        None,
+        /*depth*/ 1,
+        /*agent_role*/ None,
+        /*task_name*/ None,
     )
     .unwrap();
     let child = control
@@ -4452,7 +4452,9 @@ async fn resume_agent_cannot_relabel_a_stopped_host_root_as_a_native_child() {
     assert!(matches!(
         target
             .thread
-            .read_thread(false, false)
+            .read_thread(
+                /*include_archived*/ false, /*include_history*/ false
+            )
             .await
             .unwrap()
             .source,
@@ -4488,7 +4490,9 @@ async fn resume_agent_cannot_relabel_a_stopped_host_root_as_a_native_child() {
     assert!(matches!(
         target
             .thread
-            .read_thread(false, false)
+            .read_thread(
+                /*include_archived*/ false, /*include_history*/ false
+            )
             .await
             .unwrap()
             .source,
@@ -4553,9 +4557,9 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let source = crate::tools::handlers::multi_agents_common::thread_spawn_source(
         operator.thread_id,
         &operator.thread.session_source,
-        1,
-        None,
-        None,
+        /*depth*/ 1,
+        /*agent_role*/ None,
+        /*task_name*/ None,
     )
     .unwrap();
     let parent = control

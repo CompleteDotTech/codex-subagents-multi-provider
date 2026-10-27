@@ -865,7 +865,7 @@ fn verified_origin_requires_matching_uuid_root_and_provider_binding() {
 #[test]
 fn native_guidance_filters_authority_managed_constraints_and_definition_shadowing() {
     let fixture = Fixture::new();
-    let policy = fixture.policy("", "", None);
+    let policy = fixture.policy("", "", /*required*/ None);
     assert_eq!(
         policy.selectable_provider_ids(Some(&origin("openai")), "openai"),
         vec!["ollama", "openai", "zai"]
@@ -879,7 +879,7 @@ fn native_guidance_filters_authority_managed_constraints_and_definition_shadowin
     let shadowed = fixture.policy(
         "[model_providers.zai]\nname='forged'\nbase_url='https://forged.invalid'",
         "",
-        None,
+        /*required*/ None,
     );
     assert!(
         !shadowed
@@ -888,7 +888,7 @@ fn native_guidance_filters_authority_managed_constraints_and_definition_shadowin
     );
     assert!(
         !policy
-            .selectable_provider_ids(None, "openai")
+            .selectable_provider_ids(/*origin*/ None, "openai")
             .contains(&"openai".to_owned())
     );
 }
@@ -907,7 +907,8 @@ fn unrestricted_filesystem_rejects_file_authority_outside_all_workspace_roots() 
         filesystem
             .can_write_local_path_with_cwd(&fixture.home.path().join("config.toml"), cwd.as_path())
     );
-    let policy = fixture.policy_with_runtime_filesystem("", "", None, &[], &filesystem);
+    let policy =
+        fixture.policy_with_runtime_filesystem("", "", /*required*/ None, &[], &filesystem);
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
@@ -917,7 +918,7 @@ fn unrestricted_filesystem_rejects_file_authority_outside_all_workspace_roots() 
     );
     assert!(
         !policy
-            .selectable_provider_ids(None, "openai")
+            .selectable_provider_ids(/*origin*/ None, "openai")
             .contains(&"zai".into())
     );
 }
@@ -947,7 +948,7 @@ fn non_file_managed_authority_cannot_promote_a_writable_local_catalog() {
     let policy =
         ChildProviderPolicy::from_config_layers(&stack, &cwd, &[], &[], &filesystem).unwrap();
     // The delivered MDM definition is still trusted; its writable file payload is not.
-    assert!(policy.authorize("zai", None).is_ok());
+    assert!(policy.authorize("zai", /*origin*/ None).is_ok());
     let parent = ModelProviderInfo::default();
     let mut input = request(&parent);
     input.explicit_provider = Some("zai");
@@ -965,7 +966,7 @@ fn reopened_read_only_carveout_cannot_retain_file_authority_or_root_exemption() 
     let readonly = fixture.policy_with_runtime_filesystem(
         "",
         "",
-        None,
+        /*required*/ None,
         &protected,
         &FileSystemSandboxPolicy::restricted(Vec::new()),
     );
@@ -978,7 +979,7 @@ fn reopened_read_only_carveout_cannot_retain_file_authority_or_root_exemption() 
     let reopened = fixture.policy_with_runtime_filesystem(
         "",
         "",
-        None,
+        /*required*/ None,
         &protected,
         &FileSystemSandboxPolicy::unrestricted(),
     );

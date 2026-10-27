@@ -124,7 +124,7 @@ pub(crate) struct ChildProviderScope {
 
 impl ChildProviderScope {
     pub(crate) fn from_step(config: &Config, environments: &TurnEnvironmentSnapshot) -> Self {
-        Self::capture(config, None, environments)
+        Self::capture(config, /*settings*/ None, environments)
     }
 
     pub(crate) fn from_current(
@@ -862,7 +862,7 @@ impl ChildResumePermit {
             &caller.session,
             config,
             &resolved,
-            None,
+            /*requested_model*/ None,
             effort.clone(),
         )
         .await
@@ -1089,7 +1089,7 @@ mod tests {
         }
         assert!(store.verified(root).is_none());
         let unbound = ThreadId::new();
-        store.publish_child(unbound, root, None);
+        store.publish_child(unbound, root, /*origin*/ None);
         assert!(store.verified(unbound).is_none());
     }
 }

@@ -430,7 +430,9 @@ fn both_native_schemas_expose_only_authorized_provider_ids_even_with_hidden_mode
     let ResponsesApiNamespaceTool::Function(v1) = &v1.tools[0] else {
         panic!("v1 function")
     };
-    let ToolSpec::Function(v2) = create_spawn_agent_tool_v2(options, None) else {
+    let ToolSpec::Function(v2) =
+        create_spawn_agent_tool_v2(options, /*description_override*/ None)
+    else {
         panic!("v2 function")
     };
     for schema in [&v1.parameters, &v2.parameters] {

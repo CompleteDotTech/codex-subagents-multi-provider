@@ -440,8 +440,13 @@ async fn pinned_authority_snapshot_is_nonblocking_and_never_reconciles_or_fetche
         replace_during_fetch: false,
     });
     let manager =
-        OpenAiModelsManager::new_without_cache(endpoint.clone(), None).with_provider_catalog();
-    manager.remote_models.write().await.models = vec![remote_model("shared", "Pinned grant A", 0)];
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), /*auth_manager*/ None)
+            .with_provider_catalog();
+    manager.remote_models.write().await.models = vec![remote_model(
+        "shared",
+        "Pinned grant A",
+        /*priority*/ 0,
+    )];
     let config = ModelsManagerConfig::default();
     let info = manager
         .try_pinned_authority_model("shared", &config)
@@ -505,7 +510,8 @@ async fn pinned_default_catalog_never_turns_identity_mismatch_into_builtin_proof
         observed: Mutex::new(Some("grant-a".into())),
         replace_during_fetch: false,
     });
-    let manager = OpenAiModelsManager::new_without_cache(endpoint.clone(), None);
+    let manager =
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), /*auth_manager*/ None);
     let slug = manager
         .remote_models
         .read()
@@ -535,9 +541,9 @@ async fn pinned_default_catalog_never_turns_identity_mismatch_into_builtin_proof
 #[test]
 fn pinned_static_authority_snapshot_uses_only_immutable_available_metadata() {
     let manager = StaticModelsManager::new(
-        None,
+        /*auth_manager*/ None,
         ModelsResponse {
-            models: vec![remote_model("static", "Static", 0)],
+            models: vec![remote_model("static", "Static", /*priority*/ 0)],
         },
     );
     assert_eq!(

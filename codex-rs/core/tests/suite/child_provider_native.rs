@@ -392,7 +392,7 @@ async fn ordinary_and_builtin_role_native_children_select_provider_in_both_backe
 {
     for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
         for role in [None, Some("default")] {
-            let fixture = Fixture::new(version, None).await?;
+            let fixture = Fixture::new(version, /*default_provider*/ None).await?;
             let mut args = json!({"message":"ordinary child", "model_provider":"a"});
             if let Some(role) = role {
                 args["agent_type"] = json!(role);
@@ -404,7 +404,7 @@ async fn ordinary_and_builtin_role_native_children_select_provider_in_both_backe
                 .mount(&fixture.a)
                 .await;
             fixture.turn("delegate an ordinary child").await?;
-            let children = fixture.children(1).await?;
+            let children = fixture.children(/*expected*/ 1).await?;
             assert_eq!(children.len(), 1);
             assert_eq!(children[0].config_snapshot().await.model_provider_id, "a");
             assert_eq!(
@@ -439,7 +439,7 @@ async fn nested_native_omission_inherits_parent_and_explicit_override_selects_an
 -> Result<()> {
     for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
         for target in [None, Some("b")] {
-            let fixture = Fixture::new(version, None).await?;
+            let fixture = Fixture::new(version, /*default_provider*/ None).await?;
             scripted_spawn(
                 &fixture.root,
                 version,
@@ -458,7 +458,7 @@ async fn nested_native_omission_inherits_parent_and_explicit_override_selects_an
                 .mount(&fixture.b)
                 .await;
             fixture.turn("delegate a nested tree").await?;
-            let children = fixture.children(2).await?;
+            let children = fixture.children(/*expected*/ 2).await?;
             assert_eq!(children.len(), 2);
             let mut providers = vec![];
             for child in children {
@@ -507,7 +507,7 @@ async fn explicit_selector_beats_role_provider_and_configured_default_applies_at
         fixture
             .turn("delegate with explicit provider and a role")
             .await?;
-        let children = fixture.children(2).await?;
+        let children = fixture.children(/*expected*/ 2).await?;
         let mut providers = vec![];
         for child in children {
             providers.push(child.config_snapshot().await.model_provider_id);
@@ -544,7 +544,7 @@ async fn role_provider_is_resolved_by_both_native_backends_without_explicit_sele
             .mount(&fixture.b)
             .await;
         fixture.turn("delegate using role provider").await?;
-        let children = fixture.children(1).await?;
+        let children = fixture.children(/*expected*/ 1).await?;
         assert_eq!(children[0].config_snapshot().await.model_provider_id, "b");
         fixture.assert_provider_headers().await;
         assert!(
@@ -573,7 +573,7 @@ async fn native_history_and_authority_rejections_happen_before_catalog_helper_or
             ("blocked", None, "child_provider_not_authorized"),
             ("missing", None, "child_provider_not_authorized"),
         ] {
-            let fixture = Fixture::new(version, None).await?;
+            let fixture = Fixture::new(version, /*default_provider*/ None).await?;
             let mut args = json!({"message":"rejected native child", "model_provider":provider});
             if let Some(history) = history {
                 if version == MultiAgentVersion::V2 {
@@ -683,7 +683,8 @@ async fn native_managed_constraints_override_user_authorization_before_child_io(
                 "child_provider_not_authorized",
             ),
         ] {
-            let fixture = Fixture::with_host_setup(version, None, setup).await?;
+            let fixture =
+                Fixture::with_host_setup(version, /*default_provider*/ None, setup).await?;
             std::fs::remove_file(fixture.home.path().join("catalog.json"))?;
             scripted_spawn(
                 &fixture.root,
@@ -730,8 +731,12 @@ async fn native_managed_constraints_override_user_authorization_before_child_io(
 async fn native_runtime_cwd_and_write_scope_revoke_host_file_authority() -> Result<()> {
     for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
         for change_cwd in [true, false] {
-            let fixture =
-                Fixture::with_host_setup(version, None, allow_helper_provider_setup).await?;
+            let fixture = Fixture::with_host_setup(
+                version,
+                /*default_provider*/ None,
+                allow_helper_provider_setup,
+            )
+            .await?;
             Mock::given(method("POST"))
                 .and(path("/v1/responses"))
                 .respond_with(completion("baseline"))
@@ -850,9 +855,13 @@ async fn public_resumed_child_history_cannot_be_reclassified_by_source_labels() 
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
-    let fixture = Fixture::with_host_setup(MultiAgentVersion::V2, None, |config| {
-        config.multi_agent_v2.max_concurrent_threads_per_session = 2;
-    })
+    let fixture = Fixture::with_host_setup(
+        MultiAgentVersion::V2,
+        /*default_provider*/ None,
+        |config| {
+            config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+        },
+    )
     .await?;
     let parent = fixture.test.session_configured.thread_id;
     let native = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -953,7 +962,7 @@ async fn public_resumed_child_history_cannot_be_reclassified_by_source_labels() 
         .mount(&fixture.a)
         .await;
     fixture.turn("delegate after forged attempts").await?;
-    assert_eq!(fixture.children(1).await?.len(), 1);
+    assert_eq!(fixture.children(/*expected*/ 1).await?.len(), 1);
     fixture.assert_provider_headers().await;
     Ok(())
 }
@@ -962,7 +971,7 @@ async fn public_resumed_child_history_cannot_be_reclassified_by_source_labels() 
 async fn explicit_provider_does_not_replace_an_incompatible_role_model_or_fall_back() -> Result<()>
 {
     for version in [MultiAgentVersion::V1, MultiAgentVersion::V2] {
-        let fixture = Fixture::with_host_setup(version, None, |config| {
+        let fixture = Fixture::with_host_setup(version, /*default_provider*/ None, |config| {
             std::fs::write(
                 config.codex_home.join("role.toml"),
                 "model_provider='b'\nmodel='role-only-b'\n",

@@ -216,7 +216,13 @@ async fn spawn_v2_subagent(
         .prepared_child_authorization
         .take()
         .expect("prepared proof")
-        .consume(&control.runtime, parent_thread_id, &config, false, &source)
+        .consume(
+            &control.runtime,
+            parent_thread_id,
+            &config,
+            /*full_history*/ false,
+            &source,
+        )
         .await
         .expect("consume native proof");
     state
@@ -228,7 +234,7 @@ async fn spawn_v2_subagent(
             },
             control.clone(),
             Some(parent_thread_id),
-            None,
+            /*inherited_exec_policy*/ None,
             permit,
         )
         .await
