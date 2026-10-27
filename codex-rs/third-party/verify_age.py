@@ -110,7 +110,21 @@ def verify(root: Path = ROOT, archive: Path | None = None) -> None:
     )
     require(len(upstream["files"]) == 174, "unexpected upstream file scope")
     require(
-        set(patched["files"]) == {"Cargo.toml", "src/native/scrypt.rs"},
+        set(patched["files"]) == {
+            "Cargo.toml",
+            "src/encrypted.rs",
+            "src/format.rs",
+            "src/i18n.rs",
+            "src/native.rs",
+            "src/native/scrypt.rs",
+            "src/native/tag.rs",
+            "src/native/x25519.rs",
+            "src/primitives.rs",
+            "src/primitives/stream.rs",
+            "src/protocol.rs",
+            "src/simple.rs",
+            "src/util.rs",
+        },
         "unexpected patch scope",
     )
     require(
@@ -253,7 +267,7 @@ def verify(root: Path = ROOT, archive: Path | None = None) -> None:
                     f"archive file checksum: {name}",
                 )
     print(
-        "Verified 174 upstream files, 2 patched files, exact provenance, style, integration and reconstructed patch"
+        "Verified 174 upstream files, 13 patched files, exact provenance, style, integration and reconstructed patch"
     )
 
 

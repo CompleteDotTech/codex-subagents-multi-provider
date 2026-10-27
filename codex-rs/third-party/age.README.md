@@ -7,12 +7,29 @@ fixtures, assets, translations and benchmarks are retained. `age-core` remains
 the unchanged Git dependency at the same immutable upstream revision.
 
 `age.upstream.json` records the 174 original source/license file hashes.
-`age.patched.json` allows exactly two modified upstream files, two provenance
+`age.patched.json` allows exactly thirteen modified upstream files, two provenance
 copies, one style file and two integration files (Bazel rules and standalone
 lock). `age.patch` reconstructs
-the manifest normalization and the native calibration change against the pinned
-original bytes. The offline verifier checks the exact file set, aliases, hashes,
+the manifest normalization, native calibration, canonical decimal parsing, localization
+resource tests and strict source corrections against the pinned original bytes. The offline verifier checks the exact file set, aliases, hashes,
 normalization and reverse patch before a style or manifest exception applies.
+
+The twelve patched source files are explicitly enumerated in the verifier: encrypted
+identity, header format, localization, native tags and recipients, primitives and
+stream, protocol, simple helpers, and utility parsing. Typed fixed-size copies and
+explicit contextual invariant panics preserve encoding and internal failure policy.
+`simple::encrypt` now propagates custom recipient and invalid-label errors through
+its existing Result contract; two regression tests assert the original errors.
+Native stanza-derivation hooks remain after format/work prechecks. The localization
+resource assertions are retained. Stream chunk boundaries use the fixed 2^16 mask
+without raising the retained source MSRV. The encrypted identity test module is
+armor-qualified to match its sole existing consumer; its test body is unchanged.
+
+The additional armor unit binary and wrapper reuse the existing default unit
+metadata hub and activate only default plus armor. This permits separate configured
+feature proof, strict linting, and execution of armor inline tests, including the
+encrypted identity round trip. These provenance records do not claim those gates
+have passed.
 
 ## Manifest and feature policy
 
@@ -81,10 +98,10 @@ SSH test metadata/library/binary; zero registered vector tests is a failure.
 `testkit` requires `armor` and `async`. They read fixture paths
 relative to this crate root. Never enable all features on the production library
 to make integration tests compile, and never claim omitted or pending
-feature-qualified tests as passed. Only default unit tests, SSH vectors and
+feature-qualified tests as passed. Default and armor-enabled inline unit tests, SSH vectors and
 armor/async testkit are mapped here. Async unit tests, SSH unit tests and
 benchmarks remain unqualified; this does not claim all upstream features.
-The three test binaries request normal dependencies plus only additional
+The test binaries request normal dependencies plus only additional
 same-hub, source-required dev dependencies. i18n-embed is inherited once from
 each normal closure; its original test-only desktop/fluent features remain in
 the standalone manifest. Explicit extras must not duplicate normal labels.

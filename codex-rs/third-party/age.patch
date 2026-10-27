@@ -116,9 +116,172 @@
 +
 +# Keep upstream dev/test feature resolution outside the application workspace.
 +[workspace]
+--- a/age/src/encrypted.rs
++++ b/age/src/encrypted.rs
+@@ -103,7 +103,10 @@
+             Self::Encrypted(encrypted) => encrypted.decrypt(filename).map(|file| (file, true)),
+             Self::Decrypted(identity_file) => Ok((identity_file, false)),
+             // `IdentityState::decrypt` is only ever called with `Some`.
+-            Self::Poisoned(e) => Err(e.unwrap()),
++            Self::Poisoned(Some(error)) => Err(error),
++            Self::Poisoned(None) => {
++                panic!("encrypted identity state was taken without being restored")
++            }
+         }
+     }
+ }
+@@ -222,7 +225,7 @@
+     }
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "armor"))]
+ mod tests {
+     use std::sync::{Arc, Mutex};
+ 
+--- a/age/src/format.rs
++++ b/age/src/format.rs
+@@ -52,8 +52,9 @@
+         }
+ 
+         let mut mac = HmacWriter::new(mac_key);
+-        cookie_factory::r#gen(write::header_v1_minus_mac(&header), &mut mac)
+-            .expect("can serialize Header into HmacWriter");
++        if let Err(error) = cookie_factory::r#gen(write::header_v1_minus_mac(&header), &mut mac) {
++            panic!("cannot serialize age header into infallible HMAC writer: {error}");
++        }
+         header
+             .mac
+             .copy_from_slice(mac.finalize().into_bytes().as_slice());
+@@ -65,11 +66,13 @@
+         let mut mac = HmacWriter::new(mac_key);
+         if let Some(bytes) = &self.encoded_bytes {
+             // The MAC covers all bytes up to the end of the --- prefix.
+-            mac.write_all(&bytes[..bytes.len() - ENCODED_MAC_LENGTH - 2])
+-                .expect("can serialize Header into HmacWriter");
++            if let Err(error) = mac.write_all(&bytes[..bytes.len() - ENCODED_MAC_LENGTH - 2]) {
++                panic!("cannot serialize age header into infallible HMAC writer: {error}");
++            }
+         } else {
+-            cookie_factory::r#gen(write::header_v1_minus_mac(self), &mut mac)
+-                .expect("can serialize Header into HmacWriter");
++            if let Err(error) = cookie_factory::r#gen(write::header_v1_minus_mac(self), &mut mac) {
++                panic!("cannot serialize age header into infallible HMAC writer: {error}");
++            }
+         }
+         mac.verify(&self.mac)
+     }
+@@ -319,7 +322,7 @@
+ 
+     fn recipient_stanza<'a, W: 'a + Write>(r: &'a Stanza) -> impl SerializeFn<W> + 'a {
+         move |w: WriteContext<W>| {
+-            let args: Vec<_> = r.args.iter().map(|s| s.as_str()).collect();
++            let args: Vec<_> = r.args.iter().map(String::as_str).collect();
+             let writer = age_stanza(&r.tag, &args, &r.body);
+             writer(w)
+         }
+--- a/age/src/i18n.rs
++++ b/age/src/i18n.rs
+@@ -15,8 +15,13 @@
+         let language_loader = fluent_language_loader!();
+         // Ensure that the fallback language is always loaded, even if the library user
+         // doesn't call `localizer().select(languages)`.
+-        let fallback: LanguageIdentifier = "en-US".parse().unwrap();
+-        language_loader.load_languages(&Localizations, &[fallback]).unwrap();
++        let fallback: LanguageIdentifier = match "en-US".parse() {
++            Ok(fallback) => fallback,
++            Err(error) => panic!("invalid built-in fallback language en-US: {error}"),
++        };
++        if let Err(error) = language_loader.load_languages(&Localizations, &[fallback]) {
++            panic!("missing or invalid embedded fallback language: {error}");
++        }
+         language_loader
+     };
+ }
+@@ -101,3 +106,55 @@
+         Ok(supported_languages)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{FluentLanguageLoader, LanguageIdentifier, LanguageLoader, Localizations};
++    use i18n_embed::fluent::fluent_language_loader;
++
++    #[test]
++    fn localization_resources_and_fallback_are_available() {
++        let mut resources: Vec<_> = Localizations::iter()
++            .map(std::borrow::Cow::into_owned)
++            .collect();
++        resources.sort();
++        assert_eq!(
++            resources,
++            [
++                "en-US/age.ftl",
++                "es-AR/age.ftl",
++                "fr/age.ftl",
++                "it/age.ftl",
++                "ru/age.ftl",
++                "zh-CN/age.ftl",
++                "zh-TW/age.ftl",
++            ]
++        );
++        for path in resources {
++            let resource = Localizations::get(&path).expect("localization resource is available");
++            let text = std::str::from_utf8(resource.data.as_ref()).expect("valid Fluent UTF-8");
++            assert!(text.contains("cli-secret-input-required ="), "{path}");
++        }
++
++        // Use a fresh loader so this test cannot change the process-wide locale.
++        let loader: FluentLanguageLoader = fluent_language_loader!();
++        let fallback: LanguageIdentifier = "en-US".parse().unwrap();
++        loader.load_languages(&Localizations, &[fallback]).unwrap();
++        assert_eq!(loader.get("cli-secret-input-required"), "Input is required");
++
++        // An unavailable requested locale must still resolve through the real fallback.
++        let unavailable: LanguageIdentifier = "de-DE".parse().unwrap();
++        i18n_embed::select(&loader, &Localizations, &[unavailable]).unwrap();
++        assert_eq!(loader.get("cli-secret-input-required"), "Input is required");
++    }
++
++    #[test]
++    fn french_localization_loads_from_resources() {
++        let loader: FluentLanguageLoader = fluent_language_loader!();
++        let french: LanguageIdentifier = "fr".parse().unwrap();
++        let selected =
++            i18n_embed::select(&loader, &Localizations, std::slice::from_ref(&french)).unwrap();
++        assert!(selected.contains(&french));
++        assert_eq!(loader.get("cli-secret-input-required"), "Entrée requise");
++    }
++}
+--- a/age/src/native.rs
++++ b/age/src/native.rs
+@@ -9,15 +9,18 @@
+ pub mod x25519;
+ 
+ fn static_tag(pk: &[u8]) -> [u8; 4] {
+-    Sha256::digest(pk)[..4]
+-        .try_into()
+-        .expect("length is correct")
++    let digest = Sha256::digest(pk);
++    let mut output = [0; 4];
++    output.copy_from_slice(&digest[..4]);
++    output
+ }
+ 
+ /// Derives a tag for the tagged age recipient formats.
+ fn stanza_tag(ikm: &[u8], salt: &str) -> [u8; 4] {
+     let (tag, _) = Hkdf::<Sha256>::extract(Some(salt.as_bytes()), ikm);
+-    tag[..4].try_into().expect("correct length")
++    let mut output = [0; 4];
++    output.copy_from_slice(&tag[..4]);
++    output
+ }
+ 
+ fn label_pq_only() -> HashSet<String> {
 --- a/age/src/native/scrypt.rs
 +++ b/age/src/native/scrypt.rs
-@@ -34,6 +34,58 @@
+@@ -34,6 +34,63 @@
  /// Pick an scrypt work factor that will take around 1 second on this device.
  ///
  /// Guaranteed to return a valid work factor (less than 64).
@@ -132,14 +295,19 @@
 +            return require_native_elapsed(elapsed);
 +        }
 +        let start = Instant::now();
-+        scrypt(&[], log_n, "").expect("log_n < 64");
++        if let Err(error) = scrypt(&[], log_n, "") {
++            panic!("internally selected scrypt calibration factor {log_n} must be valid: {error}");
++        }
 +        require_native_elapsed(Instant::now().checked_duration_since(start))
 +    })
 +}
 +
 +#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
 +fn require_native_elapsed(elapsed: Option<Duration>) -> Duration {
-+    elapsed.expect("cannot calibrate scrypt: monotonic clock moved backwards")
++    match elapsed {
++        Some(duration) => duration,
++        None => panic!("cannot calibrate scrypt: monotonic clock moved backwards"),
++    }
 +}
 +
 +#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
@@ -177,7 +345,7 @@
  fn target_scrypt_work_factor() -> u8 {
      let measure_duration = |log_n| {
          // Platforms that have a functional SystemTime::now():
-@@ -113,6 +165,11 @@
+@@ -113,6 +170,11 @@
      ///
      /// The scrypt work factor is picked to target about 1 second for encryption or
      /// decryption on this device. Override it with [`Self::set_work_factor`].
@@ -189,7 +357,20 @@
      pub fn new(passphrase: SecretString) -> Self {
          Self {
              passphrase,
-@@ -184,6 +241,11 @@
+@@ -149,8 +211,10 @@
+         inner_salt[..SCRYPT_SALT_LABEL.len()].copy_from_slice(SCRYPT_SALT_LABEL);
+         inner_salt[SCRYPT_SALT_LABEL.len()..].copy_from_slice(&salt);
+ 
+-        let enc_key =
+-            scrypt(&inner_salt, self.log_n, self.passphrase.expose_secret()).expect("log_n < 64");
++        let enc_key = match scrypt(&inner_salt, self.log_n, self.passphrase.expose_secret()) {
++            Ok(key) => key,
++            Err(error) => panic!("configured scrypt recipient work factor must be valid: {error}"),
++        };
+         let encrypted_file_key = aead_encrypt(&enc_key, file_key.expose_secret());
+ 
+         let encoded_salt = BASE64_STANDARD_NO_PAD.encode(salt);
+@@ -184,6 +248,11 @@
  
  impl Identity {
      /// Constructs a new `Identity` with the given passphrase.
@@ -201,20 +382,16 @@
      pub fn new(passphrase: SecretString) -> Self {
          let target_work_factor = target_scrypt_work_factor();
  
-@@ -247,7 +309,11 @@
+@@ -247,6 +316,8 @@
          inner_salt[..SCRYPT_SALT_LABEL.len()].copy_from_slice(SCRYPT_SALT_LABEL);
          inner_salt[SCRYPT_SALT_LABEL.len()..].copy_from_slice(&salt);
  
--        let enc_key = match scrypt(&inner_salt, log_n, self.passphrase.expose_secret()) {
-+        let enc_key = match {
-+            #[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
-+            calibration_test_hooks::record_stanza_derivation();
-+            scrypt(&inner_salt, log_n, self.passphrase.expose_secret())
-+        } {
++        #[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
++        calibration_test_hooks::record_stanza_derivation();
+         let enc_key = match scrypt(&inner_salt, log_n, self.passphrase.expose_secret()) {
              Ok(k) => k,
              Err(_) => {
-                 return Some(Err(DecryptError::ExcessiveWork {
-@@ -277,3 +343,331 @@
+@@ -277,3 +348,334 @@
          )
      }
  }
@@ -279,10 +456,10 @@
 +            slot.borrow().as_ref().map(|state| {
 +                let mut state = state.borrow_mut();
 +                state.measured.push(log_n);
-+                let (expected_factor, elapsed) = state
-+                    .timings
-+                    .pop_front()
-+                    .expect("unexpected extra calibration measurement");
++                let (expected_factor, elapsed) = match state.timings.pop_front() {
++                    Some(measurement) => measurement,
++                    None => panic!("unexpected extra calibration measurement"),
++                };
 +                assert_eq!(log_n, expected_factor);
 +                elapsed
 +            })
@@ -501,10 +678,13 @@
 +                    stanza.body.pop();
 +                }
 +            }
-+            assert!(matches!(
-+                crate::Identity::unwrap_stanza(&identity, &stanza),
-+                Some(Err(DecryptError::InvalidHeader))
-+            ));
++            assert!(
++                matches!(
++                    crate::Identity::unwrap_stanza(&identity, &stanza),
++                    Some(Err(DecryptError::InvalidHeader))
++                ),
++                "malformed stanza variation {variation}"
++            );
 +        }
 +        assert_eq!(guard.derivations(), 0);
 +    }
@@ -546,3 +726,272 @@
 +        assert!(catch_unwind(|| work_factor_from_duration(10, Duration::ZERO)).is_err());
 +    }
 +}
+--- a/age/src/native/tag.rs
++++ b/age/src/native/tag.rs
+@@ -64,9 +64,14 @@
+             .into_option()
+             .ok_or("invalid P-256 point")?;
+ 
+-        let pk_recip =
+-            <Kem as hpke::Kem>::PublicKey::from_bytes(point.to_sec1_point(false).as_bytes())
+-                .expect("valid");
++        let pk_recip = match <Kem as hpke::Kem>::PublicKey::from_bytes(
++            point.to_sec1_point(false).as_bytes(),
++        ) {
++            Ok(key) => key,
++            Err(error) => {
++                panic!("validated P-256 point must convert to HPKE uncompressed SEC1: {error}")
++            }
++        };
+ 
+         Ok(Self {
+             compressed: encoded,
+--- a/age/src/native/x25519.rs
++++ b/age/src/native/x25519.rs
+@@ -110,9 +110,8 @@
+         }
+ 
+         let epk: PublicKey = ephemeral_share.into();
+-        let encrypted_file_key: [u8; ENCRYPTED_FILE_KEY_BYTES] = stanza.body[..]
+-            .try_into()
+-            .expect("Length should have been checked above");
++        let mut encrypted_file_key = [0; ENCRYPTED_FILE_KEY_BYTES];
++        encrypted_file_key.copy_from_slice(&stanza.body);
+ 
+         let pk: PublicKey = (&self.0).into();
+         let shared_secret = self.0.diffie_hellman(&epk);
+--- a/age/src/primitives.rs
++++ b/age/src/primitives.rs
+@@ -30,7 +30,10 @@
+     /// Constructs a new writer to process input data.
+     pub(crate) fn new(key: HmacKey) -> Self {
+         HmacWriter {
+-            inner: Hmac::new_from_slice(key.0.expose_secret()).expect("key is the correct length"),
++            inner: match Hmac::new_from_slice(key.0.expose_secret()) {
++                Ok(inner) => inner,
++                Err(error) => panic!("HMAC-SHA256 must accept the fixed 32-byte key: {error}"),
++            },
+         }
+     }
+ 
+@@ -65,7 +68,8 @@
+     let params = ScryptParams::new(log_n, 8, 1)?;
+ 
+     let mut output = [0; 32];
+-    scrypt_inner(password.as_bytes(), salt, &params, &mut output)
+-        .expect("output is the correct length");
++    if scrypt_inner(password.as_bytes(), salt, &params, &mut output).is_err() {
++        panic!("scrypt must accept the fixed 32-byte output");
++    }
+     Ok(output)
+ }
+--- a/age/src/primitives/stream.rs
++++ b/age/src/primitives/stream.rs
+@@ -66,9 +66,10 @@
+     }
+ 
+     fn to_bytes(self) -> [u8; 12] {
+-        self.0.to_be_bytes()[4..]
+-            .try_into()
+-            .expect("slice is correct length")
++        let bytes = self.0.to_be_bytes();
++        let mut nonce = [0; 12];
++        nonce.copy_from_slice(&bytes[4..]);
++        nonce
+     }
+ }
+ 
+@@ -183,10 +184,10 @@
+             io::Error::new(io::ErrorKind::WriteZero, "last chunk has been processed")
+         })?;
+ 
+-        let encrypted = self
+-            .aead
+-            .encrypt(&self.nonce.to_bytes().into(), chunk)
+-            .expect("we will never hit chacha20::MAX_BLOCKS because of the chunk size");
++        let encrypted = match self.aead.encrypt(&self.nonce.to_bytes().into(), chunk) {
++            Ok(encrypted) => encrypted,
++            Err(error) => panic!("age chunk size must remain below chacha20::MAX_BLOCKS: {error}"),
++        };
+         self.nonce.increment_counter();
+ 
+         Ok(encrypted)
+@@ -457,11 +458,9 @@
+     }
+ 
+     fn read_from_chunk(&mut self, buf: &mut [u8]) -> usize {
+-        if self.chunk.is_none() {
++        let Some(chunk) = self.chunk.as_ref() else {
+             return 0;
+-        }
+-
+-        let chunk = self.chunk.as_ref().unwrap();
++        };
+         let cur_chunk_offset = self.cur_plaintext_pos as usize % CHUNK_SIZE;
+ 
+         let to_read = cmp::min(chunk.expose_secret().len() - cur_chunk_offset, buf.len());
+@@ -469,7 +468,8 @@
+         buf[..to_read]
+             .copy_from_slice(&chunk.expose_secret()[cur_chunk_offset..cur_chunk_offset + to_read]);
+         self.cur_plaintext_pos += to_read as u64;
+-        if self.cur_plaintext_pos % CHUNK_SIZE as u64 == 0 {
++        // CHUNK_SIZE is fixed at 64 * 1024 (2^16), so its low-bit mask detects boundaries.
++        if self.cur_plaintext_pos & (CHUNK_SIZE as u64 - 1) == 0 {
+             // We've finished with the current chunk.
+             self.chunk = None;
+         }
+@@ -668,10 +668,9 @@
+             // size (i.e. this conditional branch), we compute the length of the
+             // plaintext. This is cached, so the overhead should be minimal.
+             else if target_pos == self.len()? {
+-                self.stream
+-                    .nonce
+-                    .set_last(true)
+-                    .expect("We unset the last chunk flag earlier");
++                if self.stream.nonce.set_last(true).is_err() {
++                    panic!("seek reset must clear the age stream final-chunk flag");
++                }
+             }
+         }
+ 
+--- a/age/src/protocol.rs
++++ b/age/src/protocol.rs
+@@ -65,8 +65,10 @@
+     ///
+     /// [`x25519::Identity`]: crate::x25519::Identity
+     pub fn with_user_passphrase(passphrase: SecretString) -> Self {
+-        Self::with_recipients(iter::once(&scrypt::Recipient::new(passphrase) as _))
+-            .expect("no errors can occur with this recipient set")
++        match Self::with_recipients(iter::once(&scrypt::Recipient::new(passphrase) as _)) {
++            Ok(encryptor) => encryptor,
++            Err(error) => panic!("single built-in scrypt recipient must be valid: {error}"),
++        }
+     }
+ 
+     /// Constructs an `Encryptor` that will create an age file encrypted to a list of
+@@ -121,7 +123,10 @@
+ 
+         let header = HeaderV1::new(recipients, mac_key(&file_key))?;
+         let nonce = Nonce::random();
+-        let payload_key = v1_payload_key(&file_key, &header, &nonce).expect("MAC is correct");
++        let payload_key = match v1_payload_key(&file_key, &header, &nonce) {
++            Ok(key) => key,
++            Err(error) => panic!("freshly generated age header MAC must verify: {error}"),
++        };
+ 
+         Ok(Self {
+             header: Header::V1(header),
+--- a/age/src/simple.rs
++++ b/age/src/simple.rs
+@@ -15,9 +15,10 @@
+ ///
+ /// This function returns binary ciphertext. To obtain an ASCII-armored text string, use
+ /// [`encrypt_and_armor`].
++///
++/// Errors from the recipient, including invalid recipient labels, are returned to the caller.
+ pub fn encrypt(recipient: &impl Recipient, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
+-    let encryptor =
+-        Encryptor::with_recipients(iter::once(recipient as _)).expect("we provided a recipient");
++    let encryptor = Encryptor::with_recipients(iter::once(recipient as _))?;
+ 
+     let mut ciphertext = Vec::with_capacity(plaintext.len());
+     let mut writer = encryptor.wrap_output(&mut ciphertext)?;
+@@ -75,7 +76,58 @@
+ #[cfg(test)]
+ mod tests {
+     use super::{decrypt, encrypt};
+-    use crate::x25519;
++    use crate::{EncryptError, Recipient, x25519};
++    use age_core::format::{FileKey, Stanza};
++    use std::{collections::HashSet, io};
++
++    struct FailingRecipient;
++
++    impl Recipient for FailingRecipient {
++        fn wrap_file_key(
++            &self,
++            _file_key: &FileKey,
++        ) -> Result<(Vec<Stanza>, HashSet<String>), EncryptError> {
++            Err(EncryptError::Io(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "recipient refused the file key",
++            )))
++        }
++    }
++
++    #[test]
++    fn encrypt_propagates_recipient_error() {
++        match encrypt(&FailingRecipient, b"plaintext") {
++            Err(EncryptError::Io(error)) => {
++                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
++                assert_eq!(error.to_string(), "recipient refused the file key");
++            }
++            other => panic!("expected original recipient error, got {other:?}"),
++        }
++    }
++
++    struct InvalidLabelRecipient(x25519::Recipient);
++
++    impl Recipient for InvalidLabelRecipient {
++        fn wrap_file_key(
++            &self,
++            file_key: &FileKey,
++        ) -> Result<(Vec<Stanza>, HashSet<String>), EncryptError> {
++            let (stanzas, mut labels) = self.0.wrap_file_key(file_key)?;
++            labels.insert("invalid label".into());
++            Ok((stanzas, labels))
++        }
++    }
++
++    #[test]
++    fn encrypt_propagates_invalid_recipient_labels() {
++        let recipient = InvalidLabelRecipient(crate::x25519::tests::TEST_PK.parse().unwrap());
++        match encrypt(&recipient, b"plaintext") {
++            Err(EncryptError::InvalidRecipientLabels(labels)) => {
++                assert_eq!(labels, HashSet::from(["invalid label".to_owned()]));
++            }
++            other => panic!("expected original invalid-label error, got {other:?}"),
++        }
++    }
+ 
+     #[cfg(feature = "armor")]
+     use super::encrypt_and_armor;
+--- a/age/src/util.rs
++++ b/age/src/util.rs
+@@ -217,7 +217,11 @@
+ 
+         let mut buf = [0; B];
+         match BASE64_STANDARD_NO_PAD.decode_slice(arg, buf.as_mut()) {
+-            Ok(n) if n == N => Some(buf[..N].try_into().unwrap()),
++            Ok(n) if n == N => {
++                let mut output = [0; N];
++                output.copy_from_slice(&buf[..N]);
++                Some(output)
++            }
+             _ => None,
+         }
+     }
+@@ -227,7 +231,23 @@
+         verify::<_, _, (), _, _>(digit1, |n: &str| !n.starts_with('0'))
+             .parse_complete(arg)
+             .ok()
++            .filter(|(remaining, _)| remaining.is_empty())
+             .and_then(|(_, n)| n.parse_to())
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::decimal_digit_arg;
++
++        #[test]
++        fn decimal_digit_arg_requires_a_complete_canonical_number() {
++            for (arg, expected) in [("1", 1u8), ("14", 14), ("63", 63), ("255", 255)] {
++                assert_eq!(decimal_digit_arg::<u8>(arg), Some(expected), "{arg:?}");
++            }
++            for arg in ["", "0", "01", "+14", "-14", "14x", "14 ", "256"] {
++                assert_eq!(decimal_digit_arg::<u8>(arg), None, "{arg:?}");
++            }
++        }
+     }
+ }
+ 
