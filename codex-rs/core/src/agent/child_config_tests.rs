@@ -1229,6 +1229,8 @@ async fn native_legacy_depth_limit_is_enforced_by_actual_parent_authority() {
     let fixture = Fixture::new().await;
     let mut config = fixture.config.clone();
     config.agent_max_depth = 1;
+    // This bundled model has no model-owned V2 override; Collab selects V1.
+    config.model = Some("gpt-5.5".into());
     config.features.disable(Feature::MultiAgentV2).unwrap();
     config.features.enable(Feature::Collab).unwrap();
     let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
