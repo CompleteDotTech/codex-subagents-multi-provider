@@ -95,22 +95,22 @@ async fn auth_socket_fixture(reject_first_generation: bool) -> anyhow::Result<Au
                     Some(websocket_config),
                 ).await;
                 let mut socket = socket.expect("synthetic websocket handshake must succeed");
-                let (path, headers) = handshake.unwrap();
+                let (path, headers) = handshake.expect("synthetic websocket handshake must be captured");
                 let index = {
-                    let mut log = log.lock().unwrap();
+                    let mut log = log.lock().expect("synthetic websocket observation lock must be available");
                     let index = log.len();
                     log.push(SocketObservation { path, headers, requests: vec![] });
                     index
                 };
                 while let Some(Ok(message)) = socket.next().await {
                     let Message::Text(payload) = message else { continue };
-                    let request: Value = serde_json::from_str(&payload).unwrap();
+                    let request: Value = serde_json::from_str(&payload).expect("synthetic websocket request must be valid JSON");
                     if request["type"] == "response.interrupt" {
                         continue;
                     }
                     assert_eq!(request["type"], "response.create");
                     let request_index = {
-                        let mut log = log.lock().unwrap();
+                        let mut log = log.lock().expect("synthetic websocket observation lock must be available");
                         log[index].requests.push(request.clone());
                         log[index].requests.len() - 1
                     };
@@ -122,7 +122,7 @@ async fn auth_socket_fixture(reject_first_generation: bool) -> anyhow::Result<Au
                             "type": "invalid_request_error", "code": "websocket_connection_limit_reached",
                             "message": "synthetic reconnect",
                         }});
-                        socket.send(Message::Text(error.to_string().into())).await.unwrap();
+                        socket.send(Message::Text(error.to_string().into())).await.expect("synthetic reconnect error must be sent");
                         let _ = socket.close(None).await;
                         break;
                     }
@@ -204,7 +204,7 @@ fn rotating_helper() -> anyhow::Result<(tempfile::TempDir, ModelProviderAuthInfo
 fn static_models() -> Arc<StaticModelsManager> {
     Arc::new(StaticModelsManager::new(
         /*auth_manager*/ None,
-        codex_models_manager::bundled_models_response().unwrap(),
+        codex_models_manager::bundled_models_response().expect("bundled models fixture must parse"),
     ))
 }
 
