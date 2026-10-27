@@ -1,5 +1,6 @@
 """Manual, observational Windows loader diagnostic; never packages the binaries."""
 
+load("//third_party/voice:windows_executable.bzl", "VoiceExecutablePackageInfo")
 load("//third_party/voice:windows_native.bzl", "WindowsBuildToolsInfo")
 
 def _logical(ctx, file):
@@ -17,6 +18,14 @@ def _impl(ctx):
     ctx.actions.write(config, json.encode({
         "helper": _logical(ctx, helper),
         "unit": _logical(ctx, unit),
+        "packages": {
+            name: {
+                "raw": _logical(ctx, target[VoiceExecutablePackageInfo].raw_executable),
+                "receipt": _logical(ctx, target[VoiceExecutablePackageInfo].receipt),
+                "dlls": [_logical(ctx, dll) for dll in target[VoiceExecutablePackageInfo].dlls],
+            }
+            for name, target in {"helper": ctx.attr.helper, "unit": ctx.attr.unit}.items()
+        },
         "dumpbin": _logical(ctx, dumpbin),
         "runtime": [_logical(ctx, f) for f in inventory],
         "status": _logical(ctx, ctx.info_file),
@@ -43,8 +52,8 @@ windows_runtime_diagnostic_test = rule(
     implementation = _impl,
     test = True,
     attrs = {
-        "helper": attr.label(mandatory = True, executable = True, cfg = "target"),
-        "unit": attr.label(mandatory = True, executable = True, cfg = "target"),
+        "helper": attr.label(mandatory = True, executable = True, cfg = "target", providers = [VoiceExecutablePackageInfo]),
+        "unit": attr.label(mandatory = True, executable = True, cfg = "target", providers = [VoiceExecutablePackageInfo]),
         "_runtime": attr.label(default = "//third_party/voice:native_link_windows_x86_64"),
         "_tools": attr.label(default = "//third_party/voice:windows_tools_x86_64", cfg = "exec", providers = [WindowsBuildToolsInfo]),
         "_launcher_template": attr.label(default = "//third_party/voice:windows_runtime_diagnostic.bat.tpl", allow_single_file = True),

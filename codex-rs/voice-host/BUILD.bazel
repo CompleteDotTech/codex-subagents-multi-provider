@@ -4,6 +4,7 @@ load("//third_party/voice:windows_runtime_diagnostic.bzl", "windows_runtime_diag
 codex_rust_crate(
     name = "voice-host",
     binaries_with_build_commit = ["codex-voice-host"],
+    binary_windows_runtime = {"codex-voice-host": "//third_party/voice:native_link"},
     crate_name = "codex_voice_host",
     crate_srcs = [],
     unit_test_args = ["--test-threads=1"],
@@ -20,5 +21,5 @@ windows_runtime_diagnostic_test(
         "@platforms//cpu:x86_64",
         "@llvm//constraints/windows/abi:msvc",
     ],
-    unit = ":codex-voice-host-bin-unit-tests-bin",
+    unit = ":codex-voice-host-bin-unit-tests-bin__windows-runtime",
 )

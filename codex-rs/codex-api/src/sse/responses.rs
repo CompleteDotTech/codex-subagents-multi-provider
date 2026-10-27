@@ -736,15 +736,13 @@ async fn process_sse_with_treatment(
                     }
                     _ => {}
                 }
-                if is_completed {
-                    if !pending_tool_calls.is_empty() {
-                        let _ = tx_event
-                            .send(Err(ApiError::Stream(
-                                "response completed with unfinished tool calls".into(),
-                            )))
-                            .await;
-                        return;
-                    }
+                if is_completed && !pending_tool_calls.is_empty() {
+                    let _ = tx_event
+                        .send(Err(ApiError::Stream(
+                            "response completed with unfinished tool calls".into(),
+                        )))
+                        .await;
+                    return;
                 }
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
