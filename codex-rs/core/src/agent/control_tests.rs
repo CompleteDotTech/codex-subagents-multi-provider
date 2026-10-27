@@ -6933,7 +6933,11 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
         ),
         "actual target fixture message must be durable before sealing"
     );
-    let stored_root = root.thread.read_thread(true, true).await.unwrap();
+    let stored_root = root
+        .thread
+        .read_thread(/*include_archived*/ true, /*include_history*/ true)
+        .await
+        .unwrap();
     let initial = InitialHistory::Resumed(ResumedHistory {
         history_revision: None,
         conversation_id: root.thread_id,
