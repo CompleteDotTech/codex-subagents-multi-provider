@@ -618,6 +618,80 @@ class FailureClassificationTests(unittest.TestCase):
         )
 
 
+class ProgressObservationTests(unittest.TestCase):
+    def test_pinned_plain_progress_prefixes_cr_lf_and_private_suffixes(self):
+        raw = (
+            b"Extracting Bazel installation...\r\n"
+            b"Computing main repo mapping: PRIVATE_URL\r"
+            b"Loading: PRIVATE_PATH\nAnalyzing: PRIVATE_LABEL\r\n"
+            b"    Fetching PRIVATE_TOKEN\nLoading: other\n"
+        )
+        result = m.classify_progress(raw)
+        self.assertEqual(
+            result["prefix_line_counts"],
+            dict(zip(m.PROGRESS_MARKERS, (1, 1, 2, 1, 1))),
+        )
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertEqual(m.classify_failure(raw)["progress_observations"], result)
+
+    def test_exact_spoof_is_observation_not_authenticated_execution(self):
+        result = m.classify_progress(b"Analyzing: arbitrary user-controlled text")
+        self.assertEqual(result["prefix_line_counts"]["analysis"], 1)
+        self.assertEqual(set(result), {"schema", "count_limit", "prefix_line_counts"})
+
+    def test_unrecognized_wrappers_substrings_and_split_markers_stay_unknown(self):
+        unknown = m.classify_progress(b"")
+        for raw in (
+            b"help: Loading: PRIVATE",
+            b"XAnalyzing: PRIVATE",
+            b" Loading: PRIVATE",
+            b"Loading:PRIVATE",
+            b"Loading:\n PRIVATE",
+            b"Computing main repo mapping:\n PRIVATE",
+            b"Analyzing\r: PRIVATE",
+            b"Extracting Bazel installation... PRIVATE",
+            b"Extracting Bazel installation....",
+            b"    FetchingPRIVATE",
+            b"\x1b[32mLoading: PRIVATE",
+            b"[12:30:00] Loading: PRIVATE",
+            b"loading: PRIVATE",
+            b"INFO: Starting Bazel in batch mode.",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(m.classify_progress(raw), unknown)
+
+    def test_cap_and_count_saturation_preserve_closed_vocabulary(self):
+        raw = b"Loading: SECRET\n" * (m.PROGRESS_COUNT_LIMIT + 2)
+        result = m.classify_progress(raw)
+        self.assertEqual(
+            result["prefix_line_counts"]["loading"], m.PROGRESS_COUNT_LIMIT
+        )
+        self.assertEqual(set(result["prefix_line_counts"]), set(m.PROGRESS_MARKERS))
+        self.assertTrue(
+            all(type(v) is int for v in result["prefix_line_counts"].values())
+        )
+        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertEqual(
+            m.classify_progress(b"x" * m.LIMIT + b"\nLoading: SECRET"),
+            m.classify_progress(b""),
+        )
+
+    def test_full_capture_adversarial_shapes_finish_within_capture_budget(self):
+        import time
+
+        start = time.monotonic()
+        unknown = m.classify_progress(b"")
+        for unit in (b"x", b"x\n", b"x\r\n", b"LoadingX: ", b"AnalyzingX: "):
+            raw = (unit * (m.LIMIT // len(unit) + 1))[: m.LIMIT]
+            self.assertEqual(m.classify_progress(raw), unknown)
+        raw = (b"Loading: PRIVATE\r\n" * (m.LIMIT // 18 + 1))[: m.LIMIT]
+        self.assertEqual(
+            m.classify_progress(raw)["prefix_line_counts"]["loading"],
+            m.PROGRESS_COUNT_LIMIT,
+        )
+        self.assertLess(time.monotonic() - start, 15)
+
+
 class EnvironmentTests(unittest.TestCase):
     def test_encoding_sorting_astral_values_and_empty_block(self):
         env = {"z": "last", "ProgramFiles(x86)": "C:/tools", "A": "astral-\U0001f642"}

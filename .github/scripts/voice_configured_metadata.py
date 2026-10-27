@@ -807,6 +807,50 @@ def classify_lines(lowered):
     return result
 
 
+# Bazel 9.2.0 (commit 8220c6198837d5c13d53fea211cf3282aa12408a):
+# archive_utils.cc:248 and util/{logging,bazel_log_handler}.cc emit the USER
+# extraction line. UiStateTracker.java:90,417..438,1179,1371,1392 and
+# SkymeldUiStateTracker.java:84..103,131 emit these fixed progress prefixes;
+# UiEventHandler.java:1093..1094 writes them as lines with --curses=no.
+# Fetching detail can be suppressed by that short-version rendering. Timestamps,
+# ANSI decoration and other spellings are deliberately not normalized/guessed.
+PROGRESS_MARKERS = (
+    "installation_extraction",
+    "main_repository_mapping",
+    "loading",
+    "analysis",
+    "fetch_detail",
+)
+PROGRESS_COUNT_LIMIT = 65535
+PROGRESS_PREFIX = re.compile(
+    rb"(?:\A|(?<=[\r\n]))(?:"
+    rb"(?P<installation_extraction>Extracting Bazel installation\.\.\.)(?=[\r\n]|\Z)|"
+    rb"(?P<main_repository_mapping>Computing main repo mapping: )|"
+    rb"(?P<loading>Loading: )|"
+    rb"(?P<analysis>Analyzing: )|"
+    rb"(?P<fetch_detail>    Fetching ))"
+)
+
+
+def classify_progress(raw):
+    """Count fixed line-prefix observations, never infer execution or progress.
+
+    Arbitrary private text can spoof every marker; absence can reflect suppressed
+    output. Counts are bounded line observations, not completed operations or
+    elapsed-time measurements. No suffix, URL, label or captured value escapes.
+    Fixed anchored literals make one bounded scan, including for many tiny lines.
+    """
+    counts = dict.fromkeys(PROGRESS_MARKERS, 0)
+    for match in PROGRESS_PREFIX.finditer(raw, 0, min(len(raw), LIMIT)):
+        name = match.lastgroup
+        counts[name] = min(counts[name] + 1, PROGRESS_COUNT_LIMIT)
+    return {
+        "schema": "fixed-progress-prefix-observations-v1",
+        "count_limit": PROGRESS_COUNT_LIMIT,
+        "prefix_line_counts": counts,
+    }
+
+
 def classify_failure(raw):
     """Observe at most LIMIT private bytes; emit only selected constants.
 
@@ -866,6 +910,7 @@ def classify_failure(raw):
         else "unknown",
         "cause": "unknown",
         "line_evidence": classify_lines(lowered),
+        "progress_observations": classify_progress(raw),
         "memory_alternatives": {
             "outofmemoryerror_token": present[b"outofmemoryerror"],
             "out_of_memory_phrase": present[b"out of memory"],
