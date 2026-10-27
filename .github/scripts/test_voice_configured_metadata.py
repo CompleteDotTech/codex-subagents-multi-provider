@@ -522,6 +522,24 @@ class BazeliskDownloadFramingTests(unittest.TestCase):
 
 
 class RejectedLineShapeTests(unittest.TestCase):
+    def test_indented_progress_remains_rejected_for_provider_and_action(self):
+        record = packages()[0][0]
+        line = "    currently loading: PRIVATE_SYNTHETIC_PACKAGE"
+        for before in (True, False):
+            for provider in (True, False):
+                with self.subTest(before=before, provider=provider):
+                    payload = (
+                        m.SENTINEL + json.dumps(record)
+                        if provider
+                        else json.dumps(graph())
+                    )
+                    text = line + "\n" + payload if before else payload + "\n" + line
+                    with self.assertRaises(m.RejectedWrapperLine):
+                        if provider:
+                            m.parse_provider(text, record["label"])
+                        else:
+                            m.parse_json(text)
+
     def test_every_shape_keeps_secret_bait_and_message_private(self):
         secret = "PRIVATE_URL_https://private.invalid/C:/private?token=SECRET"
         for prefix, four, whitespace, esc, continuation in (
@@ -1740,6 +1758,14 @@ class CaptureTests(unittest.TestCase):
                 self.assertEqual(command[0], str(shell))
                 query = "cquery" if "cquery" in command else "aquery"
                 self.assertEqual(command[command.index(query) - 1], "--batch")
+                target_separator = len(command) - 2
+                self.assertEqual(command[target_separator], "--")
+                self.assertEqual(command.count("--noshow_progress"), 1)
+                self.assertLess(command.index("--noshow_progress"), target_separator)
+                self.assertEqual(
+                    [arg for arg in command if "show_progress" in arg],
+                    ["--noshow_progress"],
+                )
                 self.assertEqual(
                     timeout, 120 if index % 8 == 0 else 45 if query == "cquery" else 90
                 )

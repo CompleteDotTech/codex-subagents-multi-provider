@@ -1100,6 +1100,7 @@ def main():
                 "--lockfile_mode=error",
                 "--color=no",
                 "--curses=no",
+                "--noshow_progress",
                 "--",
                 label,
             ]
@@ -1138,6 +1139,7 @@ def main():
             "--lockfile_mode=error",
             "--color=no",
             "--curses=no",
+            "--noshow_progress",
             "--",
             QUERY,
         ]
