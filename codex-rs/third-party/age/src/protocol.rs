@@ -482,7 +482,7 @@ mod tests {
 
         let mut recipient = scrypt::Recipient::new(SecretString::from("passphrase".to_string()));
         // Override to something very fast for testing.
-        recipient.set_work_factor(2);
+        recipient.set_work_factor(/*log_n*/ 2);
 
         let mut encrypted = vec![];
         let e = Encryptor::with_recipients(iter::once(&recipient as _)).unwrap();

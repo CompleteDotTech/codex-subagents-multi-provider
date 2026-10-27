@@ -68,7 +68,7 @@ impl IdentityFile<NoCallbacks> {
 
     /// Parses one or more identities from a buffered input containing valid UTF-8.
     pub fn from_buffer<R: io::BufRead>(data: R) -> io::Result<Self> {
-        Self::parse_identities(None, data)
+        Self::parse_identities(/*filename*/ None, data)
     }
 
     /// Parses one or more identities from an [`InputReader`];
@@ -342,49 +342,49 @@ pub(crate) mod tests {
 
     #[test]
     fn secret_key_encoding() {
-        valid_secret_key_encoding(TEST_SK, 1);
+        valid_secret_key_encoding(TEST_SK, /*num_keys*/ 1);
     }
 
     #[test]
     fn secret_key_lf() {
-        valid_secret_key_encoding(&format!("{TEST_SK}\n"), 1);
+        valid_secret_key_encoding(&format!("{TEST_SK}\n"), /*num_keys*/ 1);
     }
 
     #[test]
     fn two_secret_keys_lf() {
-        valid_secret_key_encoding(&format!("{TEST_SK}\n{TEST_SK}"), 2);
+        valid_secret_key_encoding(&format!("{TEST_SK}\n{TEST_SK}"), /*num_keys*/ 2);
     }
 
     #[test]
     fn secret_key_with_comment_lf() {
-        valid_secret_key_encoding(&format!("# Foo bar baz\n{TEST_SK}"), 1);
-        valid_secret_key_encoding(&format!("{TEST_SK}\n# Foo bar baz"), 1);
+        valid_secret_key_encoding(&format!("# Foo bar baz\n{TEST_SK}"), /*num_keys*/ 1);
+        valid_secret_key_encoding(&format!("{TEST_SK}\n# Foo bar baz"), /*num_keys*/ 1);
     }
 
     #[test]
     fn secret_key_with_empty_line_lf() {
-        valid_secret_key_encoding(&format!("\n\n{TEST_SK}"), 1);
+        valid_secret_key_encoding(&format!("\n\n{TEST_SK}"), /*num_keys*/ 1);
     }
 
     #[test]
     fn secret_key_crlf() {
-        valid_secret_key_encoding(&format!("{TEST_SK}\r\n"), 1);
+        valid_secret_key_encoding(&format!("{TEST_SK}\r\n"), /*num_keys*/ 1);
     }
 
     #[test]
     fn two_secret_keys_crlf() {
-        valid_secret_key_encoding(&format!("{TEST_SK}\r\n{TEST_SK}"), 2);
+        valid_secret_key_encoding(&format!("{TEST_SK}\r\n{TEST_SK}"), /*num_keys*/ 2);
     }
 
     #[test]
     fn secret_key_with_comment_crlf() {
-        valid_secret_key_encoding(&format!("# Foo bar baz\r\n{TEST_SK}"), 1);
-        valid_secret_key_encoding(&format!("{TEST_SK}\r\n# Foo bar baz"), 1);
+        valid_secret_key_encoding(&format!("# Foo bar baz\r\n{TEST_SK}"), /*num_keys*/ 1);
+        valid_secret_key_encoding(&format!("{TEST_SK}\r\n# Foo bar baz"), /*num_keys*/ 1);
     }
 
     #[test]
     fn secret_key_with_empty_line_crlf() {
-        valid_secret_key_encoding(&format!("\r\n\r\n{TEST_SK}"), 1);
+        valid_secret_key_encoding(&format!("\r\n\r\n{TEST_SK}"), /*num_keys*/ 1);
     }
 
     #[test]

@@ -94,7 +94,7 @@ mod tests {
         }
 
         let mut output = vec![];
-        let mut reader = LimitedReader::new(&b"abcd"[..], 3);
+        let mut reader = LimitedReader::new(&b"abcd"[..], /*n*/ 3);
         let err = reader.read_to_end(&mut output).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(output, b"abc");
@@ -115,7 +115,7 @@ mod tests {
         }
 
         let mut output = vec![];
-        let mut reader = LimitedReader::new(Cursor::new(&b"abcd"[..]), 3);
+        let mut reader = LimitedReader::new(Cursor::new(&b"abcd"[..]), /*n*/ 3);
         let err = reader.read_until(b'\n', &mut output).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(output, b"abc");

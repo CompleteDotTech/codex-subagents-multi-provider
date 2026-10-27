@@ -32,6 +32,11 @@ The recipient accumulator extension is compiled with armor plus cli-common,
 matching its sole caller inside the cli-common module under armor. Every
 configuration that calls it retains the same implementation.
 
+Parameter-name comments document literal arguments in the seven source files
+reported by the actual argument-comment lint. Their insertion and formatting
+preserve every non-comment expression, literal, assertion and existing comment;
+exact inverse and canonical formatting receipts are retained outside the source.
+
 The additional armor unit binary and wrapper reuse the existing default unit
 metadata hub and activate only default plus armor. This permits separate configured
 feature proof, strict linting, and execution of armor inline tests, including the

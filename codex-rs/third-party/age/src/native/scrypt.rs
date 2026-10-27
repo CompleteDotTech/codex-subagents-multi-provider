@@ -459,7 +459,7 @@ mod calibration_tests {
         let slow = Duration::from_millis(32);
         let timings = [fast, fast, slow, slow, fast, fast]
             .into_iter()
-            .flat_map(|duration| samples(10, duration))
+            .flat_map(|duration| samples(/*log_n*/ 10, duration))
             .collect();
         let guard = Guard::install(timings);
         let early_writer = Recipient::new(public_passphrase());
@@ -491,7 +491,7 @@ mod calibration_tests {
         assert_eq!(guard.measured(), vec![10; 18]);
         assert_eq!(guard.remaining(), 0);
         assert!(matches!(
-            crate::Identity::unwrap_stanza(&slower_reader, &public_stanza(20)),
+            crate::Identity::unwrap_stanza(&slower_reader, &public_stanza(/*factor*/ 20)),
             Some(Err(DecryptError::ExcessiveWork {
                 required: 20,
                 target: 15
@@ -509,7 +509,7 @@ mod calibration_tests {
             Duration::ZERO,
         ] {
             for position in 0..3 {
-                let mut timings = samples(10, stable);
+                let mut timings = samples(/*log_n*/ 10, stable);
                 timings[position].1 = Some(outlier);
                 let guard = Guard::install(timings);
                 assert_eq!(Recipient::new(public_passphrase()).log_n, 15);
@@ -522,9 +522,9 @@ mod calibration_tests {
     #[test]
     fn two_zero_samples_advance_one_factor_with_exact_call_counts() {
         for positive_position in 0..3 {
-            let mut timings = samples(10, Duration::ZERO);
+            let mut timings = samples(/*log_n*/ 10, Duration::ZERO);
             timings[positive_position].1 = Some(Duration::from_millis(40));
-            timings.extend(samples(11, Duration::from_millis(40)));
+            timings.extend(samples(/*log_n*/ 11, Duration::from_millis(40)));
             let guard = Guard::install(timings);
             assert_eq!(Identity::new(public_passphrase()).target_work_factor, 16);
             assert_eq!(guard.measured(), vec![10, 10, 10, 11, 11, 11]);
@@ -548,7 +548,7 @@ mod calibration_tests {
         let mut timings: Vec<_> = (10..16)
             .flat_map(|factor| samples(factor, Duration::ZERO))
             .collect();
-        timings.extend(samples(16, Duration::from_millis(40)));
+        timings.extend(samples(/*log_n*/ 16, Duration::from_millis(40)));
         let guard = Guard::install(timings);
         assert_eq!(Recipient::new(public_passphrase()).log_n, 21);
         assert_eq!(guard.measured().len(), 21);
@@ -558,7 +558,7 @@ mod calibration_tests {
     #[test]
     fn invalid_or_missing_native_elapsed_never_reuses_partial_samples_or_falls_back() {
         for invalid_position in 0..3 {
-            let mut timings = samples(10, Duration::from_millis(40));
+            let mut timings = samples(/*log_n*/ 10, Duration::from_millis(40));
             timings[invalid_position].1 = None;
             let guard = Guard::install(timings);
             assert!(catch_unwind(AssertUnwindSafe(|| Identity::new(public_passphrase()))).is_err());
@@ -568,10 +568,10 @@ mod calibration_tests {
 
     #[test]
     fn scoped_hooks_restore_prior_state_on_drop_and_unwind() {
-        let outer = Guard::install(samples(10, Duration::from_millis(40)));
+        let outer = Guard::install(samples(/*log_n*/ 10, Duration::from_millis(40)));
         assert!(
             catch_unwind(|| {
-                let _inner = Guard::install(samples(10, Duration::ZERO));
+                let _inner = Guard::install(samples(/*log_n*/ 10, Duration::ZERO));
                 panic!("simulate unrelated test panic");
             })
             .is_err()
@@ -582,10 +582,10 @@ mod calibration_tests {
 
     #[test]
     fn hooks_do_not_leak_to_another_test_thread() {
-        let guard = Guard::install(samples(10, Duration::from_millis(40)));
+        let guard = Guard::install(samples(/*log_n*/ 10, Duration::from_millis(40)));
         std::thread::spawn(|| {
-            assert!(calibration_test_hooks::measurement(10).is_none());
-            let guard = Guard::install(samples(10, Duration::from_millis(1)));
+            assert!(calibration_test_hooks::measurement(/*log_n*/ 10).is_none());
+            let guard = Guard::install(samples(/*log_n*/ 10, Duration::from_millis(1)));
             assert_eq!(Identity::new(public_passphrase()).target_work_factor, 20);
             assert_eq!(guard.remaining(), 0);
         })
@@ -598,10 +598,10 @@ mod calibration_tests {
     #[test]
     fn actual_stanza_plus_five_rejects_without_derivation_plus_four_authenticates() {
         // target10, cap14 keeps the single REAL boundary KDF to N=2^14.
-        let guard = Guard::install(samples(10, ONE_SECOND));
+        let guard = Guard::install(samples(/*log_n*/ 10, ONE_SECOND));
         let identity = Identity::new(public_passphrase());
         assert!(matches!(
-            crate::Identity::unwrap_stanza(&identity, &public_stanza(15)),
+            crate::Identity::unwrap_stanza(&identity, &public_stanza(/*factor*/ 15)),
             Some(Err(DecryptError::ExcessiveWork {
                 required: 15,
                 target: 10
@@ -609,7 +609,7 @@ mod calibration_tests {
         ));
         assert_eq!(guard.derivations(), 0);
         assert!(matches!(
-            crate::Identity::unwrap_stanza(&identity, &public_stanza(14)),
+            crate::Identity::unwrap_stanza(&identity, &public_stanza(/*factor*/ 14)),
             Some(Err(DecryptError::DecryptionFailed))
         ));
         assert_eq!(guard.derivations(), 1);
@@ -617,10 +617,10 @@ mod calibration_tests {
 
     #[test]
     fn actual_malformed_stanzas_reject_before_the_kdf_boundary() {
-        let guard = Guard::install(samples(10, ONE_SECOND));
+        let guard = Guard::install(samples(/*log_n*/ 10, ONE_SECOND));
         let identity = Identity::new(public_passphrase());
         for variation in 0..4 {
-            let mut stanza = public_stanza(14);
+            let mut stanza = public_stanza(/*factor*/ 14);
             match variation {
                 0 => stanza.args[0] = "invalid salt=".to_owned(),
                 1 => stanza.args[1] = "14x".to_owned(),
@@ -644,14 +644,14 @@ mod calibration_tests {
 
     #[test]
     fn existing_setters_remain_explicit_and_do_not_change_the_calibrated_target() {
-        let mut timings = samples(10, Duration::from_millis(40));
-        timings.extend(samples(10, Duration::from_millis(40)));
+        let mut timings = samples(/*log_n*/ 10, Duration::from_millis(40));
+        timings.extend(samples(/*log_n*/ 10, Duration::from_millis(40)));
         let guard = Guard::install(timings);
         let mut recipient = Recipient::new(public_passphrase());
-        recipient.set_work_factor(17);
+        recipient.set_work_factor(/*log_n*/ 17);
         assert_eq!(recipient.log_n, 17);
         let mut identity = Identity::new(public_passphrase());
-        identity.set_max_work_factor(18);
+        identity.set_max_work_factor(/*max_log_n*/ 18);
         assert_eq!(
             (identity.target_work_factor, identity.max_work_factor),
             (15, 18)
@@ -661,21 +661,24 @@ mod calibration_tests {
 
     #[test]
     fn estimator_retains_threshold_rounding_overflow_and_saturation_behavior() {
-        assert_eq!(work_factor_from_duration(10, ONE_SECOND), 10);
+        assert_eq!(work_factor_from_duration(/*log_n*/ 10, ONE_SECOND), 10);
         assert_eq!(
-            work_factor_from_duration(10, ONE_SECOND - Duration::from_nanos(1)),
+            work_factor_from_duration(/*log_n*/ 10, ONE_SECOND - Duration::from_nanos(1)),
             11
         );
         assert_eq!(
-            work_factor_from_duration(10, Duration::from_millis(500)),
+            work_factor_from_duration(/*log_n*/ 10, Duration::from_millis(500)),
             11
         );
         assert_eq!(
-            work_factor_from_duration(10, Duration::from_millis(499)),
+            work_factor_from_duration(/*log_n*/ 10, Duration::from_millis(499)),
             12
         );
-        assert_eq!(work_factor_from_duration(10, Duration::MAX), 10);
-        assert_eq!(work_factor_from_duration(63, Duration::from_nanos(1)), 63);
-        assert!(catch_unwind(|| work_factor_from_duration(10, Duration::ZERO)).is_err());
+        assert_eq!(work_factor_from_duration(/*log_n*/ 10, Duration::MAX), 10);
+        assert_eq!(
+            work_factor_from_duration(/*log_n*/ 63, Duration::from_nanos(1)),
+            63
+        );
+        assert!(catch_unwind(|| work_factor_from_duration(/*log_n*/ 10, Duration::ZERO)).is_err());
     }
 }

@@ -306,9 +306,9 @@ fOrxrKTj7xCdNS3+OrCdnBC8Z9cKDxjCGWW3fkjLsYha0Jo=
             let buf = ArmoredReader::new(TEST_ENCRYPTED_IDENTITY.as_bytes());
             let identity = Identity::from_buffer(
                 buf,
-                None,
+                /*filename*/ None,
                 MockCallbacks::new(Some("wrong passphrase")),
-                None,
+                /*max_work_factor*/ None,
             )
             .unwrap()
             .unwrap();
@@ -326,9 +326,14 @@ fOrxrKTj7xCdNS3+OrCdnBC8Z9cKDxjCGWW3fkjLsYha0Jo=
         // Unwrapping fails if we cannot obtain a passphrase.
         {
             let buf = ArmoredReader::new(TEST_ENCRYPTED_IDENTITY.as_bytes());
-            let identity = Identity::from_buffer(buf, None, MockCallbacks::new(None), None)
-                .unwrap()
-                .unwrap();
+            let identity = Identity::from_buffer(
+                buf,
+                /*filename*/ None,
+                MockCallbacks::new(/*passphrase*/ None),
+                /*max_work_factor*/ None,
+            )
+            .unwrap()
+            .unwrap();
 
             match identity.unwrap_stanzas(&wrapped).unwrap() {
                 Err(e) => {
@@ -343,9 +348,9 @@ fOrxrKTj7xCdNS3+OrCdnBC8Z9cKDxjCGWW3fkjLsYha0Jo=
         let buf = ArmoredReader::new(TEST_ENCRYPTED_IDENTITY.as_bytes());
         let identity = Identity::from_buffer(
             buf,
-            None,
+            /*filename*/ None,
             MockCallbacks::new(Some(TEST_ENCRYPTED_IDENTITY_PASSPHRASE)),
-            None,
+            /*max_work_factor*/ None,
         )
         .unwrap()
         .unwrap();

@@ -831,7 +831,7 @@ impl<R> ArmoredReader<R> {
                                 )
                             })?,
                     );
-                    self.count_reader_bytes(1);
+                    self.count_reader_bytes(/*read*/ 1);
                 }
                 (_, b"\r\n") => (),
                 (_, _) => {

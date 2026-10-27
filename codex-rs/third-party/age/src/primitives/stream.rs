@@ -234,7 +234,7 @@ impl<W: Write> StreamWriter<W> {
     /// encryption process. Failing to call `finish` will result in a truncated file that
     /// that will fail to decrypt.
     pub fn finish(mut self) -> io::Result<W> {
-        let encrypted = self.stream.encrypt_chunk(&self.chunk, true)?;
+        let encrypted = self.stream.encrypt_chunk(&self.chunk, /*last*/ true)?;
         self.inner.write_all(&encrypted)?;
         Ok(self.inner)
     }
@@ -256,7 +256,7 @@ impl<W: Write> Write for StreamWriter<W> {
             // Only encrypt the chunk if we have more data to write, as the last
             // chunk must be written in finish().
             if !buf.is_empty() {
-                let encrypted = self.stream.encrypt_chunk(&self.chunk, false)?;
+                let encrypted = self.stream.encrypt_chunk(&self.chunk, /*last*/ false)?;
                 self.inner.write_all(&encrypted)?;
                 self.chunk.clear();
             }
@@ -446,7 +446,7 @@ impl<R> StreamReader<R> {
                     ));
                 }
                 (Ok(chunk), _) => Some(chunk),
-                (Err(_), false) => Some(self.stream.decrypt_chunk(chunk, true)?),
+                (Err(_), false) => Some(self.stream.decrypt_chunk(chunk, /*last*/ true)?),
                 (Err(e), true) => return Err(e),
             };
         }
@@ -578,12 +578,14 @@ impl<R: Read + Seek> StreamReader<R> {
                 self.inner.seek(SeekFrom::Start(last_chunk_start))?;
                 self.inner.read_to_end(&mut last_chunk)?;
                 self.stream.nonce.set_counter(non_last_chunks);
-                self.stream.decrypt_chunk(&last_chunk, true).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Last chunk is invalid, stream might be truncated",
-                    )
-                })?;
+                self.stream
+                    .decrypt_chunk(&last_chunk, /*last*/ true)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Last chunk is invalid, stream might be truncated",
+                        )
+                    })?;
 
                 // Now that we have authenticated the ciphertext length, we can use it to
                 // calculate the plaintext length.
@@ -667,7 +669,9 @@ impl<R: Read + Seek> Seek for StreamReader<R> {
             // To handle this edge case, when `target_pos` is a multiple of the chunk
             // size (i.e. this conditional branch), we compute the length of the
             // plaintext. This is cached, so the overhead should be minimal.
-            else if target_pos == self.len()? && self.stream.nonce.set_last(true).is_err() {
+            else if target_pos == self.len()?
+                && self.stream.nonce.set_last(/*last*/ true).is_err()
+            {
                 panic!("seek reset must clear the age stream final-chunk flag");
             }
         }
@@ -699,12 +703,12 @@ mod tests {
 
         let encrypted = {
             let mut s = Stream::new(PayloadKey([7; 32].into()));
-            s.encrypt_chunk(&data, false).unwrap()
+            s.encrypt_chunk(&data, /*last*/ false).unwrap()
         };
 
         let decrypted = {
             let mut s = Stream::new(PayloadKey([7; 32].into()));
-            s.decrypt_chunk(&encrypted, false).unwrap()
+            s.decrypt_chunk(&encrypted, /*last*/ false).unwrap()
         };
 
         assert_eq!(decrypted.expose_secret(), &data);
@@ -716,15 +720,15 @@ mod tests {
 
         let encrypted = {
             let mut s = Stream::new(PayloadKey([7; 32].into()));
-            let res = s.encrypt_chunk(&data, true).unwrap();
+            let res = s.encrypt_chunk(&data, /*last*/ true).unwrap();
 
             // Further calls return an error
             assert_eq!(
-                s.encrypt_chunk(&data, false).unwrap_err().kind(),
+                s.encrypt_chunk(&data, /*last*/ false).unwrap_err().kind(),
                 io::ErrorKind::WriteZero
             );
             assert_eq!(
-                s.encrypt_chunk(&data, true).unwrap_err().kind(),
+                s.encrypt_chunk(&data, /*last*/ true).unwrap_err().kind(),
                 io::ErrorKind::WriteZero
             );
 
@@ -733,14 +737,14 @@ mod tests {
 
         let decrypted = {
             let mut s = Stream::new(PayloadKey([7; 32].into()));
-            let res = s.decrypt_chunk(&encrypted, true).unwrap();
+            let res = s.decrypt_chunk(&encrypted, /*last*/ true).unwrap();
 
             // Further calls return an error
-            match s.decrypt_chunk(&encrypted, false) {
+            match s.decrypt_chunk(&encrypted, /*last*/ false) {
                 Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
                 _ => panic!("Expected error"),
             }
-            match s.decrypt_chunk(&encrypted, true) {
+            match s.decrypt_chunk(&encrypted, /*last*/ true) {
                 Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
                 _ => panic!("Expected error"),
             }
