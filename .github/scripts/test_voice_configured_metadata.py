@@ -306,6 +306,88 @@ class ActualWrapperFramingTests(unittest.TestCase):
                 m.parse_provider(line + body, record["label"])
 
 
+class JVMWarningFramingTests(unittest.TestCase):
+    # Exact public line observed in the owned LOCALNATIVE capture and grounded
+    # in OpenJDK 25.0.2 arguments.cpp/debug.cpp. Never allow a warning prefix.
+    WARNING = (
+        "OpenJDK 64-Bit Server VM warning: Options -Xverify:none and -noverify "
+        "were deprecated in JDK 13 and will likely be removed in a future release."
+    )
+
+    def frame(self, payload, separator):
+        return separator.join(
+            (
+                "Windows fallback: native x86_64-pc-windows-msvc target and SDK; GNU cross compilation is not exercised.",
+                "BuildBuddy API key is not available; using local Bazel configuration.",
+                "BuildBuddy key unavailable; using local Bazel configuration.",
+                "Extracting Bazel installation...",
+                self.WARNING,
+                "INFO: fixture",
+                payload,
+            )
+        )
+
+    def test_observed_fixed_jvm_warning_frames_provider_record(self):
+        record = packages()[0][0]
+        for separator in ("\n", "\r\n"):
+            with self.subTest(separator=separator):
+                text = self.frame(m.SENTINEL + json.dumps(record), separator)
+                self.assertEqual(m.parse_provider(text, record["label"]), record)
+
+    def test_observed_fixed_jvm_warning_frames_action_json(self):
+        value = graph()
+        for separator in ("\n", "\r\n"):
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    m.parse_json(self.frame(json.dumps(value), separator)), value
+                )
+
+    def test_jvm_allowance_rejects_changed_warning_and_fatal_lines(self):
+        record = packages()[0][0]
+        for line in (
+            "prefix " + self.WARNING,
+            self.WARNING + " PRIVATE_SECRET",
+            " " + self.WARNING,
+            self.WARNING + " ",
+            self.WARNING.lower(),
+            self.WARNING[:-1],
+            self.WARNING.replace("JDK 13", "JDK 14"),
+            self.WARNING.replace("-noverify", "-PRIVATE_SECRET"),
+            self.WARNING.replace("were deprecated", "failed"),
+            self.WARNING.replace("warning:", "fatal error:"),
+            "FATAL: " + self.WARNING,
+            "OpenJDK 64-Bit Server VM warning: Could not create the Java Virtual Machine.",
+        ):
+            for before in (True, False):
+                with self.subTest(line=line, before=before):
+                    for payload, provider in (
+                        (json.dumps(graph()), False),
+                        (m.SENTINEL + json.dumps(record), True),
+                    ):
+                        text = (
+                            line + "\n" + payload if before else payload + "\n" + line
+                        )
+                        with self.assertRaises(m.RejectedWrapperLine):
+                            if provider:
+                                m.parse_provider(text, record["label"])
+                            else:
+                                m.parse_json(text)
+
+    def test_fixed_warning_preserves_duplicate_and_malformed_guards(self):
+        record = packages()[0][0]
+        for body in ("{}\n{}", '{"a":1,"a":2}', '{"actions": [', "{bad}"):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_json(self.WARNING + "\n" + body)
+        provider = m.SENTINEL + json.dumps(record)
+        for body in (
+            provider + "\n" + provider,
+            m.SENTINEL + '{"label":"x","label":"x"}',
+            m.SENTINEL + "{",
+        ):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_provider(self.WARNING + "\n" + body, record["label"])
+
+
 class RejectedLineShapeTests(unittest.TestCase):
     def test_every_shape_keeps_secret_bait_and_message_private(self):
         secret = "PRIVATE_URL_https://private.invalid/C:/private?token=SECRET"

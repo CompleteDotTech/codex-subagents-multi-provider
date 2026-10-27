@@ -131,10 +131,13 @@ def parse_json(text):
             if not line.strip():
                 continue
             # Complete fixed lines: Bazel 9.2.0 archive_utils.cc:248 USER output
-            # and run_bazel_with_buildbuddy.py main()'s keyless fallback message.
+            # run_bazel_with_buildbuddy.py's keyless fallback, and OpenJDK
+            # 25.0.2 arguments.cpp:2588/debug.cpp:138's verification warning.
             if line in (
                 "Extracting Bazel installation...",
                 "BuildBuddy key unavailable; using local Bazel configuration.",
+                "OpenJDK 64-Bit Server VM warning: Options -Xverify:none and -noverify "
+                "were deprecated in JDK 13 and will likely be removed in a future release.",
             ):
                 continue
             if not re.match(
