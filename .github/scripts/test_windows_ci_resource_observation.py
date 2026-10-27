@@ -236,7 +236,12 @@ class ObservationTests(unittest.TestCase):
         )
 
     def run_ownership_fixture(
-        self, offset=0, children=2, missing_identity=False, reuse_during_query=False
+        self,
+        offset=0,
+        children=2,
+        missing_identity=False,
+        reuse_during_query=False,
+        stale_nonroot=False,
     ):
         script = Path(__file__).with_name("observe_windows_ci_resources.ps1").resolve()
         fixture = r"""
@@ -251,6 +256,16 @@ function global:Get-CimInstance {
         'Win32_LogicalDisk' { [pscustomobject]@{ FreeSpace=1024; Size=8192 } }
         'Win32_Process' {
             if ($Filter -eq 'ProcessId=101') { $global:fixtureQueries++; $date=$global:fixtureCreated; if (REUSE -and $global:fixtureQueries -ge 3) { $date=$date.AddTicks(10) }; [pscustomobject]@{ ProcessId=101; CreationDate=$date }; return }
+            if (STALEMODE) {
+                if ($Filter -eq 'ParentProcessId=101') { [pscustomobject]@{ ProcessId=201; CreationDate=$global:fixtureCreated.AddMilliseconds(2); Name='cmake.exe'; WorkingSetSize=200; PrivatePageCount=200 }; return }
+                if ($Filter -eq 'ProcessId=201') { [pscustomobject]@{ CreationDate=$global:fixtureCreated.AddMilliseconds(2) }; return }
+                if ($Filter -eq 'ParentProcessId=201') {
+                    [pscustomobject]@{ ProcessId=301; CreationDate=$global:fixtureCreated.AddMilliseconds(1); Name='rustc.exe'; WorkingSetSize=100; PrivatePageCount=100 }
+                    [pscustomobject]@{ ProcessId=302; CreationDate=$global:fixtureCreated.AddMilliseconds(3); Name='link.exe'; WorkingSetSize=300; PrivatePageCount=300 }
+                    return
+                }
+                if ($Filter -eq 'ProcessId=302') { [pscustomobject]@{ CreationDate=$global:fixtureCreated.AddMilliseconds(3) }; return }
+            }
             if ($Filter -eq 'ParentProcessId=101') {
                 1..CHILDREN | ForEach-Object { [pscustomobject]@{ ProcessId=(200+$_); CreationDate=$global:fixtureCreated.AddMilliseconds(1); Name='rustc.exe'; WorkingSetSize=100; PrivatePageCount=$null } }; return
             }
@@ -280,6 +295,7 @@ $micro = [long](($global:fixtureCreated.Ticks - $epoch) / 10D) + OFFSET
             "OFFSET", str(offset)
         )
         fixture = fixture.replace("REUSE", "$true" if reuse_during_query else "$false")
+        fixture = fixture.replace("STALEMODE", "$true" if stale_nonroot else "$false")
         if missing_identity:
             fixture = fixture.replace(
                 "-CreationMicroseconds $micro", "-CreationMicroseconds 0"
@@ -346,6 +362,16 @@ $micro = [long](($global:fixtureCreated.Ticks - $epoch) / 10D) + OFFSET
                 observer.sample("after-prepare")
             self.assertIn("artifact_unavailable=1", output.getvalue())
             self.assertNotIn("SECRET", output.getvalue())
+
+    def test_powershell_nonroot_parent_rejects_older_stale_child(self):
+        data = self.run_ownership_fixture(stale_nonroot=True)
+        self.assertEqual(
+            [row["image"] for row in data["processes"]], ["cmake.exe", "link.exe"]
+        )
+        self.assertEqual(
+            [row["working_bytes"] for row in data["processes"]], [200, 300]
+        )
+        self.assertGreater(data["unavailable"], 0)
 
     def test_powershell_owned_descendants_capped(self):
         data = self.run_ownership_fixture(children=200)

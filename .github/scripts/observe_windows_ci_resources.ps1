@@ -75,8 +75,9 @@ if ($OwnedPid -gt 0) {
             if (-not $after -or $after.CreationDate -ne $creation[$parent]) { $result.unavailable++; continue }
             foreach ($p in $children) {
                 if ($seen.Count + $queue.Count -ge 128) { $result.truncated = $true; break }
-                # A reused PID older than this build cannot be an owned child.
-                if ($p.CreationDate -lt $root.CreationDate) { $result.unavailable++; continue }
+                # A stale child can retain a reused nonroot parent PID. It must
+                # have been created during this exact current parent lifetime.
+                if ($p.CreationDate -lt $current.CreationDate) { $result.unavailable++; continue }
                 $creation[[int]$p.ProcessId] = $p.CreationDate
                 $queue.Enqueue([int]$p.ProcessId)
                 if ($p.Name -match '^(rustc|link|cl|ninja|cmake|python|python3|bazel|bash)(\.exe)?$') {
