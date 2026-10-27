@@ -936,6 +936,101 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
     assert!(manager.list_thread_ids().await.is_empty());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_shutdown_preserves_a_normally_resumed_replacement() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        passthrough_image_store(),
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let source = manager
+        .start_thread(StartThreadOptions {
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..StartThreadOptions::new(config.clone())
+        })
+        .await
+        .expect("start original thread");
+    source.thread.ensure_rollout_materialized().await;
+    source
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush original rollout");
+    let rollout_path = source.thread.rollout_path().expect("original rollout path");
+    assert!(source.thread.is_running());
+
+    // This test uses Tokio's explicit current-thread runtime. One manual poll
+    // captures A and submits its shutdown, then yields waiting for the real
+    // session loop. Nothing can run A's loop until this test yields below.
+    let mut shutdown = Box::pin(tokio::task::unconstrained(
+        manager.shutdown_all_threads_bounded(Duration::from_secs(10)),
+    ));
+    assert!(futures::poll!(shutdown.as_mut()).is_pending());
+    assert!(source.thread.is_running());
+    source
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("wait for original shutdown");
+    assert!(!source.thread.is_running());
+
+    // Resume through the actual public loader/caller, never by inserting a fake
+    // map entry. The shutdown future remains unpolled until B is fully published.
+    let resumed = manager
+        .resume_legacy_thread_from_rollout(
+            config,
+            rollout_path,
+            auth_manager,
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await
+        .expect("resume original thread before delayed shutdown cleanup");
+    assert_eq!(resumed.thread_id, source.thread_id);
+    assert!(!Arc::ptr_eq(&source.thread, &resumed.thread));
+    assert!(resumed.thread.is_running());
+    let report = shutdown.await;
+    let registered = manager.get_thread(resumed.thread_id).await;
+    let replacement_was_running = resumed.thread.is_running();
+
+    // Clean the actual B runtime even when the regression assertion will fail.
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop replacement");
+    let _ = manager
+        .remove_thread_if_matches(&resumed.thread_id, &resumed.thread)
+        .await;
+    assert_eq!(report.completed, vec![source.thread_id]);
+    assert!(report.submit_failed.is_empty());
+    assert!(report.timed_out.is_empty());
+    assert!(replacement_was_running);
+    assert!(Arc::ptr_eq(
+        &registered.expect("replacement remains registered"),
+        &resumed.thread
+    ));
+}
+
 #[tokio::test]
 async fn code_mode_session_provider_is_shared_across_threads() {
     let temp_dir = tempdir().expect("tempdir");
