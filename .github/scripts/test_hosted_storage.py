@@ -472,9 +472,26 @@ class RestoreCredentialTests(unittest.TestCase):
                     content.count("uses: ./.github/actions/prepare-bazel-ci"),
                     str(path),
                 )
+                diagnostic = (
+                    re.search(
+                        r"^  voice-runtime-diagnostic:\n(.*?)(?=^  [\w-]+:|\Z)",
+                        content,
+                        re.M | re.S,
+                    )
+                    if path == github / "workflows/bazel.yml"
+                    else None
+                )
                 for call in calls:
                     params = call.group(2)
-                    if directory.name == "workflows":
+                    if (
+                        diagnostic
+                        and diagnostic.start() < call.start() < diagnostic.end()
+                    ):
+                        expected = "false"
+                        # This isolated route never receives a BuildBuddy secret.
+                        self.assertNotIn("secrets.", diagnostic.group(1))
+                        self.assertIn("unset BUILDBUDDY_API_KEY", diagnostic.group(1))
+                    elif directory.name == "workflows":
                         expected = "${{ secrets.BUILDBUDDY_API_KEY != '' }}"
                     elif path.parent.name == "run-argument-comment-lint":
                         expected = "${{ inputs.buildbuddy-api-key != '' }}"
