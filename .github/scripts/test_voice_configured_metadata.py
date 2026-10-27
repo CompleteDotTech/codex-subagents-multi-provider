@@ -804,7 +804,7 @@ class RejectedLineShapeTests(unittest.TestCase):
             if reject_here:
                 rejected.append(True)
                 payload = "INFO: ACCEPTED_SECRET\n" + secret_line + "\n" + payload
-            output.write_text(payload)
+            output.write_text(payload, encoding="utf-8")
             return {"oversize": False, "timeout": False, "exit_code": 0}
 
         def git(*args):
