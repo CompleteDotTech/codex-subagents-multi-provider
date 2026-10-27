@@ -555,6 +555,13 @@ LINE_LITERALS = {
     "failed": b"failed",
 }
 
+# Every positive output predicate requires at least one literal other than
+# "failed" (which only qualifies native_memory_allocation). A shorter line
+# therefore cannot affect any output. Derive the threshold from that vocabulary.
+MIN_LINE_EVIDENCE_LENGTH = min(
+    len(needle) for name, needle in LINE_LITERALS.items() if name != "failed"
+)
+
 
 def classify_lines(lowered):
     """One bounded line pass, fixed searches per nonempty line, fixed output.
@@ -590,12 +597,14 @@ def classify_lines(lowered):
         },
     }
     # BytesIO iteration visits each LF-delimited line once, including a final
-    # unterminated line. Empty-line floods do no literal searches. CR is not a
+    # unterminated line. Short-line floods do no literal searches. CR is not a
     # cross-line gap: split CR-only input too, without building a list of lines.
     for lf_line in io.BytesIO(lowered):
-        if lf_line in (b"\n", b"\r\n"):
+        if len(lf_line) < MIN_LINE_EVIDENCE_LENGTH:
             continue
         for match in re.finditer(rb"[^\r\n]+", lf_line):
+            if match.end() - match.start() < MIN_LINE_EVIDENCE_LENGTH:
+                continue
             line = match[0]
             present = {name: needle in line for name, needle in LINE_LITERALS.items()}
             fatal = line.startswith(b"fatal:")

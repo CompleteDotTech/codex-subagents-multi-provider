@@ -477,6 +477,27 @@ class FailureClassificationTests(unittest.TestCase):
         self.assertEqual(len(raw), 32 * 1024 * 1024)
         self.assertEqual(m.classify_lines(raw.lower()), unknown)
 
+    def test_full_limit_nonempty_tiny_line_floods_and_minimum_boundary(self):
+        self.assertEqual(m.MIN_LINE_EVIDENCE_LENGTH, len(b"out of memory"))
+        self.assertEqual(m.MIN_LINE_EVIDENCE_LENGTH, 13)
+        unknown = m.classify_lines(b"")
+        for separator in (b"\n", b"\r\n", b"\r"):
+            with self.subTest(separator=separator):
+                prefix = b"a" + separator
+                raw = (prefix * (m.LIMIT // len(prefix) + 1))[: m.LIMIT]
+                self.assertEqual(len(raw), 32 * 1024 * 1024)
+                self.assertEqual(m.classify_lines(raw), unknown)
+                # Exactly the minimum length, including an unterminated final
+                # line, must still produce the shortest positive observation.
+                for raw in (
+                    b"out of memory",
+                    b"out of memory" + separator,
+                    b"a" + separator + b"out of memory",
+                ):
+                    evidence = m.classify_lines(raw)
+                    self.assertTrue(evidence["out_of_memory_line"])
+                    self.assertFalse(evidence["fatal_out_of_memory_line"])
+
     def test_arbitrary_bytes_and_secret_text_cannot_escape(self):
         import random
 
