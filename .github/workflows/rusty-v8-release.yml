@@ -164,6 +164,7 @@ jobs:
       - name: Prepare Bazel CI
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-v8
 

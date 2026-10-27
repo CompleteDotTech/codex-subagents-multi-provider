@@ -272,6 +272,7 @@ jobs:
         if: matrix.build-system == 'bazel' || (matrix.bundle == 'primary' && contains(matrix.target, 'linux'))
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-release-${{ matrix.bundle }}
 
@@ -597,6 +598,7 @@ jobs:
       - name: Prepare Bazel CI
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-release-primary
       - name: Build matching helper and native runtime

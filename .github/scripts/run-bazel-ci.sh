@@ -7,6 +7,11 @@ print_failed_bazel_action_summary=0
 remote_download_toplevel=0
 windows_msvc_host_platform=0
 windows_cross_compile=0
+hosted_storage=0
+if [[ "${GITHUB_ACTIONS:-}" == true && "${GITHUB_REPOSITORY:-}" == CompleteDotTech/codex-subagents-multi-provider && "${RUNNER_ENVIRONMENT:-}" == github-hosted && ( "${RUNNER_OS:-}" == Linux || "${RUNNER_OS:-}" == macOS ) && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+  hosted_storage=1
+fi
+storage_script="$(dirname "${BASH_SOURCE[0]}")/hosted_storage.py"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -88,32 +93,40 @@ print_bazel_test_log_tails() {
   local testlogs_dir
 
   local -a bazel_info_args=(info)
-  if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
-    # `bazel info` needs the same CI config as the failed test invocation so
-    # platform-specific output roots match. On Windows, omitting `ci-windows`
-    # would point at `local_windows-fastbuild` even when the test ran with the
-    # MSVC host platform under `local_windows_msvc-fastbuild`.
-    bazel_info_args+=("--config=${ci_config}")
-  fi
-  if [[ $windows_native_fallback -eq 1 ]]; then
-    if [[ -n "$requested_target_platform" ]]; then
-      bazel_info_args+=("--platforms=${requested_target_platform}")
+  if [[ $hosted_storage -eq 1 ]]; then
+    # Project the same final invocation, preserving split/repeated caller flags.
+    # Do not pass test/execution-log flags or positional payload to `info`.
+    while IFS= read -r -d '' arg; do
+      bazel_info_args+=("$arg")
+    done < <(python3 "$storage_script" info "${bazel_run_args[@]}")
+  else
+    if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+      # `bazel info` needs the same CI config as the failed test invocation so
+      # platform-specific output roots match. On Windows, omitting `ci-windows`
+      # would point at `local_windows-fastbuild` even when the test ran with the
+      # MSVC host platform under `local_windows_msvc-fastbuild`.
+      bazel_info_args+=("--config=${ci_config}")
     fi
-    if [[ -n "$requested_host_platform" ]]; then
-      bazel_info_args+=("--host_platform=${requested_host_platform}")
+    if [[ $windows_native_fallback -eq 1 ]]; then
+      if [[ -n "$requested_target_platform" ]]; then
+        bazel_info_args+=("--platforms=${requested_target_platform}")
+      fi
+      if [[ -n "$requested_host_platform" ]]; then
+        bazel_info_args+=("--host_platform=${requested_host_platform}")
+      fi
     fi
-  fi
 
-  # Only pass flags that affect Bazel's output-root selection or repository
-  # lookup. Test/build-only flags such as execution logs or remote download
-  # mode can make `bazel info` fail, which would hide the real test log path.
-  for arg in "${post_config_bazel_args[@]}"; do
-    case "$arg" in
-      --host_platform=* | --platforms=* | --repo_contents_cache=* | --repository_cache=*)
-        bazel_info_args+=("$arg")
-        ;;
-    esac
-  done
+    # Only pass flags that affect Bazel's output-root selection or repository
+    # lookup. Test/build-only flags such as execution logs or remote download
+    # mode can make `bazel info` fail, which would hide the real test log path.
+    for arg in "${post_config_bazel_args[@]}"; do
+      case "$arg" in
+        --host_platform=* | --platforms=* | --repo_contents_cache=* | --repository_cache=*)
+          bazel_info_args+=("$arg")
+          ;;
+      esac
+    done
+  fi
 
   testlogs_dir="$(run_bazel_with_startup_args \
     --noexperimental_remote_repo_contents_cache \
@@ -550,6 +563,20 @@ fi
 if (( ${#post_config_bazel_args[@]} > 0 )); then
   bazel_run_args+=("${post_config_bazel_args[@]}")
 fi
+if [[ $hosted_storage -eq 1 ]]; then
+  # Use the backend's keyless config classification before deciding defaults;
+  # BUILD and INFO must see the same effective local arguments.
+  effective_bazel_args=()
+  while IFS= read -r -d '' arg; do
+    effective_bazel_args+=("$arg")
+  done < <(python3 "$storage_script" effective "${bazel_run_args[@]}")
+  if (( ${#effective_bazel_args[@]} == 0 )); then
+    echo "Could not normalize hosted Bazel arguments" >&2
+    exit 1
+  fi
+  bazel_run_args=("${effective_bazel_args[@]}")
+  python3 "$storage_script" observe before-build none "${bazel_run_args[@]}" || echo "Hosted storage observation unavailable" >&2
+fi
 set +e
 # Work around Bazel 9 remote repo contents cache / overlay materialization
 # failures seen in CI (for example "is not a symlink" or permission errors
@@ -563,6 +590,12 @@ run_bazel_with_startup_args \
   2>&1 | tee "$bazel_console_log"
 bazel_status=${PIPESTATUS[0]}
 set -e
+
+# Capture filesystem state before any follow-up Bazel information request.
+if [[ $hosted_storage -eq 1 ]]; then
+  python3 "$storage_script" observe after-build "$bazel_status" "${bazel_run_args[@]}" || echo "Hosted storage observation unavailable" >&2
+  python3 "$storage_script" resolve after-build-paths "$bazel_status" "${bazel_run_args[@]}" || echo "Hosted Bazel paths unavailable" >&2
+fi
 
 if [[ ${bazel_status:-0} -ne 0 ]]; then
   # Observe the failed build outputs before any diagnostic Bazel info call.
