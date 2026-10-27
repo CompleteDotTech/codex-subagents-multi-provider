@@ -9,6 +9,7 @@ load(":windows_native.bzl", "windows_build_tools", "windows_native_prefix")
 # All native build consumers must receive the same pinned source manifest.
 exports_files([
     "opus-toolchain.cmake",
+    "windows_runtime_diagnostic.bat.tpl",
     "windows_runtime_diagnostic.py",
 ])
 

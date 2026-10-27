@@ -244,6 +244,7 @@ def main():
     output = {
         "checkout_head": env.get("VOICE_DIAGNOSTIC_HEAD"),
         "checkout_tree": env.get("VOICE_DIAGNOSTIC_TREE"),
+        "runfiles_normalization_reason": env.get("VOICE_DIAGNOSTIC_RUNFILES_REASON"),
         "schema": 1,
         "github": {
             key: env.get(key)
