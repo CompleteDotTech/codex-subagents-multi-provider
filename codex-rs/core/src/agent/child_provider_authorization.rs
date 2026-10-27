@@ -683,7 +683,11 @@ impl ChildResumePermit {
                 &bounded,
                 &config.cwd,
             )
-            .map_err(|_| invalid("retained runtime permissions cannot be bounded safely"))?;
+            .map_err(|error| {
+                invalid(&format!(
+                    "retained runtime permissions cannot be bounded safely: {error}"
+                ))
+            })?;
         }
         config
             .permissions
