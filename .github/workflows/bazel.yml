@@ -640,19 +640,30 @@ jobs:
           unset BUILDBUDDY_API_KEY
           ./.github/scripts/run-bazel-ci.sh \
             --print-failed-test-logs --print-failed-action-summary \
-            --windows-cross-compile -- test --nocache_test_results --test_output=all --zip_undeclared_test_outputs=false \
+            --windows-cross-compile -- test --keep_going --nocache_test_results --test_output=all --zip_undeclared_test_outputs=false \
             --test_env=VOICE_DIAGNOSTIC_HEAD --test_env=VOICE_DIAGNOSTIC_TREE \
             --test_env=GITHUB_SHA --test_env=GITHUB_EVENT_NAME --test_env=GITHUB_REF --test_env=GITHUB_RUN_ID \
             --build_metadata=COMMIT_SHA=${GITHUB_SHA} -- \
-            //codex-rs/voice-host:voice-host-windows-runtime-diagnostic-test
+            //codex-rs/voice-host:voice-host-windows-runtime-diagnostic-test \
+            //codex-rs/voice-host:codex-voice-host-bin-unit-tests \
+            //codex-rs/voice-host:voice-host-installed_client-test
       - name: Collect diagnostic text outputs
         if: always() && !cancelled()
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/voice-runtime-diagnostic"
-          # Copy only the named text result/log, never executables or runfiles.
-          for file in bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.outputs/voice-runtime-diagnostic.json bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.log; do
-            if [[ -f "$file" ]]; then cp "$file" "${RUNNER_TEMP}/voice-runtime-diagnostic/"; fi
+          # Retain only named text evidence, never executables or runfiles.
+          result=bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.outputs/voice-runtime-diagnostic.json
+          if [[ -f "$result" ]]; then cp "$result" "${RUNNER_TEMP}/voice-runtime-diagnostic/"; fi
+          for target in voice-host-windows-runtime-diagnostic-test codex-voice-host-bin-unit-tests voice-host-installed_client-test; do
+            file="bazel-testlogs/codex-rs/voice-host/${target}/test.log"
+            if [[ -f "$file" ]]; then
+              head -c 8388608 "$file" > "${RUNNER_TEMP}/voice-runtime-diagnostic/${target}.test.log"
+              if [[ $(wc -c < "$file") -gt 8388608 ]]; then
+                echo "${target}: retained first 8388608 bytes; original test.log was larger"
+                printf '%s\n' 'Retained first 8388608 bytes of test.log.' > "${RUNNER_TEMP}/voice-runtime-diagnostic/${target}.truncated.txt"
+              fi
+            fi
           done
       - name: Upload diagnostic text evidence
         if: always() && !cancelled()
