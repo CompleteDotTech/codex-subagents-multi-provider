@@ -632,7 +632,7 @@ mod tests {
         let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.6-sol");
         model.used_fallback_model_metadata = false;
         let selections = [TurnEnvironmentSelection::new(
-            codex_protocol::environment::TurnEnvironmentRequest {
+            codex_protocol::protocol::TurnEnvironmentRequest {
                 environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
                 cwd: config.cwd.clone().into(),
                 workspace_roots: config
@@ -749,7 +749,7 @@ mod tests {
         let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.6-sol");
         model.used_fallback_model_metadata = false;
         let selections = [TurnEnvironmentSelection::new(
-            codex_protocol::environment::TurnEnvironmentRequest {
+            codex_protocol::protocol::TurnEnvironmentRequest {
                 environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
                 cwd: config.cwd.clone().into(),
                 workspace_roots: config

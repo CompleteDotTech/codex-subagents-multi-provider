@@ -6762,7 +6762,7 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(
 #[test_case::test_case(true; "attachment MCP restriction")]
 #[tokio::test]
 async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(mcp: bool) {
-    use codex_protocol::environment::EnvironmentConfigState;
+    use codex_protocol::protocol::EnvironmentConfigState;
     use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
     use codex_protocol::mcp_policy::McpServerIdentity;
     use codex_protocol::mcp_policy::McpServerRequirement;
