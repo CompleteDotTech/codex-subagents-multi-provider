@@ -2186,31 +2186,52 @@ class SplitOwnedCaptureTests(unittest.TestCase):
                     self.assertIn("TerminateProcess", api.events)
                     self.assertNotIn("TerminateJobObject", api.events)
 
-    def test_partial_second_pipe_and_reader_io_errors_never_resume(self):
-        for failure in ("second-pipe", "reader"):
+    def test_partial_second_pipe_failure_never_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            api, calls, original_pipe = SplitFakeAPI(), [0], os.pipe
+
+            def pipe():
+                calls[0] += 1
+                if calls[0] == 2:
+                    raise OSError("fixture pipe failure")
+                return original_pipe()
+
+            with mock.patch.object(owned.os, "pipe", side_effect=pipe):
+                result, _, _ = self.capture(directory, api)
+            self.assertTrue(result["operation_failed"])
+            self.assertNotIn("ResumeThread", api.events)
+
+    def test_reader_io_errors_after_resume_fail_closed_and_clean_owned_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            api, resumed, observed_resume = SplitFakeAPI(), threading.Event(), []
+            original_resume = api.ResumeThread
+
+            def resume(*args):
+                result = original_resume(*args)
+                resumed.set()
+                return result
+
+            def read(fd, size):
+                # Readiness precedes the first read. Force the legal schedule
+                # where both readers fail only after the root was resumed.
+                observed_resume.append(resumed.wait(2))
+                raise OSError("fixture reader failure")
+
             with (
-                self.subTest(failure=failure),
-                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(api, "ResumeThread", side_effect=resume),
+                mock.patch.object(owned.os, "read", side_effect=read),
             ):
-                api, calls, original_pipe = SplitFakeAPI(), [0], os.pipe
-
-                def pipe():
-                    calls[0] += 1
-                    if calls[0] == 2:
-                        raise OSError("fixture pipe failure")
-                    return original_pipe()
-
-                patch = (
-                    mock.patch.object(owned.os, "pipe", side_effect=pipe)
-                    if failure == "second-pipe"
-                    else mock.patch.object(
-                        owned.os, "read", side_effect=OSError("fixture reader failure")
-                    )
-                )
-                with patch:
-                    result, _, _ = self.capture(directory, api)
-                self.assertTrue(result["operation_failed"])
-                self.assertNotIn("ResumeThread", api.events)
+                result, stdout, stderr = self.capture(directory, api)
+            self.assertEqual(observed_resume, [True, True])
+            self.assertIn("ResumeThread", api.events)
+            self.assertTrue(result["assigned_before_resume"])
+            self.assertTrue(result["operation_failed"])
+            self.assertTrue(result["reader_closed"])
+            self.assertEqual(result["active_job_processes_after_cleanup"], 0)
+            self.assertIn("TerminateJobObject", api.events)
+            self.assertEqual((stdout, stderr), (b"", b""))
+            self.assertEqual(result["retained_bytes"], 0)
+            self.assertNotIn("retained_sha256", result)
 
     def test_second_file_collision_leaves_first_file_closed_and_never_launches(self):
         with tempfile.TemporaryDirectory() as directory:
