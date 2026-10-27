@@ -1537,7 +1537,8 @@ impl ThreadManager {
 
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
-    /// remain tracked so callers can retry or inspect them later.
+    /// remain tracked so callers can retry or inspect them later. Replacements registered
+    /// under a completed target's ID remain running and tracked.
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
         let threads = {
             let threads = self.state.threads.read().await;
@@ -1556,58 +1557,57 @@ impl ThreadManager {
                     Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
                     Err(_) => ShutdownOutcome::TimedOut,
                 };
-                (thread_id, outcome)
+                (thread_id, thread, outcome)
             })
             .collect::<FuturesUnordered<_>>();
         let mut report = ThreadShutdownReport::default();
+        let mut completed_threads = Vec::new();
 
-        while let Some((thread_id, outcome)) = shutdowns.next().await {
+        while let Some((thread_id, thread, outcome)) = shutdowns.next().await {
             match outcome {
-                ShutdownOutcome::Complete => report.completed.push(thread_id),
+                ShutdownOutcome::Complete => {
+                    report.completed.push(thread_id);
+                    completed_threads.push((thread_id, thread));
+                }
                 ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
                 ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
             }
         }
 
         let mut completed_authority = Vec::new();
-        for thread_id in &report.completed {
-            let thread = { self.state.threads.read().await.get(thread_id).cloned() };
-            if let Some(thread) = thread {
-                let authority =
-                    crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
-                        &thread.session,
-                        &thread.session_source,
-                    )
-                    .await;
-                if let Err(error) =
-                    crate::agent::child_provider_authorization::durable::seal_stopped(
-                        &self.state,
-                        &thread,
-                        &authority,
-                    )
-                    .await
-                {
-                    warn!(%error, "shutdown native authority remains unavailable for cold reload");
-                }
-                completed_authority.push((thread, authority));
+        for (thread_id, thread) in completed_threads {
+            let authority =
+                crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                    &thread.session,
+                    &thread.session_source,
+                )
+                .await;
+            if let Err(error) = crate::agent::child_provider_authorization::durable::seal_stopped(
+                &self.state,
+                &thread,
+                &authority,
+            )
+            .await
+            {
+                warn!(%error, "shutdown native authority remains unavailable for cold reload");
             }
+            completed_authority.push((thread_id, thread, authority));
         }
         let mut tracked_threads = self.state.threads.write().await;
-        for (thread, authority) in completed_authority {
-            if tracked_threads
-                .get(&authority.thread_id)
+        for (thread_id, thread, authority) in completed_authority {
+            if !tracked_threads
+                .get(&thread_id)
                 .is_some_and(|current| Arc::ptr_eq(current, &thread))
             {
-                thread
-                    .session
-                    .services
-                    .local_agent_runtime
-                    .retain_authority(authority);
+                continue;
             }
-        }
-        for thread_id in &report.completed {
-            if let Some(thread) = tracked_threads.remove(thread_id) {
-                thread.session.services.mcp_runtime.revoke_ema();
+            thread
+                .session
+                .services
+                .local_agent_runtime
+                .retain_authority(authority);
+            if let Some(removed) = tracked_threads.remove(&thread_id) {
+                removed.session.services.mcp_runtime.revoke_ema();
             }
         }
 
