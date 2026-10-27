@@ -84,8 +84,11 @@ to make integration tests compile, and never claim omitted or pending
 feature-qualified tests as passed. Only default unit tests, SSH vectors and
 armor/async testkit are mapped here. Async unit tests, SSH unit tests and
 benchmarks remain unqualified; this does not claim all upstream features.
-The three test binaries request normal dependencies plus explicit same-hub,
-source-required dev dependencies. Benchmark-only criterion, pprof and inferno
+The three test binaries request normal dependencies plus only additional
+same-hub, source-required dev dependencies. i18n-embed is inherited once from
+each normal closure; its original test-only desktop/fluent features remain in
+the standalone manifest. Explicit extras must not duplicate normal labels.
+Benchmark-only criterion, pprof and inferno
 must be absent from their actual configured/action closures before qualification.
 All upstream benchmark files and original dev dependency requirements remain.
 

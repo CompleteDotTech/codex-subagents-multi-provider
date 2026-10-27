@@ -205,8 +205,8 @@ class AgeIntegrityTests(unittest.TestCase):
 
         source = (self.root / "age/BUILD.bazel").read_text()
         expected = {
-            "age-unit-tests-bin": ("unit", ["proptest-1.11.0", "i18n-embed-0.16.0"]),
-            "age-test-vectors-ssh-bin": ("ssh", ["i18n-embed-0.16.0"]),
+            "age-unit-tests-bin": ("unit", ["proptest-1.11.0"]),
+            "age-test-vectors-ssh-bin": ("ssh", []),
             "age-testkit-armor-async-bin": (
                 "async",
                 [
@@ -214,12 +214,24 @@ class AgeIntegrityTests(unittest.TestCase):
                     "hex-0.4.3",
                     "test-case-3.3.1",
                     "tokio-1.52.3",
-                    "i18n-embed-0.16.0",
                 ],
             ),
         }
         locked = tomllib.loads((self.root / "age/Cargo.lock").read_text())["package"]
-        identities = {f"{row['name']}-{row['version']}" for row in locked}
+        identity_to_name = {
+            f"{row['name']}-{row['version']}": row["name"] for row in locked
+        }
+        manifest = tomllib.loads((self.root / "age/Cargo.toml").read_text())
+        normal_names = {
+            spec.get("package", name) if isinstance(spec, dict) else name
+            for name, spec in manifest["dependencies"].items()
+        }
+        # i18n stays source-required, supplied ONCE by every normal hub closure.
+        self.assertIn("i18n-embed", normal_names)
+        self.assertTrue(
+            {"fluent-system", "desktop-requester"}
+            <= set(manifest["dev-dependencies"]["i18n-embed"]["features"])
+        )
         rules = re.findall(r"rust_test\(([\s\S]*?)\n\)", source)
         for target, (hub, labels) in expected.items():
             rule = next(block for block in rules if f'name = "{target}"' in block)
@@ -228,7 +240,15 @@ class AgeIntegrityTests(unittest.TestCase):
             self.assertEqual(
                 set(actual), {(f"age_{hub}_test_crates", label) for label in labels}
             )
-            self.assertTrue(set(labels) <= identities)
+            self.assertEqual(len(actual), len(set(actual)))
+            self.assertTrue(set(labels) <= identity_to_name.keys())
+            # Concatenating a normal label duplicates it before Rust's provider
+            # filtering; the public wrapper forwards that list into both attrs.
+            self.assertTrue(
+                {identity_to_name[label] for _, label in actual}.isdisjoint(
+                    normal_names
+                )
+            )
             self.assertNotIn("normal_dev", rule)
             for name in ("criterion", "pprof", "inferno", "futures-test"):
                 self.assertNotIn(f"//:{name}-", rule)

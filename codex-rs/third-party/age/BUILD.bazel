@@ -112,7 +112,6 @@ rust_test(
     tags = ["manual"],
     version = "0.12.1",
     deps = unit_deps(normal = True) + [
-        "@age_unit_test_crates//:i18n-embed-0.16.0",
         "@age_unit_test_crates//:proptest-1.11.0",
     ],
 )
@@ -178,9 +177,7 @@ rust_test(
     rustc_flags = WINDOWS_RUSTC_LINK_FLAGS,
     tags = ["manual"],
     version = "0.12.1",
-    deps = ssh_deps(normal = True) + [
-        "@age_ssh_test_crates//:i18n-embed-0.16.0",
-    ] + [":age-ssh-test-lib"],
+    deps = ssh_deps(normal = True) + [":age-ssh-test-lib"],
 )
 
 workspace_root_test(
@@ -219,7 +216,6 @@ rust_test(
     deps = async_deps(normal = True) + [
         "@age_async_test_crates//:flate2-1.1.9",
         "@age_async_test_crates//:hex-0.4.3",
-        "@age_async_test_crates//:i18n-embed-0.16.0",
         "@age_async_test_crates//:test-case-3.3.1",
         "@age_async_test_crates//:tokio-1.52.3",
     ] + [":age-armor-async-test-lib"],
