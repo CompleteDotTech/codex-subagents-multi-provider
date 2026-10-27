@@ -48,7 +48,7 @@ fn stateless_function_profile_is_generic_and_restricts_hosted_features() {
                 }),
                 ..Default::default()
             },
-            None,
+            /*auth_manager*/ None,
         );
         let capabilities = provider.capabilities();
         assert_eq!(
@@ -63,15 +63,16 @@ fn stateless_function_profile_is_generic_and_restricts_hosted_features() {
             RemoteCompactionSupport::Unsupported
         );
     }
-    let builtins = codex_model_provider_info::built_in_model_providers(None);
+    let builtins =
+        codex_model_provider_info::built_in_model_providers(/*openai_base_url*/ None);
     assert_eq!(
-        create_model_provider(builtins["ollama"].clone(), None)
+        create_model_provider(builtins["ollama"].clone(), /*auth_manager*/ None)
             .capabilities()
             .responses,
         ResponsesCompatibility::StatelessFunctions
     );
     assert_eq!(
-        create_model_provider(builtins["openai"].clone(), None)
+        create_model_provider(builtins["openai"].clone(), /*auth_manager*/ None)
             .capabilities()
             .responses,
         ResponsesCompatibility::Full

@@ -20,7 +20,12 @@ async fn events(body: String, content_type: &'static str) -> Vec<Result<Response
             body,
         ))])),
     };
-    let mut response = spawn_response_stream(response, Duration::from_secs(1), None, None);
+    let mut response = spawn_response_stream(
+        response,
+        Duration::from_secs(1),
+        /*telemetry*/ None,
+        /*turn_state*/ None,
+    );
     let mut events = Vec::new();
     while let Some(event) = response.next().await {
         events.push(event);

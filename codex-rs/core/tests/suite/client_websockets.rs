@@ -1326,8 +1326,8 @@ async fn responses_websocket_provider_catalog_tiers_apply_to_handshake_and_warmu
     let harness = websocket_harness_with_provider_id_options_and_auth(
         provider,
         provider_id,
-        false,
-        false,
+        /*runtime_metrics_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         &[],
         Some(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
     )
@@ -1342,7 +1342,7 @@ async fn responses_websocket_provider_catalog_tiers_apply_to_handshake_and_warmu
         });
     }
     let mut session = harness.client.new_session();
-    let metadata = prewarm_metadata(&harness, None);
+    let metadata = prewarm_metadata(&harness, /*turn_id*/ None);
     session
         .preconnect_websocket(
             &model_info,
