@@ -82,6 +82,30 @@ class EvidenceError(Exception):
     """Intentionally contains only static diagnostics, never raw query content."""
 
 
+class RejectedWrapperLine(EvidenceError):
+    """One fixed shape observation; never retains the rejected private line."""
+
+    def __init__(self, line):
+        super().__init__("Unexpected wrapper output outside JSON")
+        # Inspect only 64 code points, independent of the private line length.
+        # UiStateTracker.java:90,1179 (Bazel 9.2.0) emits the fixed fetch detail
+        # prefix. Spoofed text can match; this neither authenticates a source nor
+        # authorizes the line. Absence excludes only these exact prefix shapes.
+        prefix = line[:64]
+        four_spaces = prefix.startswith("    ")
+        self.shape = {
+            "schema": "rejected-wrapper-line-shape-v1",
+            "starts_with_four_ascii_spaces": four_spaces,
+            "other_ascii_leading_whitespace": bool(prefix)
+            and prefix[0] in " \t\r\n\v\f"
+            and not four_spaces,
+            "esc_control_in_prefix": "\x1b" in prefix,
+            "fixed_bazel_continuation": "fetch-detail"
+            if prefix.startswith("    Fetching ")
+            else "none",
+        }
+
+
 def require(ok, message):
     if not ok:
         raise EvidenceError(message)
@@ -109,16 +133,12 @@ def parse_json(text):
             # Bazel 9.2.0 archive_utils.cc:248 emits this complete USER line.
             if line == "Extracting Bazel installation...":
                 continue
-            require(
-                bool(
-                    re.match(
-                        r"^(?:INFO:|DEBUG:|WARNING:|Loading:|Analyzing:|Computing main repo mapping:|"
-                        r"BuildBuddy API key is not available;|Windows fallback:)",
-                        line,
-                    )
-                ),
-                "Unexpected wrapper output outside JSON",
-            )
+            if not re.match(
+                r"^(?:INFO:|DEBUG:|WARNING:|Loading:|Analyzing:|Computing main repo mapping:|"
+                r"BuildBuddy API key is not available;|Windows fallback:)",
+                line,
+            ):
+                raise RejectedWrapperLine(line)
 
     # JSON begins at a line boundary. A log containing a brace cannot consume it.
     starts = list(re.finditer(r"(?m)^\s*\{", text))
@@ -1137,6 +1157,8 @@ def main():
         manifest["status"] = "configured-graph-and-package-structure-validated"
     except EvidenceError as error:
         manifest["failure"] = str(error)
+        if isinstance(error, RejectedWrapperLine):
+            manifest["rejected_wrapper_line_shape"] = error.shape.copy()
         raise
     finally:
         unchanged = (

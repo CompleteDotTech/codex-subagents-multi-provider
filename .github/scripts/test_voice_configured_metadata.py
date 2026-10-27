@@ -217,6 +217,200 @@ class ParsingTests(unittest.TestCase):
                 m.parse_provider(line + body, record["label"])
 
 
+class RejectedLineShapeTests(unittest.TestCase):
+    def test_every_shape_keeps_secret_bait_and_message_private(self):
+        secret = "PRIVATE_URL_https://private.invalid/C:/private?token=SECRET"
+        for prefix, four, whitespace, esc, continuation in (
+            ("    ", True, False, False, "none"),
+            ("\t", False, True, False, "none"),
+            (" ", False, True, False, "none"),
+            ("\x1b[32m", False, False, True, "none"),
+            ("    Fetching ", True, False, False, "fetch-detail"),
+            ("unknown ", False, False, False, "none"),
+        ):
+            with self.subTest(prefix=prefix):
+                error = m.RejectedWrapperLine(prefix + secret)
+                self.assertEqual(
+                    error.args, ("Unexpected wrapper output outside JSON",)
+                )
+                self.assertEqual(
+                    error.shape,
+                    {
+                        "schema": "rejected-wrapper-line-shape-v1",
+                        "starts_with_four_ascii_spaces": four,
+                        "other_ascii_leading_whitespace": whitespace,
+                        "esc_control_in_prefix": esc,
+                        "fixed_bazel_continuation": continuation,
+                    },
+                )
+                self.assertEqual(set(vars(error)), {"shape"})
+                self.assertNotIn("PRIVATE", json.dumps(vars(error)))
+                self.assertNotIn("SECRET", str(error))
+
+    def test_only_fixed_64_code_point_prefix_is_inspected(self):
+        class PrefixOnly(str):
+            def __getitem__(self, key):
+                self.test.assertEqual(key, slice(None, 64))
+                return "x" * 64
+
+        private = PrefixOnly("    Fetching SECRET")
+        private.test = self
+        error = m.RejectedWrapperLine(private)
+        self.assertEqual(error.shape["fixed_bazel_continuation"], "none")
+        self.assertFalse(error.shape["starts_with_four_ascii_spaces"])
+        self.assertFalse(
+            m.RejectedWrapperLine("x" * 64 + "\x1bSECRET").shape[
+                "esc_control_in_prefix"
+            ]
+        )
+
+    def test_spoof_and_absence_do_not_authenticate_or_accept_lines(self):
+        for line in (
+            "    Fetching SPOOFED_SECRET",
+            "    SECRET",
+            "\tSECRET",
+            "\x1bSECRET",
+            "otherSECRET",
+        ):
+            with self.subTest(line=line), self.assertRaises(m.RejectedWrapperLine):
+                m.parse_json(line + "\n{}")
+        self.assertEqual(m.parse_json("INFO: accepted SECRET\n{}"), {})
+        with self.assertRaises(m.EvidenceError) as raised:
+            m.parse_json("not JSON")
+        self.assertFalse(hasattr(raised.exception, "shape"))
+
+    def test_first_rejected_surrounding_line_in_provider_and_action_framing(self):
+        record = packages()[0][0]
+        first, later = "\tFIRST_SECRET", "    Fetching LATER_SECRET"
+        for before in (True, False):
+            for provider in (True, False):
+                payload = m.SENTINEL + json.dumps(record) if provider else "{}"
+                rejected = first + "\n" + later
+                text = "INFO: ACCEPTED_SECRET\n" + (
+                    rejected + "\n" + payload if before else payload + "\n" + rejected
+                )
+                with (
+                    self.subTest(before=before, provider=provider),
+                    self.assertRaises(m.RejectedWrapperLine) as raised,
+                ):
+                    if provider:
+                        m.parse_provider(text, record["label"])
+                    else:
+                        m.parse_json(text)
+                self.assertEqual(
+                    raised.exception.shape, m.RejectedWrapperLine(first).shape
+                )
+
+    def test_full_bounded_capture_produces_one_small_fixed_record(self):
+        import time
+
+        start = time.monotonic()
+        text = "x" * (m.LIMIT - len("SECRET\n{}")) + "SECRET\n{}"
+        self.assertEqual(len(text), m.LIMIT)
+        with self.assertRaises(m.RejectedWrapperLine) as raised:
+            m.parse_json(text)
+        self.assertLess(len(json.dumps(raised.exception.shape)), 300)
+        self.assertNotIn("SECRET", json.dumps(raised.exception.shape))
+        self.assertLess(time.monotonic() - start, 10)
+
+    def run_main_rejection(
+        self, provider, *, source_changed=False, deadline_expired=False
+    ):
+        records = {p["label"]: p for p in packages()[0]}
+        captured, statuses, rejected = [], [], []
+        secret_line = "    Fetching https://PRIVATE.invalid/?token=SECRET"
+
+        def capture(command, output, budget, timeout=45, *, env=None):
+            captured.append(command)
+            if "cquery" in command:
+                payload = m.SENTINEL + json.dumps(records[command[-1]])
+                reject_here = provider
+            else:
+                payload = json.dumps(graph())
+                reject_here = True
+            if reject_here:
+                rejected.append(True)
+                payload = "INFO: ACCEPTED_SECRET\n" + secret_line + "\n" + payload
+            output.write_text(payload)
+            return {"oversize": False, "timeout": False, "exit_code": 0}
+
+        def git(*args):
+            if args == ("rev-parse", "HEAD"):
+                return "head"
+            if args == ("rev-parse", "HEAD^{tree}"):
+                return "tree"
+            statuses.append(True)
+            return " M owned" if source_changed and len(statuses) > 1 else ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            shell, root = Path(directory) / "bash.exe", Path(directory) / "evidence"
+            shell.touch()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "capture",
+                        "--git-bash",
+                        str(shell),
+                        "--root",
+                        str(root),
+                        "--expected-head",
+                        "head",
+                        "--expected-tree",
+                        "tree",
+                    ],
+                ),
+                mock.patch.dict(os.environ, diagnostic_parent(directory), clear=True),
+                mock.patch.object(m, "git", side_effect=git),
+                mock.patch.object(m, "capture", side_effect=capture),
+                mock.patch.object(
+                    m.time,
+                    "monotonic",
+                    side_effect=lambda: 571 if deadline_expired and rejected else 0,
+                ),
+                mock.patch("builtins.print") as printed,
+                self.assertRaises(m.EvidenceError),
+            ):
+                m.main()
+            printed.assert_not_called()
+            self.assertEqual(len(captured), 1 if provider else 8)
+            self.assertEqual(
+                [p.name for p in (root / "upload").iterdir()], ["manifest.json"]
+            )
+            raw = (root / "upload" / "manifest.json").read_bytes()
+            self.assertNotIn(b"PRIVATE", raw)
+            self.assertNotIn(b"SECRET", raw)
+            manifest = json.loads(raw)
+            self.assertEqual(
+                manifest["rejected_wrapper_line_shape"],
+                m.RejectedWrapperLine(secret_line).shape,
+            )
+            self.assertNotIn("artifacts", manifest)
+            self.assertEqual(manifest["source_unchanged"], not source_changed)
+            return manifest
+
+    def test_real_main_propagates_provider_and_action_shape_without_artifacts(self):
+        for provider in (True, False):
+            with self.subTest(provider=provider):
+                manifest = self.run_main_rejection(provider)
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(
+                    manifest["failure"], "Unexpected wrapper output outside JSON"
+                )
+
+    def test_shape_does_not_bypass_source_or_final_deadline_guards(self):
+        self.assertEqual(
+            self.run_main_rejection(True, source_changed=True)["status"],
+            "failed-source-changed",
+        )
+        manifest = self.run_main_rejection(True, deadline_expired=True)
+        self.assertEqual(manifest["status"], "failed-deadline")
+        self.assertEqual(
+            manifest["failure"], "Configured metadata invocation deadline exhausted"
+        )
+
+
 class GraphTests(unittest.TestCase):
     def test_complete_graph_paths_and_arguments_retained_env_values_removed(self):
         raw = graph()
