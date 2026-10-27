@@ -632,11 +632,20 @@ jobs:
           native-windows-voice: true
           cache-scope: bazel-test
       - name: Capture bounded configured voice metadata
-        timeout-minutes: 25
+        # 7x45s providers + 90s actions + 8x15s cleanup < 10m.
+        # Runtime keeps 45m; job retains 5m for preparation/uploads.
+        timeout-minutes: 10
         shell: bash
         run: |
           unset BUILDBUDDY_API_KEY
+          [[ -n "${BASH_VERSION:-}" && ( "$BASH" == /* || "$BASH" =~ ^[A-Za-z]:[/\\] ) ]] || exit 1
+          git_bash="$(cygpath -aw -- "$BASH" 2>/dev/null)" || exit 1
+          [[ "$git_bash" =~ ^[A-Za-z]:[/\\] ]] || exit 1
+          git_bash_posix="$(cygpath -au -- "$git_bash" 2>/dev/null)" || exit 1
+          [[ -f "$git_bash_posix" && -x "$git_bash_posix" ]] || exit 1
+          case "${git_bash_posix##*/}" in [bB][aA][sS][hH]|[bB][aA][sS][hH].[eE][xX][eE]) ;; *) exit 1 ;; esac
           python .github/scripts/voice_configured_metadata.py \
+            --git-bash "$git_bash" \
             --root "${RUNNER_TEMP}/voice-configured-evidence" \
             --expected-head "${VOICE_DIAGNOSTIC_HEAD}" \
             --expected-tree "${VOICE_DIAGNOSTIC_TREE}"

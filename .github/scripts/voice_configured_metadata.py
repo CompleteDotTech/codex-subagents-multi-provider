@@ -18,7 +18,9 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import threading
+import tempfile
+
+from voice_metadata_owned_job import capture_owned
 
 LIMIT = 32 * 1024 * 1024
 TOTAL = 128 * 1024 * 1024
@@ -176,7 +178,7 @@ def safe_arguments(args):
             not re.match(r"^(?:--(?:host_)?action_env=|--env=)", arg),
             "Embedded environment option requires review",
         )
-        assignment = re.match(r"^([A-Z][A-Z_0-9]*)=", arg)
+        assignment = re.match(r"^([A-Za-z_][A-Za-z_0-9]*)=", arg)
         require(not assignment, "Embedded environment assignment requires review")
     return args
 
@@ -341,16 +343,13 @@ def graph_metadata(raw):
             prop["value"] = "<redacted>"
         for substitution in action.get("substitutions", []):
             require(set(substitution) <= {"key", "value"}, "Unknown substitution shape")
-            require(
-                not SENSITIVE.search(substitution.get("key", ""))
-                and not SENSITIVE.search(substitution.get("value", "")),
-                "Sensitive substitution rejected",
-            )
+            # Arbitrary generated text can reproduce environment values with no
+            # recognizable variable name or credential word. Retain shape only.
+            for key in substitution:
+                substitution[key] = "<redacted>"
         for field in ("templateContent", "fileContents", "unresolvedSymlinkTarget"):
-            require(
-                not SENSITIVE.search(action.get(field, "")),
-                "Sensitive action content rejected",
-            )
+            if field in action:
+                action[field] = "<redacted>"
         resolved.append(
             {
                 "owner": owner,
@@ -441,54 +440,11 @@ def package_proof(providers, actions):
     return proofs
 
 
-def capture(command, destination, budget, timeout=600):
-    """Stream merged output privately; kill the owned subprocess tree on cap/time.
-
-    Raw-byte count/hash covers the retained bytes; oversize never uploads a prefix.
-    taskkill targets only the subprocess created here, never a shared Bazel server.
-    """
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    )
-    expired = threading.Event()
-
-    def stop():
-        expired.set()
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        else:
-            process.kill()
-
-    timer = threading.Timer(timeout, stop)
-    timer.start()
-    size, digest, oversized = 0, hashlib.sha256(), False
-    try:
-        with destination.open("xb") as output:
-            while chunk := process.stdout.read(65536):
-                size += len(chunk)
-                if size > LIMIT or budget[0] + len(chunk) > TOTAL - MANIFEST_RESERVE:
-                    oversized = True
-                    stop()
-                    break
-                budget[0] += len(chunk)
-                digest.update(chunk)
-                output.write(chunk)
-        code = process.wait()
-    finally:
-        timer.cancel()
-        process.stdout.close()
-    return {
-        "bytes_observed": size,
-        "retained_sha256": digest.hexdigest(),
-        "exit_code": code,
-        "oversize": oversized,
-        "timeout": expired.is_set() and not oversized,
-    }
+def capture(command, destination, budget, timeout=45):
+    cap = max(0, min(LIMIT, TOTAL - MANIFEST_RESERVE - budget[0]))
+    result = capture_owned(command, destination, cap, timeout)
+    budget[0] += result["retained_bytes"]
+    return result
 
 
 def git(*args):
@@ -500,11 +456,23 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--expected-head", required=True)
     parser.add_argument("--expected-tree", required=True)
+    parser.add_argument("--git-bash", type=Path, required=True)
     args = parser.parse_args()
     require(
         os.name == "nt" and os.environ.get("PROCESSOR_ARCHITECTURE") == "AMD64",
         "Configured capture requires native Windows AMD64",
     )
+    require(
+        args.git_bash.is_absolute()
+        and args.git_bash.is_file()
+        and args.git_bash.name.lower() in {"bash", "bash.exe"},
+        "Expected qualified absolute current Git Bash",
+    )
+    runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+    # mkdtemp guarantees this invocation cannot attach to a reusable server or
+    # the ordinary runtime output root. Batch further forbids daemon reuse.
+    query_root = Path(tempfile.mkdtemp(prefix="voice-metadata-bazel-", dir=runner_temp))
+    os.environ["BAZEL_OUTPUT_USER_ROOT"] = str(query_root)
     require(
         git("rev-parse", "HEAD") == args.expected_head
         and git("rev-parse", "HEAD^{tree}") == args.expected_tree,
@@ -552,10 +520,11 @@ def main():
         for i, label in enumerate(LABELS):
             output = private / f"provider-{i}.raw"
             cmd = [
-                "bash",
+                str(args.git_bash),
                 "./.github/scripts/run-bazel-ci.sh",
                 "--windows-cross-compile",
                 "--",
+                "--batch",
                 "cquery",
                 "--output=starlark",
                 "--starlark:file=.github/scripts/voice_providers.cquery",
@@ -576,10 +545,11 @@ def main():
             providers.append(parse_provider(output.read_text(encoding="utf-8"), label))
         output = private / "actions.raw"
         cmd = [
-            "bash",
+            str(args.git_bash),
             "./.github/scripts/run-bazel-ci.sh",
             "--windows-cross-compile",
             "--",
+            "--batch",
             "aquery",
             "--output=jsonproto",
             "--include_commandline",
@@ -592,7 +562,7 @@ def main():
             "--",
             QUERY,
         ]
-        result = capture(cmd, output, budget)
+        result = capture(cmd, output, budget, timeout=90)
         manifest["phases"].append({"phase": "actions", **result})
         require(
             not result["oversize"]

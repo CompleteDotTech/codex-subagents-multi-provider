@@ -3,12 +3,15 @@
 import copy
 import json
 from pathlib import Path
+import ctypes as c
+import os
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import voice_configured_metadata as m
+import voice_metadata_owned_job as owned
 
 
 def graph():
@@ -136,6 +139,54 @@ class GraphTests(unittest.TestCase):
         self.assertNotIn("private-value", json.dumps(sanitized))
         self.assertIn("private-value", json.dumps(raw))
 
+    def test_generated_text_and_substitution_keys_values_are_irreversibly_redacted(
+        self,
+    ):
+        for field in ("templateContent", "fileContents", "unresolvedSymlinkTarget"):
+            for text in (
+                "PATH=private-value\n",
+                "private-value",
+                "unrecognized-data",
+                "Path=private-value",
+            ):
+                raw = graph()
+                raw["actions"][0][field] = text
+                sanitized, _ = m.graph_metadata(raw)
+                self.assertEqual(sanitized["actions"][0][field], "<redacted>")
+                self.assertNotIn("private-value", json.dumps(sanitized))
+        raw = graph()
+        raw["actions"][0]["substitutions"] = [
+            {"key": "private-value", "value": "other-value"}
+        ]
+        sanitized, _ = m.graph_metadata(raw)
+        self.assertEqual(
+            sanitized["actions"][0]["substitutions"],
+            [{"key": "<redacted>", "value": "<redacted>"}],
+        )
+        self.assertNotIn("private-value", json.dumps(sanitized))
+
+    def test_mixed_case_assignments_fail_in_arguments_and_parameter_files(self):
+        for assignment in (
+            "Path=private-value",
+            "SystemRoot=private-value",
+            "path=private-value",
+            "_private=private-value",
+            "a1=private-value",
+        ):
+            for param in (False, True):
+                raw = graph()
+                args = (
+                    raw["actions"][0]["paramFiles"][0]["arguments"]
+                    if param
+                    else raw["actions"][0]["arguments"]
+                )
+                args.append(assignment)
+                with (
+                    self.subTest(assignment=assignment, param=param),
+                    self.assertRaises(m.EvidenceError),
+                ):
+                    m.graph_metadata(raw)
+
     def test_missing_references_duplicates_and_cycles_fail(self):
         mutations = [
             lambda g: g["artifacts"][0].update(pathFragmentId=999),
@@ -210,36 +261,161 @@ class GraphTests(unittest.TestCase):
                 m.package_proof(r, a)
 
 
-class CaptureTests(unittest.TestCase):
-    def test_oversize_is_failure_without_truncated_success(self):
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            mock.patch.object(m, "LIMIT", 64),
-        ):
-            result = m.capture(
-                [sys.executable, "-c", 'print("x" * 1000)'],
-                Path(directory) / "raw",
-                [0],
-            )
-            self.assertTrue(result["oversize"])
-            self.assertLessEqual((Path(directory) / "raw").stat().st_size, 64)
+class FakeAPI:
+    """Pure Win32 mock: pipes carry fixtures; no process is created."""
 
-    def test_total_limit_and_nonzero_exit_are_observed(self):
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            mock.patch.object(m, "TOTAL", 64),
-        ):
-            result = m.capture(
-                [sys.executable, "-c", 'print("x" * 60)'], Path(directory) / "raw", [63]
-            )
-            self.assertTrue(result["oversize"])
+    def __init__(self, payload=b"fixture", code=7, fail_assign=False, wait=0):
+        self.payload, self.code = payload, code
+        self.fail_assign, self.wait = fail_assign, wait
+        self.events = []
+
+    def oshandle(self, fd):
+        return fd
+
+    def __getattr__(self, name):
+        def call(*args):
+            self.events.append(name)
+            if name == "CreateJobObjectW":
+                return 1001
+            if name == "InitializeProcThreadAttributeList":
+                c.cast(args[3], c.POINTER(c.c_size_t))[0] = 64
+            if name == "CreateProcessW":
+                pi = c.cast(args[-1], c.POINTER(owned.PI)).contents
+                pi.process, pi.thread, pi.pid = 1002, 1003, 1004
+                si = c.cast(args[-2], c.POINTER(owned.SIEX)).contents
+                import os
+
+                os.write(si.startup.hStdOutput, self.payload)
+            if name == "GetProcessTimes":
+                c.cast(args[1], c.POINTER(owned.w.FILETIME)).contents.dwLowDateTime = 42
+            if name == "AssignProcessToJobObject":
+                return not self.fail_assign
+            if name == "IsProcessInJob":
+                c.cast(args[2], c.POINTER(owned.w.BOOL))[0] = True
+            if name == "WaitForSingleObject":
+                return self.wait if args[1] == 25 else 0
+            if name == "GetExitCodeProcess":
+                c.cast(args[1], c.POINTER(owned.w.DWORD))[0] = self.code
+            return 1
+
+        return call
+
+
+class CaptureTests(unittest.TestCase):
+    def test_main_emits_batch_queries_with_absolute_shell_and_unique_private_root(self):
+        records = {p["label"]: p for p in packages()[0]}
+        seen = []
+
+        def capture(command, output, budget, timeout=45):
+            seen.append((command, timeout, os.environ["BAZEL_OUTPUT_USER_ROOT"]))
+            if "cquery" in command:
+                output.write_text(m.SENTINEL + json.dumps(records[command[-1]]))
+            else:
+                output.write_text(json.dumps(graph()))
+            return {"oversize": False, "timeout": False, "exit_code": 0}
+
         with tempfile.TemporaryDirectory() as directory:
-            result = m.capture(
-                [sys.executable, "-c", "raise SystemExit(7)"],
-                Path(directory) / "raw",
-                [0],
-            )
-            self.assertEqual(result["exit_code"], 7)
+            shell = Path(directory) / "bash.exe"
+            shell.touch()
+            for attempt in range(2):
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "capture",
+                            "--git-bash",
+                            str(shell),
+                            "--root",
+                            str(Path(directory) / str(attempt)),
+                            "--expected-head",
+                            "head",
+                            "--expected-tree",
+                            "tree",
+                        ],
+                    ),
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "RUNNER_TEMP": directory,
+                            "PROCESSOR_ARCHITECTURE": "AMD64",
+                            "BAZEL_OUTPUT_USER_ROOT": "ordinary-runtime-root",
+                        },
+                    ),
+                    mock.patch.object(
+                        m,
+                        "git",
+                        side_effect=lambda *args: (
+                            "head"
+                            if args == ("rev-parse", "HEAD")
+                            else "tree"
+                            if args == ("rev-parse", "HEAD^{tree}")
+                            else ""
+                        ),
+                    ),
+                    mock.patch.object(m, "capture", side_effect=capture),
+                    mock.patch.object(m, "package_proof", return_value=[]),
+                    mock.patch("builtins.print"),
+                ):
+                    m.main()
+            self.assertEqual(len(seen), 16)
+            self.assertNotEqual(seen[0][2], seen[8][2])
+            for command, timeout, root in seen:
+                self.assertEqual(command[0], str(shell))
+                query = "cquery" if "cquery" in command else "aquery"
+                self.assertEqual(command[command.index(query) - 1], "--batch")
+                self.assertEqual(timeout, 45 if query == "cquery" else 90)
+                self.assertTrue(Path(root).is_relative_to(directory))
+                self.assertNotEqual(root, "ordinary-runtime-root")
+
+    def capture(self, api, cap=64, timeout=60):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "raw"
+            result = owned.capture_owned(["qualified.exe"], path, cap, timeout, api=api)
+            return result, path.read_bytes()
+
+    def test_owned_identity_assignment_precedes_execution_and_cleanup_is_joined(self):
+        api = FakeAPI()
+        result, data = self.capture(api)
+        self.assertEqual(data, b"fixture")
+        self.assertEqual(result["exit_code"], 7)
+        self.assertEqual(result["root_identity"]["creation_filetime"], 42)
+        self.assertTrue(result["reader_closed"])
+        self.assertEqual(result["active_job_processes_after_cleanup"], 0)
+        self.assertLess(
+            api.events.index("AssignProcessToJobObject"),
+            api.events.index("ResumeThread"),
+        )
+        self.assertLess(
+            api.events.index("TerminateJobObject"),
+            api.events.index("QueryInformationJobObject"),
+        )
+        self.assertNotIn("TerminateProcess", api.events)
+
+    def test_failed_assignment_never_resumes_and_terminates_only_retained_root(self):
+        api = FakeAPI(fail_assign=True)
+        with self.assertRaises(OSError):
+            self.capture(api)
+        self.assertNotIn("ResumeThread", api.events)
+        self.assertIn("TerminateProcess", api.events)
+        self.assertNotIn("TerminateJobObject", api.events)
+
+    def test_cap_and_timeout_fail_without_timer_or_pid_lookup(self):
+        result, data = self.capture(FakeAPI(payload=b"x" * 1000))
+        self.assertTrue(result["oversize"])
+        self.assertLessEqual(len(data), 64)
+        result, _ = self.capture(FakeAPI(wait=258), timeout=-1)
+        self.assertTrue(result["timeout"])
+        self.assertIsNone(result["exit_code"])
+
+    def test_total_budget_is_passed_to_owned_capture(self):
+        with mock.patch.object(
+            m, "capture_owned", return_value={"retained_bytes": 2}
+        ) as capture:
+            budget = [m.TOTAL - m.MANIFEST_RESERVE - 3]
+            m.capture(["qualified.exe"], Path("unused"), budget)
+            self.assertEqual(capture.call_args.args[2:], (3, 45))
+            self.assertEqual(budget[0], m.TOTAL - m.MANIFEST_RESERVE - 1)
 
 
 if __name__ == "__main__":
