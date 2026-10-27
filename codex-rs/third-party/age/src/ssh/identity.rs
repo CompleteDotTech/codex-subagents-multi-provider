@@ -345,11 +345,12 @@ fn rsa_privkey(input: &str) -> IResult<&str, Identity> {
                             .ok()
                             .map(|privkey| {
                                 let mut ssh_key = vec![];
-                                cookie_factory::r#gen(
+                                if let Err(error) = cookie_factory::r#gen(
                                     write_ssh::rsa_pubkey(&privkey.to_public_key()),
                                     &mut ssh_key,
-                                )
-                                .expect("can write into a Vec");
+                                ) {
+                                    panic!("RSA public key serialization into a Vec must succeed: {error}");
+                                }
                                 UnencryptedKey::SshRsa(ssh_key, Box::new(privkey)).into()
                             })
                     }

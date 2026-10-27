@@ -156,8 +156,14 @@ mod decrypt {
             .map(|kdf_output| {
                 let (key, iv) = kdf_output.split_at(KeySize::USIZE);
                 (
-                    Array::try_from(key).expect("key is correct length"),
-                    Array::try_from(iv).expect("iv is correct length"),
+                    match Array::try_from(key) {
+                        Ok(key) => key,
+                        Err(_) => unreachable!("derived key has the requested length"),
+                    },
+                    match Array::try_from(iv) {
+                        Ok(iv) => iv,
+                        Err(_) => unreachable!("derived IV has the requested length"),
+                    },
                 )
             })
     }

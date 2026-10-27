@@ -529,12 +529,15 @@ impl<W: AsyncWrite> AsyncWrite for ArmoredWriter<W> {
                     // Only encode the line if we have more data to write, as the last
                     // line must be written in poll_close().
                     if !buf.is_empty() {
-                        assert_eq!(
-                            BASE64_STANDARD
-                                .encode_slice(&byte_buf, &mut encoded_buf[..],)
-                                .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES"),
-                            BASE64_CHUNK_SIZE_COLUMNS
-                        );
+                        let encoded = match BASE64_STANDARD
+                            .encode_slice(&byte_buf, &mut encoded_buf[..])
+                        {
+                            Ok(encoded) => encoded,
+                            Err(error) => panic!(
+                                "age armor base64 output buffer must fit the bounded byte chunk: {error}"
+                            ),
+                        };
+                        assert_eq!(encoded, BASE64_CHUNK_SIZE_COLUMNS);
                         *encoded_line = Some(EncodedBytes {
                             offset: 0,
                             end: BASE64_CHUNK_SIZE_COLUMNS,
@@ -576,9 +579,12 @@ impl<W: AsyncWrite> AsyncWrite for ArmoredWriter<W> {
             if let Some(byte_buf) = byte_buf {
                 // Finish the armored format with a partial line (if necessary) and the end
                 // marker.
-                let encoded = BASE64_STANDARD
-                    .encode_slice(byte_buf, &mut encoded_buf[..])
-                    .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES");
+                let encoded = match BASE64_STANDARD.encode_slice(byte_buf, &mut encoded_buf[..]) {
+                    Ok(encoded) => encoded,
+                    Err(error) => panic!(
+                        "age armor base64 output buffer must fit the bounded byte chunk: {error}"
+                    ),
+                };
                 *encoded_line = Some(EncodedBytes {
                     offset: 0,
                     end: encoded,
@@ -1071,7 +1077,9 @@ fn read_line_internal<R: AsyncBufRead + ?Sized>(
     bytes: &mut Vec<u8>,
     read: &mut usize,
 ) -> Poll<io::Result<usize>> {
-    let ret = ready!(read_until_internal(reader, cx, b'\n', bytes, read));
+    let ret = ready!(read_until_internal(
+        reader, cx, /*byte*/ b'\n', bytes, read
+    ));
     match String::from_utf8(mem::take(bytes)) {
         Err(_) => Poll::Ready(ret.and_then(|_| {
             Err(io::Error::new(

@@ -56,7 +56,12 @@ pub fn read_identities(
             // IdentityFileEntry::into_identity will never return a PluginResolve error
             // when plugin feature is not enabled.
             #[cfg(not(feature = "plugin"))]
-            let new_identities = new_identities.unwrap();
+            let new_identities = match new_identities {
+                Ok(identities) => identities,
+                Err(_) => unreachable!(
+                    "identity conversion cannot resolve plugins without the plugin feature"
+                ),
+            };
 
             identities.extend(new_identities.into_iter().map(|i| i as _));
 

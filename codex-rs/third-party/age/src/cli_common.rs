@@ -170,7 +170,12 @@ impl Callbacks for UiCallbacks {
     }
 
     fn request_passphrase(&self, description: &str) -> Option<SecretString> {
-        read_secret(description, &fl!("cli-passphrase-prompt"), None).ok()
+        read_secret(
+            description,
+            &fl!("cli-passphrase-prompt"),
+            /*confirm*/ None,
+        )
+        .ok()
     }
 }
 
@@ -185,14 +190,17 @@ pub enum Passphrase {
 impl Passphrase {
     /// Generates a secure passphrase.
     pub fn random<R: CryptoRng>(mut rng: R) -> Self {
-        let between = Uniform::try_from(0..2048).expect("valid");
+        let between = match Uniform::try_from(0..2048) {
+            Ok(between) => between,
+            Err(_) => unreachable!("the nonempty BIP39 index range is valid"),
+        };
         let new_passphrase = (0..10)
-            .map(|_| {
-                BIP39_WORDLIST
-                    .lines()
-                    .nth(between.sample(&mut rng))
-                    .expect("index is in range")
-            })
+            .map(
+                |_| match BIP39_WORDLIST.lines().nth(between.sample(&mut rng)) {
+                    Some(word) => word,
+                    None => unreachable!("the BIP39 wordlist contains every sampled index"),
+                },
+            )
             .fold(String::new(), |acc, s| {
                 if acc.is_empty() {
                     acc + s

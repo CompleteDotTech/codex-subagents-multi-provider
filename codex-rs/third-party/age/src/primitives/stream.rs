@@ -335,7 +335,7 @@ impl<W: AsyncWrite> AsyncWrite for StreamWriter<W> {
             if !buf.is_empty() {
                 let this = self.as_mut().project();
                 *this.encrypted_chunk = Some(EncryptedChunk {
-                    bytes: this.stream.encrypt_chunk(this.chunk, false)?,
+                    bytes: this.stream.encrypt_chunk(this.chunk, /*last*/ false)?,
                     offset: 0,
                 });
                 this.chunk.clear();
@@ -369,7 +369,7 @@ impl<W: AsyncWrite> AsyncWrite for StreamWriter<W> {
             // Finish the stream.
             let this = self.as_mut().project();
             *this.encrypted_chunk = Some(EncryptedChunk {
-                bytes: this.stream.encrypt_chunk(this.chunk, true)?,
+                bytes: this.stream.encrypt_chunk(this.chunk, /*last*/ true)?,
                 offset: 0,
             });
         }

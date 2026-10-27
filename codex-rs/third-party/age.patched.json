@@ -1,6 +1,10 @@
 {
   "files": {
     "Cargo.toml": "2e347f731b73aa8af791ed2b7634a143b953c2914d1cd5a68ab4908e85ee9993",
+    "src/cli_common.rs": "4e101be11da2a8940fa1f2e5ed46cc5ac99b98d9f9016f399b4a89565efd9e5a",
+    "src/cli_common/file_io.rs": "e3bc97307ca5ec163fb07da66ba29f978227c7bb40c68af28ea2ef86a768d229",
+    "src/cli_common/identities.rs": "e6e111e1f58f305b92bc123e1cd95d5aca2e136933949fb17b3cc7acabe6cdee",
+    "src/cli_common/recipients.rs": "5346f6696bdcb461fe465a71f9dd0d6995b49337b40ff579647ef4bb7ff1c4db",
     "src/encrypted.rs": "e9986733ece72e363a87f6fd7c3fdf2e1c634b97e021361532a0098a09bfebf4",
     "src/format.rs": "29e7155fa8732dab9bac878f8fb72a5b29c21dc990e7c2c5a1bea715356f2621",
     "src/i18n.rs": "7eb3fe56a376f5676ef3d19c71a0fef57d66200de9fc359e185b4611265c9f82",
@@ -10,10 +14,13 @@
     "src/native/tag.rs": "9d62d1635ef1921b3b653cf78f2894a10757a42e95ef47ac58c22b992a5dbb83",
     "src/native/x25519.rs": "ee22787c99bc1900eb10d291b9695cbfa82b5a8beb04d56efa58c208b7e35252",
     "src/primitives.rs": "e84f74eea99594a3a908db5c99e27ba860e9dca2abda6daa5a74e4bb6a112439",
-    "src/primitives/armor.rs": "5ede0234b4f23b908db05c92f24197d6e7f502ced35f8d80933be580e2494a26",
-    "src/primitives/stream.rs": "7b10f5a4347b6566bf151a2763c3c3f24fe37229045ecf3d26970b9853c74824",
+    "src/primitives/armor.rs": "00149a093d98fc9f5fd8cd3e6b3719e1a901a459c339dd410fe984f93eea5056",
+    "src/primitives/stream.rs": "d9b25e80a53ffe72af5822b163292af771e1902236c93af0b59fcbd1e1c7a04b",
     "src/protocol.rs": "c90131dc4f8becf55583d207f5ec2fc3e26fc46dea1a3a64a010c2bec8e791c7",
     "src/simple.rs": "1151b49b6da90cd972066b7954054ec68286f9aeeeec38f44bd6cdb19ed3a31e",
+    "src/ssh.rs": "43468fc8d57bf1794227d83565d4384536ef1d3e25afdea820dbb1172d933543",
+    "src/ssh/identity.rs": "c86a5606d28ec5aebe086428bb62dfb2ef47efa86958d2662fbd6af0b8be6559",
+    "src/ssh/recipient.rs": "ac6807116127985ad0d2ede643f20ef0e99a8a44f43e0c9fb07471fd03149f34",
     "src/util.rs": "46e81fb40968a01695402f64d90bb0bf3d2d05b5e1900139d4e3dc98d69896f4"
   },
   "extras": {
@@ -27,5 +34,5 @@
     "BUILD.bazel": "7d07b37a24b4feed919ff8e5340e5a230038edebcb77835a2065038190a8784b",
     "Cargo.lock": "6e04d9b80727ef6385789ed8e4bbc799dc0a3cf65665f09117a4da67c10f8c7f"
   },
-  "patch_sha256": "12564f0d2f9563e8c672e931d6836ffd84ca1fbdd326fc995960f012b0304e58"
+  "patch_sha256": "fb5cf16bf4ab3fc73b1d1e5b0f94b7e9e366351dd2942be6660c00b15af75dd0"
 }

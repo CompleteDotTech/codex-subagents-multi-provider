@@ -161,13 +161,14 @@ impl crate::Recipient for Recipient {
 
         let stanzas = match self {
             Recipient::SshRsa(ssh_key, pk) => {
-                let encrypted_file_key = pk
-                    .encrypt(
-                        &mut rng,
-                        Oaep::<Sha256>::new_with_label(SSH_RSA_OAEP_LABEL),
-                        file_key.expose_secret(),
-                    )
-                    .expect("pubkey is valid and file key is not too long");
+                let encrypted_file_key = match pk.encrypt(
+                    &mut rng,
+                    Oaep::<Sha256>::new_with_label(SSH_RSA_OAEP_LABEL),
+                    file_key.expose_secret(),
+                ) {
+                    Ok(encrypted) => encrypted,
+                    Err(error) => panic!("RSA public key is valid and the file key fits: {error}"),
+                };
 
                 let encoded_tag = BASE64_STANDARD_NO_PAD.encode(ssh_tag(ssh_key));
 
@@ -239,7 +240,7 @@ fn ssh_ed25519_pubkey(input: &str) -> IResult<&str, ParsedRecipient> {
     preceded(
         pair(tag(SSH_ED25519_KEY_PREFIX), tag(" ")),
         map_opt(
-            encoded_str(51, BASE64_STANDARD_NO_PAD),
+            encoded_str(/*count*/ 51, BASE64_STANDARD_NO_PAD),
             |ssh_key| match read_ssh::ed25519_pubkey(&ssh_key) {
                 Ok((_, pk)) => Some(ParsedRecipient::Supported(Recipient::SshEd25519(
                     ssh_key, pk,

@@ -185,12 +185,14 @@ pub fn read_recipients(
         },
         #[cfg(feature = "ssh")]
         |recipients, filename, identity| {
-            let recipient = parse_ssh_recipient(
+            let recipient = match parse_ssh_recipient(
                 || ssh::Recipient::try_from(identity),
                 || Err(ReadError::InvalidRecipient(filename.to_owned())),
                 filename,
-            )?
-            .expect("unsupported identities were already handled");
+            )? {
+                Some(recipient) => recipient,
+                None => unreachable!("unsupported identities were already handled"),
+            };
             recipients.push(recipient);
             Ok(())
         },
