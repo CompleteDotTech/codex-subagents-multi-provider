@@ -984,7 +984,7 @@ async fn prepared_fresh_spawn_rejects_stopped_or_replaced_caller(replace: bool) 
         &parent.session_source,
         next_thread_spawn_depth(&parent.session_source),
         None,
-        Some("stale-preparation-worker".into()),
+        Some("stale_preparation_worker".into()),
     )
     .expect("source for original actual parent");
     let prepared = harness
