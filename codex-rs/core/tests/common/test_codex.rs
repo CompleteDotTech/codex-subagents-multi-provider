@@ -842,20 +842,33 @@ impl TestCodexBuilder {
         server: &MockServer,
         previous: &TestCodex,
     ) -> Result<TestCodex> {
+        // The fresh manager and its resumed root must share one actual backend,
+        // rather than allocating a second Cached-auth manager in the legacy arm.
+        let auth_manager = self.auth.manager_for_home(previous.home.path());
+        anyhow::ensure!(
+            !Arc::ptr_eq(&auth_manager, &previous.thread_manager.auth_manager()),
+            "cold fixture requires a fresh actual authentication backend"
+        );
+        self.auth = TestAuth::Manager(Arc::clone(&auth_manager));
         let rollout_path = previous
             .session_configured
             .rollout_path
             .clone()
             .context("actual local rollout path")?;
         previous.codex.shutdown_and_wait().await?;
-        Box::pin(self.build_with_home_and_base_url(
+        let restored = Box::pin(self.build_with_home_and_base_url(
             format!("{}/v1", server.uri()),
             Arc::clone(&previous.home),
             Some(rollout_path),
             TestEnv::fresh_local_in_same_workspace(&previous._test_env)?,
             /*include_local_environment*/ false,
         ))
-        .await
+        .await?;
+        assert!(Arc::ptr_eq(
+            &restored.thread_manager.auth_manager(),
+            &auth_manager
+        ));
+        Ok(restored)
     }
 
     /// Restarts without changing the executor platform selected by the test process.
