@@ -25,6 +25,7 @@ use super::session::Session;
 pub(crate) struct SessionStartup {
     teardown: StdMutex<Option<AgentTreeTeardownGuard>>,
     native_admission: StdMutex<NativeAdmissionState>,
+    resume_fence: StdMutex<ResumeFenceState>,
     pub(crate) persistence: Mutex<LiveThreadInitGuard>,
     pub(crate) session: OnceLock<Arc<Session>>,
     pub(crate) io: OnceLock<SessionIo>,
@@ -38,7 +39,53 @@ enum NativeAdmissionState {
     Consumed,
 }
 
+#[derive(Default)]
+enum ResumeFenceState {
+    #[default]
+    Unclassified,
+    Pending(ThreadId),
+    Consumed,
+}
+
 impl SessionStartup {
+    pub(crate) fn defer_resume_fence(&self, target: ThreadId) -> codex_protocol::error::Result<()> {
+        let mut state = self
+            .resume_fence
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*state, ResumeFenceState::Unclassified) {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "resume startup fence already classified",
+            ));
+        }
+        *state = ResumeFenceState::Pending(target);
+        Ok(())
+    }
+
+    pub(crate) fn take_resume_fence(
+        &self,
+        resumed_target: Option<ThreadId>,
+    ) -> codex_protocol::error::Result<Option<ThreadId>> {
+        let mut state = self
+            .resume_fence
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match std::mem::replace(&mut *state, ResumeFenceState::Consumed) {
+            ResumeFenceState::Unclassified if resumed_target.is_some() => {
+                Err(crate::agent::child_provider_authorization::invalid(
+                    "manager resume startup fence is missing",
+                ))
+            }
+            ResumeFenceState::Unclassified => Ok(None),
+            ResumeFenceState::Pending(target) if Some(target) == resumed_target => Ok(Some(target)),
+            ResumeFenceState::Pending(_) | ResumeFenceState::Consumed => {
+                Err(crate::agent::child_provider_authorization::invalid(
+                    "resume startup fence does not match its history or was already consumed",
+                ))
+            }
+        }
+    }
+
     pub(crate) fn set_native_admission(
         &self,
         admission: crate::agent::child_provider_authorization::NativeChildAdmission,

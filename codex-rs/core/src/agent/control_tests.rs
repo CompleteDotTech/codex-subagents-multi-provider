@@ -114,6 +114,7 @@ use pretty_assertions::assert_eq;
 use std::future::Future;
 use std::future::poll_fn;
 use std::sync::RwLock;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -6825,4 +6826,227 @@ async fn failed_saved_authority_invalidation_prevents_runtime_and_auth_helper_st
             .exists()
     );
     assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+struct ColdResumeAdmissionRevoker {
+    policy: codex_config::CloudConfigBundlePolicy,
+    sharing: std::sync::atomic::AtomicBool,
+    armed: std::sync::atomic::AtomicBool,
+    revocations: std::sync::atomic::AtomicUsize,
+}
+
+impl ThreadInstructionsProvider for ColdResumeAdmissionRevoker {
+    fn share_with_subagents(&self) -> bool {
+        if !self.sharing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.armed.swap(false, Ordering::SeqCst) {
+            let mut bundle = codex_config::CloudConfigBundle::default();
+            bundle
+                .config_toml
+                .enterprise_managed
+                .push(codex_config::CloudConfigFragment {
+                    id: "cold-resume-late-revocation".into(),
+                    name: "revoke before final admission".into(),
+                    contents: "[agents]\nallowed_model_providers=[]".into(),
+                });
+            self.policy.observe_remote_bundle(&bundle).unwrap();
+            self.revocations.fetch_add(1, Ordering::SeqCst);
+        }
+        true
+    }
+
+    fn load_thread_instructions(&self) -> LoadInstructionsFuture<'_> {
+        Box::pin(async { LoadedUserInstructions::default() })
+    }
+}
+
+#[tokio::test]
+async fn denied_final_cold_admission_preserves_receipt_for_a_current_policy_retry() {
+    let (home, mut config) = test_config_with_host_configuration(
+        Vec::new(),
+        Some("[agents]\nallowed_model_providers=['openai']\n"),
+    )
+    .await;
+    for feature in [Feature::Sqlite, Feature::MultiAgentV2] {
+        config.features.enable(feature).unwrap();
+    }
+    config.model = Some("gpt-5.6-sol".into());
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let root = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .unwrap();
+    let source = thread_spawn_source(
+        root.thread_id,
+        &root.thread.session_source,
+        1,
+        None,
+        Some("cold-target".into()),
+    )
+    .unwrap();
+    let child = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("cold target"),
+            source,
+            SpawnAgentOptions {
+                parent_thread_id: Some(root.thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let target = harness.manager.get_thread(child.thread_id).await.unwrap();
+    persist_thread_for_tree_resume(&root.thread, "root for cold admission retry").await;
+    persist_thread_for_tree_resume(&target, "target for cold admission retry").await;
+    let turn = target.session.new_default_turn().await;
+    assert!(
+        target
+            .session
+            .persist_rollout_items(&[RolloutItem::TurnContext(turn.to_turn_context_item()),])
+            .await
+    );
+    target.session.flush_rollout().await.unwrap();
+    assert_eq!(
+        target
+            .read_thread(false, false)
+            .await
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("gpt-5.6-sol")
+    );
+    let stored_root = root.thread.read_thread(true, true).await.unwrap();
+    let root_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: root.thread_id,
+        history_revision: None,
+        history: Arc::new(stored_root.history.unwrap().items),
+        rollout_path: stored_root.rollout_path,
+    });
+    let original_state = harness.control.runtime.upgrade().unwrap();
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.timed_out.is_empty());
+    let receipt = original_state
+        .read_native_authority_receipt(child.thread_id)
+        .await
+        .unwrap()
+        .expect("real stopped target must have a sealed host receipt");
+    assert_eq!(receipt.epoch.parent_thread_id, Some(root.thread_id));
+    assert_eq!(receipt.epoch.root_thread_id, root.thread_id);
+
+    for revoke in [true, false] {
+        let policy = codex_config::CloudConfigBundlePolicy::default();
+        let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+            bundle: Ok(None),
+            binding: None,
+            config_server: None,
+        };
+        policy.publish_snapshot(&mut snapshot);
+        let mut current = harness.config.clone();
+        current.config_layer_stack = current
+            .config_layer_stack
+            .with_cloud_config_binding(snapshot.binding);
+        let provider = Arc::new(ColdResumeAdmissionRevoker {
+            policy,
+            sharing: std::sync::atomic::AtomicBool::new(false),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            revocations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            current.model_provider.clone(),
+            current.codex_home.to_path_buf(),
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            harness.state_db.clone(),
+        );
+        let resumed_root = manager
+            .start_thread(StartThreadOptions {
+                initial_history: root_history.clone(),
+                session_source: Some(SessionSource::Exec),
+                thread_instructions_provider: Some(provider.clone()),
+                ..StartThreadOptions::new(current.clone())
+            })
+            .await
+            .unwrap();
+        let runtime = &resumed_root.thread.session.services.local_agent_runtime;
+        assert!(
+            runtime.retained_authority(child.thread_id).is_none(),
+            "target must be genuinely cold"
+        );
+        provider.sharing.store(true, Ordering::SeqCst);
+        provider.armed.store(revoke, Ordering::SeqCst);
+        let state = runtime.upgrade().unwrap();
+        assert_eq!(
+            state
+                .read_native_authority_receipt(child.thread_id)
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        let result = runtime
+            .control(resumed_root.thread.session.session_id())
+            .resume_agent_from_rollout(current, child.thread_id, target.session_source.clone())
+            .await;
+        assert_eq!(
+            provider.revocations.load(Ordering::SeqCst),
+            usize::from(revoke),
+            "real late manager callback must execute before interpreting the result"
+        );
+        if revoke {
+            let error = result
+                .err()
+                .expect("late policy revocation must deny cold startup");
+            assert!(
+                error
+                    .to_string()
+                    .contains("revoked before startup admission"),
+                "{error}"
+            );
+            assert!(runtime.retained_authority(child.thread_id).is_none());
+            assert_eq!(manager.list_thread_ids().await, vec![root.thread_id]);
+            assert_eq!(
+                state
+                    .read_native_authority_receipt(child.thread_id)
+                    .await
+                    .unwrap(),
+                Some(receipt.clone()),
+                "denied final admission cannot invalidate the only cold receipt"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                child.thread_id,
+                "a fresh current binding must permit the original cold retry"
+            );
+            let restored = manager.get_thread(child.thread_id).await.unwrap();
+            assert_eq!(
+                restored.thread_settings_snapshot().await.model,
+                "gpt-5.6-sol"
+            );
+            assert_eq!(
+                restored.session.session_id(),
+                resumed_root.thread.session.session_id()
+            );
+        }
+        let report = manager
+            .shutdown_all_threads_bounded(Duration::from_secs(5))
+            .await;
+        assert!(report.timed_out.is_empty());
+    }
 }

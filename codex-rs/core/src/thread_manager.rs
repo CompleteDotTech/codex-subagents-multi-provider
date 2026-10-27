@@ -2649,18 +2649,10 @@ impl ThreadManagerState {
             }
         }
         if let InitialHistory::Resumed(saved) = &initial_history {
-            match self
-                .thread_store
-                .invalidate_native_authority_receipt(saved.conversation_id, uuid::Uuid::now_v7())
-                .await
-            {
-                Ok(()) | Err(ThreadStoreError::Unsupported { .. }) => {}
-                Err(_) => {
-                    return Err(crate::agent::child_provider_authorization::invalid(
-                        "saved authority could not be invalidated before runtime startup",
-                    ));
-                }
-            }
+            // A denied final admission must leave the stopped runtime's sealed
+            // receipt intact. Session fences this exact target after admission
+            // and before startup effects; inline Session paths remain unmarked.
+            startup_state.defer_resume_fence(saved.conversation_id)?;
         }
         // A host factory is injectable code, so guard its invocation as well
         // as the final Session startup after the remaining metadata awaits.

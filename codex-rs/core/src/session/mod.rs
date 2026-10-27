@@ -621,6 +621,33 @@ impl Session {
             .config_layer_stack
             .ensure_config_server_applied()?;
         args.config.validate_windows_mxc_requirement()?;
+        let resumed_target = match &args.conversation_history {
+            InitialHistory::Resumed(saved) => Some(saved.conversation_id),
+            _ => None,
+        };
+        let resume_fence = args
+            .startup
+            .as_ref()
+            .map(|startup| startup.take_resume_fence(resumed_target))
+            .transpose()?
+            .flatten();
+        if let Some(target) = resume_fence {
+            // Final policy admission above is synchronous. Only an admitted
+            // manager-owned resume may invalidate the prior receipt, and that
+            // fence must commit before channels, Session creation or startup I/O.
+            match args
+                .thread_store
+                .invalidate_native_authority_receipt(target, uuid::Uuid::now_v7())
+                .await
+            {
+                Ok(()) | Err(codex_thread_store::ThreadStoreError::Unsupported { .. }) => {}
+                Err(_) => {
+                    return Err(crate::agent::child_provider_authorization::invalid(
+                        "saved authority could not be invalidated before runtime startup",
+                    ));
+                }
+            }
+        }
         let SessionSpawnArgs {
             startup,
             config,
