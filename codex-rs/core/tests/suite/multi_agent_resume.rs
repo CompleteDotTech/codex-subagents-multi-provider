@@ -10,7 +10,10 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::NativeAuthorityStorage;
 use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ThreadStore;
 use core_test_support::responses::assert_parent_turn;
 use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
@@ -27,6 +30,7 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -144,7 +148,7 @@ async fn mount_root_collaboration_call(
 
 fn configure_multi_agent_v2_with_role(
     config: &mut codex_core::config::Config,
-    model_provider_base_url: &str,
+    _model_provider_base_url: &str,
 ) {
     config
         .features
@@ -162,7 +166,11 @@ fn configure_multi_agent_v2_with_role(
     std::fs::write(
         &role_path,
         format!(
-            "model = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"high\"\ndeveloper_instructions = \"{ROLE_DEVELOPER_INSTRUCTIONS}\"\nsandbox_mode = \"read-only\"\nmodel_provider = \"mock\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{model_provider_base_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
+            r#"model = "{ROLE_MODEL}"
+model_reasoning_effort = "high"
+developer_instructions = "{ROLE_DEVELOPER_INSTRUCTIONS}"
+sandbox_mode = "read-only"
+"#
         ),
     )
     .expect("write durable worker role config");
@@ -177,6 +185,7 @@ fn configure_multi_agent_v2_with_role(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The protected memory owner survives a NEW runtime; this is not disk/process durability.
 async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Result<()> {
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
@@ -274,10 +283,17 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     .await;
 
     let initial_model_provider_base_url = format!("{}/v1", server.uri());
-    let mut initial_builder = test_codex().with_config(move |config| {
-        configure_multi_agent_v2_with_role(config, &initial_model_provider_base_url);
-    });
+    let protected_store: Arc<dyn ThreadStore> = Arc::new(InMemoryThreadStore::default());
+    let mut initial_builder = test_codex()
+        .with_thread_store(Arc::clone(&protected_store))
+        .with_config(move |config| {
+            configure_multi_agent_v2_with_role(config, &initial_model_provider_base_url);
+        });
     let initial = initial_builder.build_with_auto_env(&server).await?;
+    assert!(matches!(
+        initial.thread_store.native_authority_storage(),
+        Some(NativeAuthorityStorage::InMemory { .. })
+    ));
     let root_thread_id = initial.session_configured.thread_id;
     let root_session_id = initial.session_configured.session_id;
     initial
@@ -477,12 +493,30 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     );
     let resumed_model_provider_base_url = format!("{}/v1", server.uri());
     let mut resume_builder = test_codex()
+        .with_thread_store(Arc::clone(&protected_store))
         .with_analytics_events_client(analytics_client.clone())
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &resumed_model_provider_base_url);
             config.analytics_enabled = Some(true);
         });
-    let resumed = resume_builder.restart(&server, &initial).await?;
+    let resumed = resume_builder
+        .restart_from_thread_store(&server, &initial)
+        .await?;
+    assert!(!Arc::ptr_eq(
+        &initial.thread_manager,
+        &resumed.thread_manager
+    ));
+    assert_eq!(
+        initial.thread_store.native_authority_storage(),
+        resumed.thread_store.native_authority_storage()
+    );
+    assert!(
+        protected_store
+            .read_native_authority_receipt(worker_thread_id)
+            .await?
+            .is_some(),
+        "the actual clean stopped memory owner must supply cold proof"
+    );
     resumed
         .codex
         .set_app_server_client_info(
@@ -814,5 +848,137 @@ openai_base_url = "{redirected_base_url}"
         "a changed role must not redirect resumed model requests",
     );
 
+    Ok(())
+}
+
+/// Full filesystem access cannot authenticate a local SQLite authority record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_downgrade()
+-> Result<()> {
+    const PROMPT: &str = "create the writable-store child";
+    const TASK: &str = "initial writable-store task";
+    let server = start_mock_server().await;
+    mount_root_collaboration_call(
+        &server,
+        PROMPT,
+        "spawn-writable-store",
+        "spawn_agent",
+        &json!({"message":TASK,"task_name":"worker","agent_type":ROLE_NAME,"fork_turns":"none"})
+            .to_string(),
+    )
+    .await;
+    let child_request = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_has_model(request, ROLE_MODEL) && body_contains(request, TASK)
+        },
+        sse(vec![ev_completed("writable-store-child-complete")]),
+    )
+    .await;
+    let initial_url = format!("{}/v1", server.uri());
+    let initial = test_codex()
+        .with_config(move |config| {
+            configure_multi_agent_v2_with_role(config, &initial_url);
+            config.features.enable(Feature::Sqlite).unwrap();
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .unwrap();
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    assert!(matches!(
+        initial.thread_store.native_authority_storage(),
+        Some(NativeAuthorityStorage::Local { .. })
+    ));
+    let root = initial.session_configured.thread_id;
+    initial.submit_turn(PROMPT).await?;
+    let ids = initial.thread_manager.list_thread_ids().await;
+    assert_eq!(ids.len(), 2);
+    let child_id = *ids.iter().find(|id| **id != root).unwrap();
+    let child = initial.thread_manager.get_thread(child_id).await?;
+    wait_for_event(child.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(child_request.requests().len(), 1);
+    assert_eq!(
+        child.config_snapshot().await.permission_profile,
+        PermissionProfile::Disabled
+    );
+    child.flush_rollout().await?;
+    child.shutdown_and_wait().await?;
+    assert!(
+        initial
+            .thread_store
+            .read_native_authority_receipt(child_id)
+            .await?
+            .is_none(),
+        "a model-writable local owner cannot seal a cold authority receipt"
+    );
+    initial.codex.flush_rollout().await?;
+    let resume_url = format!("{}/v1", server.uri());
+    let resumed = test_codex()
+        .with_config(move |config| {
+            configure_multi_agent_v2_with_role(config, &resume_url);
+            config.features.enable(Feature::Sqlite).unwrap();
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .unwrap();
+        })
+        .restart(&server, &initial)
+        .await?;
+    assert!(!Arc::ptr_eq(
+        &initial.thread_manager,
+        &resumed.thread_manager
+    ));
+    assert_eq!(
+        resumed
+            .codex
+            .thread_settings_snapshot()
+            .await
+            .permission_profile,
+        PermissionProfile::Disabled
+    );
+    let before = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .len();
+    let error = resumed
+        .thread_manager
+        .ensure_multi_agent_v2_child_loaded(child_id)
+        .await
+        .err()
+        .expect("a full-access executor cannot use local cold authority metadata");
+    assert!(
+        error
+            .to_string()
+            .contains("cold authority metadata is writable by the current executor"),
+        "{error}"
+    );
+    assert_eq!(resumed.thread_manager.list_thread_ids().await, vec![root]);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .len(),
+        before
+    );
+    assert_eq!(
+        resumed
+            .codex
+            .thread_settings_snapshot()
+            .await
+            .permission_profile,
+        PermissionProfile::Disabled
+    );
+    assert_eq!(
+        child.config_snapshot().await.permission_profile,
+        PermissionProfile::Disabled
+    );
+    resumed.codex.shutdown_and_wait().await?;
     Ok(())
 }
