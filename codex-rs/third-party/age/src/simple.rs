@@ -15,9 +15,10 @@ use crate::armor::{ArmoredReader, ArmoredWriter, Format};
 ///
 /// This function returns binary ciphertext. To obtain an ASCII-armored text string, use
 /// [`encrypt_and_armor`].
+///
+/// Errors from the recipient, including invalid recipient labels, are returned to the caller.
 pub fn encrypt(recipient: &impl Recipient, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
-    let encryptor =
-        Encryptor::with_recipients(iter::once(recipient as _)).expect("we provided a recipient");
+    let encryptor = Encryptor::with_recipients(iter::once(recipient as _))?;
 
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let mut writer = encryptor.wrap_output(&mut ciphertext)?;
@@ -75,7 +76,58 @@ pub fn decrypt(identity: &impl Identity, ciphertext: &[u8]) -> Result<Vec<u8>, D
 #[cfg(test)]
 mod tests {
     use super::{decrypt, encrypt};
-    use crate::x25519;
+    use crate::{EncryptError, Recipient, x25519};
+    use age_core::format::{FileKey, Stanza};
+    use std::{collections::HashSet, io};
+
+    struct FailingRecipient;
+
+    impl Recipient for FailingRecipient {
+        fn wrap_file_key(
+            &self,
+            _file_key: &FileKey,
+        ) -> Result<(Vec<Stanza>, HashSet<String>), EncryptError> {
+            Err(EncryptError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recipient refused the file key",
+            )))
+        }
+    }
+
+    #[test]
+    fn encrypt_propagates_recipient_error() {
+        match encrypt(&FailingRecipient, b"plaintext") {
+            Err(EncryptError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "recipient refused the file key");
+            }
+            other => panic!("expected original recipient error, got {other:?}"),
+        }
+    }
+
+    struct InvalidLabelRecipient(x25519::Recipient);
+
+    impl Recipient for InvalidLabelRecipient {
+        fn wrap_file_key(
+            &self,
+            file_key: &FileKey,
+        ) -> Result<(Vec<Stanza>, HashSet<String>), EncryptError> {
+            let (stanzas, mut labels) = self.0.wrap_file_key(file_key)?;
+            labels.insert("invalid label".into());
+            Ok((stanzas, labels))
+        }
+    }
+
+    #[test]
+    fn encrypt_propagates_invalid_recipient_labels() {
+        let recipient = InvalidLabelRecipient(crate::x25519::tests::TEST_PK.parse().unwrap());
+        match encrypt(&recipient, b"plaintext") {
+            Err(EncryptError::InvalidRecipientLabels(labels)) => {
+                assert_eq!(labels, HashSet::from(["invalid label".to_owned()]));
+            }
+            other => panic!("expected original invalid-label error, got {other:?}"),
+        }
+    }
 
     #[cfg(feature = "armor")]
     use super::encrypt_and_armor;

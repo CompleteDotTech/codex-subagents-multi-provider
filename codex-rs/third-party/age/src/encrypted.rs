@@ -103,7 +103,10 @@ impl<R: io::Read, C: Callbacks> IdentityState<R, C> {
             Self::Encrypted(encrypted) => encrypted.decrypt(filename).map(|file| (file, true)),
             Self::Decrypted(identity_file) => Ok((identity_file, false)),
             // `IdentityState::decrypt` is only ever called with `Some`.
-            Self::Poisoned(e) => Err(e.unwrap()),
+            Self::Poisoned(Some(error)) => Err(error),
+            Self::Poisoned(None) => {
+                panic!("encrypted identity state was taken without being restored")
+            }
         }
     }
 }
@@ -222,7 +225,7 @@ impl<R: io::Read, C: Callbacks> crate::Identity for Identity<R, C> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "armor"))]
 mod tests {
     use std::sync::{Arc, Mutex};
 

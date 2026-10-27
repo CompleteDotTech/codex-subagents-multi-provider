@@ -44,14 +44,19 @@ fn target_scrypt_work_factor() -> u8 {
             return require_native_elapsed(elapsed);
         }
         let start = Instant::now();
-        scrypt(&[], log_n, "").expect("log_n < 64");
+        if let Err(error) = scrypt(&[], log_n, "") {
+            panic!("internally selected scrypt calibration factor {log_n} must be valid: {error}");
+        }
         require_native_elapsed(Instant::now().checked_duration_since(start))
     })
 }
 
 #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
 fn require_native_elapsed(elapsed: Option<Duration>) -> Duration {
-    elapsed.expect("cannot calibrate scrypt: monotonic clock moved backwards")
+    match elapsed {
+        Some(duration) => duration,
+        None => panic!("cannot calibrate scrypt: monotonic clock moved backwards"),
+    }
 }
 
 #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
@@ -206,8 +211,10 @@ impl crate::Recipient for Recipient {
         inner_salt[..SCRYPT_SALT_LABEL.len()].copy_from_slice(SCRYPT_SALT_LABEL);
         inner_salt[SCRYPT_SALT_LABEL.len()..].copy_from_slice(&salt);
 
-        let enc_key =
-            scrypt(&inner_salt, self.log_n, self.passphrase.expose_secret()).expect("log_n < 64");
+        let enc_key = match scrypt(&inner_salt, self.log_n, self.passphrase.expose_secret()) {
+            Ok(key) => key,
+            Err(error) => panic!("configured scrypt recipient work factor must be valid: {error}"),
+        };
         let encrypted_file_key = aead_encrypt(&enc_key, file_key.expose_secret());
 
         let encoded_salt = BASE64_STANDARD_NO_PAD.encode(salt);
@@ -309,11 +316,9 @@ impl crate::Identity for Identity {
         inner_salt[..SCRYPT_SALT_LABEL.len()].copy_from_slice(SCRYPT_SALT_LABEL);
         inner_salt[SCRYPT_SALT_LABEL.len()..].copy_from_slice(&salt);
 
-        let enc_key = match {
-            #[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
-            calibration_test_hooks::record_stanza_derivation();
-            scrypt(&inner_salt, log_n, self.passphrase.expose_secret())
-        } {
+        #[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
+        calibration_test_hooks::record_stanza_derivation();
+        let enc_key = match scrypt(&inner_salt, log_n, self.passphrase.expose_secret()) {
             Ok(k) => k,
             Err(_) => {
                 return Some(Err(DecryptError::ExcessiveWork {
@@ -404,10 +409,10 @@ mod calibration_test_hooks {
             slot.borrow().as_ref().map(|state| {
                 let mut state = state.borrow_mut();
                 state.measured.push(log_n);
-                let (expected_factor, elapsed) = state
-                    .timings
-                    .pop_front()
-                    .expect("unexpected extra calibration measurement");
+                let (expected_factor, elapsed) = match state.timings.pop_front() {
+                    Some(measurement) => measurement,
+                    None => panic!("unexpected extra calibration measurement"),
+                };
                 assert_eq!(log_n, expected_factor);
                 elapsed
             })

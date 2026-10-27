@@ -217,7 +217,11 @@ pub(crate) mod read {
 
         let mut buf = [0; B];
         match BASE64_STANDARD_NO_PAD.decode_slice(arg, buf.as_mut()) {
-            Ok(n) if n == N => Some(buf[..N].try_into().unwrap()),
+            Ok(n) if n == N => {
+                let mut output = [0; N];
+                output.copy_from_slice(&buf[..N]);
+                Some(output)
+            }
             _ => None,
         }
     }

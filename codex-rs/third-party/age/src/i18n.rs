@@ -15,8 +15,13 @@ lazy_static! {
         let language_loader = fluent_language_loader!();
         // Ensure that the fallback language is always loaded, even if the library user
         // doesn't call `localizer().select(languages)`.
-        let fallback: LanguageIdentifier = "en-US".parse().unwrap();
-        language_loader.load_languages(&Localizations, &[fallback]).unwrap();
+        let fallback: LanguageIdentifier = match "en-US".parse() {
+            Ok(fallback) => fallback,
+            Err(error) => panic!("invalid built-in fallback language en-US: {error}"),
+        };
+        if let Err(error) = language_loader.load_languages(&Localizations, &[fallback]) {
+            panic!("missing or invalid embedded fallback language: {error}");
+        }
         language_loader
     };
 }
@@ -110,7 +115,7 @@ mod tests {
     #[test]
     fn localization_resources_and_fallback_are_available() {
         let mut resources: Vec<_> = Localizations::iter()
-            .map(|path| path.into_owned())
+            .map(std::borrow::Cow::into_owned)
             .collect();
         resources.sort();
         assert_eq!(

@@ -52,8 +52,9 @@ impl HeaderV1 {
         }
 
         let mut mac = HmacWriter::new(mac_key);
-        cookie_factory::r#gen(write::header_v1_minus_mac(&header), &mut mac)
-            .expect("can serialize Header into HmacWriter");
+        if let Err(error) = cookie_factory::r#gen(write::header_v1_minus_mac(&header), &mut mac) {
+            panic!("cannot serialize age header into infallible HMAC writer: {error}");
+        }
         header
             .mac
             .copy_from_slice(mac.finalize().into_bytes().as_slice());
@@ -65,11 +66,13 @@ impl HeaderV1 {
         let mut mac = HmacWriter::new(mac_key);
         if let Some(bytes) = &self.encoded_bytes {
             // The MAC covers all bytes up to the end of the --- prefix.
-            mac.write_all(&bytes[..bytes.len() - ENCODED_MAC_LENGTH - 2])
-                .expect("can serialize Header into HmacWriter");
+            if let Err(error) = mac.write_all(&bytes[..bytes.len() - ENCODED_MAC_LENGTH - 2]) {
+                panic!("cannot serialize age header into infallible HMAC writer: {error}");
+            }
         } else {
-            cookie_factory::r#gen(write::header_v1_minus_mac(self), &mut mac)
-                .expect("can serialize Header into HmacWriter");
+            if let Err(error) = cookie_factory::r#gen(write::header_v1_minus_mac(self), &mut mac) {
+                panic!("cannot serialize age header into infallible HMAC writer: {error}");
+            }
         }
         mac.verify(&self.mac)
     }
@@ -319,7 +322,7 @@ mod write {
 
     fn recipient_stanza<'a, W: 'a + Write>(r: &'a Stanza) -> impl SerializeFn<W> + 'a {
         move |w: WriteContext<W>| {
-            let args: Vec<_> = r.args.iter().map(|s| s.as_str()).collect();
+            let args: Vec<_> = r.args.iter().map(String::as_str).collect();
             let writer = age_stanza(&r.tag, &args, &r.body);
             writer(w)
         }

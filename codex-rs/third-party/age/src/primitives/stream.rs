@@ -66,9 +66,10 @@ impl Nonce {
     }
 
     fn to_bytes(self) -> [u8; 12] {
-        self.0.to_be_bytes()[4..]
-            .try_into()
-            .expect("slice is correct length")
+        let bytes = self.0.to_be_bytes();
+        let mut nonce = [0; 12];
+        nonce.copy_from_slice(&bytes[4..]);
+        nonce
     }
 }
 
@@ -183,10 +184,10 @@ impl Stream {
             io::Error::new(io::ErrorKind::WriteZero, "last chunk has been processed")
         })?;
 
-        let encrypted = self
-            .aead
-            .encrypt(&self.nonce.to_bytes().into(), chunk)
-            .expect("we will never hit chacha20::MAX_BLOCKS because of the chunk size");
+        let encrypted = match self.aead.encrypt(&self.nonce.to_bytes().into(), chunk) {
+            Ok(encrypted) => encrypted,
+            Err(error) => panic!("age chunk size must remain below chacha20::MAX_BLOCKS: {error}"),
+        };
         self.nonce.increment_counter();
 
         Ok(encrypted)
@@ -457,11 +458,9 @@ impl<R> StreamReader<R> {
     }
 
     fn read_from_chunk(&mut self, buf: &mut [u8]) -> usize {
-        if self.chunk.is_none() {
+        let Some(chunk) = self.chunk.as_ref() else {
             return 0;
-        }
-
-        let chunk = self.chunk.as_ref().unwrap();
+        };
         let cur_chunk_offset = self.cur_plaintext_pos as usize % CHUNK_SIZE;
 
         let to_read = cmp::min(chunk.expose_secret().len() - cur_chunk_offset, buf.len());
@@ -469,7 +468,7 @@ impl<R> StreamReader<R> {
         buf[..to_read]
             .copy_from_slice(&chunk.expose_secret()[cur_chunk_offset..cur_chunk_offset + to_read]);
         self.cur_plaintext_pos += to_read as u64;
-        if self.cur_plaintext_pos % CHUNK_SIZE as u64 == 0 {
+        if self.cur_plaintext_pos.is_multiple_of(CHUNK_SIZE as u64) {
             // We've finished with the current chunk.
             self.chunk = None;
         }
@@ -668,10 +667,9 @@ impl<R: Read + Seek> Seek for StreamReader<R> {
             // size (i.e. this conditional branch), we compute the length of the
             // plaintext. This is cached, so the overhead should be minimal.
             else if target_pos == self.len()? {
-                self.stream
-                    .nonce
-                    .set_last(true)
-                    .expect("We unset the last chunk flag earlier");
+                if self.stream.nonce.set_last(true).is_err() {
+                    panic!("seek reset must clear the age stream final-chunk flag");
+                }
             }
         }
 

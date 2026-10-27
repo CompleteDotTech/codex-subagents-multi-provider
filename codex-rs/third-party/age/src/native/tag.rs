@@ -64,9 +64,14 @@ impl std::str::FromStr for Recipient {
             .into_option()
             .ok_or("invalid P-256 point")?;
 
-        let pk_recip =
-            <Kem as hpke::Kem>::PublicKey::from_bytes(point.to_sec1_point(false).as_bytes())
-                .expect("valid");
+        let pk_recip = match <Kem as hpke::Kem>::PublicKey::from_bytes(
+            point.to_sec1_point(false).as_bytes(),
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                panic!("validated P-256 point must convert to HPKE uncompressed SEC1: {error}")
+            }
+        };
 
         Ok(Self {
             compressed: encoded,

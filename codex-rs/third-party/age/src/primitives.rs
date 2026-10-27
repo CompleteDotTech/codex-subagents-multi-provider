@@ -30,7 +30,10 @@ impl HmacWriter {
     /// Constructs a new writer to process input data.
     pub(crate) fn new(key: HmacKey) -> Self {
         HmacWriter {
-            inner: Hmac::new_from_slice(key.0.expose_secret()).expect("key is the correct length"),
+            inner: match Hmac::new_from_slice(key.0.expose_secret()) {
+                Ok(inner) => inner,
+                Err(error) => panic!("HMAC-SHA256 must accept the fixed 32-byte key: {error}"),
+            },
         }
     }
 
@@ -65,7 +68,8 @@ pub(crate) fn scrypt(salt: &[u8], log_n: u8, password: &str) -> Result<[u8; 32],
     let params = ScryptParams::new(log_n, 8, 1)?;
 
     let mut output = [0; 32];
-    scrypt_inner(password.as_bytes(), salt, &params, &mut output)
-        .expect("output is the correct length");
+    if scrypt_inner(password.as_bytes(), salt, &params, &mut output).is_err() {
+        panic!("scrypt must accept the fixed 32-byte output");
+    }
     Ok(output)
 }

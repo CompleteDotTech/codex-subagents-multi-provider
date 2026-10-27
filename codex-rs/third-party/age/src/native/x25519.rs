@@ -110,9 +110,8 @@ impl crate::Identity for Identity {
         }
 
         let epk: PublicKey = ephemeral_share.into();
-        let encrypted_file_key: [u8; ENCRYPTED_FILE_KEY_BYTES] = stanza.body[..]
-            .try_into()
-            .expect("Length should have been checked above");
+        let mut encrypted_file_key = [0; ENCRYPTED_FILE_KEY_BYTES];
+        encrypted_file_key.copy_from_slice(&stanza.body);
 
         let pk: PublicKey = (&self.0).into();
         let shared_secret = self.0.diffie_hellman(&epk);

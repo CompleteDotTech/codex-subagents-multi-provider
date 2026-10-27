@@ -65,8 +65,10 @@ impl Encryptor {
     ///
     /// [`x25519::Identity`]: crate::x25519::Identity
     pub fn with_user_passphrase(passphrase: SecretString) -> Self {
-        Self::with_recipients(iter::once(&scrypt::Recipient::new(passphrase) as _))
-            .expect("no errors can occur with this recipient set")
+        match Self::with_recipients(iter::once(&scrypt::Recipient::new(passphrase) as _)) {
+            Ok(encryptor) => encryptor,
+            Err(error) => panic!("single built-in scrypt recipient must be valid: {error}"),
+        }
     }
 
     /// Constructs an `Encryptor` that will create an age file encrypted to a list of
@@ -121,7 +123,10 @@ impl Encryptor {
 
         let header = HeaderV1::new(recipients, mac_key(&file_key))?;
         let nonce = Nonce::random();
-        let payload_key = v1_payload_key(&file_key, &header, &nonce).expect("MAC is correct");
+        let payload_key = match v1_payload_key(&file_key, &header, &nonce) {
+            Ok(key) => key,
+            Err(error) => panic!("freshly generated age header MAC must verify: {error}"),
+        };
 
         Ok(Self {
             header: Header::V1(header),
