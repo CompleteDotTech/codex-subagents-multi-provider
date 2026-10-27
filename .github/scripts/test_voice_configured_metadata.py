@@ -1,6 +1,7 @@
 """Adversarial fixtures for configured evidence, without invoking Bazel."""
 
 import copy
+import io
 import json
 from pathlib import Path
 import ctypes as c
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import run_bazel_with_buildbuddy as wrapper
 import voice_configured_metadata as m
 import voice_metadata_owned_job as owned
 
@@ -203,6 +205,93 @@ class ParsingTests(unittest.TestCase):
 
     def test_extraction_line_preserves_duplicate_and_malformed_guards(self):
         line = "Extracting Bazel installation...\n"
+        record = packages()[0][0]
+        for body in ("{}\n{}", '{"a":1,"a":2}', '{"actions": [', "{bad}"):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_json(line + body)
+        provider = m.SENTINEL + json.dumps(record)
+        for body in (
+            provider + "\n" + provider,
+            m.SENTINEL + '{"label":"x","label":"x"}',
+            m.SENTINEL + "{",
+        ):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_provider(line + body, record["label"])
+
+
+class ActualWrapperFramingTests(unittest.TestCase):
+    def keyless_wrapper_stderr(self, query):
+        env = {"CODEX_BAZEL_BIN": "fixture-bazel"}
+        command = wrapper.bazel_command(query, env=env)
+        self.assertIsNone(wrapper.remote_config([query], env))
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(sys, "argv", ["wrapper", query]),
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(
+                wrapper.subprocess,
+                "run",
+                return_value=wrapper.subprocess.CompletedProcess(command, 0),
+            ) as run,
+            mock.patch.object(
+                wrapper.os, "execvp", side_effect=SystemExit(0)
+            ) as execute,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            wrapper.main()
+        self.assertEqual(raised.exception.code, 0)
+        if os.name == "nt":
+            run.assert_called_once_with(command, check=False)
+            execute.assert_not_called()
+        else:
+            execute.assert_called_once_with(command[0], command)
+            run.assert_not_called()
+        self.assertEqual(
+            stderr.getvalue(),
+            "BuildBuddy key unavailable; using local Bazel configuration.\n",
+        )
+        return stderr.getvalue()
+
+    def test_real_keyless_wrapper_line_frames_provider_record(self):
+        record = packages()[0][0]
+        text = self.keyless_wrapper_stderr("cquery") + m.SENTINEL + json.dumps(record)
+        self.assertEqual(m.parse_provider(text, record["label"]), record)
+
+    def test_real_keyless_wrapper_line_frames_action_json(self):
+        value = graph()
+        text = self.keyless_wrapper_stderr("aquery") + json.dumps(value)
+        self.assertEqual(m.parse_json(text), value)
+
+    def test_python_wrapper_allowance_is_exact_complete_line(self):
+        record = packages()[0][0]
+        exact = self.keyless_wrapper_stderr("cquery").rstrip("\n")
+        for line in (
+            "prefix " + exact,
+            exact + " PRIVATE_SUFFIX",
+            " " + exact,
+            exact + " ",
+            exact.lower(),
+            exact[:-1],
+            "UNKNOWN_PRIVATE_WRAPPER_LINE",
+        ):
+            for before in (True, False):
+                with self.subTest(line=line, before=before):
+
+                    def frame(payload):
+                        return (
+                            line + "\n" + payload if before else payload + "\n" + line
+                        )
+
+                    with self.assertRaises(m.EvidenceError):
+                        m.parse_json(frame(json.dumps(graph())))
+                    with self.assertRaises(m.EvidenceError):
+                        m.parse_provider(
+                            frame(m.SENTINEL + json.dumps(record)), record["label"]
+                        )
+
+    def test_real_wrapper_line_preserves_duplicate_and_malformed_guards(self):
+        line = self.keyless_wrapper_stderr("cquery")
         record = packages()[0][0]
         for body in ("{}\n{}", '{"a":1,"a":2}', '{"actions": [', "{bad}"):
             with self.subTest(body=body), self.assertRaises(m.EvidenceError):

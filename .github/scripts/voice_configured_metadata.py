@@ -130,8 +130,12 @@ def parse_json(text):
         for line in lines.splitlines():
             if not line.strip():
                 continue
-            # Bazel 9.2.0 archive_utils.cc:248 emits this complete USER line.
-            if line == "Extracting Bazel installation...":
+            # Complete fixed lines: Bazel 9.2.0 archive_utils.cc:248 USER output
+            # and run_bazel_with_buildbuddy.py main()'s keyless fallback message.
+            if line in (
+                "Extracting Bazel installation...",
+                "BuildBuddy key unavailable; using local Bazel configuration.",
+            ):
                 continue
             if not re.match(
                 r"^(?:INFO:|DEBUG:|WARNING:|Loading:|Analyzing:|Computing main repo mapping:|"
