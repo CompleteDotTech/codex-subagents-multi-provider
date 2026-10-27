@@ -137,6 +137,65 @@ def fixture(root, helper, runtime):
     return copied
 
 
+def package_adjacency(executable, package, declared, env):
+    """Check exposed bytes and every declared DLL, without changing probe behavior."""
+    raw = resolve(package["raw"], env)
+    receipt_path = resolve(package["receipt"], env)
+    if receipt_path.stat().st_size > 64 * 1024:
+        raise ValueError("packaging receipt size bound exceeded")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    expected = {
+        name: path for name, path in declared.items() if path.suffix.lower() == ".dll"
+    }
+    if not expected:
+        raise ValueError("empty declared DLL closure")
+    supplied = inventory([resolve(key, env) for key in package["dlls"]])
+    adjacent = inventory(
+        [
+            path
+            for path in executable.parent.iterdir()
+            if path.is_file() and path.suffix.lower() == ".dll"
+        ]
+    )
+    if len(adjacent) > 128:
+        raise ValueError("package adjacency inventory bound exceeded")
+    if supplied.keys() != expected.keys() or adjacent.keys() != expected.keys():
+        raise ValueError("exposed executable lacks exact declared DLL siblings")
+    raw_sha, exposed_sha = digest(raw), digest(executable)
+    if raw_sha != exposed_sha:
+        raise ValueError("raw and exposed executable bytes differ")
+    if receipt["executable"] != {
+        "name": executable.name,
+        "source_sha256": raw_sha,
+        "output_sha256": exposed_sha,
+    }:
+        raise ValueError("executable packaging receipt mismatch")
+    recorded = {row["name"].lower(): row for row in receipt["dlls"]}
+    if len(recorded) != len(receipt["dlls"]) or recorded.keys() != expected.keys():
+        raise ValueError("DLL packaging receipt inventory mismatch")
+    result = {}
+    for name, original in expected.items():
+        copied = supplied[name]
+        expected_sha = digest(original)
+        if copied.parent != executable.parent or copied != adjacent[name]:
+            raise ValueError("declared packaged DLL is not executable-adjacent")
+        if digest(copied) != expected_sha or recorded[name] != {
+            "name": copied.name,
+            "source_sha256": expected_sha,
+            "output_sha256": expected_sha,
+        }:
+            raise ValueError("DLL packaging byte checksum mismatch")
+        result[name] = {"sha256": expected_sha, "matches_declared": True}
+    return {
+        "raw_path": str(raw),
+        "raw_sha256": raw_sha,
+        "exposed_sha256": exposed_sha,
+        "declared_dll_count": len(expected),
+        "dlls": result,
+        "valid": True,
+    }
+
+
 def diagnose(config, env, output):
     helper, unit, dumpbin, status = [
         resolve(config[key], env) for key in ("helper", "unit", "dumpbin", "status")
@@ -230,13 +289,26 @@ def diagnose(config, env, output):
         output["pe"].append(
             dict(parsed, path=str(path), edges=edges, inspection=result)
         )
-    return all(
-        p.get("code") == 0
-        and not p.get("timeout")
-        and not p.get("truncated")
-        and not p.get("reader_incomplete")
-        for p in output["probes"]
-    ) and all(p["stdout"].strip() == commit[0] for p in output["probes"][:2])
+    # Keep original startup/PE metrics even when a package layout check fails.
+    output["packaging"] = {}
+    for name, executable in (("helper", helper), ("unit", unit)):
+        try:
+            output["packaging"][name] = package_adjacency(
+                executable, config["packages"][name], declared, env
+            )
+        except (KeyError, ValueError, OSError, TypeError) as error:
+            output["packaging"][name] = {"valid": False, "error": str(error)}
+    return (
+        all(value["valid"] for value in output["packaging"].values())
+        and all(
+            p.get("code") == 0
+            and not p.get("timeout")
+            and not p.get("truncated")
+            and not p.get("reader_incomplete")
+            for p in output["probes"]
+        )
+        and all(p["stdout"].strip() == commit[0] for p in output["probes"][:2])
+    )
 
 
 def main():

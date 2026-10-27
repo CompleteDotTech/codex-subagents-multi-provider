@@ -8,6 +8,7 @@ load(":windows_native.bzl", "windows_build_tools", "windows_native_prefix")
 
 # All native build consumers must receive the same pinned source manifest.
 exports_files([
+    "package_windows_executable.py",
     "opus-toolchain.cmake",
     "windows_runtime_diagnostic.bat.tpl",
     "windows_runtime_diagnostic.py",
@@ -433,3 +434,13 @@ label_flag(
     )
     for cpu in ("x86_64", "aarch64")
 ]
+
+# The public helper alias selects packaged executables only for this ABI.
+config_setting(
+    name = "windows_msvc",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@llvm//constraints/windows/abi:msvc",
+    ],
+    visibility = ["//visibility:public"],
+)
