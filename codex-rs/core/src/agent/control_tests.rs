@@ -949,6 +949,200 @@ async fn spawn_failure_context_preserves_shutdown_during_child_startup() {
         .expect("spawn releases its membership");
 }
 
+#[test_case::test_case(false; "stopped caller remains registered")]
+#[test_case::test_case(true; "same ID equal authority replacement")]
+#[tokio::test]
+async fn prepared_fresh_spawn_rejects_stopped_or_replaced_caller(replace: bool) {
+    use crate::agent::child_provider_authorization::RetainedAgentAuthority;
+    let harness = AgentControlHarness::new().await;
+    let started = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .expect("start actual parent");
+    let parent_id = started.thread_id;
+    let parent = started.thread;
+    persist_thread_for_tree_resume(&parent, "original caller lifetime fixture").await;
+    let stored = parent
+        .read_thread(/*include_archived*/ true, /*include_history*/ true)
+        .await
+        .expect("persisted root history");
+    let initial = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: parent_id,
+        history: Arc::new(stored.history.expect("root history").items),
+        rollout_path: stored.rollout_path,
+    });
+    let mut source = thread_spawn_source(
+        parent_id,
+        &parent.session_source,
+        next_thread_spawn_depth(&parent.session_source),
+        None,
+        Some("stale-preparation-worker".into()),
+    )
+    .expect("source for original actual parent");
+    let prepared = harness
+        .control
+        .prepare_spawn_fixture(&harness.config, &source, /*full_history*/ false)
+        .await
+        .expect("prepare against live original caller");
+    let authorization = prepared
+        .prepared_child_authorization
+        .as_ref()
+        .expect("actual host preparation");
+    if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) = &mut source {
+        *agent_role = authorization.role_name();
+    }
+    assert_eq!(source.parent_thread_id(), Some(parent_id));
+    let original_authority =
+        RetainedAgentAuthority::capture(&parent.session, &parent.session_source).await;
+    let origins = &parent
+        .session
+        .services
+        .local_agent_runtime
+        .child_provider_origins;
+    let original_origin = origins.verified(parent_id);
+    assert!(
+        original_origin.is_some(),
+        "real root startup publishes its provider origin"
+    );
+    parent
+        .shutdown_and_wait()
+        .await
+        .expect("stop original caller");
+    assert!(!parent.is_running());
+    let registered = harness
+        .manager
+        .get_thread(parent_id)
+        .await
+        .expect("stopped caller retained in manager");
+    assert!(Arc::ptr_eq(&registered, &parent));
+    let stopped_authority =
+        RetainedAgentAuthority::capture(&registered.session, &registered.session_source).await;
+    assert_eq!(
+        stopped_authority.config.as_ref(),
+        original_authority.config.as_ref()
+    );
+    assert_eq!(stopped_authority.settings, original_authority.settings);
+    assert!(stopped_authority.scope == original_authority.scope);
+    assert_eq!(origins.verified(parent_id), original_origin);
+
+    let replacement = if replace {
+        let removed = harness
+            .manager
+            .remove_thread(&parent_id)
+            .await
+            .expect("remove stopped original through manager API");
+        assert!(Arc::ptr_eq(&removed, &parent));
+        let replacement = harness
+            .manager
+            .start_thread_with_control_for_tests(
+                StartThreadOptions {
+                    initial_history: initial,
+                    session_source: Some(parent.session_source.clone()),
+                    history_mode: Some(ThreadHistoryMode::Legacy),
+                    ..StartThreadOptions::new(harness.config.clone())
+                },
+                harness.control.clone(),
+            )
+            .await
+            .expect("resume actual equal-authority root with same ID");
+        assert_eq!(replacement.thread_id, parent_id);
+        assert!(replacement.thread.is_running());
+        assert!(!Arc::ptr_eq(&replacement.thread.session, &parent.session));
+        let actual = harness.manager.get_thread(parent_id).await.unwrap();
+        assert!(Arc::ptr_eq(&actual, &replacement.thread));
+        let replacement_authority =
+            RetainedAgentAuthority::capture(&actual.session, &actual.session_source).await;
+        assert_eq!(
+            replacement_authority.config.as_ref(),
+            original_authority.config.as_ref()
+        );
+        assert_eq!(replacement_authority.settings, original_authority.settings);
+        assert!(replacement_authority.scope == original_authority.scope);
+        assert_eq!(
+            origins.verified(parent_id),
+            original_origin,
+            "equal provider origin cannot identify the Session lifetime"
+        );
+        assert_ne!(
+            replacement_authority.epoch().generation,
+            original_authority.epoch().generation
+        );
+        assert!(Arc::ptr_eq(
+            origins,
+            &actual
+                .session
+                .services
+                .local_agent_runtime
+                .child_provider_origins
+        ));
+        Some(replacement.thread)
+    } else {
+        None
+    };
+    assert_eq!(harness.manager.list_thread_ids().await, vec![parent_id]);
+    let mut created = harness.manager.subscribe_thread_created();
+    let outcome = harness
+        .control
+        .spawn(SpawnRequest {
+            caller: parent_id,
+            config: prepared,
+            input: AgentInput::UserInput(text_input("must never start for a stale caller")),
+            source,
+            options: SpawnAgentOptions {
+                parent_thread_id: Some(parent_id),
+                ..Default::default()
+            },
+        })
+        .await;
+    // Preserve a clean fixture even when the current implementation admits the
+    // stale preparation. The assertion below records that actual unexpected success.
+    if let Ok((agent, _)) = &outcome {
+        let child = harness
+            .manager
+            .get_thread(agent.thread_id)
+            .await
+            .expect("unexpected child is registered");
+        child
+            .shutdown_and_wait()
+            .await
+            .expect("clean unexpected stale-authorized child");
+        harness
+            .manager
+            .remove_thread(&agent.thread_id)
+            .await
+            .expect("remove unexpected child");
+    }
+    if let Some(replacement) = replacement {
+        replacement
+            .shutdown_and_wait()
+            .await
+            .expect("clean replacement caller");
+    }
+    let error = outcome
+        .err()
+        .expect("stale preparation unexpectedly authorized actual child startup");
+    assert!(
+        error.to_string().contains("child_provider_policy_conflict"),
+        "{error}"
+    );
+    assert!(
+        matches!(
+            created.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "stale caller rejection must precede child startup publication"
+    );
+    assert_eq!(harness.manager.list_thread_ids().await, vec![parent_id]);
+}
+
 #[tokio::test]
 async fn cancelled_spawn_after_input_admission_discards_child() {
     let harness = AgentControlHarness::new().await;
