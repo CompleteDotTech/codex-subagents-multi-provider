@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+RUSTFMT_COMMAND_LIMIT = 16_000
 
 
 @dataclass(frozen=True)
@@ -40,12 +41,107 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
     return FormatterGroup("Just", (Command(tuple(args)),))
 
 
+def rustfmt_batches(prefix: list[str], paths: list[str]) -> list[tuple[str, ...]]:
+    """Bound Windows quoting and UTF-16 size, including the terminating NUL."""
+
+    def fits(args: list[str]) -> bool:
+        return (
+            len(
+                subprocess.list2cmdline(args).encode(
+                    "utf-16-le", errors="surrogatepass"
+                )
+            )
+            // 2
+            + 1
+            <= RUSTFMT_COMMAND_LIMIT
+        )
+
+    batches = []
+    batch = prefix.copy()
+    for path in paths:
+        if not fits([*prefix, path]):
+            raise ValueError(
+                f"Rust formatter path exceeds command-line limit: {path!r}"
+            )
+        if not fits([*batch, path]):
+            batches.append(tuple(batch))
+            batch = prefix.copy()
+        batch.append(path)
+    if len(batch) > len(prefix):
+        batches.append(tuple(batch))
+    return batches
+
+
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
     args = [sys.executable, str(REPO_ROOT / ".github/scripts/check_rust_format.py")]
     if not check:
         args.append("--write")
-    command = Command(tuple(args), REPO_ROOT / "codex-rs")
-    return FormatterGroup("Rust", (command,))
+    workspace = REPO_ROOT / "codex-rs"
+    commands = [Command(tuple(args), workspace)]
+    # Cargo follows modules, whereas Git also finds standalone and untracked
+    # sources. Run the integrity-aware helper first: no Rust writer may run if
+    # the pinned vendor tree fails verification. Never send vendor files to the
+    # strict first-party writer, even when Git discovers untracked vendor files.
+    repository_files = subprocess.check_output(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.rs",
+        ],
+        cwd=REPO_ROOT,
+    ).split(b"\0")
+    vendor = Path("codex-rs/third-party/aws-config")
+    protected_tree = (REPO_ROOT / vendor).resolve()
+    protected_identities = {
+        (status.st_dev, status.st_ino)
+        for path in protected_tree.rglob("*")
+        if path.is_file()
+        for status in [path.stat()]
+    }
+    rust_files = set()
+    for encoded in repository_files:
+        if not encoded:
+            continue
+        path = Path(os.fsdecode(encoded))
+        source = REPO_ROOT / path
+        if path.is_relative_to(vendor) or not source.is_file():
+            continue
+        resolved = source.resolve()
+        if not resolved.is_relative_to(REPO_ROOT.resolve()):
+            raise ValueError(f"Rust source resolves outside repository: {path}")
+        status = source.stat()
+        if (
+            resolved.is_relative_to(protected_tree)
+            or (status.st_dev, status.st_ino) in protected_identities
+        ):
+            raise ValueError(
+                f"Rust source aliases protected vendor file; break alias: {path}"
+            )
+        rust_files.add(os.path.relpath(source, workspace))
+    rust_files = sorted(rust_files)
+    if rust_files:
+        rustfmt_args = [
+            "rustfmt",
+            "--edition",
+            "2024",
+            "--config-path",
+            str(workspace / "rustfmt.toml"),
+            "--config",
+            "imports_granularity=Item,skip_children=true",
+        ]
+        if check:
+            rustfmt_args.append("--check")
+        rustfmt_args.append("--")
+        commands.extend(
+            Command(batch, workspace)
+            for batch in rustfmt_batches(rustfmt_args, rust_files)
+        )
+    return FormatterGroup("Rust", tuple(commands))
 
 
 def buildifier_formatter_group(*, check: bool) -> FormatterGroup:
