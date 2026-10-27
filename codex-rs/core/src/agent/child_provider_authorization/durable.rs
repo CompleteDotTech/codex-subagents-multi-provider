@@ -621,6 +621,203 @@ mod tests {
     use crate::config::ConfigBuilder;
 
     #[tokio::test]
+    async fn attachment_executable_grants_change_the_actual_fingerprint() {
+        use codex_network_proxy::EnvironmentNetworkPolicy;
+        let home = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.6-sol");
+        model.used_fallback_model_metadata = false;
+        let selections = [TurnEnvironmentSelection::new(
+            codex_protocol::environment::TurnEnvironmentRequest {
+                environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+                cwd: config.cwd.clone().into(),
+                workspace_roots: config
+                    .workspace_roots
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                config: EnvironmentConfigState::FromThread,
+            },
+            &[],
+        )];
+        let baseline_scope = candidate_scope(&config, Some(&selections));
+        let baseline = fingerprint(&config, &baseline_scope, &model, &[], &[]).unwrap();
+        let ready = baseline_scope.environments[0].1.as_ref().unwrap();
+        assert!(ready.exec_policy.is_none() && ready.mcp_policy.is_none());
+        let network = EnvironmentNetworkPolicy {
+            requires_proxy: false,
+            domains: None,
+            unix_sockets: None,
+            allow_upstream_proxy: false,
+            dangerously_allow_all_unix_sockets: false,
+            allow_local_binding: None,
+            managed_allowed_domains_only: false,
+        };
+        let mut cases = Vec::new();
+        let mut changed = ready.clone();
+        changed.network_policy = Some(network.clone());
+        cases.push(("explicit network policy", changed));
+        for (label, value) in [
+            ("requires proxy", json!({"requiresProxy": true})),
+            (
+                "domain deny",
+                json!({"domains": {"example.invalid": "deny"}}),
+            ),
+            (
+                "socket deny",
+                json!({"unixSockets": {"/private/fixture.sock": "deny"}}),
+            ),
+            ("upstream proxy", json!({"allowUpstreamProxy": true})),
+            (
+                "all sockets",
+                json!({"dangerouslyAllowAllUnixSockets": true}),
+            ),
+            ("local binding deny", json!({"allowLocalBinding": false})),
+            ("local binding allow", json!({"allowLocalBinding": true})),
+            (
+                "managed domains only",
+                json!({"managedAllowedDomainsOnly": true}),
+            ),
+        ] {
+            let mut policy = serde_json::to_value(&network).unwrap();
+            policy
+                .as_object_mut()
+                .unwrap()
+                .extend(value.as_object().unwrap().clone());
+            let mut changed = ready.clone();
+            changed.network_policy = Some(serde_json::from_value(policy).unwrap());
+            cases.push((label, changed));
+        }
+        let mut changed = ready.clone();
+        changed.use_legacy_landlock = !changed.use_legacy_landlock;
+        cases.push(("legacy Landlock", changed));
+        for level in [
+            codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken,
+            codex_protocol::config_types::WindowsSandboxLevel::Elevated,
+        ] {
+            let mut changed = ready.clone();
+            changed.windows_sandbox_level = level;
+            cases.push(("Windows sandbox level", changed));
+        }
+        for backend in [
+            codex_protocol::sandbox::SandboxType::WindowsRestrictedToken,
+            codex_protocol::sandbox::SandboxType::WindowsMxc,
+        ] {
+            let mut changed = ready.clone();
+            changed.windows_sandbox_type = backend;
+            cases.push(("Windows sandbox backend", changed));
+        }
+        let mut changed = ready.clone();
+        changed.selected_capability_roots = vec![SelectedCapabilityRoot {
+            id: "attachment-only".into(),
+            location: codex_protocol::capabilities::CapabilityRootLocation::Environment {
+                environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+                path: config.cwd.clone().into(),
+            },
+        }];
+        cases.push(("attachment capability roots", changed));
+        let mut fingerprints = HashSet::new();
+        for (label, changed) in cases {
+            assert_ne!(ready, &changed, "{label}");
+            let mut selection = selections[0].clone();
+            selection.config = EnvironmentConfigState::Ready(changed);
+            let scope = candidate_scope(&config, Some(&[selection]));
+            let actual = fingerprint(&config, &scope, &model, &[], &[]).unwrap();
+            assert_ne!(actual, baseline, "attachment grant omitted: {label}");
+            assert!(
+                fingerprints.insert(actual),
+                "distinct attachment grants collide: {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_attachment_exec_and_mcp_policies_have_no_fingerprint_proof() {
+        use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
+        use codex_protocol::mcp_policy::McpServerRequirement;
+        let home = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.6-sol");
+        model.used_fallback_model_metadata = false;
+        let selections = [TurnEnvironmentSelection::new(
+            codex_protocol::environment::TurnEnvironmentRequest {
+                environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+                cwd: config.cwd.clone().into(),
+                workspace_roots: config
+                    .workspace_roots
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                config: EnvironmentConfigState::FromThread,
+            },
+            &[],
+        )];
+        assert!(
+            fingerprint(
+                &config,
+                &candidate_scope(&config, Some(&selections)),
+                &model,
+                &[],
+                &[]
+            )
+            .is_some()
+        );
+        for secret in [None, Some("synthetic-secret-a"), Some("synthetic-secret-b")] {
+            let mut policy = codex_execpolicy::Policy::empty();
+            if let Some(secret) = secret {
+                policy
+                    .add_prefix_rule(
+                        &["restricted-command".into(), secret.into()],
+                        codex_execpolicy::Decision::Forbidden,
+                    )
+                    .unwrap();
+            }
+            let baseline = candidate_scope(&config, Some(&selections));
+            let mut ready = baseline.environments[0].1.as_ref().unwrap().clone();
+            ready.exec_policy = Some(codex_execpolicy::RequirementsExecPolicy::new(policy));
+            let mut selection = selections[0].clone();
+            selection.config = EnvironmentConfigState::Ready(ready);
+            let scope = candidate_scope(&config, Some(&[selection]));
+            assert!(
+                fingerprint(&config, &scope, &model, &[], &[]).is_none(),
+                "opaque command policies, including explicit empty ones, must decline proof"
+            );
+            for requirement in [
+                json!({"identity": {"url": {"match": "exact", "value": format!("https://example.invalid/?token={}", secret.unwrap_or("empty"))}}}),
+                json!({"identity": {"command": {"executable": "restricted-server", "args": [{"match": "prefix", "value": secret.unwrap_or("empty")}]}}}),
+            ] {
+                let mut ready = baseline.environments[0].1.as_ref().unwrap().clone();
+                ready.mcp_policy = Some(EnvironmentMcpPolicy {
+                    servers: secret.map(|_| {
+                        BTreeMap::from([(
+                            "restricted-server".into(),
+                            serde_json::from_value::<McpServerRequirement>(requirement).unwrap(),
+                        )])
+                    }),
+                    plugins: None,
+                });
+                let mut selection = selections[0].clone();
+                selection.config = EnvironmentConfigState::Ready(ready);
+                let scope = candidate_scope(&config, Some(&[selection]));
+                assert!(
+                    fingerprint(&config, &scope, &model, &[], &[]).is_none(),
+                    "opaque MCP policies, including explicit empty ones, must decline proof"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn grant_fingerprint_tracks_effective_feature_and_model_limits_but_excludes_credentials()
     {
         let home = tempfile::tempdir().unwrap();

@@ -6758,6 +6758,276 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(
     }
 }
 
+#[test_case::test_case(false; "attachment command deny")]
+#[test_case::test_case(true; "attachment MCP restriction")]
+#[tokio::test]
+async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(mcp: bool) {
+    use codex_protocol::environment::EnvironmentConfigState;
+    use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
+    use codex_protocol::mcp_policy::McpServerIdentity;
+    use codex_protocol::mcp_policy::McpServerRequirement;
+    let (home, mut config) = test_config_with_host_configuration(
+        Vec::new(),
+        Some("[agents]\nallowed_model_providers=['openai']\n"),
+    )
+    .await;
+    for feature in [Feature::Sqlite, Feature::MultiAgentV2, Feature::ShellTool] {
+        config.features.enable(feature).unwrap();
+    }
+    config.model = Some("gpt-5.6-sol".into());
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    // The same helper is configured throughout; compare its marker immediately
+    // around the denied child send, after legitimate root startup has finished.
+    let marker = home.path().join("attachment-auth-invocations");
+    let script = home.path().join(if cfg!(windows) {
+        "attachment-auth.cmd"
+    } else {
+        "attachment-auth.sh"
+    });
+    std::fs::write(
+        &script,
+        if cfg!(windows) {
+            "@echo off\r\necho invoked>>attachment-auth-invocations\r\necho synthetic\r\n"
+        } else {
+            "echo invoked >> attachment-auth-invocations\nprintf synthetic\n"
+        },
+    )
+    .unwrap();
+    config.model_provider.auth = Some(serde_json::from_value(if cfg!(windows) {
+        serde_json::json!({"command":"cmd.exe","args":["/D","/C",script],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+    } else {
+        serde_json::json!({"command":"sh","args":[script],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
+    }).unwrap());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let root = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .unwrap();
+    let control = root
+        .thread
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.thread.session.session_id());
+    let child =
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &root.thread, "worker").await;
+    let target = child.thread_id;
+    let target_thread = harness.manager.get_thread(target).await.unwrap();
+    let (before_config, before_settings, before_environments) = target_thread
+        .session
+        .native_agent_authority_snapshot()
+        .await;
+    let ready = before_environments.primary().unwrap();
+    let original = ready.config().clone();
+    assert!(original.exec_policy.is_none() && original.mcp_policy.is_none());
+    let mut restricted = original.clone();
+    if mcp {
+        restricted.mcp_policy = Some(EnvironmentMcpPolicy {
+            servers: Some(std::collections::BTreeMap::from([(
+                "restricted-server".into(),
+                McpServerRequirement::Identity {
+                    identity: McpServerIdentity::Command {
+                        command: "restricted-server".into(),
+                    },
+                },
+            )])),
+            plugins: None,
+        });
+    } else {
+        let mut policy = codex_execpolicy::Policy::empty();
+        policy
+            .add_prefix_rule(
+                &["restricted-command".into()],
+                codex_execpolicy::Decision::Forbidden,
+            )
+            .unwrap();
+        restricted.exec_policy = Some(codex_execpolicy::RequirementsExecPolicy::new(policy));
+    }
+    let mut selection = ready.selection();
+    selection.config = EnvironmentConfigState::Ready(restricted.clone());
+    target_thread
+        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                before_settings.cwd.clone(),
+                vec![selection.into_request()],
+            )),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let activated = target_thread
+        .session
+        .new_turn_with_default_settings("attachment-only-restriction".into(), Default::default())
+        .await;
+    drop(activated);
+    let (after_config, after_settings, after_environments) = target_thread
+        .session
+        .native_agent_authority_snapshot()
+        .await;
+    assert_eq!(after_settings.cwd, before_settings.cwd);
+    assert_eq!(
+        after_config.permissions.effective_permission_profile(),
+        before_config.permissions.effective_permission_profile()
+    );
+    assert_eq!(
+        after_config.permissions.shell_environment_policy,
+        before_config.permissions.shell_environment_policy
+    );
+    assert_eq!(after_config.workspace_roots, before_config.workspace_roots);
+    assert_eq!(
+        after_config.features.enabled(Feature::ShellTool),
+        before_config.features.enabled(Feature::ShellTool)
+    );
+    assert_eq!(after_environments.primary().unwrap().config(), &restricted);
+    let mut stripped = after_environments.primary().unwrap().config().clone();
+    stripped.exec_policy = None;
+    stripped.mcp_policy = None;
+    assert_eq!(
+        stripped, original,
+        "only the actual attachment policy changed"
+    );
+    let global = target_thread.session.services.exec_policy.current();
+    assert!(
+        global.rules().is_empty()
+            && global.network_rules().is_empty()
+            && global.host_executables().is_empty()
+    );
+    assert!(
+        target_thread
+            .session
+            .services
+            .selected_capability_roots
+            .is_empty()
+    );
+    persist_thread_for_tree_resume(&root.thread, "root attachment receipt fixture").await;
+    persist_thread_for_tree_resume(&target_thread, "target attachment restriction fixture").await;
+    wait_for_live_thread_spawn_children(&control, root.thread_id, &[target]).await;
+    let stored_target = target_thread.read_thread(true, true).await.unwrap();
+    assert!(!stored_target.history.unwrap().items.is_empty());
+    let stored_root = root.thread.read_thread(true, true).await.unwrap();
+    let initial = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: root.thread_id,
+        history: Arc::new(stored_root.history.unwrap().items),
+        rollout_path: stored_root.rollout_path,
+    });
+    let state = control.runtime.upgrade().unwrap();
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.timed_out.is_empty());
+    assert!(
+        state
+            .read_native_authority_receipt(root.thread_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "unrestricted root remains sealable"
+    );
+    assert!(
+        state
+            .read_native_authority_receipt(target)
+            .await
+            .unwrap()
+            .is_none(),
+        "opaque attachment restriction must produce NoProof, never a weaker sealed receipt"
+    );
+    let fresh = harness.config.clone();
+    let state_db = harness.state_db.clone();
+    let root_id = root.thread_id;
+    drop(global);
+    drop(target_thread);
+    drop(root);
+    drop(control);
+    drop(state);
+    let _home = harness._home;
+    drop(harness.manager);
+    drop(harness.control);
+    drop(harness.config);
+    drop(harness.state_db);
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        fresh.model_provider.clone(),
+        fresh.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        state_db,
+    );
+    let resumed = manager
+        .start_thread(StartThreadOptions {
+            initial_history: initial,
+            session_source: Some(SessionSource::Exec),
+            ..StartThreadOptions::new(fresh.clone())
+        })
+        .await
+        .unwrap();
+    let runtime = &resumed.thread.session.services.local_agent_runtime;
+    assert!(runtime.retained_authority(target).is_none());
+    assert!(runtime.registry.evicted_environments(target).is_none());
+    let restored = resumed
+        .thread
+        .session
+        .inherited_environment_snapshot()
+        .await;
+    assert_eq!(
+        restored.primary().unwrap().config(),
+        &original,
+        "owner removes only the attachment restriction"
+    );
+    let mut created = manager.subscribe_thread_created();
+    let helper_before = std::fs::read(&marker).unwrap_or_default();
+    let error = resumed
+        .thread
+        .session
+        .services
+        .agent_control
+        .send(SendRequest {
+            caller: root_id,
+            target: AgentTarget::Id(target),
+            resume_config: fresh,
+            input: AgentInput::Message {
+                message: AgentMessage::Plaintext("cold attachment retry".into()),
+                mode: MessageDeliveryMode::QueueOnly,
+            },
+            start_options: Default::default(),
+        })
+        .await
+        .err()
+        .expect("attachment NoProof must deny cold resume before startup");
+    assert!(
+        error
+            .to_string()
+            .contains("cold effective authority is unsealed or unavailable"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&marker).unwrap_or_default(),
+        helper_before,
+        "denied send must invoke no auth helper"
+    );
+    assert!(
+        matches!(
+            created.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "denied send must publish no startup event"
+    );
+    assert_eq!(manager.list_thread_ids().await, vec![root_id]);
+    assert_thread_not_loaded(&manager, target).await;
+    assert!(runtime.retained_authority(target).is_none());
+    assert!(runtime.registry.evicted_environments(target).is_none());
+}
+
 #[tokio::test]
 async fn failed_saved_authority_invalidation_prevents_runtime_and_auth_helper_startup() {
     let (home, mut config) = test_config().await;
