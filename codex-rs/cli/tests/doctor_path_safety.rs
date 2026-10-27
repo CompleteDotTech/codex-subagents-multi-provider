@@ -148,6 +148,10 @@ wire_api = "responses"
             .env("TERM", "dumb")
             .env("ZELLIJ", "0")
             .timeout(Duration::from_secs(/*secs*/ 45));
+        // Hermetic Windows tests must discover the fixture's batch helpers
+        // without depending on inherited extension settings or executing them.
+        #[cfg(windows)]
+        command.env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
         Ok(command)
     }
 }
