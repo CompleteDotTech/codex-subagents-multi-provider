@@ -729,7 +729,16 @@ jobs:
         # its native MSVC route. This is not GNU cross-compile evidence.
         run: |
           unset BUILDBUDDY_API_KEY
-          python .github/scripts/observe_windows_ci_resources.py supervise -- bash ./.github/scripts/run-bazel-ci.sh \
+          if [[ "$OSTYPE" != msys || "$BASH" != /* || ! -x "$BASH" ]]; then
+            echo "Expected the current Git Bash executable" >&2
+            exit 1
+          fi
+          git_bash="$(cygpath -w "$BASH")"
+          case "$git_bash" in
+            [A-Za-z]:\\*|[A-Za-z]:/*) ;;
+            *) echo "Git Bash did not resolve to an absolute Windows path" >&2; exit 1 ;;
+          esac
+          python .github/scripts/observe_windows_ci_resources.py supervise -- "$git_bash" ./.github/scripts/run-bazel-ci.sh \
             --print-failed-test-logs --print-failed-action-summary \
             --windows-cross-compile -- test --keep_going --nocache_test_results --test_output=all --zip_undeclared_test_outputs=false \
             --test_env=VOICE_DIAGNOSTIC_HEAD --test_env=VOICE_DIAGNOSTIC_TREE \

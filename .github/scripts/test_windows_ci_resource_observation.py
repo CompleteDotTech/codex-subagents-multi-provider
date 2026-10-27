@@ -4,12 +4,15 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import sys
 import threading
 import time
+import textwrap
 import unittest
 from unittest.mock import patch, Mock
 
@@ -79,6 +82,75 @@ class ObservationTests(unittest.TestCase):
         ):
             with self.assertRaises(FileNotFoundError):
                 m.supervise(["missing-build"], None)
+
+    @unittest.skipUnless(sys.platform == "win32", "native Windows command selection")
+    def test_workflow_selects_current_git_bash_and_preserves_native_child_exit(self):
+        workflow = (Path(__file__).parents[1] / "workflows/bazel.yml").read_text()
+        step = workflow.split("      - name: Diagnose native MSVC voice runtime\n", 1)[
+            1
+        ].split("      - name:", 1)[0]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        launch = re.search(
+            r'python \.github/scripts/observe_windows_ci_resources\.py supervise -- ("[^"\n]+"|[^\s]+)',
+            script,
+        )
+        self.assertIsNotNone(launch)
+        # Execute the workflow's real shell selection, without its build payload.
+        probe = script[: launch.start()] + "printf '%s\\0' " + launch.group(1)
+        outer = Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe"
+        self.assertTrue(outer.is_file(), "Git Bash is required on Windows")
+        with tempfile.TemporaryDirectory() as directory:
+            script_path = Path(directory) / "workflow selection.sh"
+            script_path.write_text(probe, newline="\n")
+            selected = subprocess.run(
+                [
+                    str(outer),
+                    "--noprofile",
+                    "--norc",
+                    "-e",
+                    "-o",
+                    "pipefail",
+                    script_path.as_posix(),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=True,
+            ).stdout
+        self.assertEqual(selected.count(b"\0"), 1)
+        executable = Path(selected[:-1].decode())
+        self.assertTrue(
+            executable.is_absolute(), "never resolve a bare bash through PATH"
+        )
+        self.assertTrue(executable.is_file())
+        observer = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "shell identity.txt"
+            child_script = Path(directory) / "harmless child.sh"
+            child_script.write_text(
+                'printf "%s\\n" "$BASH_VERSION" "$2" > "$1"\nexit 37\n',
+                newline="\n",
+            )
+            with patch.object(m, "collect", side_effect=AssertionError("no host CIM")):
+                code = m.supervise(
+                    [
+                        str(executable),
+                        "--noprofile",
+                        "--norc",
+                        child_script.as_posix(),
+                        marker.as_posix(),
+                        "argument with spaces",
+                    ],
+                    observer,
+                )
+            self.assertEqual(code, 37)
+            version, argument = marker.read_text().splitlines()
+            self.assertTrue(re.fullmatch(r"\d+\.\d+.*", version))
+            self.assertEqual(argument, "argument with spaces")
+        self.assertEqual(
+            [call.args[0] for call in observer.sample.call_args_list],
+            ["before-build", "build-exit"],
+        )
 
     def test_oversized_collector_rejected(self):
         with patch.object(m, "bounded_output", side_effect=OverflowError()):
@@ -197,7 +269,7 @@ class ObservationTests(unittest.TestCase):
         before, job = workflow.read_text().split("  voice-runtime-diagnostic:", 1)
         self.assertNotIn("observe_windows_ci_resources", before)
         self.assertIn(
-            "python .github/scripts/observe_windows_ci_resources.py supervise -- bash ./.github/scripts/run-bazel-ci.sh",
+            'python .github/scripts/observe_windows_ci_resources.py supervise -- "$git_bash" ./.github/scripts/run-bazel-ci.sh',
             job,
         )
         self.assertIn(
