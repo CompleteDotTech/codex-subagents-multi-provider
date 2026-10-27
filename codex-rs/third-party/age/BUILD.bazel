@@ -123,6 +123,33 @@ workspace_root_test(
     workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
 )
 
+# Armor has no additional Cargo dependencies. Recompile the existing unit crate
+# with cfg(test) + armor so its encrypted-identity and armor unit tests execute.
+# Keep the default-feature unit target unchanged and use the SAME metadata hub.
+rust_test(
+    name = "age-armor-unit-tests-bin",
+    crate = ":age-unit-test-lib",
+    crate_features = [
+        "default",
+        "armor",
+    ],
+    data = _TEST_DATA,
+    rustc_env = _ENV,
+    rustc_flags = WINDOWS_RUSTC_LINK_FLAGS,
+    tags = ["manual"],
+    version = "0.12.1",
+    deps = unit_deps(normal = True) + [
+        "@age_unit_test_crates//:proptest-1.11.0",
+    ],
+)
+
+workspace_root_test(
+    name = "age-armor-unit-tests",
+    test_bin = ":age-armor-unit-tests-bin",
+    working_directory_marker = ":Cargo.toml",
+    workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+)
+
 # Preserve the original Cargo required-feature closures, including implicit
 # dependency features. The annotations select only these TEST metadata repos.
 _SSH_FEATURES = [
