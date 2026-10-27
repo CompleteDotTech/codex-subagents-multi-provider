@@ -254,14 +254,14 @@ def test_root_format_driver_covers_all_formatter_groups(
             (sys.executable, str(tmp_path / ".github/scripts/check_rust_format.py"), "--write"),
             tmp_path / "codex-rs",
         ),
-        script.Command(rustfmt_args + rust_files, tmp_path / "codex-rs"),
+        script.Command(rustfmt_args + ("--",) + rust_files, tmp_path / "codex-rs"),
     )
     assert checks[1].commands == (
         script.Command(
             (sys.executable, str(tmp_path / ".github/scripts/check_rust_format.py")),
             tmp_path / "codex-rs",
         ),
-        script.Command(rustfmt_args + ("--check",) + rust_files, tmp_path / "codex-rs"),
+        script.Command(rustfmt_args + ("--check", "--") + rust_files, tmp_path / "codex-rs"),
     )
     format_buildifier_args = formatters[2].commands[-1].args
     check_buildifier_args = checks[2].commands[-1].args
@@ -1622,3 +1622,33 @@ def test_root_rust_rejects_resolved_aliases(monkeypatch, tmp_path, destination):
     expected = "aliases protected vendor" if destination == "vendor" else "outside repository"
     with pytest.raises(ValueError, match=expected):
         script.rust_formatter_group(check=False)
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_root_rust_flag_like_filename_is_literal_after_separator(monkeypatch, tmp_path, check):
+    script = _load_root_format_script_module()
+    source = tmp_path / "codex-rs/--config-path=override.rs"
+    source.parent.mkdir(parents=True)
+    source.write_text("fn main() {}")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        script.subprocess, "check_output", lambda *a, **kw: b"codex-rs/--config-path=override.rs\0"
+    )
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[0] == "rustfmt":
+            separator = args.index("--")
+            assert args[separator + 1 :] == ("--config-path=override.rs",)
+            assert "imports_granularity=Item,skip_children=true" in args[:separator]
+            assert ("--check" in args[:separator]) == check
+            assert (
+                len(subprocess.list2cmdline(args).encode("utf-16-le")) // 2 + 1
+                <= script.RUSTFMT_COMMAND_LIMIT
+            )
+        return subprocess.CompletedProcess(args, 0, "")
+
+    monkeypatch.setattr(script.subprocess, "run", run)
+    assert script.run_formatter_group(script.rust_formatter_group(check=check)).returncode == 0
+    assert len(calls) == 2

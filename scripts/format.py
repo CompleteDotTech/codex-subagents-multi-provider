@@ -136,6 +136,7 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
         ]
         if check:
             rustfmt_args.append("--check")
+        rustfmt_args.append("--")
         commands.extend(
             Command(batch, workspace)
             for batch in rustfmt_batches(rustfmt_args, rust_files)
