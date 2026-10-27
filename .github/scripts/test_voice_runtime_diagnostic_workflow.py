@@ -61,9 +61,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", job)
         self.assertIn("native-windows-voice: true", job)
         self.assertIn("--nocache_test_results", job)
+        self.assertIn("--keep_going", job)
         self.assertEqual(
             re.findall(r"//codex-rs/[^\s]+", job),
-            ["//codex-rs/voice-host:voice-host-windows-runtime-diagnostic-test"],
+            [
+                "//codex-rs/voice-host:voice-host-windows-runtime-diagnostic-test",
+                "//codex-rs/voice-host:codex-voice-host-bin-unit-tests",
+                "//codex-rs/voice-host:voice-host-installed_client-test",
+            ],
         )
         self.assertNotIn("//...", job)
         self.assertIn("'voice-diagnostic' || 'normal'", self.text.split("jobs:", 1)[0])
