@@ -1206,6 +1206,7 @@ async fn native_preparation_rejects_stale_step_approval_and_reviewer_before_cata
 
 struct RevokeDuringInheritedInstructions {
     policy: codex_config::CloudConfigBundlePolicy,
+    sharing: std::sync::atomic::AtomicBool,
     armed: std::sync::atomic::AtomicBool,
     revocations: std::sync::atomic::AtomicUsize,
 }
@@ -1225,6 +1226,9 @@ fn revoke_native_child_access(policy: &codex_config::CloudConfigBundlePolicy) {
 
 impl codex_extension_api::ThreadInstructionsProvider for RevokeDuringInheritedInstructions {
     fn share_with_subagents(&self) -> bool {
+        if !self.sharing.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
         if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.revocations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1253,6 +1257,7 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
     policy.publish_snapshot(&mut snapshot);
     let provider = Arc::new(RevokeDuringInheritedInstructions {
         policy: policy.clone(),
+        sharing: std::sync::atomic::AtomicBool::new(false),
         armed: std::sync::atomic::AtomicBool::new(false),
         revocations: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -1265,6 +1270,11 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
         Some(&base_url),
     )
     .await;
+    // Opt in after actual root registration so its manager retains the direct
+    // host provider, rather than the shared wrapper's unconditional opt-in.
+    provider
+        .sharing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
@@ -1331,6 +1341,13 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
             permit,
         )
         .await;
+    assert_eq!(
+        provider
+            .revocations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        usize::from(stage == 1),
+        "the real manager inherited-instruction await must be crossed in the delayed case"
+    );
     if stage == 2 {
         let child = result.expect("unchanged live managed policy remains authorized");
         assert_eq!(fixture.manager.list_thread_ids().await.len(), 2);
@@ -1368,13 +1385,6 @@ async fn native_managed_binding_is_checked_at_actual_startup_admission(stage: u8
             vec![fixture.parent.session.thread_id]
         );
     }
-    assert_eq!(
-        provider
-            .revocations
-            .load(std::sync::atomic::Ordering::SeqCst),
-        usize::from(stage == 1),
-        "the real manager inherited-instruction await must be crossed in the delayed case"
-    );
 }
 
 #[test_case::test_case(true; "revoked during resumed manager instruction await")]
@@ -1390,12 +1400,16 @@ async fn native_managed_resume_keeps_live_binding_through_final_admission(revoke
     policy.publish_snapshot(&mut snapshot);
     let provider = Arc::new(RevokeDuringInheritedInstructions {
         policy: policy.clone(),
+        sharing: std::sync::atomic::AtomicBool::new(false),
         armed: std::sync::atomic::AtomicBool::new(false),
         revocations: std::sync::atomic::AtomicUsize::new(0),
     });
     let fixture =
         Fixture::with_admission_setup(None, snapshot.binding, None, Some(provider.clone()), None)
             .await;
+    provider
+        .sharing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let config = fixture
         .prepared(&fixture.resolved("zai").await, None, None)
         .await
@@ -1422,6 +1436,13 @@ async fn native_managed_resume_keeps_live_binding_through_final_admission(revoke
             child.session_source.clone(),
         )
         .await;
+    assert_eq!(
+        provider
+            .revocations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        usize::from(revoke),
+        "the real resumed manager instruction await must execute before interpreting its result"
+    );
     if revoke {
         let error = result
             .err()
@@ -1450,12 +1471,6 @@ async fn native_managed_resume_keeps_live_binding_through_final_admission(revoke
         );
         restored.shutdown_and_wait().await.unwrap();
     }
-    assert_eq!(
-        provider
-            .revocations
-            .load(std::sync::atomic::Ordering::SeqCst),
-        usize::from(revoke)
-    );
 }
 
 #[tokio::test]
