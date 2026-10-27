@@ -1,10 +1,13 @@
 use anyhow::Context;
 use anyhow::Result;
 use codex_analytics::AnalyticsEventsClient;
+use codex_config::CloudConfigBundleLoader;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_login::CodexAuth;
+use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -148,6 +151,19 @@ async fn mount_root_collaboration_call(
     .await;
 }
 
+fn managed_cold_provider_loader(server: &wiremock::MockServer) -> Result<CloudConfigBundleLoader> {
+    // Match the test harness's actual provider without importing any credentials.
+    let mut provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
+    Ok(CloudConfigBundleFixture::loader_with_enterprise_config(
+        format!(
+            "[agents]\nallowed_model_providers=['openai']\n[model_providers.openai]\n{}",
+            toml::to_string(&provider)?
+        ),
+    ))
+}
+
 fn configure_multi_agent_v2_with_role(
     config: &mut codex_core::config::Config,
     _model_provider_base_url: &str,
@@ -287,6 +303,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     let initial_model_provider_base_url = format!("{}/v1", server.uri());
     let protected_store: Arc<dyn ThreadStore> = Arc::new(InMemoryThreadStore::default());
     let mut initial_builder = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_thread_store(Arc::clone(&protected_store))
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &initial_model_provider_base_url);
@@ -524,6 +541,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     );
     let resumed_model_provider_base_url = format!("{}/v1", server.uri());
     let mut resume_builder = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_thread_store(Arc::clone(&protected_store))
         .with_analytics_events_client(analytics_client.clone())
         .with_config(move |config| {
@@ -934,6 +952,7 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
     .await;
     let initial_url = format!("{}/v1", server.uri());
     let initial = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &initial_url);
             config.features.enable(Feature::Sqlite).unwrap();
@@ -982,6 +1001,7 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
     initial.codex.flush_rollout().await?;
     let resume_url = format!("{}/v1", server.uri());
     let resumed = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &resume_url);
             config.features.enable(Feature::Sqlite).unwrap();

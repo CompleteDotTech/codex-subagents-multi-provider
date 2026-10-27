@@ -4,6 +4,7 @@ use super::ROLE_MODEL;
 use super::ROLE_NAME;
 use super::body_contains;
 use super::configure_multi_agent_v2_with_role;
+use super::managed_cold_provider_loader;
 use super::mount_root_collaboration_call;
 use super::request_has_input_type;
 use super::request_has_model;
@@ -196,6 +197,7 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
     let server = start_mock_server().await;
     let initial_url = format!("{}/v1", server.uri());
     let initial = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &initial_url);
             config
@@ -302,6 +304,7 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
     });
     let resume_url = format!("{}/v1", server.uri());
     let mut resume_builder = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_thread_store(store)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &resume_url);
