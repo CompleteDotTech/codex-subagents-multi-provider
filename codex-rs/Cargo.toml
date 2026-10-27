@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["third-party/age"]
 members = [
     "third-party/aws-config",
     "aws-auth",
@@ -664,7 +665,7 @@ opt-level = 0
 # Keep authentication behavior while using the maintained P-256 implementation.
 aws-config = { path = "third-party/aws-config" }
 # Upstream age migration, pinned for reproducible review (Refs #31).
-age = { git = "https://github.com/str4d/rage", rev = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f" }
+age = { path = "third-party/age" }
 age-core = { git = "https://github.com/str4d/rage", rev = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f" }
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }

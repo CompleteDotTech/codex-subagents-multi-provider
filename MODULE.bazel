@@ -346,25 +346,62 @@ register_toolchains("@rules_rust_bindgen//:all")
 register_toolchains("//bazel/toolchains/prost:toolchain")
 
 crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+
+_CODEX_RUST_PLATFORMS = [
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    # Preserve both Windows ABIs used by the production metadata.
+    "aarch64-pc-windows-msvc",
+    "aarch64-pc-windows-gnullvm",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-pc-windows-gnullvm",
+]
+
 crate.from_cargo(
     cargo_lock = "//codex-rs:Cargo.lock",
     cargo_toml = "//codex-rs:Cargo.toml",
-    platform_triples = [
-        "aarch64-unknown-linux-gnu",
-        "aarch64-unknown-linux-musl",
-        "aarch64-apple-darwin",
-        # Keep both Windows ABIs in the generated Cargo metadata: the V8
-        # experiment still consumes release assets that only exist under the
-        # MSVC names while targeting the GNU toolchain.
-        "aarch64-pc-windows-msvc",
-        "aarch64-pc-windows-gnullvm",
-        "x86_64-unknown-linux-gnu",
-        "x86_64-unknown-linux-musl",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-pc-windows-gnullvm",
-    ],
+    platform_triples = _CODEX_RUST_PLATFORMS,
 )
+
+# Keep age's original dev features and optional integration feature closures
+# outside the production @crates graph. One source/lock, independent resolutions.
+crate.from_cargo(
+    name = "age_unit_test_crates",
+    cargo_lock = "//codex-rs/third-party/age:Cargo.lock",
+    cargo_toml = "//codex-rs/third-party/age:Cargo.toml",
+    platform_triples = _CODEX_RUST_PLATFORMS,
+)
+crate.from_cargo(
+    name = "age_ssh_test_crates",
+    cargo_lock = "//codex-rs/third-party/age:Cargo.lock",
+    cargo_toml = "//codex-rs/third-party/age:Cargo.toml",
+    platform_triples = _CODEX_RUST_PLATFORMS,
+)
+crate.from_cargo(
+    name = "age_async_test_crates",
+    cargo_lock = "//codex-rs/third-party/age:Cargo.lock",
+    cargo_toml = "//codex-rs/third-party/age:Cargo.toml",
+    platform_triples = _CODEX_RUST_PLATFORMS,
+)
+crate.annotation(
+    crate = "age",
+    crate_features = ["ssh"],
+    repositories = ["age_ssh_test_crates"],
+)
+crate.annotation(
+    crate = "age",
+    crate_features = [
+        "armor",
+        "async",
+    ],
+    repositories = ["age_async_test_crates"],
+)
+use_repo(crate, "age_async_test_crates", "age_ssh_test_crates", "age_unit_test_crates")
+
 crate.from_cargo(
     name = "argument_comment_lint_crates",
     cargo_lock = "//tools/argument-comment-lint:Cargo.lock",

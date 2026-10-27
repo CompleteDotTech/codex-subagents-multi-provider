@@ -45,6 +45,7 @@ class VerifiedVendorManifestPolicyTests(unittest.TestCase):
         self.assertEqual(self.run_policy(), (0, ""))
         verified = policy.verified_vendor_manifests()
         self.assertNotIn("aws-config", policy.workspace_package_names(verified))
+        self.assertNotIn("age", policy.workspace_package_names(verified))
         self.assertFalse(
             policy.is_internal_dependency(
                 self.auth,
@@ -80,6 +81,14 @@ class VerifiedVendorManifestPolicyTests(unittest.TestCase):
         status, output = self.run_policy()
         self.assertEqual(status, 1)
         self.assertIn("integrity check failed", output)
+
+    def test_age_guard_and_source_are_required_before_manifest_exemption(self):
+        source = self.cargo / "third-party/age/src/native/scrypt.rs"
+        source.write_bytes(source.read_bytes() + b"\n// unreviewed\n")
+        status, output = self.run_policy()
+        self.assertEqual(status, 1)
+        self.assertIn("age vendor integrity check failed", output)
+        self.assertIn("checksum", output)
 
     def test_verified_external_dependency_does_not_allow_first_party_optional_toggle(
         self,

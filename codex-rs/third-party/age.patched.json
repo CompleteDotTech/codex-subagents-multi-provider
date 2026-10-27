@@ -1,0 +1,17 @@
+{
+  "files": {
+    "Cargo.toml": "8af77b3113b873f4077f83b18ac1c8766dc2c107d6154d28ac3f44e1c14b8c0b",
+    "src/native/scrypt.rs": "32ce49fdf819310b49f764156a1d31a9276d9b01b47fb7238a9e06b8c26bbfba"
+  },
+  "extras": {
+    "Cargo.toml.orig": "f59a2e0ae1fefb72ea8c2ce2f8ef0ba0c454bbe44623f8fa3fed83be98351eae",
+    "UPSTREAM-WORKSPACE.toml": "14f9f3586ef4fc0472b2febc8fd6e7a83a9b873111603dfac91fc5db82a526b9"
+  },
+  "style": {
+    "rustfmt.toml": "01a8047a54e3a011a08cd12f6fcec322116bccc70da45224bff2e3e9ec8f21cc"
+  },
+  "integration": {
+    "BUILD.bazel": "bbd9242b9ddeb01d73ae7f484d79bc8a93de46b647c2dc5e3e2093c945449094"
+  },
+  "patch_sha256": "f42d6fe95a0e452e3a5706e87b98466ec821814095843fdaf9c23ceb03ee127a"
+}

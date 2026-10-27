@@ -1,0 +1,549 @@
+--- a/age/Cargo.toml
++++ b/age/Cargo.toml
+@@ -2,28 +2,28 @@
+ name = "age"
+ description = "[BETA] A simple, secure, and modern encryption library."
+ version = "0.12.1"
+-authors.workspace = true
+-repository.workspace = true
++authors = ["Jack Grigg <thestr4d@gmail.com>"]
++repository = "https://github.com/str4d/rage"
+ readme = "README.md"
+ keywords = ["rage", "encryption"]
+ categories = ["cryptography"]
+-license.workspace = true
+-edition.workspace = true
+-rust-version.workspace = true
++license = "MIT OR Apache-2.0"
++edition = "2024"
++rust-version = "1.85"
+ 
+ [badges]
+ maintenance = { status = "experimental" }
+ 
+ [dependencies]
+-age-core.workspace = true
++age-core = { "version" = "0.12.0", "git" = "https://github.com/str4d/rage", "rev" = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f" }
+ 
+ # Dependencies exposed in a public API:
+ # (Breaking upgrades to these require a breaking upgrade to this crate.)
+-base64.workspace = true
+-chacha20poly1305.workspace = true
+-hmac.workspace = true
+-i18n-embed.workspace = true
+-rand.workspace = true
++base64 = { "version" = "0.22" }
++chacha20poly1305 = { "version" = "0.11", "default-features" = false, "features" = ["alloc"] }
++hmac = { "version" = "0.13" }
++i18n-embed = { "version" = "0.16", "features" = ["fluent-system"] }
++rand = { "version" = "0.10" }
+ 
+ # OpenSSH-specific dependencies:
+ # - RSAES-OAEP from RFC 8017 with SHA-256 and MGF1
+@@ -39,27 +39,27 @@
+ pin-project = "1"
+ 
+ # Common CLI dependencies
+-pinentry = { workspace = true, optional = true }
++pinentry = { "version" = "0.8", "optional" = true }
+ 
+ # Dependencies used internally:
+ # (Breaking upgrades to these are usually backwards-compatible, but check MSRVs.)
+-bech32.workspace = true
++bech32 = { "version" = "0.11" }
+ cipher = { version = "0.5", features = ["alloc"] }
+-cookie-factory.workspace = true
+-hkdf.workspace = true
+-hpke = { workspace = true, features = ["mlkem", "nistp"] }
+-i18n-embed-fl.workspace = true
+-lazy_static.workspace = true
+-ml-kem.workspace = true
+-nom.workspace = true
+-p256.workspace = true
+-rust-embed.workspace = true
+-scrypt.workspace = true
+-sha2.workspace = true
+-sha3.workspace = true
+-subtle.workspace = true
+-x25519-dalek.workspace = true
+-zeroize.workspace = true
++cookie-factory = { "version" = "0.3.1" }
++hkdf = { "version" = "0.13" }
++hpke = { "version" = "0.14", "default-features" = false, "features" = ["alloc", "chacha", "mlkem", "nistp"] }
++i18n-embed-fl = { "version" = "0.10" }
++lazy_static = { "version" = "1" }
++ml-kem = { "version" = "0.3" }
++nom = { "version" = "8", "default-features" = false, "features" = ["alloc"] }
++p256 = { "version" = "0.14", "default-features" = false, "features" = ["arithmetic"] }
++rust-embed = { "version" = "8" }
++scrypt = { "version" = "0.12", "default-features" = false }
++sha2 = { "version" = "0.11" }
++sha3 = { "version" = "0.12" }
++subtle = { "version" = "2.6" }
++x25519-dalek = { "version" = "3", "features" = ["static_secrets"] }
++zeroize = { "version" = "1" }
+ 
+ # OpenSSH-specific dependencies:
+ # - RSAES-OAEP from RFC 8017 with SHA-256 and MGF1
+@@ -82,7 +82,7 @@
+ memchr = { version = "2.5", optional = true }
+ 
+ # Common CLI dependencies
+-console = { workspace = true, optional = true, features = ["std"] }
++console = { "version" = "0.16", "default-features" = false, "optional" = true, "features" = ["std"] }
+ is-terminal = { version = "0.4", optional = true }
+ rpassword = { version = "7", optional = true }
+ 
+@@ -93,10 +93,10 @@
+ 
+ [dev-dependencies]
+ criterion = "0.5"
+-flate2.workspace = true
++flate2 = { "version" = "1" }
+ futures-test = "0.3"
+ hex = "0.4"
+-i18n-embed = { workspace = true, features = ["desktop-requester"] }
++i18n-embed = { "version" = "0.16", "features" = ["fluent-system", "desktop-requester"] }
+ proptest = "1"
+ test-case = "3"
+ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+@@ -149,4 +149,8 @@
+ rustdoc-args = ["--cfg", "docsrs"]
+ 
+ [lints]
+-workspace = true
++rust = { "unexpected_cfgs" = { "level" = "warn", "check-cfg" = ["cfg(fuzzing)"] } }
++
++# Keep upstream dev/test feature resolution outside the application workspace.
++[workspace]
++
+--- a/age/src/native/scrypt.rs
++++ b/age/src/native/scrypt.rs
+@@ -34,6 +34,58 @@
+ /// Pick an scrypt work factor that will take around 1 second on this device.
+ ///
+ /// Guaranteed to return a valid work factor (less than 64).
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn target_scrypt_work_factor() -> u8 {
++    use std::time::Instant;
++
++    calibrate_native_work_factor(|log_n| {
++        #[cfg(test)]
++        if let Some(elapsed) = calibration_test_hooks::measurement(log_n) {
++            return require_native_elapsed(elapsed);
++        }
++        let start = Instant::now();
++        scrypt(&[], log_n, "").expect("log_n < 64");
++        require_native_elapsed(Instant::now().checked_duration_since(start))
++    })
++}
++
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn require_native_elapsed(elapsed: Option<Duration>) -> Duration {
++    elapsed.expect("cannot calibrate scrypt: monotonic clock moved backwards")
++}
++
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn calibrate_native_work_factor(mut measure: impl FnMut(u8) -> Duration) -> u8 {
++    // At most 21 measurements, with a maximum 64 MiB primary scrypt workspace.
++    // Each new recipient and identity still measures current capacity independently.
++    for log_n in 10..=16 {
++        let mut samples = [Duration::ZERO; 3];
++        for sample in &mut samples {
++            *sample = measure(log_n);
++        }
++        samples.sort_unstable();
++        let duration = samples[1];
++        if !duration.is_zero() {
++            return work_factor_from_duration(log_n, duration);
++        }
++    }
++    panic!("cannot calibrate scrypt: timer resolution insufficient through log_n=16");
++}
++
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn work_factor_from_duration(mut log_n: u8, mut duration: Duration) -> u8 {
++    assert!(log_n < 64 && !duration.is_zero());
++    // Preserve round-up extrapolation. Multiplication only happens below one
++    // second, so neither Duration overflow nor invalid work factors are introduced.
++    while duration < ONE_SECOND && log_n < 63 {
++        log_n += 1;
++        duration *= 2;
++    }
++    log_n
++}
++
++// Preserve the complete upstream browser/WASM calibration body and fallback.
++#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+ fn target_scrypt_work_factor() -> u8 {
+     let measure_duration = |log_n| {
+         // Platforms that have a functional SystemTime::now():
+@@ -113,6 +165,11 @@
+     ///
+     /// The scrypt work factor is picked to target about 1 second for encryption or
+     /// decryption on this device. Override it with [`Self::set_work_factor`].
++    ///
++    /// # Panics
++    /// On native platforms (including WASI), panics if the monotonic timer is
++    /// invalid or three-sample medians remain zero through work factor 16.
++    /// A weaker factor is not substituted. Browser/WASM behavior is unchanged.
+     pub fn new(passphrase: SecretString) -> Self {
+         Self {
+             passphrase,
+@@ -184,6 +241,11 @@
+ 
+ impl Identity {
+     /// Constructs a new `Identity` with the given passphrase.
++    ///
++    /// # Panics
++    /// On native platforms (including WASI), panics if the monotonic timer is
++    /// invalid or three-sample medians remain zero through work factor 16.
++    /// A more permissive cap is not substituted. Browser/WASM behavior is unchanged.
+     pub fn new(passphrase: SecretString) -> Self {
+         let target_work_factor = target_scrypt_work_factor();
+ 
+@@ -247,7 +309,11 @@
+         inner_salt[..SCRYPT_SALT_LABEL.len()].copy_from_slice(SCRYPT_SALT_LABEL);
+         inner_salt[SCRYPT_SALT_LABEL.len()..].copy_from_slice(&salt);
+ 
+-        let enc_key = match scrypt(&inner_salt, log_n, self.passphrase.expose_secret()) {
++        let enc_key = match {
++            #[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
++            calibration_test_hooks::record_stanza_derivation();
++            scrypt(&inner_salt, log_n, self.passphrase.expose_secret())
++        } {
+             Ok(k) => k,
+             Err(_) => {
+                 return Some(Err(DecryptError::ExcessiveWork {
+@@ -277,3 +343,331 @@
+         )
+     }
+ }
++
++// Test-only hooks are thread-local, scoped, and absent from production builds.
++// Installing timings changes calibration measurement only; stanza derivation
++// instrumentation counts the real KDF boundary and never substitutes a key.
++#[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
++mod calibration_test_hooks {
++    use std::cell::RefCell;
++    use std::collections::VecDeque;
++    use std::rc::Rc;
++    use std::time::Duration;
++
++    #[derive(Default)]
++    struct State {
++        timings: VecDeque<(u8, Option<Duration>)>,
++        measured: Vec<u8>,
++        stanza_derivations: usize,
++    }
++
++    thread_local! {
++        static CURRENT: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
++    }
++
++    pub(super) struct Guard {
++        state: Rc<RefCell<State>>,
++        previous: Option<Rc<RefCell<State>>>,
++    }
++
++    impl Guard {
++        pub(super) fn install(timings: Vec<(u8, Option<Duration>)>) -> Self {
++            let state = Rc::new(RefCell::new(State {
++                timings: timings.into(),
++                ..State::default()
++            }));
++            let previous = CURRENT.with(|slot| slot.replace(Some(Rc::clone(&state))));
++            Self { state, previous }
++        }
++
++        pub(super) fn measured(&self) -> Vec<u8> {
++            self.state.borrow().measured.clone()
++        }
++
++        pub(super) fn remaining(&self) -> usize {
++            self.state.borrow().timings.len()
++        }
++
++        pub(super) fn derivations(&self) -> usize {
++            self.state.borrow().stanza_derivations
++        }
++    }
++
++    impl Drop for Guard {
++        fn drop(&mut self) {
++            CURRENT.with(|slot| slot.replace(self.previous.take()));
++        }
++    }
++
++    pub(super) fn measurement(log_n: u8) -> Option<Option<Duration>> {
++        CURRENT.with(|slot| {
++            slot.borrow().as_ref().map(|state| {
++                let mut state = state.borrow_mut();
++                state.measured.push(log_n);
++                let (expected_factor, elapsed) = state
++                    .timings
++                    .pop_front()
++                    .expect("unexpected extra calibration measurement");
++                assert_eq!(log_n, expected_factor);
++                elapsed
++            })
++        })
++    }
++
++    pub(super) fn record_stanza_derivation() {
++        CURRENT.with(|slot| {
++            if let Some(state) = slot.borrow().as_ref() {
++                state.borrow_mut().stanza_derivations += 1;
++            }
++        });
++    }
++}
++
++#[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
++mod calibration_tests {
++    use super::*;
++    use calibration_test_hooks::Guard;
++    use std::panic::{AssertUnwindSafe, catch_unwind};
++
++    fn samples(log_n: u8, duration: Duration) -> Vec<(u8, Option<Duration>)> {
++        vec![(log_n, Some(duration)); 3]
++    }
++
++    fn public_passphrase() -> SecretString {
++        "public calibration regression".to_owned().into()
++    }
++
++    fn public_stanza(factor: u8) -> Stanza {
++        Stanza {
++            tag: SCRYPT_RECIPIENT_TAG.to_owned(),
++            args: vec![
++                BASE64_STANDARD_NO_PAD.encode([0_u8; SALT_LEN]),
++                factor.to_string(),
++            ],
++            body: vec![0; ENCRYPTED_FILE_KEY_BYTES],
++        }
++    }
++
++    #[test]
++    fn public_constructors_recalibrate_readers_and_writers_in_both_directions() {
++        let fast = Duration::from_millis(1);
++        let slow = Duration::from_millis(32);
++        let timings = [fast, fast, slow, slow, fast, fast]
++            .into_iter()
++            .flat_map(|duration| samples(10, duration))
++            .collect();
++        let guard = Guard::install(timings);
++        let early_writer = Recipient::new(public_passphrase());
++        let early_reader = Identity::new(public_passphrase());
++        let slower_reader = Identity::new(public_passphrase());
++        let slower_writer = Recipient::new(public_passphrase());
++        let faster_reader = Identity::new(public_passphrase());
++        let faster_writer = Recipient::new(public_passphrase());
++        assert_eq!(
++            (early_writer.log_n, early_reader.target_work_factor),
++            (20, 20)
++        );
++        assert_eq!(
++            (slower_writer.log_n, slower_reader.target_work_factor),
++            (15, 15)
++        );
++        assert_eq!(
++            (faster_writer.log_n, faster_reader.target_work_factor),
++            (20, 20)
++        );
++        assert_eq!(
++            (
++                early_reader.max_work_factor,
++                slower_reader.max_work_factor,
++                faster_reader.max_work_factor
++            ),
++            (24, 19, 24)
++        );
++        assert_eq!(guard.measured(), vec![10; 18]);
++        assert_eq!(guard.remaining(), 0);
++        assert!(matches!(
++            crate::Identity::unwrap_stanza(&slower_reader, &public_stanza(20)),
++            Some(Err(DecryptError::ExcessiveWork {
++                required: 20,
++                target: 15
++            }))
++        ));
++        assert_eq!(guard.derivations(), 0);
++    }
++
++    #[test]
++    fn every_isolated_high_low_or_zero_sample_preserves_two_representative_samples() {
++        let stable = Duration::from_millis(40);
++        for outlier in [
++            Duration::from_secs(2),
++            Duration::from_nanos(1),
++            Duration::ZERO,
++        ] {
++            for position in 0..3 {
++                let mut timings = samples(10, stable);
++                timings[position].1 = Some(outlier);
++                let guard = Guard::install(timings);
++                assert_eq!(Recipient::new(public_passphrase()).log_n, 15);
++                assert_eq!(guard.measured(), vec![10; 3]);
++                assert_eq!(guard.remaining(), 0);
++            }
++        }
++    }
++
++    #[test]
++    fn two_zero_samples_advance_one_factor_with_exact_call_counts() {
++        for positive_position in 0..3 {
++            let mut timings = samples(10, Duration::ZERO);
++            timings[positive_position].1 = Some(Duration::from_millis(40));
++            timings.extend(samples(11, Duration::from_millis(40)));
++            let guard = Guard::install(timings);
++            assert_eq!(Identity::new(public_passphrase()).target_work_factor, 16);
++            assert_eq!(guard.measured(), vec![10, 10, 10, 11, 11, 11]);
++            assert_eq!(guard.remaining(), 0);
++        }
++    }
++
++    #[test]
++    fn zero_resolution_is_bounded_and_fails_closed_after_twenty_one_calls() {
++        let timings = (10..=16)
++            .flat_map(|factor| samples(factor, Duration::ZERO))
++            .collect();
++        let guard = Guard::install(timings);
++        assert!(catch_unwind(AssertUnwindSafe(|| Recipient::new(public_passphrase()))).is_err());
++        assert_eq!(guard.measured().len(), 21);
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn last_permitted_factor_can_measure_without_exceeding_the_bound() {
++        let mut timings: Vec<_> = (10..16)
++            .flat_map(|factor| samples(factor, Duration::ZERO))
++            .collect();
++        timings.extend(samples(16, Duration::from_millis(40)));
++        let guard = Guard::install(timings);
++        assert_eq!(Recipient::new(public_passphrase()).log_n, 21);
++        assert_eq!(guard.measured().len(), 21);
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn invalid_or_missing_native_elapsed_never_reuses_partial_samples_or_falls_back() {
++        for invalid_position in 0..3 {
++            let mut timings = samples(10, Duration::from_millis(40));
++            timings[invalid_position].1 = None;
++            let guard = Guard::install(timings);
++            assert!(catch_unwind(AssertUnwindSafe(|| Identity::new(public_passphrase()))).is_err());
++            assert_eq!(guard.measured().len(), invalid_position + 1);
++        }
++    }
++
++    #[test]
++    fn scoped_hooks_restore_prior_state_on_drop_and_unwind() {
++        let outer = Guard::install(samples(10, Duration::from_millis(40)));
++        assert!(
++            catch_unwind(|| {
++                let _inner = Guard::install(samples(10, Duration::ZERO));
++                panic!("simulate unrelated test panic");
++            })
++            .is_err()
++        );
++        assert_eq!(Recipient::new(public_passphrase()).log_n, 15);
++        assert_eq!(outer.remaining(), 0);
++    }
++
++    #[test]
++    fn hooks_do_not_leak_to_another_test_thread() {
++        let guard = Guard::install(samples(10, Duration::from_millis(40)));
++        std::thread::spawn(|| {
++            assert!(calibration_test_hooks::measurement(10).is_none());
++            let guard = Guard::install(samples(10, Duration::from_millis(1)));
++            assert_eq!(Identity::new(public_passphrase()).target_work_factor, 20);
++            assert_eq!(guard.remaining(), 0);
++        })
++        .join()
++        .expect("isolated test thread");
++        assert_eq!(Recipient::new(public_passphrase()).log_n, 15);
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn actual_stanza_plus_five_rejects_without_derivation_plus_four_authenticates() {
++        // target10, cap14 keeps the single REAL boundary KDF to N=2^14.
++        let guard = Guard::install(samples(10, ONE_SECOND));
++        let identity = Identity::new(public_passphrase());
++        assert!(matches!(
++            crate::Identity::unwrap_stanza(&identity, &public_stanza(15)),
++            Some(Err(DecryptError::ExcessiveWork {
++                required: 15,
++                target: 10
++            }))
++        ));
++        assert_eq!(guard.derivations(), 0);
++        assert!(matches!(
++            crate::Identity::unwrap_stanza(&identity, &public_stanza(14)),
++            Some(Err(DecryptError::DecryptionFailed))
++        ));
++        assert_eq!(guard.derivations(), 1);
++    }
++
++    #[test]
++    fn actual_malformed_stanzas_reject_before_the_kdf_boundary() {
++        let guard = Guard::install(samples(10, ONE_SECOND));
++        let identity = Identity::new(public_passphrase());
++        for variation in 0..4 {
++            let mut stanza = public_stanza(14);
++            match variation {
++                0 => stanza.args[0] = "invalid salt=".to_owned(),
++                1 => stanza.args[1] = "14x".to_owned(),
++                2 => {
++                    stanza.args.pop();
++                }
++                _ => {
++                    stanza.body.pop();
++                }
++            }
++            assert!(matches!(
++                crate::Identity::unwrap_stanza(&identity, &stanza),
++                Some(Err(DecryptError::InvalidHeader))
++            ));
++        }
++        assert_eq!(guard.derivations(), 0);
++    }
++
++    #[test]
++    fn existing_setters_remain_explicit_and_do_not_change_the_calibrated_target() {
++        let mut timings = samples(10, Duration::from_millis(40));
++        timings.extend(samples(10, Duration::from_millis(40)));
++        let guard = Guard::install(timings);
++        let mut recipient = Recipient::new(public_passphrase());
++        recipient.set_work_factor(17);
++        assert_eq!(recipient.log_n, 17);
++        let mut identity = Identity::new(public_passphrase());
++        identity.set_max_work_factor(18);
++        assert_eq!(
++            (identity.target_work_factor, identity.max_work_factor),
++            (15, 18)
++        );
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn estimator_retains_threshold_rounding_overflow_and_saturation_behavior() {
++        assert_eq!(work_factor_from_duration(10, ONE_SECOND), 10);
++        assert_eq!(
++            work_factor_from_duration(10, ONE_SECOND - Duration::from_nanos(1)),
++            11
++        );
++        assert_eq!(
++            work_factor_from_duration(10, Duration::from_millis(500)),
++            11
++        );
++        assert_eq!(
++            work_factor_from_duration(10, Duration::from_millis(499)),
++            12
++        );
++        assert_eq!(work_factor_from_duration(10, Duration::MAX), 10);
++        assert_eq!(work_factor_from_duration(63, Duration::from_nanos(1)), 63);
++        assert!(catch_unwind(|| work_factor_from_duration(10, Duration::ZERO)).is_err());
++    }
++}
