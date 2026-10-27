@@ -189,6 +189,38 @@ impl AgentRegistry {
         }
     }
 
+    /// Fresh grants require Current; completed residency eviction is exclusively
+    /// a private-resume exception. Keep revocation ordered through the callback.
+    pub(crate) fn with_fresh_caller<T>(
+        &self,
+        caller: &crate::session::session::Session,
+        registration_id: uuid::Uuid,
+        admit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let state = self.active_agents.lock().map_err(|_| {
+            crate::agent::child_provider_authorization::invalid(
+                "fresh child caller registry is unavailable",
+            )
+        })?;
+        let valid = state
+            .retained_authority
+            .get(&caller.thread_id)
+            .is_some_and(|entry| {
+                entry.phase == CallerPhase::Current
+                    && entry.authority.registration_id() == registration_id
+                    && entry.authority.matches_session(caller)
+            });
+        if !valid {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "fresh child caller was revoked or changed before startup admission",
+            ));
+        }
+        // No await, map lookup, or registry reentry in this callback.
+        let result = admit();
+        drop(state);
+        result
+    }
+
     /// The callback must not reenter this registry. Hold this lock through the
     /// final synchronous decision so replacement and revocation cannot race it.
     pub(crate) fn with_resume_caller<T>(

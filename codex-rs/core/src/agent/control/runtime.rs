@@ -221,6 +221,16 @@ impl LocalAgentRuntime {
         self.registry.retire_authority(authority);
     }
 
+    pub(crate) fn with_fresh_caller<T>(
+        &self,
+        caller: &crate::session::session::Session,
+        registration_id: uuid::Uuid,
+        admit: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        self.registry
+            .with_fresh_caller(caller, registration_id, admit)
+    }
+
     pub(crate) fn with_resume_caller<T>(
         &self,
         authority: &crate::agent::child_provider_authorization::RetainedAgentAuthority,

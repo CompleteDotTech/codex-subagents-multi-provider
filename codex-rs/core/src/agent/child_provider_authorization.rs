@@ -266,6 +266,10 @@ pub(crate) struct RetainedAgentAuthority {
 }
 
 impl RetainedAgentAuthority {
+    pub(crate) fn registration_id(&self) -> Uuid {
+        self.registration_id
+    }
+
     pub(crate) fn same_registration(&self, other: &Self) -> bool {
         self.thread_id == other.thread_id
             && self.registration_id == other.registration_id
@@ -375,18 +379,15 @@ impl FreshChildCaller {
         if !*live
             || !caller.is_running()
             || !Arc::ptr_eq(&self.live, &caller.session.fresh_child_admission_live)
-            || !runtime
-                .retained_authority(caller.session.thread_id)
-                .is_some_and(|authority| {
-                    authority.registration_id == self.registration_id
-                        && authority.session_allocation == Arc::as_ptr(&caller.session) as usize
-                })
         {
             return Err(invalid(
                 "fresh child caller stopped or changed before startup admission",
             ));
         }
-        let result = admit();
+        // Explicit close can revoke the registry while this signal is still
+        // live. Hold Current/epoch validation through the same synchronous
+        // decision, ordered signal -> registry -> managed binding.
+        let result = runtime.with_fresh_caller(&caller.session, self.registration_id, admit);
         drop(live);
         result
     }
