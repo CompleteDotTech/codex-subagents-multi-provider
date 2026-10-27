@@ -34,15 +34,37 @@ use webrtc::peer_connection::SettingEngineBuilder;
 const DEADLINE: Duration = Duration::from_secs(/*secs*/ 10);
 
 async fn build_commit() -> Result<String> {
+    let helper = cargo_bin("codex-voice-host")?;
     let output = timeout(
         DEADLINE,
-        Command::new(cargo_bin("codex-voice-host")?)
+        Command::new(&helper)
             .arg("--build-commit")
             .kill_on_drop(true)
             .output(),
     )
     .await??;
-    assert!(output.status.success());
+    let bounded_output = |bytes: &[u8]| {
+        let mut text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
+        let mut end = text.len().min(4096);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text
+    };
+    assert!(
+        output.status.success(),
+        "voice helper --build-commit failed: helper={} status={} code={:?} code_u32_hex={:?} stdout(first at most 4096 bytes)={} stderr(first at most 4096 bytes)={}",
+        helper.display(),
+        output.status,
+        output.status.code(),
+        output
+            .status
+            .code()
+            .map(|code| format!("0x{:08x}", u32::from_ne_bytes(code.to_ne_bytes()))),
+        bounded_output(&output.stdout),
+        bounded_output(&output.stderr),
+    );
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
