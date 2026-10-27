@@ -21,6 +21,9 @@ def diagnostic_parent(directory):
             "RUNNER_TEMP": directory,
             "RUNNER_OS": "Windows",
             "GITHUB_ACTIONS": "true",
+            "GITHUB_REPOSITORY": "CompleteDotTech/codex-subagents-multi-provider",
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_JOB": "voice-runtime-diagnostic",
             "PROCESSOR_ARCHITECTURE": "AMD64",
             "VOICE_WINDOWS_HOST_ARCH": "AMD64",
             "SYSTEMROOT": "C:/Windows",
@@ -675,6 +678,16 @@ class EnvironmentTests(unittest.TestCase):
                     value.encode("utf-16-le"),
                 )
         self.assertEqual(child["BAZEL_OUTPUT_USER_ROOT"], "unique-root")
+        self.assertEqual(child["VOICE_CONFIGURED_METADATA_MODE"], "bounded-v1")
+        self.assertTrue(metrics["metadata_named_path_bindings_requested"])
+        self.assertEqual(
+            metrics["selected_path_utf16_units"],
+            m.utf16_units(parent["CODEX_BAZEL_WINDOWS_PATH"]),
+        )
+        self.assertEqual(
+            metrics["repeated_path_utf16_units_removed_projection"],
+            3 * (1 + m.utf16_units(parent["CODEX_BAZEL_WINDOWS_PATH"])),
+        )
         for name in (
             "UNRELATED_SECRET",
             "BUILDBUDDY_API_KEY",
@@ -740,6 +753,9 @@ class EnvironmentTests(unittest.TestCase):
             "GITHUB_SHA",
             "VOICE_WINDOWS_SYSTEM_ROOT",
             "VOICE_WINDOWS_HOST_ARCH",
+            "GITHUB_REPOSITORY",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_JOB",
         ):
             parent = diagnostic_parent("temp")
             parent[name] = "PRIVATE-mismatch"
@@ -922,6 +938,7 @@ class CaptureTests(unittest.TestCase):
             )
             self.assertNotIn("BUILDBUDDY_API_KEY", env)
             self.assertNotIn("CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR", env)
+            self.assertEqual(env["VOICE_CONFIGURED_METADATA_MODE"], "bounded-v1")
             if "cquery" in command:
                 output.write_text(m.SENTINEL + json.dumps(records[command[-1]]))
             else:

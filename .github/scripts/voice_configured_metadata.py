@@ -523,6 +523,10 @@ def diagnostic_environment(parent, query_root, expected_head, expected_tree):
     require(
         indexed["RUNNER_OS"] == "Windows"
         and indexed["GITHUB_ACTIONS"] == "true"
+        and indexed["GITHUB_REPOSITORY"]
+        == "CompleteDotTech/codex-subagents-multi-provider"
+        and indexed["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+        and indexed["GITHUB_JOB"] == "voice-runtime-diagnostic"
         and indexed["PROCESSOR_ARCHITECTURE"] == "AMD64"
         and indexed["VOICE_WINDOWS_HOST_ARCH"]
         == indexed.get("PROCESSOR_ARCHITEW6432", indexed["PROCESSOR_ARCHITECTURE"])
@@ -538,6 +542,7 @@ def diagnostic_environment(parent, query_root, expected_head, expected_tree):
     # Only this child receives the unique output root. Credentials and execution
     # log settings are absent from the explicit allowlist, never popped globally.
     child["BAZEL_OUTPUT_USER_ROOT"] = str(query_root)
+    child["VOICE_CONFIGURED_METADATA_MODE"] = "bounded-v1"
     from voice_metadata_owned_job import environment_block
 
     try:
@@ -551,10 +556,14 @@ def diagnostic_environment(parent, query_root, expected_head, expected_tree):
         "included_values_unchanged": all(
             indexed[k.upper()] == v
             for k, v in child.items()
-            if k != "BAZEL_OUTPUT_USER_ROOT"
+            if k not in {"BAZEL_OUTPUT_USER_ROOT", "VOICE_CONFIGURED_METADATA_MODE"}
         ),
         "client_env_accounting": "unescaped-projection-not-final-command-length",
         "windows_command_line_limit_utf16_units": 32768,
+        "metadata_named_path_bindings_requested": True,
+        "selected_path_utf16_units": utf16_units(indexed["CODEX_BAZEL_WINDOWS_PATH"]),
+        "repeated_path_utf16_units_removed_projection": 3
+        * (1 + utf16_units(indexed["CODEX_BAZEL_WINDOWS_PATH"])),
     }
     return child, metrics
 

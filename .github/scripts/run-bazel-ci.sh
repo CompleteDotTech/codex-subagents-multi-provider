@@ -263,6 +263,72 @@ if [[ ${#bazel_args[@]} -eq 0 || ${#bazel_targets[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# Only the owned, bounded metadata route may replace repeated PATH values with
+# named client bindings. Ordinary runtime/RBE calls keep their existing bytes.
+metadata_path_mode=0
+metadata_context=0
+if [[ "${RUNNER_OS:-}" == Windows && "${GITHUB_ACTIONS:-}" == true &&
+      "${GITHUB_REPOSITORY:-}" == CompleteDotTech/codex-subagents-multi-provider &&
+      "${GITHUB_EVENT_NAME:-}" == workflow_dispatch && "${GITHUB_JOB:-}" == voice-runtime-diagnostic ]]; then
+  metadata_context=1
+fi
+metadata_query=0
+metadata_batch=0
+metadata_command=""
+for arg in "${bazel_args[@]}"; do
+  if [[ -z "$metadata_command" && "$arg" == --batch ]]; then metadata_batch=$((metadata_batch + 1)); fi
+  if [[ -z "$metadata_command" && "$arg" != -* ]]; then metadata_command="$arg"; fi
+  if [[ "$arg" == --nobatch ]]; then metadata_batch=-100; fi
+done
+if [[ "$metadata_command" == cquery || "$metadata_command" == aquery ]]; then metadata_query=1; fi
+metadata_private_root=0
+if [[ -n "${VOICE_CONFIGURED_METADATA_MODE+x}" || ( $metadata_context -eq 1 && $metadata_query -eq 1 && $metadata_batch -eq 1 ) ]]; then
+  metadata_root="$(cygpath -am -- "${BAZEL_OUTPUT_USER_ROOT:-}" 2>/dev/null)" || metadata_root=""
+  metadata_temp="$(cygpath -am -- "${RUNNER_TEMP:-}" 2>/dev/null)" || metadata_temp=""
+  metadata_root_lower="${metadata_root,,}"
+  metadata_temp_lower="${metadata_temp,,}"
+  metadata_temp_lower="${metadata_temp_lower%/}"
+  metadata_leaf="${metadata_root_lower#"${metadata_temp_lower}/"}"
+  if [[ -n "$metadata_temp_lower" && "$metadata_root_lower" == "${metadata_temp_lower}/"* &&
+        "$metadata_leaf" == voice-metadata-bazel-?* && "$metadata_leaf" != */* &&
+        -d "$metadata_root" && -d "$metadata_temp" ]]; then metadata_private_root=1; fi
+fi
+if [[ -z "${VOICE_CONFIGURED_METADATA_MODE+x}" ]]; then
+  if [[ $metadata_context -eq 1 && $metadata_query -eq 1 && $metadata_batch -eq 1 && $metadata_private_root -eq 1 ]]; then
+    echo "Configured metadata PATH mode is required." >&2
+    exit 1
+  fi
+else
+  if [[ "${VOICE_CONFIGURED_METADATA_MODE}" != bounded-v1 || $metadata_context -ne 1 ||
+        $metadata_query -ne 1 || $metadata_batch -ne 1 || $metadata_private_root -ne 1 ||
+        $windows_cross_compile -ne 1 || -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+    echo "Invalid configured metadata PATH context." >&2
+    exit 1
+  fi
+  for metadata_sdk_name in PATH INCLUDE LIB LIBPATH UCRTVersion UniversalCRTSdkDir VCINSTALLDIR VCToolsInstallDir WindowsLibPath WindowsSdkBinPath WindowsSdkDir WindowsSDKLibVersion WindowsSDKVersion CODEX_BAZEL_WINDOWS_PATH; do
+    if [[ -z "${!metadata_sdk_name:-}" ]]; then
+      echo "Missing configured metadata SDK input." >&2
+      exit 1
+    fi
+  done
+  # Input PATH overrides are not caller-owned in this route. The exact three
+  # named bindings below are added after SDK/native argument validation.
+  for ((metadata_i = 0; metadata_i < ${#bazel_args[@]}; metadata_i++)); do
+    case "${bazel_args[$metadata_i]}" in
+      --action_env=*|--host_action_env=*|--test_env=*) metadata_env_value="${bazel_args[$metadata_i]#*=}" ;;
+      --action_env|--host_action_env|--test_env) metadata_env_value="${bazel_args[$((metadata_i + 1))]:-}" ;;
+      *) continue ;;
+    esac
+    metadata_env_value="${metadata_env_value#=}"
+    metadata_env_name="${metadata_env_value%%=*}"
+    if [[ "${metadata_env_name^^}" == PATH ]]; then
+      echo "Configured metadata owns its named PATH bindings." >&2
+      exit 1
+    fi
+  done
+  metadata_path_mode=1
+fi
+
 windows_native_fallback=0
 if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
   # Without authenticated RBE this is a native MSVC build, not GNU cross coverage.
@@ -518,7 +584,9 @@ if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
     exit 1
   fi
 
-  if [[ $pass_windows_build_env -eq 1 ]]; then
+  if [[ $metadata_path_mode -eq 1 ]]; then
+    post_config_bazel_args+=(--action_env=PATH --host_action_env=PATH)
+  elif [[ $pass_windows_build_env -eq 1 ]]; then
     post_config_bazel_args+=(
       "--action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
       "--host_action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
@@ -532,7 +600,11 @@ if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
       "--host_action_env=PATH=/usr/bin:/bin"
     )
   fi
-  post_config_bazel_args+=("--test_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}")
+  if [[ $metadata_path_mode -eq 1 ]]; then
+    post_config_bazel_args+=(--test_env=PATH)
+  else
+    post_config_bazel_args+=("--test_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}")
+  fi
 fi
 
 bazel_console_log="$(mktemp)"

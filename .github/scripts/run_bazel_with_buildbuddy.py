@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -187,7 +188,122 @@ def bazel_command(*args: str, env: Mapping[str, str] | None = None) -> list[str]
     return [bazel, *startup_args(args, env), *bazel_args_with_remote_config(args, env)]
 
 
+METADATA_MODE_NAME = "VOICE_CONFIGURED_METADATA_MODE"
+METADATA_MODE_VALUE = "bounded-v1"
+METADATA_SDK_NAMES = """PATH INCLUDE LIB LIBPATH UCRTVersion UniversalCRTSdkDir
+VCINSTALLDIR VCToolsInstallDir WindowsLibPath WindowsSdkBinPath WindowsSdkDir
+WindowsSDKLibVersion WindowsSDKVersion""".upper().split()
+METADATA_PATH_OPTIONS = ("--action_env", "--host_action_env", "--test_env")
+
+
+def metadata_path_mode(args: Sequence[str], env: Mapping[str, str]) -> bool:
+    """Validate the explicitly owned diagnostic route; never report input text."""
+    indexed = {name.upper(): value for name, value in env.items()}
+    mode = indexed.get(METADATA_MODE_NAME)
+    context = (
+        indexed.get("RUNNER_OS") == "Windows"
+        and indexed.get("GITHUB_ACTIONS") == "true"
+        and indexed.get("GITHUB_REPOSITORY")
+        == "CompleteDotTech/codex-subagents-multi-provider"
+        and indexed.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and indexed.get("GITHUB_JOB") == "voice-runtime-diagnostic"
+    )
+    before = list(args[: args.index("--")] if "--" in args else args)
+    command_index = next(
+        (i for i, arg in enumerate(before) if not arg.startswith("-")), None
+    )
+    query = command_index is not None and before[command_index] in ("cquery", "aquery")
+    batch = (
+        command_index is not None
+        and before[:command_index].count("--batch") == 1
+        and "--nobatch" not in before[:command_index]
+    )
+    if mode is None and not (context and query and batch):
+        return False
+    private_root = False
+    try:
+        root = Path(indexed.get("BAZEL_OUTPUT_USER_ROOT", ""))
+        temp = Path(indexed.get("RUNNER_TEMP", ""))
+        private_root = (
+            root.is_absolute()
+            and temp.is_absolute()
+            and root.is_dir()
+            and temp.is_dir()
+            and root.resolve(strict=True).parent == temp.resolve(strict=True)
+            and root.resolve(strict=True).name.startswith("voice-metadata-bazel-")
+            and len(root.resolve(strict=True).name) > len("voice-metadata-bazel-")
+        )
+    except (OSError, RuntimeError, ValueError):
+        private_root = False
+    if mode is None:
+        if context and query and batch and private_root:
+            raise ValueError("Metadata PATH mode is required")
+        return False
+    if (
+        mode != METADATA_MODE_VALUE
+        or os.name != "nt"
+        or not context
+        or not query
+        or not batch
+        or not private_root
+        or indexed.get("BUILDBUDDY_API_KEY")
+        or not all(indexed.get(name) for name in METADATA_SDK_NAMES)
+        or not indexed.get("CODEX_BAZEL_WINDOWS_PATH")
+        or indexed.get("PROCESSOR_ARCHITECTURE") != "AMD64"
+        or indexed.get("VOICE_WINDOWS_HOST_ARCH") != "AMD64"
+        or not indexed.get("VOICE_WINDOWS_BAZEL_REPOSITORY")
+        or not indexed.get("SYSTEMROOT")
+        or indexed.get("VOICE_WINDOWS_SYSTEM_ROOT") != indexed.get("SYSTEMROOT")
+    ):
+        raise ValueError("Invalid metadata PATH mode context")
+    # Only the exact three owned named bindings are permitted; never accept a
+    # value assignment, unset form, mixed-case alias or duplicate PATH binding.
+    found = {option: 0 for option in METADATA_PATH_OPTIONS}
+    for i, arg in enumerate(before):
+        for option in METADATA_PATH_OPTIONS:
+            value = (
+                (before[i + 1] if i + 1 < len(before) else "")
+                if arg == option
+                else arg[len(option) + 1 :]
+                if arg.startswith(option + "=")
+                else None
+            )
+            if (
+                value is not None
+                and value.lstrip("=").split("=", 1)[0].upper() == "PATH"
+            ):
+                if arg != option + "=PATH":
+                    raise ValueError("Invalid metadata PATH binding")
+                found[option] += 1
+    if any(count != 1 for count in found.values()):
+        raise ValueError("Metadata named PATH bindings are required")
+    # The shell normally supplies this exact startup option. Reject an override
+    # instead of silently attaching metadata to another output user root.
+    if any(
+        arg.startswith("--output_user_root=")
+        and arg != "--output_user_root=" + indexed["BAZEL_OUTPUT_USER_ROOT"]
+        for arg in before[:command_index]
+    ):
+        raise ValueError("Invalid metadata output root binding")
+    return True
+
+
+def metadata_bazel_launch(command: list[str], env: Mapping[str, str]):
+    """Freeze original tool selection, then normalize only the spawned PATH."""
+    executable = shutil.which(command[0], path=env.get("PATH"))
+    if executable is None:
+        raise ValueError("Metadata Bazel executable is unavailable")
+    child = dict(env)
+    child["PATH"] = env["CODEX_BAZEL_WINDOWS_PATH"]
+    return [str(Path(executable).resolve(strict=True)), *command[1:]], child
+
+
 def main() -> None:
+    try:
+        metadata_mode = metadata_path_mode(sys.argv[1:], os.environ)
+    except ValueError:
+        print("Invalid configured metadata PATH context or bindings.", file=sys.stderr)
+        raise SystemExit(1) from None
     config = remote_config(sys.argv[1:], os.environ)
     if config is None:
         print(
@@ -207,7 +323,17 @@ def main() -> None:
     if os.name == "nt":
         # Windows CRT exec can split arguments containing spaces and lose the
         # eventual child exit status. Wait for Bazel and propagate its status.
-        result = subprocess.run(command, check=False)
+        if metadata_mode:
+            try:
+                command, child_environment = metadata_bazel_launch(command, os.environ)
+            except (OSError, ValueError):
+                print(
+                    "Configured metadata Bazel executable unavailable.", file=sys.stderr
+                )
+                raise SystemExit(1) from None
+            result = subprocess.run(command, check=False, env=child_environment)
+        else:
+            result = subprocess.run(command, check=False)
         raise SystemExit(result.returncode)
 
     os.execvp(command[0], command)

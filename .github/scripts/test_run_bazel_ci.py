@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -102,7 +103,19 @@ class RunBazelCiTest(unittest.TestCase):
         )
         self.assertEqual(args[separator + 1 :], list(payload))
 
-    def invoke(self, *, args=(), flags=(), env=None, targets=(TARGET,), provision=True):
+    def invoke(
+        self,
+        *,
+        args=(),
+        flags=(),
+        env=None,
+        targets=(TARGET,),
+        provision=True,
+        command="test",
+        startup=(),
+        metadata=False,
+        real_wrapper=False,
+    ):
         bash = (
             str(
                 Path(os.environ.get("ProgramFiles", "C:/Program Files"))
@@ -120,7 +133,15 @@ class RunBazelCiTest(unittest.TestCase):
                 SCRIPT.read_text(encoding="utf-8"), encoding="utf-8", newline="\n"
             )
             stub = root / "run_bazel_with_buildbuddy.py"
-            stub.write_text(STUB, encoding="utf-8", newline="\n")
+            stub.write_text(
+                Path(__file__)
+                .with_name("run_bazel_with_buildbuddy.py")
+                .read_text(encoding="utf-8")
+                if real_wrapper
+                else STUB,
+                encoding="utf-8",
+                newline="\n",
+            )
             stub.chmod(0o755)
             record = root / "calls.jsonl"
             tools = root / "voice tools"
@@ -148,9 +169,72 @@ class RunBazelCiTest(unittest.TestCase):
                 VOICE_WINDOWS_HOST_ARCH="AMD64",
                 VOICE_WINDOWS_BAZEL_REPOSITORY=str(tools),
             )
-            environment.update(env or {})
+            if metadata:
+                metadata_root = root / "voice-metadata-bazel-fixture"
+                metadata_root.mkdir()
+                environment.update(
+                    {
+                        name: "fixture-sdk"
+                        for name in (
+                            "INCLUDE",
+                            "LIB",
+                            "LIBPATH",
+                            "UCRTVersion",
+                            "UniversalCRTSdkDir",
+                            "VCINSTALLDIR",
+                            "VCToolsInstallDir",
+                            "WindowsLibPath",
+                            "WindowsSdkBinPath",
+                            "WindowsSdkDir",
+                            "WindowsSDKLibVersion",
+                            "WindowsSDKVersion",
+                        )
+                    }
+                )
+                environment.update(
+                    VOICE_CONFIGURED_METADATA_MODE="bounded-v1",
+                    GITHUB_EVENT_NAME="workflow_dispatch",
+                    GITHUB_JOB="voice-runtime-diagnostic",
+                    RUNNER_TEMP=str(root),
+                    BAZEL_OUTPUT_USER_ROOT=str(metadata_root),
+                )
+            if real_wrapper:
+                # ROOT runs this native Git Bash probe after source review. The
+                # fixture exports only equality/binding booleans, never PATH/argv.
+                fake_python = root / "fake_bazel.py"
+                fake_python.write_text(
+                    "import json,os,sys\nfrom pathlib import Path\n"
+                    "args=sys.argv[1:]\n"
+                    "Path(os.environ['BAZEL_STUB_RECORD']).write_text(json.dumps({"
+                    "'path_matches_selected':os.environ.get('PATH')==os.environ['CODEX_BAZEL_WINDOWS_PATH'],"
+                    "'named_bindings':all(args.count(x+'=PATH')==1 for x in ('--action_env','--host_action_env','--test_env')),"
+                    "'no_path_values':not any(x.startswith(('--action_env=PATH=','--host_action_env=PATH=','--test_env=PATH=')) for x in args),"
+                    "'batch_query':'--batch' in args and 'cquery' in args})+'\\n')\n",
+                    encoding="utf-8",
+                )
+                fake_cmd = root / "fake_bazel.cmd"
+                fake_cmd.write_text(
+                    '@"' + sys.executable + '" "%~dp0fake_bazel.py" %*\n',
+                    encoding="utf-8",
+                )
+                environment["CODEX_BAZEL_BIN"] = str(fake_cmd)
+            for name, value in (env or {}).items():
+                if value is None:
+                    environment.pop(name, None)
+                else:
+                    environment[name] = value
             result = subprocess.run(
-                [bash, str(script), *flags, "--", "test", *args, "--", *targets],
+                [
+                    bash,
+                    str(script),
+                    *flags,
+                    "--",
+                    *startup,
+                    command,
+                    *args,
+                    "--",
+                    *targets,
+                ],
                 cwd=root,
                 env=environment,
                 capture_output=True,
@@ -164,6 +248,122 @@ class RunBazelCiTest(unittest.TestCase):
                 else []
             )
             return result, calls
+
+    def test_owned_metadata_queries_use_three_named_bindings_and_keep_sdk_flags(self):
+        for command in ("cquery", "aquery"):
+            result, args = self.successful_call(
+                metadata=True,
+                command=command,
+                startup=("--batch",),
+                flags=("--windows-cross-compile",),
+            )
+            for option in ("--action_env", "--host_action_env", "--test_env"):
+                self.assertEqual(args.count(option + "=PATH"), 1)
+                self.assertFalse(any(arg.startswith(option + "=PATH=") for arg in args))
+            self.assertIn("--action_env=UCRTVersion", args)
+            self.assertIn("--host_action_env=WindowsSdkDir", args)
+            self.assertIn("--config=ci-windows-msvc", args)
+            self.assertIn(
+                "--workspace_status_command=scripts/workspace-status.cmd", args
+            )
+            self.assertIn("--batch", args)
+            self.assertIn("--noexperimental_remote_repo_contents_cache", args)
+            self.assertIn(DECLARATION, args)
+            self.assertIn("GNU cross compilation is not exercised", result.stdout)
+
+    def test_metadata_mode_rejects_wrong_context_missing_sdk_and_path_overrides(self):
+        for environment in (
+            {"VOICE_CONFIGURED_METADATA_MODE": "wrong"},
+            {"GITHUB_REPOSITORY": "other/fork"},
+            {"GITHUB_EVENT_NAME": "push"},
+            {"GITHUB_JOB": "ordinary"},
+            {"RUNNER_OS": "Linux"},
+            {"BUILDBUDDY_API_KEY": "fixture-key"},
+            {"INCLUDE": ""},
+            {"CODEX_BAZEL_WINDOWS_PATH": ""},
+            {"BAZEL_OUTPUT_USER_ROOT": "C:/not-private"},
+            {"VOICE_CONFIGURED_METADATA_MODE": None},
+        ):
+            result, calls = self.invoke(
+                metadata=True,
+                command="cquery",
+                startup=("--batch",),
+                flags=("--windows-cross-compile",),
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(calls, [])
+        for option in ("--action_env", "--host_action_env", "--test_env"):
+            for choice in (
+                (option + "=PATH=fixture-private",),
+                (option, "Path=fixture-private"),
+                (option + "==PATH",),
+            ):
+                result, calls = self.invoke(
+                    metadata=True,
+                    command="cquery",
+                    startup=("--batch",),
+                    flags=("--windows-cross-compile",),
+                    args=choice,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+        for startup, command in (
+            ((), "cquery"),
+            (("--batch", "--batch"), "cquery"),
+            (("--batch",), "test"),
+        ):
+            result, calls = self.invoke(
+                metadata=True,
+                command=command,
+                startup=startup,
+                flags=("--windows-cross-compile",),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(calls, [])
+
+    def test_no_mode_runtime_or_other_job_retains_explicit_path_values(self):
+        for command, environment in (
+            ("test", {"VOICE_CONFIGURED_METADATA_MODE": None}),
+            (
+                "cquery",
+                {"VOICE_CONFIGURED_METADATA_MODE": None, "GITHUB_JOB": "ordinary"},
+            ),
+        ):
+            _, args = self.successful_call(
+                metadata=True,
+                command=command,
+                startup=("--batch",),
+                flags=("--windows-cross-compile",),
+                env=environment,
+            )
+            for option in ("--action_env", "--host_action_env", "--test_env"):
+                self.assertIn(
+                    option + r"=PATH=C:\Program Files\SDK;C:\Windows\System32", args
+                )
+                self.assertNotIn(option + "=PATH", args)
+
+    @unittest.skipUnless(os.name == "nt", "ROOT native Windows Git Bash probe")
+    def test_real_git_bash_python_wrapper_fake_bazel_receives_exact_selected_path(self):
+        result, calls = self.invoke(
+            metadata=True,
+            real_wrapper=True,
+            command="cquery",
+            startup=("--batch",),
+            flags=("--windows-cross-compile",),
+        )
+        self.assertEqual(result.returncode, 0, "Native fake-Bazel probe failed")
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "path_matches_selected": True,
+                    "named_bindings": True,
+                    "no_path_values": True,
+                    "batch_query": True,
+                }
+            ],
+        )
 
     def successful_call(self, **kwargs):
         result, calls = self.invoke(**kwargs)
