@@ -997,8 +997,47 @@ async fn review_uses_custom_review_model_from_config() {
         .await
         .expect("custom review conversation should be created");
     let codex = Arc::clone(&test.codex);
-    std::fs::remove_file(codex_home.path().join("models_cache.json"))
-        .expect("initial empty model catalog should be cached");
+    let cache_directory = codex_home.path().join("models_cache.d");
+    assert!(
+        std::fs::symlink_metadata(&cache_directory)
+            .expect("initial catalog cache directory")
+            .file_type()
+            .is_dir(),
+        "the fixture cache directory must be a real directory, not a symlink"
+    );
+    let entries = std::fs::read_dir(&cache_directory)
+        .expect("initial partitioned model catalog cache")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read every entry in the fixture's cache directory");
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the fixture's initial cache partition"
+    );
+    let entry = &entries[0];
+    assert!(
+        entry.file_type().unwrap().is_file(),
+        "the initial cache partition must be a regular file, not a symlink"
+    );
+    let cache_file = entry.path();
+    assert_eq!(
+        cache_file
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("json")
+    );
+    let cached: codex_models_manager::cache::ModelsCacheEntry =
+        serde_json::from_slice(&std::fs::read(&cache_file).unwrap())
+            .expect("the actual initial catalog cache entry");
+    assert!(cached.models.is_empty());
+    assert!(
+        cached
+            .identity
+            .as_deref()
+            .is_some_and(|identity| !identity.is_empty())
+    );
+    std::fs::remove_file(cache_file)
+        .expect("remove only the verified initial empty catalog partition");
     let mut models = codex_models_manager::bundled_models_response()
         .expect("bundled model catalog should parse");
     let model = models
