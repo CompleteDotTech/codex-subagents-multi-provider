@@ -83,8 +83,7 @@ class ObservationTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 m.supervise(["missing-build"], None)
 
-    @unittest.skipUnless(sys.platform == "win32", "native Windows command selection")
-    def test_workflow_selects_current_git_bash_and_preserves_native_child_exit(self):
+    def workflow_git_bash_probe(self, setup):
         workflow = (Path(__file__).parents[1] / "workflows/bazel.yml").read_text()
         step = workflow.split("      - name: Diagnose native MSVC voice runtime\n", 1)[
             1
@@ -96,13 +95,13 @@ class ObservationTests(unittest.TestCase):
         )
         self.assertIsNotNone(launch)
         # Execute the workflow's real shell selection, without its build payload.
-        probe = script[: launch.start()] + "printf '%s\\0' " + launch.group(1)
+        probe = setup + script[: launch.start()] + "printf '%s\\0' " + launch.group(1)
         outer = Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe"
         self.assertTrue(outer.is_file(), "Git Bash is required on Windows")
         with tempfile.TemporaryDirectory() as directory:
             script_path = Path(directory) / "workflow selection.sh"
             script_path.write_text(probe, newline="\n")
-            selected = subprocess.run(
+            result = subprocess.run(
                 [
                     str(outer),
                     "--noprofile",
@@ -114,43 +113,100 @@ class ObservationTests(unittest.TestCase):
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=dict(os.environ, ISSUE67_NON_SHELL=sys.executable),
                 timeout=10,
-                check=True,
-            ).stdout
-        self.assertEqual(selected.count(b"\0"), 1)
-        executable = Path(selected[:-1].decode())
-        self.assertTrue(
-            executable.is_absolute(), "never resolve a bare bash through PATH"
-        )
-        self.assertTrue(executable.is_file())
-        observer = Mock()
-        with tempfile.TemporaryDirectory() as directory:
-            marker = Path(directory) / "shell identity.txt"
-            child_script = Path(directory) / "harmless child.sh"
-            child_script.write_text(
-                'printf "%s\\n" "$BASH_VERSION" "$2" > "$1"\nexit 37\n',
-                newline="\n",
+                check=False,
             )
-            with patch.object(m, "collect", side_effect=AssertionError("no host CIM")):
-                code = m.supervise(
-                    [
-                        str(executable),
-                        "--noprofile",
-                        "--norc",
-                        child_script.as_posix(),
-                        marker.as_posix(),
-                        "argument with spaces",
-                    ],
-                    observer,
-                )
-            self.assertEqual(code, 37)
-            version, argument = marker.read_text().splitlines()
-            self.assertTrue(re.fullmatch(r"\d+\.\d+.*", version))
-            self.assertEqual(argument, "argument with spaces")
+        line, separator, selected = result.stdout.partition(b"\n")
+        self.assertEqual(separator, b"\n")
+        prefix = b"git-bash-selection "
+        self.assertTrue(line.startswith(prefix))
+        diagnostics = json.loads(line[len(prefix) :])
         self.assertEqual(
-            [call.args[0] for call in observer.sample.call_args_list],
-            ["before-build", "build-exit"],
+            set(diagnostics),
+            {
+                "original_ostype_msys",
+                "original_bash_posix_absolute",
+                "original_bash_executable",
+                "path_form",
+            },
         )
+        for key in diagnostics.keys() - {"path_form"}:
+            self.assertIs(type(diagnostics[key]), bool)
+        self.assertIn(
+            diagnostics["path_form"],
+            ("relative", "posix_absolute", "windows_absolute"),
+        )
+        return result, diagnostics, selected
+
+    @unittest.skipUnless(sys.platform == "win32", "native Windows command selection")
+    def test_workflow_selects_current_git_bash_and_preserves_native_child_exit(self):
+        executables = []
+        for setup, form in (
+            ('BASH="$(cygpath -au "$BASH")"\n', "posix_absolute"),
+            (
+                'BASH="$(cygpath -aw "$BASH")"\nOSTYPE=fixture\n',
+                "windows_absolute",
+            ),
+        ):
+            with self.subTest(form=form):
+                result, diagnostics, selected = self.workflow_git_bash_probe(setup)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(diagnostics["path_form"], form)
+                if form == "windows_absolute":
+                    self.assertFalse(diagnostics["original_ostype_msys"])
+                    self.assertFalse(diagnostics["original_bash_posix_absolute"])
+                self.assertEqual(selected.count(b"\0"), 1)
+                executable = Path(selected[:-1].decode())
+                self.assertTrue(
+                    executable.is_absolute(), "never resolve a bare bash through PATH"
+                )
+                self.assertTrue(executable.is_file())
+                executables.append(executable)
+                observer = Mock()
+                with tempfile.TemporaryDirectory() as directory:
+                    marker = Path(directory) / "shell identity.txt"
+                    child_script = Path(directory) / "harmless child.sh"
+                    child_script.write_text(
+                        'printf "%s\\n" "$BASH_VERSION" "$2" > "$1"\nexit 37\n',
+                        newline="\n",
+                    )
+                    with patch.object(
+                        m, "collect", side_effect=AssertionError("no host CIM")
+                    ):
+                        code = m.supervise(
+                            [
+                                str(executable),
+                                "--noprofile",
+                                "--norc",
+                                child_script.as_posix(),
+                                marker.as_posix(),
+                                "argument with spaces",
+                            ],
+                            observer,
+                        )
+                    self.assertEqual(code, 37)
+                    version, argument = marker.read_text().splitlines()
+                    self.assertTrue(re.fullmatch(r"\d+\.\d+.*", version))
+                    self.assertEqual(argument, "argument with spaces")
+                self.assertEqual(
+                    [call.args[0] for call in observer.sample.call_args_list],
+                    ["before-build", "build-exit"],
+                )
+        self.assertTrue(executables[0].samefile(executables[1]))
+
+    @unittest.skipUnless(sys.platform == "win32", "native Windows command selection")
+    def test_workflow_rejects_relative_missing_and_non_shell_executables(self):
+        for setup in (
+            "BASH=bash\n",
+            'BASH="$(cygpath -aw "$BASH").does-not-exist"\n',
+            'BASH="$(cygpath -aw "$ISSUE67_NON_SHELL")"\n',
+        ):
+            with self.subTest(setup=setup):
+                result, diagnostics, selected = self.workflow_git_bash_probe(setup)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(selected, b"")
+                self.assertNotIn(sys.executable.encode(), result.stdout + result.stderr)
 
     def test_oversized_collector_rejected(self):
         with patch.object(m, "bounded_output", side_effect=OverflowError()):

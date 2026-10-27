@@ -729,15 +729,34 @@ jobs:
         # its native MSVC route. This is not GNU cross-compile evidence.
         run: |
           unset BUILDBUDDY_API_KEY
-          if [[ "$OSTYPE" != msys || "$BASH" != /* || ! -x "$BASH" ]]; then
-            echo "Expected the current Git Bash executable" >&2
+          original_ostype_msys=false
+          original_bash_posix_absolute=false
+          original_bash_executable=false
+          if [[ "${OSTYPE:-}" == msys ]]; then original_ostype_msys=true; fi
+          if [[ "${BASH:-}" == /* ]]; then original_bash_posix_absolute=true; fi
+          if [[ -x "${BASH:-}" ]]; then original_bash_executable=true; fi
+          bash_path_form=relative
+          case "${BASH:-}" in
+            /*) bash_path_form=posix_absolute ;;
+            [A-Za-z]:\\*|[A-Za-z]:/*) bash_path_form=windows_absolute ;;
+          esac
+          printf 'git-bash-selection {"original_ostype_msys":%s,"original_bash_posix_absolute":%s,"original_bash_executable":%s,"path_form":"%s"}\n' \
+            "$original_ostype_msys" "$original_bash_posix_absolute" "$original_bash_executable" "$bash_path_form"
+          if [[ -z "${BASH_VERSION:-}" || "$bash_path_form" == relative ]]; then
+            echo "Expected an absolute current Bash executable" >&2
             exit 1
           fi
-          git_bash="$(cygpath -w "$BASH")"
+          git_bash="$(cygpath -aw "$BASH" 2>/dev/null)"
           case "$git_bash" in
             [A-Za-z]:\\*|[A-Za-z]:/*) ;;
             *) echo "Git Bash did not resolve to an absolute Windows path" >&2; exit 1 ;;
           esac
+          git_bash_posix="$(cygpath -au "$git_bash" 2>/dev/null)"
+          git_bash_name="${git_bash_posix##*/}"
+          if [[ "$git_bash_posix" != /* || ! -f "$git_bash_posix" || ! -x "$git_bash_posix" || ( "${git_bash_name,,}" != bash.exe && "${git_bash_name,,}" != bash ) ]]; then
+            echo "Current Bash executable validation failed" >&2
+            exit 1
+          fi
           python .github/scripts/observe_windows_ci_resources.py supervise -- "$git_bash" ./.github/scripts/run-bazel-ci.sh \
             --print-failed-test-logs --print-failed-action-summary \
             --windows-cross-compile -- test --keep_going --nocache_test_results --test_output=all --zip_undeclared_test_outputs=false \
