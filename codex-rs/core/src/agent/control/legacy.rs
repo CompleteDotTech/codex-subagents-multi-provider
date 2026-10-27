@@ -7,6 +7,7 @@ impl LocalAgentControl {
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
     /// persisted spawn-edge state.
     pub(crate) async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
+        self.runtime.registry.revoke_caller(agent_id);
         let state = self.runtime.upgrade()?;
         let result = if let Ok(thread) = state.get_thread(agent_id).await {
             thread
@@ -50,6 +51,7 @@ impl LocalAgentControl {
     /// Mark `agent_id` as explicitly closed in persisted spawn-edge state, then shut down the
     /// agent and any live descendants reached from the in-memory tree.
     pub(crate) async fn close_agent(&self, agent_id: ThreadId) -> CodexResult<AgentInfo> {
+        self.runtime.registry.revoke_caller(agent_id);
         let state = self.runtime.upgrade()?;
         let metadata = self.get_agent_metadata(agent_id);
         let known_agent = metadata.is_some();

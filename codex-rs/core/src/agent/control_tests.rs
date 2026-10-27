@@ -8363,3 +8363,225 @@ async fn private_cold_resume_keeps_original_caller_through_final_factory_admissi
         );
     }
 }
+
+#[test_case::test_case(0; "completed eviction then explicit unloaded close")]
+#[test_case::test_case(1; "explicit close blocks in flight eviction completion")]
+#[test_case::test_case(2; "stale evicted allocation cannot retire real replacement")]
+#[tokio::test]
+async fn real_private_resume_caller_lifecycle_distinguishes_eviction_and_revocation(stage: u8) {
+    use crate::agent::child_provider_authorization::RetainedAgentAuthority;
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    config.model = Some("gpt-5.6-sol".into());
+    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, root) = harness.start_paginated_thread().await;
+    let control = root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let child =
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "lifecycle_caller")
+            .await;
+    let caller = harness.manager.get_thread(child.thread_id).await.unwrap();
+    persist_thread_for_tree_resume(&caller, "retained caller lifecycle").await;
+    caller
+        .session
+        .abort_all_tasks(TurnAbortReason::Interrupted)
+        .await;
+    caller.session.mark_interrupted();
+    *caller.session.active_turn.lock().await = None;
+    let _ = caller.session.input_queue.drain_mailbox_input_items().await;
+    assert!(caller.is_running());
+    let runtime = &caller.session.services.local_agent_runtime;
+    let epoch = RetainedAgentAuthority::capture(&caller.session, &caller.session_source).await;
+    assert!(
+        runtime
+            .with_resume_caller(&epoch, /*live*/ true, || Ok(()))
+            .is_ok()
+    );
+    // Busy is not successful residency removal and cannot manufacture a stopped
+    // caller exception. The original caller still runs with the same real epoch.
+    let busy_guard = caller.residency_gate.read().await;
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(Arc::clone(&caller))
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Busy
+    );
+    assert!(
+        runtime
+            .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
+            .is_err()
+    );
+    drop(busy_guard);
+
+    if stage == 1 {
+        let state = runtime.upgrade().unwrap();
+        // A real read guard allows eviction's initial lookup and shutdown, but
+        // blocks its exact map removal/completion transaction. No state is forged.
+        let map_guard = state.threads.read().await;
+        let eviction = harness.manager.try_evict_v2_thread(Arc::clone(&caller));
+        tokio::pin!(eviction);
+        tokio::select! {
+            result = &mut eviction => panic!("map read barrier must retain in-flight eviction: {result:?}"),
+            stopped = timeout(Duration::from_secs(10), caller.wait_until_terminated()) => {
+                stopped.expect("actual eviction must stop the original caller");
+            }
+        }
+        assert!(!caller.is_running());
+        let close = control.close_agent(child.thread_id);
+        tokio::pin!(close);
+        poll_fn(|cx| match close.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("actual close must await map removal behind read barrier"),
+        })
+        .await;
+        drop(map_guard);
+        let (evicted, closed) = tokio::join!(eviction, close);
+        assert!(matches!(
+            evicted.unwrap(),
+            ThreadEvictionOutcome::Evicted | ThreadEvictionOutcome::NotCurrent
+        ));
+        closed.expect("actual loaded close should finish after barrier release");
+        assert!(
+            runtime
+                .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
+                .is_err(),
+            "close tombstone must survive in-flight eviction completion"
+        );
+        assert!(
+            runtime
+                .registry
+                .evicted_environments(child.thread_id)
+                .is_none()
+        );
+    } else {
+        assert_eq!(
+            harness
+                .manager
+                .try_evict_v2_thread(Arc::clone(&caller))
+                .await
+                .unwrap(),
+            ThreadEvictionOutcome::Evicted
+        );
+        assert!(!caller.is_running());
+        assert!(harness.manager.get_thread(child.thread_id).await.is_err());
+        assert!(
+            runtime
+                .retained_authority(child.thread_id)
+                .unwrap()
+                .same_registration(&epoch)
+        );
+        assert!(
+            runtime
+                .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
+                .is_ok(),
+            "only actual completed same-epoch host eviction grants stopped-caller exception"
+        );
+        assert!(
+            runtime
+                .registry
+                .evicted_environments(child.thread_id)
+                .is_some()
+        );
+        if stage == 0 {
+            assert_matches!(
+                control.close_agent(child.thread_id).await.unwrap(),
+                AgentInfo::Unloaded(_)
+            );
+            assert!(
+                runtime
+                    .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
+                    .is_err(),
+                "explicit unloaded close must revoke completed eviction"
+            );
+            let snapshot =
+                RetainedAgentAuthority::capture(&caller.session, &caller.session_source).await;
+            assert!(snapshot.same_registration(&epoch));
+            runtime.retire_authority(snapshot);
+            assert!(
+                runtime
+                    .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
+                    .is_err(),
+                "ordinary same-epoch snapshot retention must not reset a revocation tombstone"
+            );
+            assert_eq!(
+                harness
+                    .manager
+                    .try_evict_v2_thread(Arc::clone(&caller))
+                    .await
+                    .unwrap(),
+                ThreadEvictionOutcome::NotCurrent
+            );
+            assert!(
+                runtime
+                    .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
+                    .is_err()
+            );
+        } else {
+            // The real native reload supplies a new Session/UUID under the same
+            // thread ID. Old snapshot data cannot authenticate the new allocation.
+            let loaded = control
+                .resume_agent_from_rollout(
+                    harness.config.clone(),
+                    child.thread_id,
+                    caller.session_source.clone(),
+                )
+                .await
+                .expect("root can reload actual evicted native caller");
+            assert_eq!(loaded, child.thread_id);
+            let replacement = harness.manager.get_thread(child.thread_id).await.unwrap();
+            assert!(!Arc::ptr_eq(&replacement, &caller));
+            let replacement_epoch =
+                RetainedAgentAuthority::capture(&replacement.session, &replacement.session_source)
+                    .await;
+            assert_ne!(
+                replacement_epoch.epoch().generation,
+                epoch.epoch().generation
+            );
+            assert!(
+                runtime
+                    .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .with_resume_caller(&replacement_epoch, /*live*/ true, || Ok(()))
+                    .is_ok()
+            );
+            // Delayed removal and eviction of the held original must leave the
+            // replacement's Current epoch and actual registration untouched.
+            assert!(
+                harness
+                    .manager
+                    .remove_thread_if_matches(&child.thread_id, &caller)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                harness
+                    .manager
+                    .try_evict_v2_thread(Arc::clone(&caller))
+                    .await
+                    .unwrap(),
+                ThreadEvictionOutcome::NotCurrent
+            );
+            assert!(Arc::ptr_eq(
+                &harness.manager.get_thread(child.thread_id).await.unwrap(),
+                &replacement
+            ));
+            assert!(
+                runtime
+                    .with_resume_caller(&replacement_epoch, /*live*/ true, || Ok(()))
+                    .is_ok()
+            );
+            replacement.shutdown_and_wait().await.unwrap();
+        }
+    }
+    root.shutdown_and_wait().await.unwrap();
+}

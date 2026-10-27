@@ -1489,7 +1489,7 @@ impl ThreadManager {
             .session
             .services
             .local_agent_runtime
-            .retain_authority(authority);
+            .retire_authority(authority);
         Ok(threads
             .remove(thread_id)
             .inspect(|thread| thread.session.services.mcp_runtime.revoke_ema()))
@@ -1531,7 +1531,7 @@ impl ThreadManager {
             .session
             .services
             .local_agent_runtime
-            .retain_authority(authority);
+            .retire_authority(authority);
         threads
             .remove(thread_id)
             .inspect(|thread| thread.session.services.mcp_runtime.revoke_ema())
@@ -1608,7 +1608,7 @@ impl ThreadManager {
                 .session
                 .services
                 .local_agent_runtime
-                .retain_authority(authority);
+                .retire_authority(authority);
             if let Some(removed) = tracked_threads.remove(&thread_id) {
                 removed.session.services.mcp_runtime.revoke_ema();
             }
@@ -2090,7 +2090,7 @@ impl ThreadManagerState {
             .session
             .services
             .local_agent_runtime
-            .retain_authority(authority);
+            .retire_authority(authority);
         threads
             .remove(thread_id)
             .inspect(|thread| thread.session.services.mcp_runtime.revoke_ema())
@@ -2647,7 +2647,7 @@ impl ThreadManagerState {
                         .session
                         .services
                         .local_agent_runtime
-                        .retain_authority(authority);
+                        .retire_authority(authority);
                 }
                 thread.session.revoke_fresh_child_admission();
                 threads.remove(&resumed.conversation_id);
@@ -2988,7 +2988,7 @@ impl ThreadManagerState {
                 session
                     .services
                     .local_agent_runtime
-                    .retain_authority(retained_authority);
+                    .register_authority(retained_authority);
                 ema_cancellation.publish();
                 let thread = Arc::new(CodexThread::new(
                     session,

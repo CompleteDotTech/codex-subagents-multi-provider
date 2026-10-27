@@ -97,22 +97,14 @@ impl ThreadManagerState {
                 tracing::warn!(%error, "evicted native authority remains unavailable for cold reload");
             }
             let mut threads = manager.threads.write().await;
-            if threads
-                .get(&thread_id)
-                .is_some_and(|registered| !Arc::ptr_eq(registered, &thread))
-            {
+            if !threads.get(&thread_id).is_some_and(|registered| Arc::ptr_eq(registered, &thread)) {
                 teardown.complete();
                 return Ok(ThreadEvictionOutcome::NotCurrent);
             }
-            runtime
-                .registry
-                .save_evicted_environments(thread_id, environments);
-            if threads.contains_key(&thread_id) {
-                thread.session.revoke_fresh_child_admission();
-            }
+            thread.session.revoke_fresh_child_admission();
             let removed = threads.remove(&thread_id).is_some();
             if removed {
-                runtime.registry.retain_authority(authority);
+                runtime.registry.complete_residency_eviction(authority, environments);
             }
             runtime.residency.remove(thread_id);
             teardown.complete();

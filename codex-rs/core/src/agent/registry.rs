@@ -1,3 +1,4 @@
+use crate::agent::child_provider_authorization::RetainedAgentAuthority;
 use crate::agent::types::AgentMetadata;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_protocol::AgentPath;
@@ -36,10 +37,21 @@ struct ActiveAgents {
     thread_paths: HashMap<ThreadId, RegisteredAgent>,
     // Actual finalized/unloaded Session ceilings only; never serialized, printed,
     // or sufficient by themselves to authorize provider use.
-    retained_authority:
-        HashMap<ThreadId, Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>>,
+    retained_authority: HashMap<ThreadId, RetainedAuthorityEntry>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallerPhase {
+    Current,
+    CompletedResidencyEviction,
+    Revoked,
+}
+
+struct RetainedAuthorityEntry {
+    authority: Arc<RetainedAgentAuthority>,
+    phase: CallerPhase,
 }
 
 /// Thread defaults and executor bindings retained while a child's runtime is unloaded.
@@ -99,27 +111,128 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 }
 
 impl AgentRegistry {
-    pub(crate) fn retain_authority(
-        &self,
-        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
-    ) {
-        self.active_agents
+    /// Only successful actual registration installs a NEW Current epoch.
+    /// Same-registration snapshot refresh preserves eviction/revocation phase.
+    pub(crate) fn register_authority(&self, authority: Arc<RetainedAgentAuthority>) {
+        let mut state = self
+            .active_agents
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let thread_id = authority.thread_id;
+        if let Some(entry) = state.retained_authority.get_mut(&thread_id)
+            && entry.authority.same_registration(&authority)
+        {
+            entry.authority = authority;
+            return;
+        }
+        state.retained_authority.insert(
+            thread_id,
+            RetainedAuthorityEntry {
+                authority,
+                phase: CallerPhase::Current,
+            },
+        );
+        if let Some(agent) = state.thread_paths.get_mut(&thread_id) {
+            agent.evicted_environments = None;
+        }
+    }
+
+    pub(crate) fn retire_authority(&self, authority: Arc<RetainedAgentAuthority>) {
+        let mut state = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.retained_authority.get_mut(&authority.thread_id)
+            && entry.authority.same_registration(&authority)
+        {
+            entry.authority = authority;
+            entry.phase = CallerPhase::Revoked;
+        }
+    }
+
+    /// Explicit loaded or unloaded close sets a tombstone before its first await.
+    pub(crate) fn revoke_caller(&self, thread_id: ThreadId) {
+        let mut state = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.retained_authority.get_mut(&thread_id) {
+            entry.phase = CallerPhase::Revoked;
+        }
+        if let Some(agent) = state.thread_paths.get_mut(&thread_id) {
+            agent.evicted_environments = None;
+        }
+    }
+
+    /// Called only after exact successful map removal. CAS cannot undo a close
+    /// tombstone or attach a stale completion to a replacement registration.
+    pub(crate) fn complete_residency_eviction(
+        &self,
+        authority: Arc<RetainedAgentAuthority>,
+        environments: EvictedEnvironments,
+    ) {
+        let mut state = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let thread_id = authority.thread_id;
+        let Some(entry) = state.retained_authority.get_mut(&thread_id) else {
+            return;
+        };
+        if !entry.authority.same_registration(&authority) || entry.phase != CallerPhase::Current {
+            return;
+        }
+        entry.authority = authority;
+        entry.phase = CallerPhase::CompletedResidencyEviction;
+        if let Some(agent) = state.thread_paths.get_mut(&thread_id) {
+            agent.evicted_environments = Some(environments);
+        }
+    }
+
+    /// The callback must not reenter this registry. Hold this lock through the
+    /// final synchronous decision so replacement and revocation cannot race it.
+    pub(crate) fn with_resume_caller<T>(
+        &self,
+        authority: &RetainedAgentAuthority,
+        live: bool,
+        admit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let state = self.active_agents.lock().map_err(|_| {
+            crate::agent::child_provider_authorization::invalid(
+                "private resume caller registry is unavailable",
+            )
+        })?;
+        let valid = state
             .retained_authority
-            .insert(authority.thread_id, authority);
+            .get(&authority.thread_id)
+            .is_some_and(|entry| {
+                entry.authority.same_registration(authority)
+                    && match entry.phase {
+                        CallerPhase::Current => live,
+                        CallerPhase::CompletedResidencyEviction => true,
+                        CallerPhase::Revoked => false,
+                    }
+            });
+        if !valid {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "private resume caller stopped or changed before startup admission",
+            ));
+        }
+        let result = admit();
+        drop(state);
+        result
     }
 
     pub(crate) fn retained_authority(
         &self,
         thread_id: ThreadId,
-    ) -> Option<Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>> {
+    ) -> Option<Arc<RetainedAgentAuthority>> {
         self.active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retained_authority
             .get(&thread_id)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.authority))
     }
 
     pub(crate) fn reserve_spawn_slot(
@@ -204,20 +317,6 @@ impl AgentRegistry {
             .get(&thread_id)
             .and_then(|agent| active_agents.agent_tree.get(&agent.path))
             .cloned()
-    }
-
-    pub(crate) fn save_evicted_environments(
-        &self,
-        thread_id: ThreadId,
-        environments: EvictedEnvironments,
-    ) {
-        let mut active_agents = self
-            .active_agents
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(agent) = active_agents.thread_paths.get_mut(&thread_id) {
-            agent.evicted_environments = Some(environments);
-        }
     }
 
     pub(crate) fn evicted_environments(&self, thread_id: ThreadId) -> Option<EvictedEnvironments> {

@@ -207,11 +207,27 @@ pub(crate) struct LocalAgentRuntime {
 }
 
 impl LocalAgentRuntime {
-    pub(crate) fn retain_authority(
+    pub(crate) fn register_authority(
         &self,
         authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
     ) {
-        self.registry.retain_authority(authority);
+        self.registry.register_authority(authority);
+    }
+
+    pub(crate) fn retire_authority(
+        &self,
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+    ) {
+        self.registry.retire_authority(authority);
+    }
+
+    pub(crate) fn with_resume_caller<T>(
+        &self,
+        authority: &crate::agent::child_provider_authorization::RetainedAgentAuthority,
+        live: bool,
+        admit: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        self.registry.with_resume_caller(authority, live, admit)
     }
 
     pub(crate) fn retained_authority(

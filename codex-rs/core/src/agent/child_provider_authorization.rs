@@ -266,6 +266,17 @@ pub(crate) struct RetainedAgentAuthority {
 }
 
 impl RetainedAgentAuthority {
+    pub(crate) fn same_registration(&self, other: &Self) -> bool {
+        self.thread_id == other.thread_id
+            && self.registration_id == other.registration_id
+            && self.session_allocation == other.session_allocation
+    }
+
+    pub(crate) fn matches_session(&self, session: &Session) -> bool {
+        self.thread_id == session.thread_id
+            && self.session_allocation == session as *const Session as usize
+    }
+
     pub(crate) async fn capture(session: &Session, source: &SessionSource) -> Arc<Self> {
         let (config, settings, environments) = session.native_agent_authority_snapshot().await;
         let scope = ChildProviderScope::from_current(&config, &settings, &environments);
@@ -580,10 +591,47 @@ impl ChildLaunchPermit {
     }
 }
 
+/// Held only by an in-flight private operation, never Config or the registry.
+/// Completed host residency eviction preserves this exact registration; shutdown
+/// and explicit close do not. Registry phase and epoch remain live until admit.
+struct ResumeChildCaller {
+    caller: Arc<CodexThread>,
+    epoch: Arc<RetainedAgentAuthority>,
+}
+
+impl ResumeChildCaller {
+    fn check_current(&self) -> Result<()> {
+        self.with_current(|| Ok(()))
+    }
+
+    fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let live = self
+            .caller
+            .session
+            .fresh_child_admission_live
+            .lock()
+            .map_err(|_| invalid("private resume caller admission state is unavailable"))?;
+        let runtime = &self.caller.session.services.local_agent_runtime;
+        if runtime.shutdown.is_cancelled() {
+            return Err(
+                CodexErr::InvalidRequest("agent runtime is shutting down".to_owned())
+                    .with_agent_context(AgentErrorContext::RuntimeShutdown),
+            );
+        }
+        // Signal -> registry -> binding. The registry holds its epoch/phase lock
+        // through admit; no map lock, async guard, or registry reentry is allowed.
+        let result =
+            runtime.with_resume_caller(&self.epoch, *live && self.caller.is_running(), admit);
+        drop(live);
+        result
+    }
+}
+
 /// Opaque, non-cloneable continuation of a real native launch authorization.
 /// Config equality cannot freeze this live managed-policy binding.
 pub(crate) struct NativeChildAdmission {
     caller_fence: Option<FreshChildCaller>,
+    resume_caller: Option<ResumeChildCaller>,
     binding: Option<codex_config::CloudConfigBundleBinding>,
 }
 
@@ -591,6 +639,7 @@ impl NativeChildAdmission {
     fn new(config: &Config) -> Self {
         Self {
             caller_fence: None,
+            resume_caller: None,
             binding: config.config_layer_stack.cloud_config_binding().cloned(),
         }
     }
@@ -602,10 +651,20 @@ impl NativeChildAdmission {
         }
     }
 
+    fn for_resume(config: &Config, resume_caller: ResumeChildCaller) -> Self {
+        Self {
+            resume_caller: Some(resume_caller),
+            ..Self::new(config)
+        }
+    }
+
     pub(crate) fn check_current(&self) -> Result<()> {
         match &self.caller_fence {
             Some(caller) => caller.with_current(|| self.check_binding()),
-            None => self.check_binding(),
+            None => match &self.resume_caller {
+                Some(caller) => caller.with_current(|| self.check_binding()),
+                None => self.check_binding(),
+            },
         }
     }
 
@@ -625,7 +684,8 @@ impl NativeChildAdmission {
         // For fresh launches the caller signal lock spans the epoch/liveness
         // checks and managed binding read. Admission and exact-caller revocation
         // therefore have a shared synchronous ordering after all startup awaits.
-        // Private resume keeps its separate caller/own-eviction authorization.
+        // Private resume carries its original caller epoch and allows only a
+        // registry-authenticated completed residency eviction of that same epoch.
         self.check_current()
     }
 }
@@ -701,7 +761,7 @@ impl ChildResumePermit {
         }
         let current =
             RetainedAgentAuthority::capture(&caller.session, &caller.session_source).await;
-        if current.thread_id != caller_epoch.thread_id
+        if !current.same_registration(&caller_epoch)
             || current.config.as_ref() != caller_epoch.config.as_ref()
             || current.settings != caller_epoch.settings
             || current.scope != caller_epoch.scope
@@ -1054,6 +1114,11 @@ impl ChildResumePermit {
                 ));
             }
         }
+        ResumeChildCaller {
+            caller: Arc::clone(&caller),
+            epoch: Arc::clone(&caller_epoch),
+        }
+        .check_current()?;
         Ok(Self {
             caller,
             caller_epoch,
@@ -1108,6 +1173,11 @@ impl ChildResumePermit {
                 "private resume permit does not match this runtime/history/config",
             ));
         }
+        let caller_fence = ResumeChildCaller {
+            caller: Arc::clone(&self.caller),
+            epoch: Arc::clone(&self.caller_epoch),
+        };
+        caller_fence.check_current()?;
         let retained = runtime.retained_authority(self.target);
         if match (&retained, &self.target_ceiling) {
             (Some(current), Some(captured)) => !Arc::ptr_eq(current, captured),
@@ -1151,6 +1221,7 @@ impl ChildResumePermit {
         let current =
             RetainedAgentAuthority::capture(&self.caller.session, &self.caller.session_source)
                 .await;
+        caller_fence.check_current()?;
         if current.config.as_ref() != self.caller_epoch.config.as_ref()
             || current.settings != self.caller_epoch.settings
             || current.scope != self.caller_epoch.scope
@@ -1166,7 +1237,10 @@ impl ChildResumePermit {
                 self.authorization_origin.as_ref(),
             )
             .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-        Ok((self.origin, NativeChildAdmission::new(&current.config)))
+        Ok((
+            self.origin,
+            NativeChildAdmission::for_resume(&current.config, caller_fence),
+        ))
     }
 }
 
