@@ -3,4 +3,12 @@ load("//:defs.bzl", "codex_rust_crate")
 codex_rust_crate(
     name = "mxc-sandbox",
     crate_name = "codex_mxc_sandbox",
+    unit_test_env_inherit = select({
+        "@platforms//os:windows": [
+            "SystemDrive",
+            "LOCALAPPDATA",
+            "SystemRoot",
+        ],
+        "//conditions:default": [],
+    }),
 )
