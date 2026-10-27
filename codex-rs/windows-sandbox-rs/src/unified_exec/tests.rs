@@ -1137,3 +1137,6 @@ fn legacy_tty_cmd_emits_output_and_accepts_input() {
         assert!(stdout.contains("second"), "stdout={stdout:?}");
     });
 }
+
+#[path = "legacy_delete_diagnostics.rs"]
+mod legacy_delete_diagnostics;
