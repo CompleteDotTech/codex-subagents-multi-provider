@@ -6893,7 +6893,7 @@ async fn denied_final_cold_admission_preserves_receipt_for_a_current_policy_retr
         &root.thread.session_source,
         1,
         None,
-        Some("cold-target".into()),
+        Some("cold_target".into()),
     )
     .unwrap();
     let child = harness

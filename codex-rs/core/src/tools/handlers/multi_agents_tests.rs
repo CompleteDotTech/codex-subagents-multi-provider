@@ -30,8 +30,6 @@ use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandle
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
-use codex_history::InitialHistory;
-use codex_history::RolloutItem;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
@@ -47,14 +45,11 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::items::TurnItem;
-use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
@@ -751,7 +746,7 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
     turn.config = Arc::new(config);
     turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
     let manager = thread_manager_with_catalog(&turn.config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -1725,7 +1720,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
     let mut config = (*turn.config).clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     let spawn_output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -1884,7 +1879,7 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
     let mut config = (*turn.config).clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     let spawn_output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -1938,7 +1933,7 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
     let mut config = (*turn.config).clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     let spawn_output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -2052,7 +2047,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
     let mut config = turn.config.as_ref().clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -2391,7 +2386,7 @@ async fn multi_agent_v2_spawn_omits_agent_id_when_named() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -3205,7 +3200,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -3698,7 +3693,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     let spawn_output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -3785,7 +3780,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -3863,7 +3858,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     for task_name in ["worker_a", "worker_b"] {
         SpawnAgentHandlerV2::default()
@@ -3951,7 +3946,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
-    let (root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
+    let (_root, session, turn) = registered_handler_context(&manager, (*turn.config).clone()).await;
 
     SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -4130,7 +4125,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
     let codex_home = tempfile::tempdir().expect("create codex home");
-    let (session, turn, _) = make_session_and_context_with_auth_config_home_and_rx(
+    let (_session, turn, _) = make_session_and_context_with_auth_config_home_and_rx(
         CodexAuth::from_api_key("Test API Key"),
         Vec::new(),
         codex_home.path(),
