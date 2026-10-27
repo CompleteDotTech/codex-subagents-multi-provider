@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime
 import hashlib
 import io
 import json
@@ -123,6 +124,27 @@ def unique_object(pairs):
     return result
 
 
+def is_bazelisk_download_notice(line):
+    # Bazelisk 1.28.1 httputil.go:215 and Go 1.24 log.go:114 emit this
+    # complete public URL/message with a calendar-valid date/time header.
+    # A match is framing only, never source authentication or download proof.
+    if len(line) > 192:
+        return False
+    match = re.fullmatch(
+        r"([0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}) "
+        r"Downloading https://releases\.bazel\.build/9\.2\.0/release/"
+        r"bazel-9\.2\.0-windows-x86_64\.exe\.\.\.",
+        line,
+    )
+    if match is None:
+        return False
+    try:
+        datetime.datetime.strptime(match[1], "%Y/%m/%d %H:%M:%S")
+    except ValueError:
+        return False
+    return True
+
+
 def parse_json(text):
     """Decode one JSON object, allowing only recognized wrapper/Bazel log lines."""
 
@@ -139,6 +161,8 @@ def parse_json(text):
                 "OpenJDK 64-Bit Server VM warning: Options -Xverify:none and -noverify "
                 "were deprecated in JDK 13 and will likely be removed in a future release.",
             ):
+                continue
+            if is_bazelisk_download_notice(line):
                 continue
             if not re.match(
                 r"^(?:INFO:|DEBUG:|WARNING:|Loading:|Analyzing:|Computing main repo mapping:|"

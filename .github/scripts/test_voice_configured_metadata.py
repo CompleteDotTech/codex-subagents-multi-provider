@@ -388,6 +388,139 @@ class JVMWarningFramingTests(unittest.TestCase):
                 m.parse_provider(self.WARNING + "\n" + body, record["label"])
 
 
+class BazeliskDownloadFramingTests(unittest.TestCase):
+    # Synthetic timestamps only. The actual LOCALNATIVE observed stamp remains
+    # in the separately owned private fixture, never in tracked source.
+    STAMPS = ("2004/02/29 23:59:59", "2001/02/03 04:05:06")
+    BODY = (
+        "Downloading https://releases.bazel.build/9.2.0/release/"
+        "bazel-9.2.0-windows-x86_64.exe..."
+    )
+
+    def test_known_official_download_frames_provider_record(self):
+        record = packages()[0][0]
+        payload = m.SENTINEL + json.dumps(record)
+        for stamp in self.STAMPS:
+            for separator in ("\n", "\r\n"):
+                for before in (True, False):
+                    with self.subTest(stamp=stamp, separator=separator, before=before):
+                        line = stamp + " " + self.BODY
+                        text = separator.join(
+                            (line, payload) if before else (payload, line)
+                        )
+                        self.assertEqual(
+                            m.parse_provider(text, record["label"]), record
+                        )
+
+    def test_known_official_download_frames_action_json(self):
+        value = graph()
+        payload = json.dumps(value)
+        for stamp in self.STAMPS:
+            for separator in ("\n", "\r\n"):
+                for before in (True, False):
+                    with self.subTest(stamp=stamp, separator=separator, before=before):
+                        line = stamp + " " + self.BODY
+                        text = separator.join(
+                            (line, payload) if before else (payload, line)
+                        )
+                        self.assertEqual(m.parse_json(text), value)
+
+    def test_download_notice_rejects_near_urls_secrets_and_fatal_lines(self):
+        record = packages()[0][0]
+        exact = self.STAMPS[0] + " " + self.BODY
+        for line in (
+            "prefix " + exact,
+            " " + exact,
+            exact + " ",
+            exact + " PRIVATE_SECRET",
+            exact.lower(),
+            exact[:-1],
+            exact[:30],
+            exact.replace("https://", "http://"),
+            exact.replace("releases.bazel.build", "PRIVATE.invalid"),
+            exact.replace("https://", "https://user:PRIVATE_SECRET@"),
+            exact.replace("9.2.0", "9.2.1"),
+            exact.replace(".exe...", ".exe?token=PRIVATE_SECRET..."),
+            exact.replace(".exe...", ".exe#PRIVATE_SECRET..."),
+            exact.replace(".exe...", ".exe.extra..."),
+            exact.replace("Downloading", "FATAL: Downloading"),
+            "FATAL: " + exact,
+            exact.replace("Downloading", "Download failed for"),
+            "x" * 193,
+        ):
+            for before in (True, False):
+                for payload, provider in (
+                    (json.dumps(graph()), False),
+                    (m.SENTINEL + json.dumps(record), True),
+                ):
+                    with self.subTest(line=line, before=before, provider=provider):
+                        text = (
+                            line + "\n" + payload if before else payload + "\n" + line
+                        )
+                        with self.assertRaises(m.RejectedWrapperLine) as raised:
+                            if provider:
+                                m.parse_provider(text, record["label"])
+                            else:
+                                m.parse_json(text)
+                        self.assertEqual(
+                            raised.exception.args,
+                            ("Unexpected wrapper output outside JSON",),
+                        )
+                        self.assertNotIn("PRIVATE", json.dumps(vars(raised.exception)))
+
+    def test_calendar_invalid_or_non_ascii_timestamps_remain_rejected(self):
+        record = packages()[0][0]
+        for stamp in (
+            "0000/01/01 00:00:00",
+            "2001/02/29 04:05:06",
+            "2004/13/01 04:05:06",
+            "2004/04/31 04:05:06",
+            "2004/02/29 24:05:06",
+            "2004/02/29 04:60:06",
+            "2004/02/29 04:05:60",
+            "2004/2/29 04:05:06",
+            "2004/02/29\t04:05:06",
+            "２００４/02/29 04:05:06",
+            "2004/02/29 04:05:06Z",
+        ):
+            line = stamp + " " + self.BODY
+            for before in (True, False):
+                for payload, provider in (
+                    (json.dumps(graph()), False),
+                    (m.SENTINEL + json.dumps(record), True),
+                ):
+                    with self.subTest(stamp=stamp, before=before, provider=provider):
+                        text = (
+                            line + "\n" + payload if before else payload + "\n" + line
+                        )
+                        with self.assertRaises(m.RejectedWrapperLine):
+                            if provider:
+                                m.parse_provider(text, record["label"])
+                            else:
+                                m.parse_json(text)
+
+    def test_notice_bound_precedes_matching(self):
+        with mock.patch.object(
+            m.re, "fullmatch", side_effect=AssertionError("Oversized line inspected")
+        ):
+            self.assertFalse(m.is_bazelisk_download_notice("x" * 193))
+
+    def test_notice_keeps_duplicate_and_malformed_guards(self):
+        line = self.STAMPS[0] + " " + self.BODY + "\n"
+        record = packages()[0][0]
+        for body in ("{}\n{}", '{"a":1,"a":2}', '{"actions": [', "{bad}"):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_json(line + body)
+        provider = m.SENTINEL + json.dumps(record)
+        for body in (
+            provider + "\n" + provider,
+            m.SENTINEL + '{"label":"x","label":"x"}',
+            m.SENTINEL + "{",
+        ):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_provider(line + body, record["label"])
+
+
 class RejectedLineShapeTests(unittest.TestCase):
     def test_every_shape_keeps_secret_bait_and_message_private(self):
         secret = "PRIVATE_URL_https://private.invalid/C:/private?token=SECRET"
