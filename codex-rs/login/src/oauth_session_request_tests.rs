@@ -56,9 +56,28 @@ async fn derived_cache_scope_is_unknown_for_busy_pending_rejected_expired_or_mis
             .unwrap()
             .is_some()
     );
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let cache_owner = manager.clone();
+    let held_cache = tokio::task::spawn_blocking(move || {
+        let _cached = cache_owner.state.cached_token.blocking_lock();
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let observation = tokio::time::timeout(
+        Duration::from_millis(250),
+        manager.observe_credential_identity(),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    held_cache.await.unwrap();
+    assert_eq!(observation.unwrap().unwrap(), None);
     {
         let mut cached = manager.state.cached_token.lock().await;
-        assert_eq!(manager.observe_credential_identity().await.unwrap(), None);
         cached.token = Some(token.clone());
         cached.pending = Some(token.clone());
     }
