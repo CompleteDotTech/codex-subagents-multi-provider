@@ -107,8 +107,14 @@ impl fmt::Debug for PtyHandles {
 /// there is no local `PtyHandles` instance to resize directly.
 type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 
+#[cfg(all(test, windows))]
+#[path = "windows_pty_diagnostics.rs"]
+pub(crate) mod windows_diagnostics;
+
 /// Handle for driving an interactive process (PTY or pipe).
 pub struct ProcessHandle {
+    #[cfg(all(test, windows))]
+    pub(crate) windows_diagnostics: Option<Arc<windows_diagnostics::Diagnostics>>,
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
@@ -146,6 +152,8 @@ impl ProcessHandle {
         resizer: Option<ResizeFn>,
     ) -> Self {
         Self {
+            #[cfg(all(test, windows))]
+            windows_diagnostics: None,
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
             reader_handle: StdMutex::new(Some(reader_handle)),

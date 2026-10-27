@@ -459,6 +459,7 @@ async fn conpty_ctrl_c_interrupts_powershell_foreground_child() -> anyhow::Resul
     )
     .await?;
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
+    let _diagnostic_report = session.windows_diagnostics.as_ref().map(|d| d.enable());
     let writer = session.writer_sender();
     writer.send(b"ping.exe -4 -t localhost\n".to_vec()).await?;
     wait_for_output_contains(&mut output_rx, "127.0.0.1", /*timeout_ms*/ 10_000).await?;

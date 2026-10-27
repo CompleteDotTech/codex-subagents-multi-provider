@@ -4,6 +4,7 @@ load("@rules_rust//cargo/private:cargo_build_script_wrapper.bzl", "cargo_build_s
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
 load("//bazel/rules/testing:foreign_platform_binary.bzl", "foreign_platform_binary")
 load("//bazel/rules/testing/wine:wine_runtime.bzl", "WINE_TEST_TARGET_COMPATIBLE_WITH", "wine_test_runtime")
+load("//third_party/voice:windows_executable.bzl", "windows_voice_executable")
 
 # Reserve 8 MiB of stack on Windows and statically link the CRT on MSVC.
 # V8's x64 allocator shim defines malloc/free; importing them from dynamic UCRT
@@ -209,6 +210,7 @@ def codex_rust_crate(
         lib_data_extra = [],
         rustc_flags_extra = [],
         binary_rustc_flags_extra = {},
+        binary_windows_runtime = {},
         binaries_with_build_commit = [],
         rustc_env = {},
         rustc_env_files = [],
@@ -255,6 +257,8 @@ def codex_rust_crate(
         lib_data_extra: Extra runtime data for the library target.
         binary_rustc_flags_extra: Mapping from binary names to extra rustc
             flags for those binary targets.
+        binary_windows_runtime: Opt-in binary name to declared voice runtime label,
+            packaged beside its EXE on Windows/MSVC only. Defaults to empty.
         binaries_with_build_commit: Binary names that embed STABLE_GIT_COMMIT from the
             generated build-commit environment file. Other workspace status is
             excluded from their compilation inputs.
@@ -423,8 +427,11 @@ def codex_rust_crate(
         sanitized_binaries.append(binary)
         cargo_env_runfiles[":" + binary] = "CARGO_BIN_EXE_" + binary
         cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath :%s)" % binary
+        runtime = binary_windows_runtime.get(binary)
+        raw_binary = binary + "__rust" if runtime else binary
+        binary_kwargs = {"binary_name": binary} if runtime else {}
         rust_binary(
-            name = binary,
+            name = raw_binary,
             crate_name = binary.replace("-", "_"),
             crate_root = main,
             deps = all_crate_deps() + maybe_deps + deps_extra,
@@ -451,8 +458,24 @@ def codex_rust_crate(
             srcs = native.glob(["src/**/*.rs"]),
             stamp = 0,
             version = crate_version,
-            visibility = ["//visibility:public"],
+            visibility = ["//visibility:private"] if runtime else ["//visibility:public"],
+            **binary_kwargs
         )
+        if runtime:
+            windows_voice_executable(
+                name = binary + "__windows-runtime",
+                binary = ":" + raw_binary,
+                runtime = runtime,
+                target_compatible_with = ["@platforms//os:windows", "@llvm//constraints/windows/abi:msvc"],
+            )
+            native.alias(
+                name = binary,
+                actual = select({
+                    "//third_party/voice:windows_msvc": ":" + binary + "__windows-runtime",
+                    "//conditions:default": ":" + raw_binary,
+                }),
+                visibility = ["//visibility:public"],
+            )
 
         binary_unit_test_name = binary + "-bin-unit-tests"
         binary_unit_test_binary = binary_unit_test_name + "-bin"
@@ -462,7 +485,7 @@ def codex_rust_crate(
         # sharding while Clippy can still discover the underlying test crate.
         rust_test(
             name = binary_unit_test_binary,
-            crate = ":" + binary,
+            crate = ":" + raw_binary,
             crate_features = crate_features,
             deps = all_crate_deps(normal_dev = True),
             rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS + [
@@ -474,6 +497,21 @@ def codex_rust_crate(
             tags = test_tags + ["manual"],
             version = crate_version,
         )
+
+        exposed_unit = ":" + binary_unit_test_binary
+        if runtime:
+            windows_voice_executable(
+                name = binary_unit_test_binary + "__windows-runtime",
+                binary = exposed_unit,
+                runtime = runtime,
+                testonly = True,
+                tags = ["manual"],
+                target_compatible_with = ["@platforms//os:windows", "@llvm//constraints/windows/abi:msvc"],
+            )
+            exposed_unit = select({
+                "//third_party/voice:windows_msvc": exposed_unit + "__windows-runtime",
+                "//conditions:default": exposed_unit,
+            })
 
         binary_unit_test_kwargs = {}
         if unit_test_args:
@@ -487,7 +525,7 @@ def codex_rust_crate(
         workspace_root_test(
             name = binary_unit_test_name,
             env = test_env,
-            test_bin = ":" + binary_unit_test_binary,
+            test_bin = exposed_unit,
             workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
             working_directory_marker = unit_test_working_directory_marker,
             target_compatible_with = binary_test_target_compatible_with,

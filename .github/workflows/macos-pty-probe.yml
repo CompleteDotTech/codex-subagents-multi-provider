@@ -41,6 +41,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ steps.native.outputs.target }}
           cache-scope: macos-pty-probe
 

@@ -209,6 +209,10 @@ async fn spawn_process_portable(
     }
 
     let mut child = pair.slave.spawn_command(command_builder)?;
+    #[cfg(all(test, windows))]
+    let diagnostics = Arc::new(crate::process::windows_diagnostics::Diagnostics::capture(
+        child.as_ref(),
+    ));
     #[cfg(unix)]
     // portable-pty establishes the spawned PTY child as a new session leader on
     // Unix, so PID == PGID and we can reuse the pipe backend's process-group
@@ -251,16 +255,30 @@ async fn spawn_process_portable(
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let writer_handle: JoinHandle<()> = tokio::spawn({
             let writer = Arc::clone(&writer);
+            #[cfg(all(test, windows))]
+            let diagnostics = Arc::clone(&diagnostics);
             async move {
                 #[cfg(windows)]
                 let mut windows_input = crate::WindowsTtyInputNormalizer::default();
                 while let Some(bytes) = writer_rx.recv().await {
+                    #[cfg(all(test, windows))]
+                    let raw_summary = crate::process::windows_diagnostics::Summary::new(&bytes);
                     #[cfg(windows)]
                     let bytes = windows_input.normalize(&bytes);
                     let mut guard = writer.lock().await;
                     use std::io::Write;
-                    let _ = guard.write_all(&bytes);
-                    let _ = guard.flush();
+                    #[cfg(not(all(test, windows)))]
+                    {
+                        let _ = guard.write_all(&bytes);
+                        let _ = guard.flush();
+                    }
+                    #[cfg(all(test, windows))]
+                    {
+                        let write_result = guard.write_all(&bytes);
+                        let flush_result = guard.flush();
+                        drop(guard);
+                        diagnostics.record(raw_summary, &bytes, &write_result, &flush_result);
+                    }
                 }
             }
         });
@@ -309,6 +327,13 @@ async fn spawn_process_portable(
         Some(handles),
         /*resizer*/ None,
     );
+
+    #[cfg(all(test, windows))]
+    let handle = {
+        let mut handle = handle;
+        handle.windows_diagnostics = Some(diagnostics);
+        handle
+    };
 
     Ok(SpawnedProcess {
         session: handle,
