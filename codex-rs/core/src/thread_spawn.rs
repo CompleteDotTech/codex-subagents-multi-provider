@@ -115,7 +115,7 @@ pub(crate) async fn spawn(
     {
         let selected_models = config.prepared_child_models.as_ref();
         let models_manager = selected_models
-            .map(|prepared| prepared.manager())
+            .map(crate::agent::child_config::PreparedChildModels::manager)
             .unwrap_or(&session.services.models_manager);
         let child_model_info = match config.model.as_deref() {
             Some(model) if selected_models.is_some() || model != turn.model_info().slug => Some(
