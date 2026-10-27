@@ -227,7 +227,7 @@ async fn blocked_credential_observation(
 async fn credential_observation_rejects_cache_changes_during_keyring_read() {
     for change in ["pending", "rejected", "replacement"] {
         let (manager, _home, keyring) = blocking_client();
-        save_token(&manager, "existing", None, i64::MAX);
+        save_token(&manager, "existing", /*refresh_token*/ None, i64::MAX);
         assert_eq!(manager.resolve_access_token().await.unwrap(), "existing");
         let token = manager
             .state
@@ -267,7 +267,7 @@ async fn credential_observation_rejects_cache_changes_during_keyring_read() {
 #[tokio::test]
 async fn credential_observation_rejects_status_aba_during_keyring_read() {
     let (manager, _home, keyring) = blocking_client();
-    save_token(&manager, "existing", None, i64::MAX);
+    save_token(&manager, "existing", /*refresh_token*/ None, i64::MAX);
     assert_eq!(manager.resolve_access_token().await.unwrap(), "existing");
     let token = manager
         .state
@@ -281,7 +281,7 @@ async fn credential_observation_rejects_status_aba_during_keyring_read() {
     let (observation, release) = blocked_credential_observation(&manager, &keyring).await;
     // Both the cache and final status/credential return to their initial values.
     // Only the consumed watch revision reveals the intervening login attempt.
-    manager.publish_status(crate::OAuthSessionStatus::Started, None);
+    manager.publish_status(crate::OAuthSessionStatus::Started, /*credential*/ None);
     manager.publish_status(crate::OAuthSessionStatus::Succeeded, Some(&token));
     release.send(()).unwrap();
     assert_eq!(
@@ -305,7 +305,7 @@ async fn credential_observation_rejects_status_aba_during_keyring_read() {
 #[tokio::test]
 async fn credential_observation_yields_store_to_logout_without_waiting_for_cache() {
     let (manager, _home, keyring) = blocking_client();
-    save_token(&manager, "existing", None, i64::MAX);
+    save_token(&manager, "existing", /*refresh_token*/ None, i64::MAX);
     assert_eq!(manager.resolve_access_token().await.unwrap(), "existing");
     let (observation, release) = blocked_credential_observation(&manager, &keyring).await;
     let writer = manager.clone();
@@ -352,7 +352,7 @@ async fn credential_observation_yields_store_to_logout_without_waiting_for_cache
 #[tokio::test]
 async fn cancelled_credential_observation_retains_store_but_not_cache_until_read_finishes() {
     let (manager, _home, keyring) = blocking_client();
-    save_token(&manager, "existing", None, i64::MAX);
+    save_token(&manager, "existing", /*refresh_token*/ None, i64::MAX);
     assert_eq!(manager.resolve_access_token().await.unwrap(), "existing");
     let mut status_changes = manager.state.status.subscribe();
     drop(status_changes.borrow_and_update());
