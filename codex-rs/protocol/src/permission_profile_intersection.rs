@@ -211,6 +211,14 @@ pub fn intersect_effective_permission_profiles(
             .then_with(|| left.as_path().cmp(right.as_path()))
     });
     paths.dedup();
+    // Inspect every boundary before omitting redundant metadata restrictions:
+    // a later nested grant can reopen writes below an earlier read-only path.
+    let has_writable_paths = common_temp.is_some()
+        || paths.iter().any(|path| {
+            let [left, right] = sources
+                .map(|(policy, denies)| effective_access(policy, denies, path.as_path(), cwd));
+            intersect_access(left, right).can_write()
+        });
     denies.sort_by_cached_key(|entry| format!("{:?}", entry.path));
     let mut intersection = FileSystemSandboxPolicy::restricted(denies);
     intersection.glob_scan_max_depth = glob_depth.flatten();
@@ -240,7 +248,15 @@ pub fn intersect_effective_permission_profiles(
                     && entry_path(entry, cwd).ok().flatten().as_ref() == Some(&path)
             })
         });
-        if access == current && !optional_metadata && !required_restriction {
+        // Optional metadata entries protect missing paths in writable trees.
+        // With no writable boundary, an inherited Read already enforces the
+        // same ceiling. Retaining these entries would produce optional grants
+        // with no writable root, which cannot safely be intersected again.
+        let redundant_optional_read = !has_writable_paths && access == FileSystemAccessMode::Read;
+        if access == current
+            && (!optional_metadata || redundant_optional_read)
+            && !required_restriction
+        {
             continue;
         }
         let path = if path.as_path().parent().is_none()
