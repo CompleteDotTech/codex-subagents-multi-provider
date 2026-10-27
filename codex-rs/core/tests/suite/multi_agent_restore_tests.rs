@@ -263,6 +263,12 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
         .await;
         child.flush_rollout().await?;
         child.shutdown_and_wait().await?;
+        let removed = initial
+            .thread_manager
+            .remove_thread(&child_id)
+            .await
+            .context("actual stopped SQLite child must be removed through its manager")?;
+        assert!(Arc::ptr_eq(&removed, &child));
         assert_eq!(
             child.config_snapshot().await.permission_profile,
             PermissionProfile::read_only()

@@ -428,6 +428,29 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         .timestamp();
     sibling_thread.shutdown_and_wait().await?;
     worker_thread.shutdown_and_wait().await?;
+    let nested_thread_id = codex_protocol::ThreadId::from_string(
+        nested_id.as_str().context("actual grandchild thread ID")?,
+    )?;
+    let nested_thread = initial.thread_manager.get_thread(nested_thread_id).await?;
+    nested_thread.shutdown_and_wait().await?;
+    for (thread_id, thread) in [
+        (nested_thread_id, &nested_thread),
+        (sibling_thread_id, &sibling_thread),
+        (worker_thread_id, &worker_thread),
+    ] {
+        let removed = initial
+            .thread_manager
+            .remove_thread(&thread_id)
+            .await
+            .context("actual stopped child must be removed through its manager")?;
+        assert!(Arc::ptr_eq(&removed, thread));
+        let receipt = protected_store
+            .read_native_authority_receipt(thread_id)
+            .await?
+            .context("actual stopped memory child must seal before cold reconstruction")?;
+        assert_eq!(receipt.epoch.thread_id, thread_id);
+    }
+    drop(nested_thread);
     drop(sibling_thread);
     drop(worker_thread);
     drop(worker_completion);
@@ -908,6 +931,12 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
     );
     child.flush_rollout().await?;
     child.shutdown_and_wait().await?;
+    let removed = initial
+        .thread_manager
+        .remove_thread(&child_id)
+        .await
+        .context("actual stopped SQLite child must be removed through its manager")?;
+    assert!(Arc::ptr_eq(&removed, &child));
     assert!(
         initial
             .thread_store
