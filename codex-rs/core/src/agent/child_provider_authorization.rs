@@ -542,6 +542,18 @@ pub(crate) struct ChildResumePermit {
     approved: Arc<Config>,
 }
 
+/// The existing lower-admission inputs, borrowed together for one permit consumption.
+/// This context carries no authorization and cannot mint or clone a permit.
+pub(crate) struct ChildResumeAdmissionContext<'a> {
+    pub(crate) runtime: &'a LocalAgentRuntime,
+    pub(crate) config: &'a Config,
+    pub(crate) history: &'a InitialHistory,
+    pub(crate) source: &'a SessionSource,
+    pub(crate) parent: Option<ThreadId>,
+    pub(crate) selections: &'a Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) inherited: Option<&'a TurnEnvironmentSnapshot>,
+}
+
 impl ChildResumePermit {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prepare(
@@ -953,14 +965,17 @@ impl ChildResumePermit {
 
     pub(crate) async fn consume(
         self,
-        runtime: &LocalAgentRuntime,
-        config: &Config,
-        history: &InitialHistory,
-        source: &SessionSource,
-        parent: Option<ThreadId>,
-        selections: &Option<Vec<TurnEnvironmentSelection>>,
-        inherited: Option<&TurnEnvironmentSnapshot>,
+        context: ChildResumeAdmissionContext<'_>,
     ) -> Result<(Option<VerifiedChildProviderOrigin>, NativeChildAdmission)> {
+        let ChildResumeAdmissionContext {
+            runtime,
+            config,
+            history,
+            source,
+            parent,
+            selections,
+            inherited,
+        } = context;
         let InitialHistory::Resumed(saved) = history else {
             return Err(invalid("reload history changed"));
         };

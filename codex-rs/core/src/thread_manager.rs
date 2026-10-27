@@ -2313,13 +2313,15 @@ impl ThreadManagerState {
         let (provider_origin, native_admission) = if let Some(authorization) = authorization {
             let (origin, admission) = authorization
                 .consume(
-                    &agent_control.runtime,
-                    &config,
-                    &initial_history,
-                    &session_source,
-                    parent_thread_id,
-                    &environment_selections,
-                    inherited_environments.as_ref(),
+                    crate::agent::child_provider_authorization::ChildResumeAdmissionContext {
+                        runtime: &agent_control.runtime,
+                        config: &config,
+                        history: &initial_history,
+                        source: &session_source,
+                        parent: parent_thread_id,
+                        selections: &environment_selections,
+                        inherited: inherited_environments.as_ref(),
+                    },
                 )
                 .await?;
             (origin, Some(admission))
