@@ -448,19 +448,73 @@ def capture(command, destination, budget, timeout=45):
 
 
 # Output is a closed vocabulary of observations, never excerpts or causal claims.
+# Each category is OR across alternatives, AND across fixed literal needles.
+# Co-occurrence is deliberately only an observation, with no ordering/cause claim.
 FAILURE_PATTERNS = {
-    "memory_signature": rb"outofmemoryerror|out of memory|cannot allocate memory|native memory allocation.*failed",
-    "paging_signature": rb"paging file is too small|paging file.*minimum",
-    "disk_full_signature": rb"no space left on device|disk is full|not enough space on the disk",
-    "path_too_long_signature": rb"filename or extension is too long|path too long|filename too long",
-    "symlink_signature": rb"cannot create symbolic link|failed to create symbolic link|symlink.*(?:failed|error)",
-    "lock_signature": rb"failed to acquire.*lock|cannot acquire.*lock|another command.*running",
-    "server_signature": rb"server terminated abruptly|server crashed|unable to start.*server",
-    "connect_signature": rb"connection refused|failed to connect|could not connect|cannot connect",
-    "invalid_option_signature": rb"unrecognized (?:option|vm option)|unknown (?:option|startup option)|invalid (?:option|flag)",
-    "starlark_evaluation_signature": rb"error evaluating starlark|starlark evaluation error|traceback \(most recent call last\):",
-    "formatter_signature": rb"error evaluating.*(?:format|starlark expression)|invalid.*starlark.*expression|formatter.*(?:failed|error)",
-    "java_fatal_signature": rb"a fatal error has been detected by the java runtime environment|error occurred during initialization of vm|could not create the java virtual machine",
+    "memory_signature": (
+        (b"outofmemoryerror",),
+        (b"out of memory",),
+        (b"cannot allocate memory",),
+        (b"native memory allocation", b"failed"),
+    ),
+    "paging_signature": ((b"paging file is too small",), (b"paging file", b"minimum")),
+    "disk_full_signature": (
+        (b"no space left on device",),
+        (b"disk is full",),
+        (b"not enough space on the disk",),
+    ),
+    "path_too_long_signature": (
+        (b"filename or extension is too long",),
+        (b"path too long",),
+        (b"filename too long",),
+    ),
+    "symlink_signature": (
+        (b"cannot create symbolic link",),
+        (b"failed to create symbolic link",),
+        (b"symlink", b"failed"),
+        (b"symlink", b"error"),
+    ),
+    "lock_signature": (
+        (b"failed to acquire", b"lock"),
+        (b"cannot acquire", b"lock"),
+        (b"another command", b"running"),
+    ),
+    "server_signature": (
+        (b"server terminated abruptly",),
+        (b"server crashed",),
+        (b"unable to start", b"server"),
+    ),
+    "connect_signature": (
+        (b"connection refused",),
+        (b"failed to connect",),
+        (b"could not connect",),
+        (b"cannot connect",),
+    ),
+    "invalid_option_signature": (
+        (b"unrecognized option",),
+        (b"unrecognized vm option",),
+        (b"unknown option",),
+        (b"unknown startup option",),
+        (b"invalid option",),
+        (b"invalid flag",),
+    ),
+    "starlark_evaluation_signature": (
+        (b"error evaluating starlark",),
+        (b"starlark evaluation error",),
+        (b"traceback (most recent call last):",),
+    ),
+    "formatter_signature": (
+        (b"error evaluating", b"format"),
+        (b"error evaluating", b"starlark expression"),
+        (b"invalid", b"starlark", b"expression"),
+        (b"formatter", b"failed"),
+        (b"formatter", b"error"),
+    ),
+    "java_fatal_signature": (
+        (b"a fatal error has been detected by the java runtime environment",),
+        (b"error occurred during initialization of vm",),
+        (b"could not create the java virtual machine",),
+    ),
 }
 KNOWN_EXCEPTION_CLASSES = (
     "java.lang.OutOfMemoryError",
@@ -480,17 +534,29 @@ KNOWN_OS_EXCEPTION_CODES = (0xC0000005, 0xC0000017, 0xC00000FD, 0xC0000409)
 
 
 def classify_failure(raw):
-    """Observe at most LIMIT private bytes; regex matches only select constants.
+    """Observe at most LIMIT private bytes; emit only selected constants.
 
     A matching signature may occur in arbitrary text, so it identifies evidence
     only. Neither a match nor exit 37 establishes an underlying failure cause.
     No captured group, decoded line, or arbitrary input reaches the result.
     """
     raw = raw[:LIMIT]
+    lowered = raw.lower()
+    # Fixed vocabulary bounds the number of linear literal searches regardless
+    # of repeated prefixes. No suffix search restarts at each prefix occurrence.
+    present = {
+        needle: needle in lowered
+        for alternatives in FAILURE_PATTERNS.values()
+        for alternative in alternatives
+        for needle in alternative
+    }
     signatures = [
         name
-        for name, pattern in FAILURE_PATTERNS.items()
-        if re.search(pattern, raw, re.IGNORECASE)
+        for name, alternatives in FAILURE_PATTERNS.items()
+        if any(
+            all(present[needle] for needle in alternative)
+            for alternative in alternatives
+        )
     ]
     exceptions = [
         name
@@ -503,7 +569,7 @@ def classify_failure(raw):
         {
             int(match[1])
             for match in re.finditer(
-                rb"(?i)\b(?:win32(?: error)?|getlasterror|createprocess(?:w)? failed(?: with error)?)\s*[:=(]?\s*([0-9]{1,10})(?![0-9])",
+                rb"(?i)\b(?:win32(?: error)?|getlasterror|createprocess(?:w)? failed(?: with error)?)\s{0,16}[:=(]?\s{0,16}([0-9]{1,10})(?![0-9])",
                 raw,
             )
             if int(match[1]) <= 0xFFFFFFFF

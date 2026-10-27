@@ -323,7 +323,9 @@ class FailureClassificationTests(unittest.TestCase):
                 result = m.classify_failure(raw)
                 self.assertIn(name, result["signatures"])
                 self.assertEqual(result["cause"], "unknown")
-                self.assertEqual(result["jvm_fatal_signature"], name == "java_fatal_signature")
+                self.assertEqual(
+                    result["jvm_fatal_signature"], name == "java_fatal_signature"
+                )
         for name in m.KNOWN_EXCEPTION_CLASSES:
             self.assertEqual(
                 m.classify_failure(name.encode())["exception_classes"], [name]
@@ -341,6 +343,27 @@ class FailureClassificationTests(unittest.TestCase):
         self.assertTrue(result["error_prefix"])
         self.assertTrue(result["fatal_prefix"])
         self.assertEqual(result["win32_decimal_codes"], [112, 1455])
+
+    def test_every_literal_alternative_and_missing_wildcard_suffix(self):
+        for name, alternatives in m.FAILURE_PATTERNS.items():
+            for alternative in alternatives:
+                with self.subTest(name=name, alternative=alternative):
+                    raw = b" private-gap ".join(alternative)
+                    self.assertIn(name, m.classify_failure(raw)["signatures"])
+        # Every former wildcard prefix without its required suffix occurs many
+        # times on one line. Exercise the real classifier at the unchanged cap.
+        prefixes = (
+            b"native memory allocation paging file symlink another command unable to start formatter ",
+            b"failed to acquire cannot acquire error evaluating invalid starlark ",
+        )
+        for prefix in prefixes:
+            raw = (prefix * (m.LIMIT // len(prefix) + 1))[: m.LIMIT]
+            self.assertEqual(len(raw), 32 * 1024 * 1024)
+            self.assertEqual(m.classify_failure(raw), m.classify_failure(b""))
+        # Explicit numeric marker followed by a long missing-code gap must also
+        # terminate; bounded separators prevent whitespace backtracking growth.
+        raw = b"Win32 error:" + b" " * (m.LIMIT - len(b"Win32 error:"))
+        self.assertEqual(m.classify_failure(raw), m.classify_failure(b""))
 
     def test_arbitrary_bytes_and_secret_text_cannot_escape(self):
         import random
