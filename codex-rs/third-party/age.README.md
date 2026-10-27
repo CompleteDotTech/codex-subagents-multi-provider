@@ -7,14 +7,14 @@ fixtures, assets, translations and benchmarks are retained. `age-core` remains
 the unchanged Git dependency at the same immutable upstream revision.
 
 `age.upstream.json` records the 174 original source/license file hashes.
-`age.patched.json` allows exactly twenty-two modified upstream files, two provenance
+`age.patched.json` allows exactly twenty-three modified upstream files, two provenance
 copies, one style file and two integration files (Bazel rules and standalone
 lock). `age.patch` reconstructs
 the manifest normalization, native calibration, canonical decimal parsing, localization
 resource tests and strict source corrections against the pinned original bytes. The offline verifier checks the exact file set, aliases, hashes,
 normalization and reverse patch before a style or manifest exception applies.
 
-The twenty-one patched source files are explicitly enumerated in the verifier: encrypted
+The twenty-two patched source files are explicitly enumerated in the verifier: encrypted
 identity, header format, localization, native tags and recipients, primitives and
 stream, protocol, simple helpers, and utility parsing. Typed fixed-size copies and
 explicit contextual invariant panics preserve encoding and internal failure policy.
@@ -44,6 +44,11 @@ metadata hub and activate only default plus armor. This permits separate configu
 feature proof, strict linting, and execution of armor inline tests, including the
 encrypted identity round trip. These provenance records do not claim those gates
 have passed.
+
+The upstream testkit fixture parser now uses explicit contextual Result/Option
+invariant failures and a single-passphrase slice match. All 492 test cases, four
+entrypoints, expected outcomes, assertions, corpus and work-factor caps remain.
+Malformed fixtures and I/O failures still panic; no new lint allowances apply.
 
 ## Manifest and feature policy
 

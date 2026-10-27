@@ -620,6 +620,13 @@ fn format_testkit_comment(testfile: &TestFile) -> String {
         .unwrap_or_default()
 }
 
+fn fixture_value<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => panic!("{context}: {error:?}"),
+    }
+}
+
 fn get_testkit_identities(filename: &str, testfile: &TestFile) -> Vec<x25519::Identity> {
     assert_eq!(
         testfile.passphrases.len(),
@@ -628,21 +635,26 @@ fn get_testkit_identities(filename: &str, testfile: &TestFile) -> Vec<x25519::Id
         // different recipient stanza kind.
         usize::from(filename == "scrypt_uppercase")
     );
-    testfile
-        .identities
-        .iter()
-        .map(|s| s.as_str())
-        .map(x25519::Identity::from_str)
-        .collect::<Result<_, _>>()
-        .unwrap()
+    fixture_value(
+        testfile
+            .identities
+            .iter()
+            .map(String::as_str)
+            .map(x25519::Identity::from_str)
+            .collect::<Result<_, _>>(),
+        "testkit identities must be valid x25519 identities",
+    )
 }
 
 fn get_testkit_passphrase(testfile: &TestFile, comment: &str) -> SecretString {
     assert_eq!(testfile.identities.len(), 0);
-    match testfile.passphrases.len() {
-        0 => panic!("Test file is missing passphrase{comment}"),
-        1 => testfile.passphrases.first().cloned().unwrap().into(),
-        n => panic!("Too many passphrases ({n}){comment}"),
+    match testfile.passphrases.as_slice() {
+        [] => panic!("Test file is missing passphrase{comment}"),
+        [passphrase] => passphrase.clone().into(),
+        passphrases => {
+            let n = passphrases.len();
+            panic!("Too many passphrases ({n}){comment}")
+        }
     }
 }
 
@@ -769,33 +781,53 @@ struct TestFile {
 
 impl TestFile {
     fn parse(filename: &str) -> Self {
-        let file = File::open(format!("./tests/testdata/testkit/{filename}")).unwrap();
+        let file = fixture_value(
+            File::open(format!("./tests/testdata/testkit/{filename}")),
+            "testkit fixture must be readable",
+        );
         let mut r = BufReader::new(file);
         let mut line = String::new();
 
         fn data<'l>(line: &'l str, prefix: &str) -> &'l str {
-            line.strip_prefix(prefix).unwrap().trim()
+            match line.strip_prefix(prefix) {
+                Some(data) => data.trim(),
+                None => panic!("testkit field must start with {prefix:?}"),
+            }
         }
 
         let expect = {
-            r.read_line(&mut line).unwrap();
+            fixture_value(r.read_line(&mut line), "testkit line must be readable");
             match data(&line, "expect:") {
                 "success" => {
                     line.clear();
-                    r.read_line(&mut line).unwrap();
+                    fixture_value(r.read_line(&mut line), "testkit line must be readable");
                     let payload = data(&line, "payload:");
                     Expect::Success {
-                        payload_sha256: hex::decode(payload).unwrap().try_into().unwrap(),
+                        payload_sha256: fixture_value(
+                            fixture_value(
+                                hex::decode(payload),
+                                "testkit payload digest must be hex",
+                            )
+                            .try_into(),
+                            "testkit payload digest must contain exactly 32 bytes",
+                        ),
                     }
                 }
                 "armor failure" => Expect::ArmorFailure,
                 "header failure" => Expect::HeaderFailure,
                 "payload failure" => {
                     line.clear();
-                    r.read_line(&mut line).unwrap();
+                    fixture_value(r.read_line(&mut line), "testkit line must be readable");
                     let payload = data(&line, "payload:");
                     Expect::PayloadFailure {
-                        payload_sha256: hex::decode(payload).unwrap().try_into().unwrap(),
+                        payload_sha256: fixture_value(
+                            fixture_value(
+                                hex::decode(payload),
+                                "testkit payload digest must be hex",
+                            )
+                            .try_into(),
+                            "testkit payload digest must contain exactly 32 bytes",
+                        ),
                     }
                 }
                 "HMAC failure" => Expect::HmacFailure,
@@ -806,8 +838,11 @@ impl TestFile {
 
         let _file_key = {
             line.clear();
-            r.read_line(&mut line).unwrap();
-            hex::decode(data(&line, "file key: ")).unwrap()
+            fixture_value(r.read_line(&mut line), "testkit line must be readable");
+            fixture_value(
+                hex::decode(data(&line, "file key: ")),
+                "testkit file key must be hex",
+            )
         };
 
         let mut identities = vec![];
@@ -817,12 +852,15 @@ impl TestFile {
         let mut comment = None;
         loop {
             line.clear();
-            r.read_line(&mut line).unwrap();
+            fixture_value(r.read_line(&mut line), "testkit line must be readable");
             if line.trim().is_empty() {
                 break;
             }
 
-            let (prefix, data) = line.trim().split_once(": ").unwrap();
+            let (prefix, data) = match line.trim().split_once(": ") {
+                Some(field) => field,
+                None => panic!("testkit metadata must contain a colon and space"),
+            };
             match prefix {
                 "compressed" => match data {
                     "zlib" => compressed = true,
@@ -839,9 +877,15 @@ impl TestFile {
         let mut age_file = vec![];
         if compressed {
             let mut z = flate2::read::ZlibDecoder::new(r);
-            z.read_to_end(&mut age_file).unwrap();
+            fixture_value(
+                z.read_to_end(&mut age_file),
+                "compressed testkit payload must be readable",
+            );
         } else {
-            r.read_to_end(&mut age_file).unwrap();
+            fixture_value(
+                r.read_to_end(&mut age_file),
+                "testkit payload must be readable",
+            );
         };
 
         Self {

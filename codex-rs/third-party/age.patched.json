@@ -21,7 +21,8 @@
     "src/ssh.rs": "43468fc8d57bf1794227d83565d4384536ef1d3e25afdea820dbb1172d933543",
     "src/ssh/identity.rs": "c86a5606d28ec5aebe086428bb62dfb2ef47efa86958d2662fbd6af0b8be6559",
     "src/ssh/recipient.rs": "ac6807116127985ad0d2ede643f20ef0e99a8a44f43e0c9fb07471fd03149f34",
-    "src/util.rs": "46e81fb40968a01695402f64d90bb0bf3d2d05b5e1900139d4e3dc98d69896f4"
+    "src/util.rs": "46e81fb40968a01695402f64d90bb0bf3d2d05b5e1900139d4e3dc98d69896f4",
+    "tests/testkit.rs": "68f5f0da9f105dc4c4caa1af63582c22e3cb2bb745aa8047b8e6a65e61efe17a"
   },
   "extras": {
     "Cargo.toml.orig": "f59a2e0ae1fefb72ea8c2ce2f8ef0ba0c454bbe44623f8fa3fed83be98351eae",
@@ -34,5 +35,5 @@
     "BUILD.bazel": "7d07b37a24b4feed919ff8e5340e5a230038edebcb77835a2065038190a8784b",
     "Cargo.lock": "6e04d9b80727ef6385789ed8e4bbc799dc0a3cf65665f09117a4da67c10f8c7f"
   },
-  "patch_sha256": "fb5cf16bf4ab3fc73b1d1e5b0f94b7e9e366351dd2942be6660c00b15af75dd0"
+  "patch_sha256": "bf2ec76f4d3128d0bfa49c36b3094bdfd7410d15837427f67441259b1f5ea3f5"
 }

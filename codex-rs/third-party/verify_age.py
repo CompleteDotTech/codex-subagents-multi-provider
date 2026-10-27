@@ -134,6 +134,7 @@ def verify(root: Path = ROOT, archive: Path | None = None) -> None:
             "src/ssh/identity.rs",
             "src/ssh/recipient.rs",
             "src/util.rs",
+            "tests/testkit.rs",
         },
         "unexpected patch scope",
     )
@@ -277,7 +278,7 @@ def verify(root: Path = ROOT, archive: Path | None = None) -> None:
                     f"archive file checksum: {name}",
                 )
     print(
-        "Verified 174 upstream files, 22 patched files, exact provenance, style, integration and reconstructed patch"
+        "Verified 174 upstream files, 23 patched files, exact provenance, style, integration and reconstructed patch"
     )
 
 
