@@ -23,6 +23,7 @@ codex-core = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-guardian-v2 = { workspace = true }
+codex-history = { workspace = true }
 codex-home = { workspace = true }
 codex-features = { workspace = true }
 codex-hooks = { workspace = true }

@@ -5904,6 +5904,7 @@ dependencies = [
  "codex-extension-api",
  "codex-features",
  "codex-guardian-v2",
+ "codex-history",
  "codex-home",
  "codex-hooks",
  "codex-http-client",
