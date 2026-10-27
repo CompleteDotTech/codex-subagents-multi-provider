@@ -165,6 +165,38 @@ fn managed_cold_provider_loader(server: &wiremock::MockServer) -> Result<CloudCo
     ))
 }
 
+async fn local_scope_descriptor(thread: &codex_core::CodexThread) -> Result<Value> {
+    let settings = thread.config_snapshot().await;
+    let config = thread.config().await;
+    let executors = settings
+        .environment_selections()
+        .iter()
+        .map(|selection| {
+            let (profile, login_shell) = match &selection.config {
+                codex_protocol::protocol::EnvironmentConfigState::FromThread => (
+                    &settings.permission_profile,
+                    config.permissions.allow_login_shell,
+                ),
+                codex_protocol::protocol::EnvironmentConfigState::Ready(ready) => (
+                    ready.permission_profile.permission_profile(),
+                    ready.allow_login_shell,
+                ),
+                _ => anyhow::bail!("cold fixture executor must have resolved local authority"),
+            };
+            Ok(
+                json!({"cwd":selection.cwd,"roots":selection.workspace_roots,
+                "profile":profile,"login_shell":login_shell}),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(
+        json!({"cwd":settings.cwd(),"roots":settings.workspace_roots,
+        "profile":settings.permission_profile,"login_shell":config.permissions.allow_login_shell,
+        "approval":settings.approval_policy,
+        "executors":executors}),
+    )
+}
+
 fn configure_multi_agent_v2_with_role(
     config: &mut codex_core::config::Config,
     _model_provider_base_url: &str,
@@ -378,6 +410,9 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         "roles must inherit the parent's complete model provider",
     );
     let initial_worker_config = worker_thread.config_snapshot().await;
+    let initial_worker_scope = local_scope_descriptor(&worker_thread).await?;
+    let initial_caller_scope = local_scope_descriptor(&initial.codex).await?;
+    assert_eq!(initial_worker_scope, initial_caller_scope);
     assert_eq!(initial_worker_config.approval_policy, AskForApproval::Never);
     assert_eq!(
         initial.codex.config_snapshot().await.approval_policy,
@@ -650,6 +685,11 @@ openai_base_url = "{redirected_base_url}"
     )
     .await;
     resumed.submit_turn(QUEUE_PROMPT).await?;
+    assert_eq!(
+        local_scope_descriptor(&resumed.codex).await?,
+        initial_caller_scope,
+        "fresh local caller must execute in the same actual workspace and grants"
+    );
     assert_eq!(
         resumed.codex.config_snapshot().await.approval_policy,
         AskForApproval::Never
@@ -1015,7 +1055,7 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
                 .set_permission_profile(PermissionProfile::Disabled)
                 .unwrap();
         })
-        .restart(&server, &initial)
+        .restart_in_same_local_workspace(&server, &initial)
         .await?;
     assert!(!Arc::ptr_eq(
         &initial.thread_manager,

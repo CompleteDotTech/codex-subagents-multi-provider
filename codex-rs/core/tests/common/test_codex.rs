@@ -208,6 +208,32 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
+    fn fresh_local_in_same_workspace(previous: &Self) -> Result<Self> {
+        anyhow::ensure!(
+            previous.exec_server_url.is_none()
+                && previous.remote_container_name.is_none()
+                && previous.selection.environment_id == codex_exec_server::LOCAL_ENVIRONMENT_ID
+                && matches!(
+                    &previous.selection.config,
+                    EnvironmentConfigState::FromThread
+                ),
+            "same-workspace restart requires an actual local FromThread fixture"
+        );
+        Ok(Self {
+            environment: codex_exec_server::Environment::create_for_tests(None)?,
+            exec_server_url: None,
+            cwd: previous.cwd.clone(),
+            selection: previous.selection.clone(),
+            local_cwd_temp_dir: Some(Arc::clone(
+                previous
+                    .local_cwd_temp_dir
+                    .as_ref()
+                    .context("actual local workspace owner")?,
+            )),
+            remote_container_name: None,
+        })
+    }
+
     pub async fn local() -> Result<Self> {
         Self::local_with_exec_server_url(/*exec_server_url*/ None).await
     }
@@ -804,7 +830,29 @@ impl TestCodexBuilder {
             format!("{}/v1", server.uri()),
             Arc::clone(&previous.home),
             None,
-            TestEnv::local().await?,
+            TestEnv::fresh_local_in_same_workspace(&previous._test_env)?,
+            /*include_local_environment*/ false,
+        ))
+        .await
+    }
+
+    /// Restarts the actual local rollout in a fresh runtime with the same owned workspace.
+    pub async fn restart_in_same_local_workspace(
+        &mut self,
+        server: &MockServer,
+        previous: &TestCodex,
+    ) -> Result<TestCodex> {
+        let rollout_path = previous
+            .session_configured
+            .rollout_path
+            .clone()
+            .context("actual local rollout path")?;
+        previous.codex.shutdown_and_wait().await?;
+        Box::pin(self.build_with_home_and_base_url(
+            format!("{}/v1", server.uri()),
+            Arc::clone(&previous.home),
+            Some(rollout_path),
+            TestEnv::fresh_local_in_same_workspace(&previous._test_env)?,
             /*include_local_environment*/ false,
         ))
         .await
