@@ -620,12 +620,34 @@ openai_base_url = "{redirected_base_url}"
     )
     .await;
     resumed.submit_turn(QUEUE_PROMPT).await?;
+    let queue_output = server
+        .received_requests()
+        .await
+        .context("queue diagnostic requires enabled request recording")?
+        .iter()
+        .filter_map(decoded_body)
+        .filter_map(|body| serde_json::from_slice::<Value>(&body).ok())
+        .filter_map(|body| {
+            body["input"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| {
+                        item["type"] == "function_call_output" && item["call_id"] == QUEUE_CALL_ID
+                    })
+                    .map(|item| item["output"].clone())
+            })
+        })
+        .last();
 
     let reloaded_worker = resumed
         .thread_manager
         .get_thread(worker_thread_id)
         .await
-        .expect("queued message should lazily reload the original worker");
+        .unwrap_or_else(|error| {
+            panic!(
+                "queued message should lazily reload the original worker: {error}; queue output: {queue_output:?}"
+            )
+        });
     assert_eq!(
         reloaded_worker.config().await.model_provider,
         resumed.codex.config().await.model_provider,
