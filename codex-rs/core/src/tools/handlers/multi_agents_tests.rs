@@ -4443,6 +4443,66 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 }
 
 #[tokio::test]
+async fn resume_agent_cannot_relabel_a_stopped_host_root_as_a_native_child() {
+    let (_session, configured) = make_session_and_context().await;
+    let manager = thread_manager();
+    let (target, target_session, _) =
+        registered_handler_context(&manager, (*configured.config).clone()).await;
+    target.thread.ensure_rollout_materialized().await;
+    target_session.flush_rollout().await.unwrap();
+    assert!(matches!(
+        target
+            .thread
+            .read_thread(false, false)
+            .await
+            .unwrap()
+            .source,
+        SessionSource::Exec
+    ));
+    target_session
+        .services
+        .local_agent_runtime
+        .control(target_session.session_id())
+        .shutdown_live_agent(target.thread_id)
+        .await
+        .unwrap();
+    let (operator, session, turn) =
+        registered_handler_context(&manager, (*configured.config).clone()).await;
+    let error = ResumeAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "resume_agent",
+            function_payload(json!({"id": target.thread_id.to_string()})),
+        ))
+        .await
+        .err()
+        .expect("a model cannot convert an unrelated host root into its child");
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected model-facing source rejection")
+    };
+    assert!(
+        message.contains("saved runtime source cannot be relabeled"),
+        "{message}"
+    );
+    assert_eq!(manager.list_thread_ids().await, vec![operator.thread_id]);
+    assert!(matches!(
+        target
+            .thread
+            .read_thread(false, false)
+            .await
+            .unwrap()
+            .source,
+        SessionSource::Exec
+    ));
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.submit_failed.is_empty());
+    assert!(report.timed_out.is_empty());
+}
+
+#[tokio::test]
 async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let (_session, turn, _) = make_session_and_context_with_auth_config_home_and_rx(
@@ -4482,12 +4542,42 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         /*external_time_provider*/ None,
     );
 
-    let parent = manager
+    let operator = manager
         .start_thread(StartThreadOptions::new(config.clone()))
         .await
-        .expect("parent thread should start");
+        .expect("operator root should start before its native subtree");
+    let operator_session = Arc::clone(&operator.thread.session);
+    let control = operator_session
+        .services
+        .local_agent_runtime
+        .control(operator_session.session_id());
+    let source = crate::tools::handlers::multi_agents_common::thread_spawn_source(
+        operator.thread_id,
+        &operator.thread.session_source,
+        1,
+        None,
+        None,
+    )
+    .unwrap();
+    let parent = control
+        .spawn_agent_with_metadata(
+            config.clone(),
+            Vec::new(),
+            source,
+            crate::agent::types::SpawnAgentOptions {
+                parent_thread_id: Some(operator.thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("operator must own a genuine native parent");
     let parent_thread_id = parent.thread_id;
-    let parent_session = parent.thread.session.clone();
+    let parent = manager.get_thread(parent_thread_id).await.unwrap();
+    assert_eq!(
+        parent.session_source.parent_thread_id(),
+        Some(operator.thread_id)
+    );
+    let parent_session = Arc::clone(&parent.session);
     let parent_turn = parent_session.new_default_turn().await;
     let mut owner_config = parent_turn
         .initial_environments
@@ -4498,9 +4588,8 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let owner_permission_profile = PermissionProfile::read_only();
     owner_config.permission_profile =
         PermissionProfileSnapshot::legacy(owner_permission_profile.clone());
-    let parent_environment = parent.thread.environment_selections().await.remove(0);
+    let parent_environment = parent.environment_selections().await.remove(0);
     parent
-        .thread
         .environment_ready(&parent_environment, owner_config)
         .await
         .expect("owner environment should be installed");
@@ -4640,11 +4729,6 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         AgentStatus::NotFound
     );
 
-    let operator = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
-        .await
-        .expect("operator thread should start");
-    let operator_session = operator.thread.session.clone();
     let _ = manager
         .agent_control()
         .shutdown_live_agent(parent_thread_id)
