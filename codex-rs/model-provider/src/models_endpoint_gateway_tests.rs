@@ -512,7 +512,10 @@ async fn pinned_identity_snapshot_uses_only_cached_gateway_state_without_http_or
     );
     *endpoint.gateway_scope.write().unwrap() = Some("already-validated-scope".into());
     assert!(endpoint.try_pinned_identity().is_some());
-    let reconciliation = endpoint.gateway_reconciliation.try_lock().unwrap();
+    let reconciliation = endpoint
+        .gateway_reconciliation
+        .try_acquire()
+        .expect("single reconciliation permit");
     assert!(
         endpoint.try_pinned_identity().is_none(),
         "active reconciliation cannot block capture"
@@ -532,4 +535,319 @@ async fn pinned_identity_snapshot_uses_only_cached_gateway_state_without_http_or
             .len(),
         0
     );
+}
+
+#[derive(Debug)]
+struct GatewayReadGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    finished: tokio::sync::oneshot::Sender<()>,
+}
+
+struct PausedGatewayRead {
+    entered: tokio::sync::oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+    finished: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[derive(Debug)]
+struct BlockingGatewayKeyring {
+    async_thread: std::thread::ThreadId,
+    gate: std::sync::Mutex<Option<GatewayReadGate>>,
+}
+
+impl BlockingGatewayKeyring {
+    fn pause_next_read(&self) -> PausedGatewayRead {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished) = tokio::sync::oneshot::channel();
+        let mut gate = self.gate.lock().expect("gateway read gate lock");
+        assert!(gate.is_none());
+        *gate = Some(GatewayReadGate {
+            entered: entered_tx,
+            release: release_rx,
+            finished: finished_tx,
+        });
+        PausedGatewayRead {
+            entered,
+            release,
+            finished,
+        }
+    }
+}
+
+impl codex_keyring_store::KeyringStore for BlockingGatewayKeyring {
+    fn load(
+        &self,
+        _service: &str,
+        _account: &str,
+    ) -> Result<Option<String>, codex_keyring_store::CredentialStoreError> {
+        assert_ne!(std::thread::current().id(), self.async_thread);
+        let gate = self.gate.lock().expect("gateway read gate lock").take();
+        if let Some(gate) = gate {
+            gate.entered
+                .send(())
+                .expect("gateway read entered receiver");
+            gate.release
+                .recv_timeout(Duration::from_secs(/*secs*/ 10))
+                .expect("release actual gateway credential read");
+            gate.finished
+                .send(())
+                .expect("gateway read finished receiver");
+        }
+        // The existing encrypted-store fixture uses this public test passphrase.
+        Ok(Some("gateway-test-passphrase".to_owned()))
+    }
+
+    fn save(
+        &self,
+        _service: &str,
+        _account: &str,
+        _value: &str,
+    ) -> Result<(), codex_keyring_store::CredentialStoreError> {
+        panic!("catalog observation must not write keyring credentials")
+    }
+
+    fn delete(
+        &self,
+        _service: &str,
+        _account: &str,
+    ) -> Result<bool, codex_keyring_store::CredentialStoreError> {
+        panic!("catalog observation must not delete keyring credentials")
+    }
+}
+
+struct GatewayReconciliationFixture {
+    home: tempfile::TempDir,
+    server: MockServer,
+    endpoint: Arc<OpenAiModelsEndpoint>,
+    keyring: Arc<BlockingGatewayKeyring>,
+}
+
+impl GatewayReconciliationFixture {
+    async fn new() -> Self {
+        let home = tempfile::tempdir().expect("gateway reconciliation home");
+        let server = MockServer::start().await;
+        let primary = AuthManager::from_auth_for_testing_with_home(
+            CodexAuth::from_api_key("synthetic-primary"),
+            home.path().to_path_buf(),
+        );
+        let provider = info(&server);
+        let _seed = seed_gateway_auth(
+            &provider,
+            &primary,
+            json!({"access_token":"single-flight-test", "expires_at":i64::MAX}),
+        );
+        let config = provider
+            .gateway_oauth
+            .as_ref()
+            .expect("gateway fixture config");
+        let keyring = Arc::new(BlockingGatewayKeyring {
+            async_thread: std::thread::current().id(),
+            gate: std::sync::Mutex::new(/*t*/ None),
+        });
+        let gateway = GatewayAuthManager::new(
+            codex_login::GatewayAuthConfig {
+                authorization_url: config.authorization_url.clone(),
+                device_authorization_url: None,
+                token_url: config.token_url.clone(),
+                client_id: config.client_id.clone(),
+                resource: config.resource.clone(),
+                scopes: config.scopes.clone(),
+                redirect_port: config.redirect_port,
+            },
+            home.path().to_path_buf(),
+            &HTTP,
+            keyring.clone(),
+        )
+        .expect("real gateway observer")
+        .without_interactive_login();
+        let endpoint = Arc::new(OpenAiModelsEndpoint::new(
+            provider,
+            Some(primary),
+            Some(Ok(Arc::new(gateway))),
+        ));
+        endpoint.reconcile_identity().await;
+        assert!(endpoint.try_pinned_identity().is_some());
+        Self {
+            home,
+            server,
+            endpoint,
+            keyring,
+        }
+    }
+
+    async fn assert_no_http(&self) {
+        assert!(
+            self.server
+                .received_requests()
+                .await
+                .expect("request recording enabled")
+                .is_empty()
+        );
+    }
+}
+
+async fn reconciliation_is_pending(future: &mut ModelsEndpointFuture<'_, ()>) -> bool {
+    std::future::poll_fn(|context| {
+        std::task::Poll::Ready(future.as_mut().poll(context).is_pending())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn gateway_reconciliation_serializes_actual_observers_in_fifo_order() {
+    let fixture = GatewayReconciliationFixture::new().await;
+    let held = fixture
+        .endpoint
+        .gateway_reconciliation
+        .try_acquire()
+        .expect("initial admission permit");
+    let mut first = fixture.endpoint.reconcile_identity();
+    let mut second = fixture.endpoint.reconcile_identity();
+    assert!(reconciliation_is_pending(&mut first).await);
+    assert!(reconciliation_is_pending(&mut second).await);
+    assert!(fixture.endpoint.try_pinned_identity().is_none());
+    drop(held);
+    assert!(
+        reconciliation_is_pending(&mut second).await,
+        "second observer cannot bypass the first queued observer"
+    );
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), first)
+        .await
+        .expect("first actual observation");
+    assert!(
+        fixture.endpoint.try_pinned_identity().is_none(),
+        "queued second observer retains exclusive admission"
+    );
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), second)
+        .await
+        .expect("second actual observation");
+    assert!(fixture.endpoint.try_pinned_identity().is_some());
+    fixture.assert_no_http().await;
+}
+
+#[tokio::test]
+async fn gateway_reconciliation_blocks_pinned_capture_during_a_real_credential_read() {
+    let fixture = GatewayReconciliationFixture::new().await;
+    let PausedGatewayRead {
+        entered,
+        release,
+        finished,
+    } = fixture.keyring.pause_next_read();
+    let observer = Arc::clone(&fixture.endpoint);
+    let task = tokio::spawn(async move { observer.reconcile_identity().await });
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 2), entered)
+        .await
+        .expect("actual observer enters keyring")
+        .expect("entered sender");
+    assert!(
+        fixture
+            .endpoint
+            .gateway_scope
+            .read()
+            .expect("scope lock")
+            .is_none()
+    );
+    let snapshot = Arc::clone(&fixture.endpoint);
+    let capture = tokio::time::timeout(
+        Duration::from_millis(/*millis*/ 250),
+        tokio::task::spawn_blocking(move || snapshot.try_pinned_identity()),
+    )
+    .await;
+    release.send(()).expect("release observer");
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 2), finished)
+        .await
+        .expect("keyring read finishes")
+        .expect("finished sender");
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), task)
+        .await
+        .expect("actual reconciliation finishes")
+        .expect("observer task");
+    assert!(
+        capture
+            .expect("pinned capture must remain nonblocking")
+            .expect("capture task")
+            .is_none()
+    );
+    assert!(fixture.endpoint.try_pinned_identity().is_some());
+    fixture.assert_no_http().await;
+}
+
+#[tokio::test]
+async fn gateway_reconciliation_cancellation_keeps_scope_unavailable_until_a_new_observation() {
+    let fixture = GatewayReconciliationFixture::new().await;
+    let PausedGatewayRead {
+        entered,
+        release,
+        finished,
+    } = fixture.keyring.pause_next_read();
+    let observer = Arc::clone(&fixture.endpoint);
+    let task = tokio::spawn(async move { observer.reconcile_identity().await });
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 2), entered)
+        .await
+        .expect("actual observer enters keyring")
+        .expect("entered sender");
+    task.abort();
+    let cancelled = tokio::time::timeout(Duration::from_secs(/*secs*/ 2), task)
+        .await
+        .expect("cancelled reconciliation joins");
+    assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+    assert_eq!(
+        fixture.endpoint.gateway_reconciliation.available_permits(),
+        1
+    );
+    assert!(fixture.endpoint.try_pinned_identity().is_none());
+    release.send(()).expect("release detached credential read");
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 2), finished)
+        .await
+        .expect("detached keyring read finishes")
+        .expect("finished sender");
+    // Observe release of the real credential-store lock, not an arbitrary delay.
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.home.path().join("secrets/gateway_oauth.lock"))
+        .expect("real gateway credential lock");
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+        loop {
+            if probe.try_lock().is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached observer releases credential-store ownership");
+    assert!(
+        fixture.endpoint.try_pinned_identity().is_none(),
+        "cancelled observer cannot publish its detached result"
+    );
+    drop(probe);
+    tokio::time::timeout(
+        Duration::from_secs(/*secs*/ 10),
+        fixture.endpoint.reconcile_identity(),
+    )
+    .await
+    .expect("fresh actual observation");
+    assert!(fixture.endpoint.try_pinned_identity().is_some());
+    fixture.assert_no_http().await;
+}
+
+#[tokio::test]
+async fn closed_gateway_reconciliation_admission_fails_closed() {
+    let fixture = GatewayReconciliationFixture::new().await;
+    fixture.endpoint.gateway_reconciliation.close();
+    assert!(fixture.endpoint.try_pinned_identity().is_none());
+    fixture.endpoint.reconcile_identity().await;
+    assert!(
+        fixture
+            .endpoint
+            .gateway_scope
+            .read()
+            .expect("scope lock")
+            .is_none()
+    );
+    assert!(fixture.endpoint.try_pinned_identity().is_none());
+    fixture.assert_no_http().await;
 }

@@ -56,7 +56,9 @@ pub(crate) struct OpenAiModelsEndpoint {
     gateway_auth_manager: Option<Result<Arc<GatewayAuthManager>, String>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
     gateway_scope: RwLock<Option<String>>,
-    gateway_reconciliation: tokio::sync::Mutex<()>,
+    // A single-flight admission permit coordinates async observation; it does
+    // not guard data. Cached scope writes retain their short synchronous lock.
+    gateway_reconciliation: tokio::sync::Semaphore,
 }
 
 impl OpenAiModelsEndpoint {
@@ -76,7 +78,7 @@ impl OpenAiModelsEndpoint {
             gateway_auth_manager,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder { redirect_policy }),
             gateway_scope: RwLock::new(None),
-            gateway_reconciliation: tokio::sync::Mutex::new(()),
+            gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
         }
     }
 
@@ -232,7 +234,7 @@ impl OpenAiModelsEndpoint {
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
     fn try_pinned_identity(&self) -> Option<codex_models_manager::manager::PinnedModelsIdentity> {
-        let _reconciliation = self.gateway_reconciliation.try_lock().ok()?;
+        let _reconciliation = self.gateway_reconciliation.try_acquire().ok()?;
         let auth = match &self.auth_manager {
             Some(manager) => manager.try_auth_cached()?,
             None => None,
@@ -261,7 +263,13 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
             if self.provider_info.gateway_oauth.is_none() {
                 return;
             }
-            let _guard = self.gateway_reconciliation.lock().await;
+            let Ok(_admission) = self.gateway_reconciliation.acquire().await else {
+                *self
+                    .gateway_scope
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                return;
+            };
             *self
                 .gateway_scope
                 .write()
@@ -565,7 +573,7 @@ mod tests {
             let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-api-key"));
             let endpoint = Arc::new(OpenAiModelsEndpoint {
                 gateway_scope: RwLock::new(None),
-                gateway_reconciliation: tokio::sync::Mutex::new(()),
+                gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
                 provider_info: ModelProviderInfo {
                     name: name.to_string(),
                     ..ModelProviderInfo::create_openai_provider(base_url.map(str::to_string))
@@ -607,7 +615,7 @@ mod tests {
             let auth_manager = auth.map(AuthManager::from_auth_for_testing);
             let endpoint = Arc::new(OpenAiModelsEndpoint {
                 gateway_scope: RwLock::new(None),
-                gateway_reconciliation: tokio::sync::Mutex::new(()),
+                gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
                 provider_info: ModelProviderInfo {
                     experimental_bearer_token: Some("provider-key".into()),
                     ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
@@ -689,7 +697,7 @@ mod tests {
         let observed_request = Arc::new(Mutex::new(None));
         let endpoint = OpenAiModelsEndpoint {
             gateway_scope: RwLock::new(None),
-            gateway_reconciliation: tokio::sync::Mutex::new(()),
+            gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             gateway_auth_manager: None,
@@ -737,7 +745,7 @@ mod tests {
         )]));
         let endpoint = OpenAiModelsEndpoint {
             gateway_scope: RwLock::new(None),
-            gateway_reconciliation: tokio::sync::Mutex::new(()),
+            gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
             provider_info,
             auth_manager: None,
             gateway_auth_manager: None,
