@@ -139,6 +139,31 @@
  mod tests {
      use std::sync::{Arc, Mutex};
  
+@@ -274,13 +277,17 @@
+ 
+         /// This intentionally panics if called twice.
+         fn request_passphrase(&self, _: &str) -> Option<SecretString> {
+-            self.0
+-                .lock()
+-                .unwrap()
+-                .take()
+-                .expect("passphrase is only input once")
+-                .to_owned()
+-                .map(SecretString::from)
++            let mut guard = match self.0.lock() {
++                Ok(guard) => guard,
++                Err(error) => {
++                    panic!("encrypted identity test passphrase mutex is poisoned: {error}")
++                }
++            };
++            let passphrase = match guard.take() {
++                Some(passphrase) => passphrase,
++                None => panic!("passphrase is only input once"),
++            };
++            passphrase.to_owned().map(SecretString::from)
+         }
+     }
+ 
 --- a/age/src/format.rs
 +++ b/age/src/format.rs
 @@ -52,8 +52,9 @@
@@ -254,6 +279,17 @@
 +        assert_eq!(loader.get("cli-secret-input-required"), "Entrée requise");
 +    }
 +}
+--- a/age/src/identity.rs
++++ b/age/src/identity.rs
+@@ -253,7 +253,7 @@
+         self.plugin_recipients.push(recipient);
+     }
+ 
+-    #[cfg(feature = "armor")]
++    #[cfg(all(feature = "armor", feature = "cli-common"))]
+     pub(crate) fn extend(
+         &mut self,
+         iter: impl IntoIterator<Item = Box<dyn crate::Recipient + Send>>,
 --- a/age/src/native.rs
 +++ b/age/src/native.rs
 @@ -9,15 +9,18 @@
@@ -785,6 +821,65 @@
 +    }
      Ok(output)
  }
+--- a/age/src/primitives/armor.rs
++++ b/age/src/primitives/armor.rs
+@@ -371,10 +371,16 @@
+                 mut encoded_buf,
+                 ..
+             } => {
+-                let byte_buf = byte_buf.unwrap();
+-                let encoded = BASE64_STANDARD
+-                    .encode_slice(byte_buf, &mut encoded_buf[..])
+-                    .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES");
++                let byte_buf = match byte_buf {
++                    Some(byte_buf) => byte_buf,
++                    None => panic!("cannot finish age armor after its byte buffer was taken"),
++                };
++                let encoded = match BASE64_STANDARD.encode_slice(byte_buf, &mut encoded_buf[..]) {
++                    Ok(encoded) => encoded,
++                    Err(error) => panic!(
++                        "age armor base64 output buffer must fit the bounded byte chunk: {error}"
++                    ),
++                };
+                 inner.write_all(&encoded_buf[..encoded])?;
+                 inner.finish()
+             }
+@@ -394,7 +400,12 @@
+             } => {
+                 // Guaranteed to be Some (as long as async and sync writing isn't mixed),
+                 // because ArmoredWriter::finish consumes self.
+-                let byte_buf = byte_buf.as_mut().unwrap();
++                let byte_buf = match byte_buf.as_mut() {
++                    Some(byte_buf) => byte_buf,
++                    None => panic!(
++                        "cannot synchronously write age armor after its byte buffer was taken"
++                    ),
++                };
+ 
+                 let mut written = 0;
+                 loop {
+@@ -415,12 +426,15 @@
+                     if buf.is_empty() {
+                         break;
+                     } else {
+-                        assert_eq!(
+-                            BASE64_STANDARD
+-                                .encode_slice(&byte_buf, &mut encoded_buf[..])
+-                                .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES"),
+-                            BASE64_CHUNK_SIZE_COLUMNS
+-                        );
++                        let encoded = match BASE64_STANDARD
++                            .encode_slice(&byte_buf, &mut encoded_buf[..])
++                        {
++                            Ok(encoded) => encoded,
++                            Err(error) => panic!(
++                                "age armor base64 output buffer must fit the bounded byte chunk: {error}"
++                            ),
++                        };
++                        assert_eq!(encoded, BASE64_CHUNK_SIZE_COLUMNS);
+                         inner.write_all(&encoded_buf[..])?;
+                         byte_buf.clear();
+                     };
 --- a/age/src/primitives/stream.rs
 +++ b/age/src/primitives/stream.rs
 @@ -66,9 +66,10 @@
@@ -840,17 +935,17 @@
              // We've finished with the current chunk.
              self.chunk = None;
          }
-@@ -668,10 +668,9 @@
+@@ -667,11 +667,8 @@
+             // To handle this edge case, when `target_pos` is a multiple of the chunk
              // size (i.e. this conditional branch), we compute the length of the
              // plaintext. This is cached, so the overhead should be minimal.
-             else if target_pos == self.len()? {
+-            else if target_pos == self.len()? {
 -                self.stream
 -                    .nonce
 -                    .set_last(true)
 -                    .expect("We unset the last chunk flag earlier");
-+                if self.stream.nonce.set_last(true).is_err() {
-+                    panic!("seek reset must clear the age stream final-chunk flag");
-+                }
++            else if target_pos == self.len()? && self.stream.nonce.set_last(true).is_err() {
++                panic!("seek reset must clear the age stream final-chunk flag");
              }
          }
  
@@ -896,7 +991,37 @@
  
      let mut ciphertext = Vec::with_capacity(plaintext.len());
      let mut writer = encryptor.wrap_output(&mut ciphertext)?;
-@@ -75,7 +76,58 @@
+@@ -32,14 +33,15 @@
+ ///
+ /// To encrypt to more than one recipient, use [`Encryptor::with_recipients`] along with
+ /// [`ArmoredWriter`].
++///
++/// Errors from the recipient, including invalid recipient labels, are returned to the caller.
+ #[cfg(feature = "armor")]
+ #[cfg_attr(docsrs, doc(cfg(feature = "armor")))]
+ pub fn encrypt_and_armor(
+     recipient: &impl Recipient,
+     plaintext: &[u8],
+ ) -> Result<String, EncryptError> {
+-    let encryptor =
+-        Encryptor::with_recipients(iter::once(recipient as _)).expect("we provided a recipient");
++    let encryptor = Encryptor::with_recipients(iter::once(recipient as _))?;
+ 
+     let mut ciphertext = Vec::with_capacity(plaintext.len());
+     let mut writer = encryptor.wrap_output(ArmoredWriter::wrap_output(
+@@ -49,7 +51,10 @@
+     writer.write_all(plaintext)?;
+     writer.finish()?.finish()?;
+ 
+-    Ok(String::from_utf8(ciphertext).expect("is armored"))
++    match String::from_utf8(ciphertext) {
++        Ok(text) => Ok(text),
++        Err(error) => panic!("age ASCII armor must contain valid UTF-8: {error}"),
++    }
+ }
+ 
+ /// Decrypts the given ciphertext with the given identity.
+@@ -75,10 +80,85 @@
  #[cfg(test)]
  mod tests {
      use super::{decrypt, encrypt};
@@ -956,6 +1081,33 @@
  
      #[cfg(feature = "armor")]
      use super::encrypt_and_armor;
++
++    #[cfg(feature = "armor")]
++    #[test]
++    fn encrypt_and_armor_propagates_recipient_error() {
++        match encrypt_and_armor(&FailingRecipient, b"plaintext") {
++            Err(EncryptError::Io(error)) => {
++                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
++                assert_eq!(error.to_string(), "recipient refused the file key");
++            }
++            other => panic!("expected original recipient error, got {other:?}"),
++        }
++    }
++
++    #[cfg(feature = "armor")]
++    #[test]
++    fn encrypt_and_armor_propagates_invalid_recipient_labels() {
++        let recipient = InvalidLabelRecipient(crate::x25519::tests::TEST_PK.parse().unwrap());
++        match encrypt_and_armor(&recipient, b"plaintext") {
++            Err(EncryptError::InvalidRecipientLabels(labels)) => {
++                assert_eq!(labels, HashSet::from(["invalid label".to_owned()]));
++            }
++            other => panic!("expected original invalid-label error, got {other:?}"),
++        }
++    }
+ 
+     #[test]
+     fn x25519_round_trip() {
 --- a/age/src/util.rs
 +++ b/age/src/util.rs
 @@ -217,7 +217,11 @@

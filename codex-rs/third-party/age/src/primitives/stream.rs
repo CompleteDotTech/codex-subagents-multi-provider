@@ -667,10 +667,8 @@ impl<R: Read + Seek> Seek for StreamReader<R> {
             // To handle this edge case, when `target_pos` is a multiple of the chunk
             // size (i.e. this conditional branch), we compute the length of the
             // plaintext. This is cached, so the overhead should be minimal.
-            else if target_pos == self.len()? {
-                if self.stream.nonce.set_last(true).is_err() {
-                    panic!("seek reset must clear the age stream final-chunk flag");
-                }
+            else if target_pos == self.len()? && self.stream.nonce.set_last(true).is_err() {
+                panic!("seek reset must clear the age stream final-chunk flag");
             }
         }
 

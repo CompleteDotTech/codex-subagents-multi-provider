@@ -371,10 +371,16 @@ impl<W: Write> ArmoredWriter<W> {
                 mut encoded_buf,
                 ..
             } => {
-                let byte_buf = byte_buf.unwrap();
-                let encoded = BASE64_STANDARD
-                    .encode_slice(byte_buf, &mut encoded_buf[..])
-                    .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES");
+                let byte_buf = match byte_buf {
+                    Some(byte_buf) => byte_buf,
+                    None => panic!("cannot finish age armor after its byte buffer was taken"),
+                };
+                let encoded = match BASE64_STANDARD.encode_slice(byte_buf, &mut encoded_buf[..]) {
+                    Ok(encoded) => encoded,
+                    Err(error) => panic!(
+                        "age armor base64 output buffer must fit the bounded byte chunk: {error}"
+                    ),
+                };
                 inner.write_all(&encoded_buf[..encoded])?;
                 inner.finish()
             }
@@ -394,7 +400,12 @@ impl<W: Write> Write for ArmoredWriter<W> {
             } => {
                 // Guaranteed to be Some (as long as async and sync writing isn't mixed),
                 // because ArmoredWriter::finish consumes self.
-                let byte_buf = byte_buf.as_mut().unwrap();
+                let byte_buf = match byte_buf.as_mut() {
+                    Some(byte_buf) => byte_buf,
+                    None => panic!(
+                        "cannot synchronously write age armor after its byte buffer was taken"
+                    ),
+                };
 
                 let mut written = 0;
                 loop {
@@ -415,12 +426,15 @@ impl<W: Write> Write for ArmoredWriter<W> {
                     if buf.is_empty() {
                         break;
                     } else {
-                        assert_eq!(
-                            BASE64_STANDARD
-                                .encode_slice(&byte_buf, &mut encoded_buf[..])
-                                .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES"),
-                            BASE64_CHUNK_SIZE_COLUMNS
-                        );
+                        let encoded = match BASE64_STANDARD
+                            .encode_slice(&byte_buf, &mut encoded_buf[..])
+                        {
+                            Ok(encoded) => encoded,
+                            Err(error) => panic!(
+                                "age armor base64 output buffer must fit the bounded byte chunk: {error}"
+                            ),
+                        };
+                        assert_eq!(encoded, BASE64_CHUNK_SIZE_COLUMNS);
                         inner.write_all(&encoded_buf[..])?;
                         byte_buf.clear();
                     };

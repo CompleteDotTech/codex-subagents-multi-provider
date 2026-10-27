@@ -33,14 +33,15 @@ pub fn encrypt(recipient: &impl Recipient, plaintext: &[u8]) -> Result<Vec<u8>, 
 ///
 /// To encrypt to more than one recipient, use [`Encryptor::with_recipients`] along with
 /// [`ArmoredWriter`].
+///
+/// Errors from the recipient, including invalid recipient labels, are returned to the caller.
 #[cfg(feature = "armor")]
 #[cfg_attr(docsrs, doc(cfg(feature = "armor")))]
 pub fn encrypt_and_armor(
     recipient: &impl Recipient,
     plaintext: &[u8],
 ) -> Result<String, EncryptError> {
-    let encryptor =
-        Encryptor::with_recipients(iter::once(recipient as _)).expect("we provided a recipient");
+    let encryptor = Encryptor::with_recipients(iter::once(recipient as _))?;
 
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let mut writer = encryptor.wrap_output(ArmoredWriter::wrap_output(
@@ -50,7 +51,10 @@ pub fn encrypt_and_armor(
     writer.write_all(plaintext)?;
     writer.finish()?.finish()?;
 
-    Ok(String::from_utf8(ciphertext).expect("is armored"))
+    match String::from_utf8(ciphertext) {
+        Ok(text) => Ok(text),
+        Err(error) => panic!("age ASCII armor must contain valid UTF-8: {error}"),
+    }
 }
 
 /// Decrypts the given ciphertext with the given identity.
@@ -131,6 +135,30 @@ mod tests {
 
     #[cfg(feature = "armor")]
     use super::encrypt_and_armor;
+
+    #[cfg(feature = "armor")]
+    #[test]
+    fn encrypt_and_armor_propagates_recipient_error() {
+        match encrypt_and_armor(&FailingRecipient, b"plaintext") {
+            Err(EncryptError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "recipient refused the file key");
+            }
+            other => panic!("expected original recipient error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "armor")]
+    #[test]
+    fn encrypt_and_armor_propagates_invalid_recipient_labels() {
+        let recipient = InvalidLabelRecipient(crate::x25519::tests::TEST_PK.parse().unwrap());
+        match encrypt_and_armor(&recipient, b"plaintext") {
+            Err(EncryptError::InvalidRecipientLabels(labels)) => {
+                assert_eq!(labels, HashSet::from(["invalid label".to_owned()]));
+            }
+            other => panic!("expected original invalid-label error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn x25519_round_trip() {

@@ -115,11 +115,13 @@ def verify(root: Path = ROOT, archive: Path | None = None) -> None:
             "src/encrypted.rs",
             "src/format.rs",
             "src/i18n.rs",
+            "src/identity.rs",
             "src/native.rs",
             "src/native/scrypt.rs",
             "src/native/tag.rs",
             "src/native/x25519.rs",
             "src/primitives.rs",
+            "src/primitives/armor.rs",
             "src/primitives/stream.rs",
             "src/protocol.rs",
             "src/simple.rs",
@@ -267,7 +269,7 @@ def verify(root: Path = ROOT, archive: Path | None = None) -> None:
                     f"archive file checksum: {name}",
                 )
     print(
-        "Verified 174 upstream files, 13 patched files, exact provenance, style, integration and reconstructed patch"
+        "Verified 174 upstream files, 15 patched files, exact provenance, style, integration and reconstructed patch"
     )
 
 

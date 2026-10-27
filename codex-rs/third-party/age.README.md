@@ -7,23 +7,30 @@ fixtures, assets, translations and benchmarks are retained. `age-core` remains
 the unchanged Git dependency at the same immutable upstream revision.
 
 `age.upstream.json` records the 174 original source/license file hashes.
-`age.patched.json` allows exactly thirteen modified upstream files, two provenance
+`age.patched.json` allows exactly fifteen modified upstream files, two provenance
 copies, one style file and two integration files (Bazel rules and standalone
 lock). `age.patch` reconstructs
 the manifest normalization, native calibration, canonical decimal parsing, localization
 resource tests and strict source corrections against the pinned original bytes. The offline verifier checks the exact file set, aliases, hashes,
 normalization and reverse patch before a style or manifest exception applies.
 
-The twelve patched source files are explicitly enumerated in the verifier: encrypted
+The fourteen patched source files are explicitly enumerated in the verifier: encrypted
 identity, header format, localization, native tags and recipients, primitives and
 stream, protocol, simple helpers, and utility parsing. Typed fixed-size copies and
 explicit contextual invariant panics preserve encoding and internal failure policy.
-`simple::encrypt` now propagates custom recipient and invalid-label errors through
-its existing Result contract; two regression tests assert the original errors.
+`simple::encrypt` and `simple::encrypt_and_armor` now propagate custom recipient
+and invalid-label errors through their existing Result contracts; four regression
+tests assert the original errors.
 Native stanza-derivation hooks remain after format/work prechecks. The localization
 resource assertions are retained. Stream chunk boundaries use the fixed 2^16 mask
 without raising the retained source MSRV. The encrypted identity test module is
 armor-qualified to match its sole existing consumer; its test body is unchanged.
+The passphrase callback retains poison and repeated-request
+panics, including the exact single-prompt failure text. Armor writer state and
+base64 buffer invariants remain explicit panics with unchanged size assertions.
+The recipient accumulator extension is compiled with armor plus cli-common,
+matching its sole caller inside the cli-common module under armor. Every
+configuration that calls it retains the same implementation.
 
 The additional armor unit binary and wrapper reuse the existing default unit
 metadata hub and activate only default plus armor. This permits separate configured

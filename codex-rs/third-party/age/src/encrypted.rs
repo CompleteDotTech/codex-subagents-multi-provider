@@ -277,13 +277,17 @@ fOrxrKTj7xCdNS3+OrCdnBC8Z9cKDxjCGWW3fkjLsYha0Jo=
 
         /// This intentionally panics if called twice.
         fn request_passphrase(&self, _: &str) -> Option<SecretString> {
-            self.0
-                .lock()
-                .unwrap()
-                .take()
-                .expect("passphrase is only input once")
-                .to_owned()
-                .map(SecretString::from)
+            let mut guard = match self.0.lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    panic!("encrypted identity test passphrase mutex is poisoned: {error}")
+                }
+            };
+            let passphrase = match guard.take() {
+                Some(passphrase) => passphrase,
+                None => panic!("passphrase is only input once"),
+            };
+            passphrase.to_owned().map(SecretString::from)
         }
     }
 
