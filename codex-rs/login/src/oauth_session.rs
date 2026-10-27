@@ -183,28 +183,50 @@ impl OAuthSessionManager {
     /// refreshing tokens or starting login. Busy, rejected, pending, missing,
     /// and expired state cannot authorize reuse of a derived cache.
     pub async fn observe_credential_identity(&self) -> io::Result<Option<String>> {
-        let Ok(cached) = self.state.cached_token.try_lock() else {
-            return Ok(None);
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || manager.observe_credential_identity_blocking())
+            .await
+            .map_err(|_| io::Error::other("provider OAuth credential observation task failed"))?
+    }
+
+    fn observe_credential_identity_blocking(&self) -> io::Result<Option<String>> {
+        let mut status_changes = self.state.status.subscribe();
+        let previous_cache = {
+            let Ok(cached) = self.state.cached_token.try_lock() else {
+                return Ok(None);
+            };
+            if cached.pending.is_some()
+                || status_changes
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|state| state.status == OAuthSessionStatus::Started)
+            {
+                return Ok(None);
+            }
+            cached.clone()
         };
-        if cached.pending.is_some()
-            || self
-                .state
-                .status
-                .borrow()
-                .as_ref()
-                .is_some_and(|state| state.status == OAuthSessionStatus::Started)
-        {
-            return Ok(None);
-        }
+        // Only this blocking worker owns the store lock, including after caller
+        // cancellation. Slow keyring I/O must not retain the in-memory cache.
         let Some(_credential_lock) = storage::try_lock_credentials(&self.state.codex_home)? else {
             return Ok(None);
         };
-        let Some(stored) = self.load_token_async().await? else {
+        let Some(stored) = self.load_token()? else {
             return Ok(None);
         };
-        if !token_is_usable(&stored)
+        // Mutators acquire cache then store. Never wait for their cache while
+        // retaining the store: a conflict invalidates this passive observation.
+        let Ok(cached) = self.state.cached_token.try_lock() else {
+            return Ok(None);
+        };
+        // Hold the watch read guard through revision validation and the decision
+        // so a status transition cannot race the final check (including ABA).
+        let status = status_changes.borrow();
+        if *cached != previous_cache
+            || status_changes.has_changed().unwrap_or(/*default*/ true)
+            || cached.pending.is_some()
+            || !token_is_usable(&stored)
             || cached.login_required.as_ref() == Some(&stored)
-            || self.state.status.borrow().as_ref().is_some_and(|state| {
+            || status.as_ref().is_some_and(|state| {
                 state.status == OAuthSessionStatus::Started
                     || (matches!(
                         state.status,
