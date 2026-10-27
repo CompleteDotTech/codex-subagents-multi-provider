@@ -1,6 +1,10 @@
 name: Build Bazel package binaries
 description: Set up Bazel and stage unstripped runtime package binaries and symbols.
 inputs:
+  remote-credentials:
+    description: Boolean credential availability; callers must explicitly report whether their Bazel credential is configured.
+    required: false
+    default: "false"
   target:
     description: Rust release target triple.
     required: true
@@ -14,6 +18,7 @@ runs:
     - name: Set up Bazel
       uses: ./.github/actions/prepare-bazel-ci
       with:
+        remote-credentials: ${{ inputs.remote-credentials }}
         target: ${{ inputs.target }}
         cache-scope: bazel-release
 

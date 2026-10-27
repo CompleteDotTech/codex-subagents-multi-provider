@@ -588,8 +588,7 @@ async fn authoritative_catalog_fallback_is_rejected_before_auth_helpers_or_trans
         let error = session
             .preconnect_websocket(&model, /*service_tier*/ None, &telemetry, &metadata)
             .await
-            .err()
-            .expect("invalid catalog must fail preconnect");
+            .expect_err("invalid catalog must fail preconnect");
         assert!(
             error
                 .to_string()
@@ -606,8 +605,7 @@ async fn authoritative_catalog_fallback_is_rejected_before_auth_helpers_or_trans
                 &metadata,
             )
             .await
-            .err()
-            .expect("invalid catalog must fail prewarm");
+            .expect_err("invalid catalog must fail prewarm");
         assert!(
             error
                 .to_string()

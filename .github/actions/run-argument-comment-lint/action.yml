@@ -16,6 +16,7 @@ runs:
     - uses: ./.github/actions/prepare-bazel-ci
       with:
         target: ${{ inputs.target }}
+        remote-credentials: ${{ inputs.buildbuddy-api-key != '' }}
         cache-scope: bazel-argument-comment-lint
 
     - name: Install Linux sandbox build dependencies

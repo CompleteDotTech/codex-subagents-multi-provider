@@ -108,6 +108,7 @@ jobs:
         if: ${{ matrix.build-system == 'bazel' }}
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-release-${{ matrix.bundle }}
 
@@ -212,6 +213,7 @@ jobs:
       - name: Prepare Bazel CI
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: release-voice-windows
       - uses: ./.github/actions/setup-msvc-env
@@ -296,7 +298,7 @@ jobs:
           output="voice-unsigned/${TARGET}"
           mkdir -p "$output"
           cp -R "$runtime" "$output/runtime"
-          cp bazel-bin/codex-rs/voice-host/codex-voice-host.exe "$output/codex-voice-host.exe"
+          cp bazel-bin/codex-rs/voice-host/codex-voice-host__windows-runtime/codex-voice-host.exe "$output/codex-voice-host.exe"
           chmod -R u+w "$output"
           tar -C "$output" -czf "voice-unsigned-${TARGET}.tar.gz" runtime codex-voice-host.exe
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

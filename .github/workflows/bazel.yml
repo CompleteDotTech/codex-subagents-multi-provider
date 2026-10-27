@@ -6,15 +6,21 @@ name: Bazel
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      voice_runtime_diagnostic:
+        description: Run only the bounded native MSVC voice loader diagnostic
+        type: boolean
+        default: false
 
 concurrency:
   # Cancel previous actions from the same PR or branch except 'main' branch.
   # See https://docs.github.com/en/actions/using-jobs/using-concurrency and https://docs.github.com/en/actions/learn-github-actions/contexts for more info.
-  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}
+  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}::${{ github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && 'voice-diagnostic' || 'normal' }}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 jobs:
   test:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     # PRs use the sharded Windows cross-compiled test jobs below. Post-merge
     # pushes to main also run the native Windows test job for broader Windows
     # signal without putting PR latency back on the critical path. When
@@ -60,6 +66,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
 
@@ -127,6 +134,16 @@ jobs:
 
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
+      - name: Observe storage before cache archive
+        id: hosted_storage
+        if: always() && !cancelled() && runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+        continue-on-error: true
+        env:
+          HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
+          HOSTED_STORAGE_CACHE_SAVE: ${{ steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe before-cache-save none
+
       - name: Save bazel repository cache
         if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
         continue-on-error: true
@@ -135,11 +152,27 @@ jobs:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
           key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
 
+      - name: Observe storage after cache archive
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe after-cache-save none
+
+      - name: Upload hosted storage observations
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: hosted-storage-${{ github.job }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/hosted-storage/*.json
+          if-no-files-found: ignore
+
       - name: Check for a clean worktree
         if: always() && !cancelled()
         uses: ./.github/actions/check-clean-worktree
 
   test-windows-shard:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     # Split the Windows Bazel test leg across separate Windows hosts. Jobs with
     # BuildBuddy credentials use Linux RBE for build actions; test execution
     # remains on a Windows runner.
@@ -182,6 +215,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: x86_64-pc-windows-gnullvm
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && secrets.BUILDBUDDY_API_KEY == '' }}
           # Reuse the former monolithic Windows test cache for restores. Do
@@ -248,7 +282,7 @@ jobs:
   test-windows:
     # Preserve the existing required-check surface while the real work happens
     # in the sharded Windows jobs above.
-    if: always()
+    if: always() && !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic)
     needs: test-windows-shard
     runs-on: ubuntu-24.04
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm
@@ -266,7 +300,7 @@ jobs:
     # Native Windows Bazel tests are slower and frequently approach the
     # 30-minute PR budget. Run this only for post-merge commits to main and give
     # it a larger timeout. Also allow manual runs for native toolchain changes.
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
     timeout-minutes: 40
     runs-on: ${{ github.repository == 'openai/codex' && fromJSON(format('{{"group":"{0}-runners","labels":"{0}-windows-x64"}}', github.event.repository.name)) || 'windows-2025' }}
     name: Bazel test on windows-latest for x86_64-pc-windows-msvc (native main)
@@ -288,6 +322,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: x86_64-pc-windows-msvc
           cache-scope: bazel-${{ github.job }}
 
@@ -348,6 +383,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   clippy:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -386,6 +422,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && matrix.target == 'x86_64-pc-windows-gnullvm' && secrets.BUILDBUDDY_API_KEY == '' }}
@@ -452,6 +489,16 @@ jobs:
 
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
+      - name: Observe storage before cache archive
+        id: hosted_storage
+        if: always() && !cancelled() && runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+        continue-on-error: true
+        env:
+          HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
+          HOSTED_STORAGE_CACHE_SAVE: ${{ steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe before-cache-save none
+
       - name: Save bazel repository cache
         if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
         continue-on-error: true
@@ -460,11 +507,27 @@ jobs:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
           key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
 
+      - name: Observe storage after cache archive
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe after-cache-save none
+
+      - name: Upload hosted storage observations
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: hosted-storage-${{ github.job }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/hosted-storage/*.json
+          if-no-files-found: ignore
+
       - name: Check for a clean worktree
         if: always() && !cancelled()
         uses: ./.github/actions/check-clean-worktree
 
   verify-release-build:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -499,6 +562,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && matrix.target == 'x86_64-pc-windows-gnullvm' && secrets.BUILDBUDDY_API_KEY == '' }}
@@ -582,6 +646,16 @@ jobs:
 
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
+      - name: Observe storage before cache archive
+        id: hosted_storage
+        if: always() && !cancelled() && runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+        continue-on-error: true
+        env:
+          HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
+          HOSTED_STORAGE_CACHE_SAVE: ${{ steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe before-cache-save none
+
       - name: Save bazel repository cache
         if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
         continue-on-error: true
@@ -590,6 +664,116 @@ jobs:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
           key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
 
+      - name: Observe storage after cache archive
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe after-cache-save none
+
+      - name: Upload hosted storage observations
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: hosted-storage-${{ github.job }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/hosted-storage/*.json
+          if-no-files-found: ignore
+
       - name: Check for a clean worktree
         if: always() && !cancelled()
         uses: ./.github/actions/check-clean-worktree
+
+  voice-runtime-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    environment:
+      name: bazel
+      deployment: false
+    steps:
+      - name: Enable long paths for Windows checkout
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Record actual checkout provenance
+        shell: pwsh
+        run: |
+          "VOICE_DIAGNOSTIC_HEAD=$(git rev-parse HEAD)" >> $env:GITHUB_ENV
+          "VOICE_DIAGNOSTIC_TREE=$(git rev-parse 'HEAD^{tree}')" >> $env:GITHUB_ENV
+      - name: Observe resources before preparation
+        continue-on-error: true
+        shell: pwsh
+        run: python .github/scripts/observe_windows_ci_resources.py before-prepare
+      - name: Prepare Bazel CI
+        uses: ./.github/actions/prepare-bazel-ci
+        with:
+          target: x86_64-pc-windows-gnullvm
+          native-windows-voice: true
+          windows-resource-observation: true
+          remote-credentials: false
+          cache-scope: bazel-test
+      - name: Observe resources after preparation and input installation
+        continue-on-error: true
+        if: always() && !cancelled()
+        shell: pwsh
+        run: python .github/scripts/observe_windows_ci_resources.py after-prepare
+      - name: Diagnose native MSVC voice runtime
+        timeout-minutes: 45
+        shell: bash
+        # Deliberately no BuildBuddy credential: the existing wrapper selects
+        # its native MSVC route. This is not GNU cross-compile evidence.
+        run: |
+          unset BUILDBUDDY_API_KEY
+          if [[ "$OSTYPE" != msys || "$BASH" != /* || ! -x "$BASH" ]]; then
+            echo "Expected the current Git Bash executable" >&2
+            exit 1
+          fi
+          git_bash="$(cygpath -w "$BASH")"
+          case "$git_bash" in
+            [A-Za-z]:\\*|[A-Za-z]:/*) ;;
+            *) echo "Git Bash did not resolve to an absolute Windows path" >&2; exit 1 ;;
+          esac
+          python .github/scripts/observe_windows_ci_resources.py supervise -- "$git_bash" ./.github/scripts/run-bazel-ci.sh \
+            --print-failed-test-logs --print-failed-action-summary \
+            --windows-cross-compile -- test --keep_going --nocache_test_results --test_output=all --zip_undeclared_test_outputs=false \
+            --test_env=VOICE_DIAGNOSTIC_HEAD --test_env=VOICE_DIAGNOSTIC_TREE \
+            --test_env=GITHUB_SHA --test_env=GITHUB_EVENT_NAME --test_env=GITHUB_REF --test_env=GITHUB_RUN_ID \
+            --build_metadata=COMMIT_SHA=${GITHUB_SHA} -- \
+            //codex-rs/voice-host:voice-host-windows-runtime-diagnostic-test \
+            //codex-rs/voice-host:codex-voice-host-bin-unit-tests \
+            //codex-rs/voice-host:voice-host-installed_client-test
+      - name: Collect diagnostic text outputs
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/voice-runtime-diagnostic"
+          # Retain only named text evidence, never executables or runfiles.
+          result=bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.outputs/voice-runtime-diagnostic.json
+          if [[ -f "$result" ]]; then cp "$result" "${RUNNER_TEMP}/voice-runtime-diagnostic/"; fi
+          for target in voice-host-windows-runtime-diagnostic-test codex-voice-host-bin-unit-tests voice-host-installed_client-test; do
+            file="bazel-testlogs/codex-rs/voice-host/${target}/test.log"
+            if [[ -f "$file" ]]; then
+              head -c 8388608 "$file" > "${RUNNER_TEMP}/voice-runtime-diagnostic/${target}.test.log"
+              if [[ $(wc -c < "$file") -gt 8388608 ]]; then
+                echo "${target}: retained first 8388608 bytes; original test.log was larger"
+                printf '%s\n' 'Retained first 8388608 bytes of test.log.' > "${RUNNER_TEMP}/voice-runtime-diagnostic/${target}.truncated.txt"
+              fi
+            fi
+          done
+      - name: Observe resources after text artifact collection
+        continue-on-error: true
+        if: always() && !cancelled()
+        shell: pwsh
+        run: python .github/scripts/observe_windows_ci_resources.py after-artifacts
+      - name: Upload diagnostic text evidence
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: voice-runtime-diagnostic-${{ github.sha }}
+          path: ${{ runner.temp }}/voice-runtime-diagnostic
+          if-no-files-found: warn
