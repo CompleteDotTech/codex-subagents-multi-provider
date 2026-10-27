@@ -468,7 +468,8 @@ impl<R> StreamReader<R> {
         buf[..to_read]
             .copy_from_slice(&chunk.expose_secret()[cur_chunk_offset..cur_chunk_offset + to_read]);
         self.cur_plaintext_pos += to_read as u64;
-        if self.cur_plaintext_pos.is_multiple_of(CHUNK_SIZE as u64) {
+        // CHUNK_SIZE is fixed at 64 * 1024 (2^16), so its low-bit mask detects boundaries.
+        if self.cur_plaintext_pos & (CHUNK_SIZE as u64 - 1) == 0 {
             // We've finished with the current chunk.
             self.chunk = None;
         }
