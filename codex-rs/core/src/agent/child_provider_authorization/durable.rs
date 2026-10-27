@@ -141,7 +141,7 @@ pub(crate) fn protected_storage(
         let Ok(roots) = selection
             .workspace_roots
             .iter()
-            .map(|root| root.to_abs_path())
+            .map(codex_utils_path_uri::PathUri::to_abs_path)
             .collect::<std::result::Result<Vec<_>, _>>()
         else {
             return false;
@@ -391,7 +391,7 @@ pub(crate) fn fingerprint(
             let paths = selection
                 .workspace_roots
                 .iter()
-                .map(|root| root.to_abs_path())
+                .map(codex_utils_path_uri::PathUri::to_abs_path)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .ok()?;
             let profile = ready

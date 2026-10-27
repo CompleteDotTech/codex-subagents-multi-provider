@@ -180,7 +180,11 @@ impl ChildProviderPolicy {
         file_system_policy: &FileSystemSandboxPolicy,
     ) -> std::io::Result<Self> {
         let mut project_roots = vec![cwd.to_path_buf()];
-        project_roots.extend(workspace_roots.iter().map(|root| root.to_path_buf()));
+        project_roots.extend(
+            workspace_roots
+                .iter()
+                .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf),
+        );
         for layer in stack.layers_low_to_high() {
             if let ConfigLayerSource::Project { dot_codex_folder } = &layer.name
                 && let Some(root) = dot_codex_folder.as_path().parent()
@@ -346,7 +350,7 @@ impl ChildProviderPolicy {
             cwd: cwd.clone(),
             protected_catalog_roots: protected_catalog_roots
                 .iter()
-                .map(|root| root.to_path_buf())
+                .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
                 .collect(),
         })
     }

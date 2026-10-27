@@ -2586,15 +2586,14 @@ impl ThreadManagerState {
             } else {
                 None
             };
-            if let (Some(thread), Some(authority)) = (&stopped, &stopped_authority) {
-                if let Err(error) =
+            if let (Some(thread), Some(authority)) = (&stopped, &stopped_authority)
+                && let Err(error) =
                     crate::agent::child_provider_authorization::durable::seal_stopped(
                         self, thread, authority,
                     )
                     .await
-                {
-                    warn!(%error, "replaced native authority remains unavailable for cold reload");
-                }
+            {
+                warn!(%error, "replaced native authority remains unavailable for cold reload");
             }
             let mut threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
@@ -2944,21 +2943,19 @@ impl ThreadManagerState {
                 &session_source,
             )
             .await;
-        if !session_source.is_non_root_agent()
+        if (!session_source.is_non_root_agent()
             || matches!(
                 session_source,
                 SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-            )
-        {
-            if let Err(error) = self
+            ))
+            && let Err(error) = self
                 .begin_native_authority_epoch(retained_authority.epoch())
                 .await
-            {
-                if let Err(shutdown_error) = io.shutdown_and_wait().await {
-                    warn!(%shutdown_error, "failed to stop runtime after authority-store fencing failure");
-                }
-                return Err(error);
+        {
+            if let Err(shutdown_error) = io.shutdown_and_wait().await {
+                warn!(%shutdown_error, "failed to stop runtime after authority-store fencing failure");
             }
+            return Err(error);
         }
         let ema_cancellation = session
             .get_config()

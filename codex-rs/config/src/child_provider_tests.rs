@@ -854,7 +854,7 @@ fn verified_origin_requires_matching_uuid_root_and_provider_binding() {
             "child_provider_policy_conflict"
         );
     }
-    let mut new_root_origin = record.clone();
+    let mut new_root_origin = record;
     new_root_origin.origin_id = Uuid::from_u128(4);
     new_root_origin.provider_id = "zai".into();
     // A later valid root origin cannot silently rebind an existing child.

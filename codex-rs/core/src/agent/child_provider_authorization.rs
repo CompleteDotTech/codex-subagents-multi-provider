@@ -713,7 +713,7 @@ impl ChildResumePermit {
                 let roots = selection
                     .workspace_roots
                     .iter()
-                    .map(|root| root.to_abs_path())
+                    .map(codex_utils_path_uri::PathUri::to_abs_path)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|_| invalid("saved executor roots are not local absolute paths"))?;
                 let requested = environment

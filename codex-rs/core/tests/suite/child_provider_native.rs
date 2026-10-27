@@ -35,11 +35,12 @@ fn body(request: &Request) -> Value {
         .and_then(|v| v.to_str().ok())
         == Some("zstd");
     let bytes = if compressed {
-        zstd::stream::decode_all(request.body.as_slice()).unwrap()
+        zstd::stream::decode_all(request.body.as_slice())
+            .expect("native mock request zstd body must decode")
     } else {
         request.body.clone()
     };
-    serde_json::from_slice(&bytes).unwrap()
+    serde_json::from_slice(&bytes).expect("native mock request body must be valid JSON")
 }
 
 fn advertised_provider_ids(value: &Value) -> Vec<String> {
@@ -143,7 +144,7 @@ impl Fixture {
             .models
             .into_iter()
             .find(|m| m.slug == "gpt-5.5")
-            .unwrap();
+            .expect("bundled catalog must contain the native fixture model");
         info.slug = "shared".into();
         info.multi_agent_version = Some(version);
         // Exercise native direct tools; deferred tool_search advertisement is
@@ -257,11 +258,20 @@ request_max_retries = 0
                 info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
             })
             .with_config(move |config| {
-                config.features.enable(Feature::Collab).unwrap();
+                config
+                    .features
+                    .enable(Feature::Collab)
+                    .expect("enable native fixture collaboration");
                 if version == MultiAgentVersion::V2 {
-                    config.features.enable(Feature::MultiAgentV2).unwrap();
+                    config
+                        .features
+                        .enable(Feature::MultiAgentV2)
+                        .expect("enable native fixture V2");
                 } else {
-                    config.features.disable(Feature::MultiAgentV2).unwrap();
+                    config
+                        .features
+                        .disable(Feature::MultiAgentV2)
+                        .expect("select native fixture V1");
                 }
                 config.agent_max_depth = 5;
                 setup(config);
@@ -305,7 +315,7 @@ request_max_retries = 0
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let ids = self.test.thread_manager.list_thread_ids().await;
-                if ids.len() >= expected + 1 {
+                if ids.len() > expected {
                     let mut children = vec![];
                     for id in ids {
                         if id != self.test.session_configured.thread_id {
@@ -324,7 +334,12 @@ request_max_retries = 0
         let mut expected_a = std::collections::HashSet::new();
         let mut expected_b = std::collections::HashSet::new();
         for id in self.test.thread_manager.list_thread_ids().await {
-            let child = self.test.thread_manager.get_thread(id).await.unwrap();
+            let child = self
+                .test
+                .thread_manager
+                .get_thread(id)
+                .await
+                .expect("actual spawned native child must be registered");
             match child.config_snapshot().await.model_provider_id.as_str() {
                 "a" => {
                     expected_a.insert(id.to_string());
@@ -365,20 +380,38 @@ request_max_retries = 0
             (&self.a, "Bearer synthetic-a"),
             (&self.b, "Bearer synthetic-b"),
         ] {
-            for request in server.received_requests().await.unwrap() {
+            for request in server
+                .received_requests()
+                .await
+                .expect("native provider request recording must be enabled")
+            {
                 if request.method.as_str() != "POST" {
                     continue;
                 }
-                assert_eq!(request.headers.get("authorization").unwrap(), token);
+                assert_eq!(
+                    request
+                        .headers
+                        .get("authorization")
+                        .expect("native provider request must carry its configured authorization"),
+                    token
+                );
                 assert!(!request.headers.contains_key("chatgpt-account-id"));
                 assert!(!request.headers.contains_key("x-openai-actor-id"));
                 assert_eq!(body(&request)["model"], "shared");
             }
         }
-        for request in self.root.received_requests().await.unwrap() {
+        for request in self
+            .root
+            .received_requests()
+            .await
+            .expect("native root request recording must be enabled")
+        {
             if request.method.as_str() == "POST" {
                 assert_eq!(
-                    request.headers.get("authorization").unwrap(),
+                    request
+                        .headers
+                        .get("authorization")
+                        .expect("native provider request must carry its configured authorization"),
                     "Bearer synthetic-root"
                 );
                 assert_eq!(body(&request)["model"], "gpt-5.5");
@@ -627,7 +660,7 @@ fn allow_helper_provider_setup(config: &mut codex_core::config::Config) {
         if matches!(layer.name, codex_config::ConfigLayerSource::User { .. }) {
             layer.config["agents"]["allowed_model_providers"]
                 .as_array_mut()
-                .unwrap()
+                .expect("native fixture allowlist must be an array")
                 .push(toml::Value::String("blocked".into()));
         }
     }
@@ -636,7 +669,7 @@ fn allow_helper_provider_setup(config: &mut codex_core::config::Config) {
         stack.requirements().clone(),
         stack.requirements_toml().clone(),
     )
-    .unwrap();
+    .expect("native fixture configuration layers must be valid");
 }
 
 fn managed_provider_setup(config: &mut codex_core::config::Config) {
@@ -648,7 +681,7 @@ fn managed_provider_setup(config: &mut codex_core::config::Config) {
         stack.requirements().clone(),
         required,
     )
-    .unwrap();
+    .expect("native fixture configuration layers must be valid");
 }
 
 fn managed_allowlist_setup(config: &mut codex_core::config::Config) {
@@ -659,15 +692,20 @@ fn managed_allowlist_setup(config: &mut codex_core::config::Config) {
             domain: "native-test".into(),
             key: "providers".into(),
         },
-        toml::from_str("[agents]\nallowed_model_providers=['b']").unwrap(),
+        toml::from_str("[agents]\nallowed_model_providers=['b']")
+            .expect("native managed allowlist TOML must be valid"),
     ));
-    layers.sort_by(|left, right| left.name.partial_cmp(&right.name).unwrap());
+    layers.sort_by(|left, right| {
+        left.name
+            .partial_cmp(&right.name)
+            .expect("native fixture layer precedence must be comparable")
+    });
     config.config_layer_stack = codex_config::ConfigLayerStack::new(
         layers,
         stack.requirements().clone(),
         stack.requirements_toml().clone(),
     )
-    .unwrap();
+    .expect("native fixture configuration layers must be valid");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

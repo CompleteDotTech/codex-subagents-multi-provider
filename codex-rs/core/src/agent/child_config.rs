@@ -214,7 +214,9 @@ pub(crate) async fn prepare_agent_spawn_config(
         || role_provider.is_some()
         || policy.default_provider().is_some()
         || resolved.changed_provider
-        || origin.as_ref().map(|origin| origin.provider_id())
+        || origin
+            .as_ref()
+            .map(codex_config::child_provider::VerifiedChildProviderOrigin::provider_id)
             != Some(resolved.provider_id.as_str());
     config.child_provider_policy = policy;
     let selected_manager = if strict_catalog {

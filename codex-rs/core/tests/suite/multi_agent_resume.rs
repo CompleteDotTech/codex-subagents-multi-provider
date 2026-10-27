@@ -735,7 +735,7 @@ openai_base_url = "{redirected_base_url}"
                     .map(|item| item["output"].clone())
             })
         })
-        .last();
+        .next_back();
 
     let reloaded_worker = resumed
         .thread_manager
@@ -1134,12 +1134,14 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
         .await
         .expect("request recording is enabled")
         .len();
-    let error = resumed
+    let error = match resumed
         .thread_manager
         .ensure_multi_agent_v2_child_loaded(child_id)
         .await
-        .err()
-        .expect("a full-access executor cannot use local cold authority metadata");
+    {
+        Ok(_) => panic!("a full-access executor cannot use local cold authority metadata"),
+        Err(error) => error,
+    };
     assert!(
         error
             .to_string()

@@ -16,10 +16,9 @@ fn prepared_source(
             depth: crate::agent::next_thread_spawn_depth(&parent.session_source),
             agent_path: None,
             agent_nickname: None,
-            agent_role: config
-                .prepared_child_authorization
-                .as_ref()
-                .and_then(|proof| proof.role_name()),
+            agent_role: config.prepared_child_authorization.as_ref().and_then(
+                crate::agent::child_provider_authorization::PreparedChildAuthorization::role_name,
+            ),
         },
     )
 }
@@ -796,7 +795,7 @@ async fn prepared_launch_rejects_whole_config_mutation_and_clone_replay() {
             0 => changed.model_provider.base_url = Some("https://forged.invalid/v1".into()),
             1 => changed.model_catalog.as_mut().unwrap().models[0].context_window = Some(1),
             2 => changed.developer_instructions = Some("forged authority".into()),
-            3 => changed.cwd = changed.codex_home.clone().try_into().unwrap(),
+            3 => changed.cwd = changed.codex_home.clone(),
             4 => {
                 changed
                     .set_legacy_sandbox_policy(
@@ -1542,9 +1541,10 @@ async fn native_managed_resume_keeps_live_binding_through_final_admission(revoke
         "the real resumed manager instruction await must execute before interpreting its result"
     );
     if revoke {
-        let error = result
-            .err()
-            .expect("revoked resumed startup must not publish the target");
+        let error = match result {
+            Ok(_) => panic!("revoked resumed startup must not publish the target"),
+            Err(error) => error,
+        };
         assert!(
             error
                 .to_string()
@@ -2083,7 +2083,7 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
     model.insert("node_repl_disabled".into(), serde_json::Value::Bool(false));
     std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
     let runtime = &fixture.parent.session.services.local_agent_runtime;
-    let error = runtime
+    let error = match runtime
         .control(fixture.parent.session.session_id())
         .resume_agent_from_rollout(
             fixture.config.clone(),
@@ -2091,8 +2091,10 @@ async fn warm_saved_child_cannot_gain_changed_catalog_tool_authority() {
             child.session_source.clone(),
         )
         .await
-        .err()
-        .expect("changed selected model grants must not bypass the warm ceiling");
+    {
+        Ok(_) => panic!("changed selected model grants must not bypass the warm ceiling"),
+        Err(error) => error,
+    };
     assert!(
         error
             .to_string()
@@ -2182,7 +2184,7 @@ async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
             .enabled(Feature::GuardianV2)
     );
     let runtime = &fixture.parent.session.services.local_agent_runtime;
-    let error = runtime
+    let error = match runtime
         .control(fixture.parent.session.session_id())
         .resume_agent_from_rollout(
             fixture.config.clone(),
@@ -2190,8 +2192,10 @@ async fn warm_saved_child_cannot_weaken_its_local_guardian_threshold() {
             child.session_source.clone(),
         )
         .await
-        .err()
-        .expect("warm reload must retain actual local Guardian safety ceiling");
+    {
+        Ok(_) => panic!("warm reload must retain actual local Guardian safety ceiling"),
+        Err(error) => error,
+    };
     assert!(
         error
             .to_string()

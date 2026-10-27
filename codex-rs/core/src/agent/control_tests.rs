@@ -197,10 +197,9 @@ impl LocalAgentControl {
         let mut source = source;
         if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) = &mut source
         {
-            *agent_role = config
-                .prepared_child_authorization
-                .as_ref()
-                .and_then(|authorization| authorization.role_name());
+            *agent_role = config.prepared_child_authorization.as_ref().and_then(
+                crate::agent::child_provider_authorization::PreparedChildAuthorization::role_name,
+            );
         }
         let caller = source
             .parent_thread_id()
@@ -6478,7 +6477,7 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
         assert!(harness.manager.get_thread(parent_id).await.is_ok());
     }
     let absent_caller = ThreadId::new();
-    let error = control
+    let error = match control
         .ensure_v2_agent_loaded(
             harness.config.clone(),
             child.thread_id,
@@ -6486,8 +6485,10 @@ async fn saved_child_reload_rejects_missing_private_permit_and_forged_caller_wit
             /*parent*/ None,
         )
         .await
-        .err()
-        .expect("invented sender must fail before reservation");
+    {
+        Ok(_) => panic!("invented sender must fail before reservation"),
+        Err(error) => error,
+    };
     assert!(
         matches!(error.details(), CodexErrorDetails::ThreadNotFound(id) if *id == absent_caller)
     );
@@ -6566,7 +6567,7 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(
         root.thread_id,
         &root.thread.session_source,
         /*depth*/ 1,
-        nested.then_some("restricted".into()),
+        nested.then_some("restricted"),
         Some("worker".into()),
     )
     .unwrap();
@@ -7045,9 +7046,10 @@ async fn denied_final_cold_admission_preserves_receipt_for_a_current_policy_retr
             "real late manager callback must execute before interpreting the result"
         );
         if revoke {
-            let error = result
-                .err()
-                .expect("late policy revocation must deny cold startup");
+            let error = match result {
+                Ok(_) => panic!("late policy revocation must deny cold startup"),
+                Err(error) => error,
+            };
             assert!(
                 error
                     .to_string()
