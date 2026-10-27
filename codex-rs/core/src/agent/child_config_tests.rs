@@ -1204,6 +1204,78 @@ async fn native_preparation_rejects_stale_step_approval_and_reviewer_before_cata
     }
 }
 
+#[tokio::test]
+async fn native_legacy_depth_limit_is_enforced_by_actual_parent_authority() {
+    async fn prepare(parent: &Arc<crate::CodexThread>) -> Config {
+        let step = StepContext::for_test(parent.session.new_default_turn().await);
+        prepare_agent_spawn_config(
+            &parent.session,
+            &step,
+            SpawnConfigOptions {
+                resolved_provider: None,
+                model_provider: None,
+                version: SpawnConfigVersion::V1,
+                full_history_fork: false,
+                role_name: None,
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await
+        .expect("real host preparation before the legacy depth check")
+        .config
+    }
+
+    let fixture = Fixture::new().await;
+    let mut config = fixture.config.clone();
+    config.agent_max_depth = 1;
+    config.features.disable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Collab).unwrap();
+    let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("parent-only"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .unwrap()
+        .thread;
+    let child = start_prepared_child(&root, prepare(&root).await).await;
+    assert_eq!(
+        child.multi_agent_version(),
+        Some(codex_protocol::protocol::MultiAgentVersion::V1)
+    );
+    assert_eq!(
+        crate::agent::next_thread_spawn_depth(&child.session_source),
+        2
+    );
+    let mut candidate = prepare(&child).await;
+    let source = prepared_source(&child, &candidate);
+    let error = candidate
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &child.session.services.local_agent_runtime,
+            child.session.thread_id,
+            &candidate,
+            false,
+            &source,
+        )
+        .await
+        .err()
+        .expect("a correctly parented legacy child cannot exceed the real parent's depth limit");
+    assert!(
+        error
+            .to_string()
+            .contains("child source changed its prepared parent, role, or depth"),
+        "{error}"
+    );
+    assert_eq!(manager.list_thread_ids().await.len(), 2);
+}
+
 struct RevokeDuringInheritedInstructions {
     policy: codex_config::CloudConfigBundlePolicy,
     sharing: std::sync::atomic::AtomicBool,

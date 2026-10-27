@@ -387,7 +387,8 @@ impl PreparedChildAuthorization {
         };
         if *parent_thread_id != caller
             || *depth != crate::agent::next_thread_spawn_depth(&parent.session_source)
-            || crate::agent::exceeds_thread_spawn_depth_limit(*depth, config.agent_max_depth)
+            || (parent.multi_agent_version() != Some(MultiAgentVersion::V2)
+                && crate::agent::exceeds_thread_spawn_depth_limit(*depth, config.agent_max_depth))
             || agent_role != &self.role_name
         {
             return Err(invalid(
