@@ -106,6 +106,9 @@ def parse_json(text):
         for line in lines.splitlines():
             if not line.strip():
                 continue
+            # Bazel 9.2.0 archive_utils.cc:248 emits this complete USER line.
+            if line == "Extracting Bazel installation...":
+                continue
             require(
                 bool(
                     re.match(

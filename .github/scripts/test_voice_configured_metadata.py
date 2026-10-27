@@ -147,6 +147,75 @@ class ParsingTests(unittest.TestCase):
             with self.subTest(text=wrong), self.assertRaises(m.EvidenceError):
                 m.parse_provider(wrong, record["label"])
 
+    def test_exact_extraction_line_frames_provider_record(self):
+        record = packages()[0][0]
+        for separator in ("\n", "\r\n"):
+            text = separator.join(
+                (
+                    "Extracting Bazel installation...",
+                    m.SENTINEL + json.dumps(record),
+                    "INFO: done",
+                )
+            )
+            self.assertEqual(m.parse_provider(text, record["label"]), record)
+
+    def test_exact_extraction_line_frames_action_json(self):
+        value = graph()
+        for separator in ("\n", "\r\n"):
+            text = separator.join(
+                (
+                    "Extracting Bazel installation...",
+                    json.dumps(value),
+                    "INFO: done",
+                )
+            )
+            self.assertEqual(m.parse_json(text), value)
+
+    def test_extraction_allowance_rejects_variants_and_unknown_lines(self):
+        record = packages()[0][0]
+        for line in (
+            "prefix Extracting Bazel installation...",
+            "Extracting Bazel installation... PRIVATE",
+            " Extracting Bazel installation...",
+            "Extracting Bazel installation... ",
+            "Extracting Bazel installation....",
+            "Extracting Bazel installation..",
+            "extracting Bazel installation...",
+            "Extracting Other installation...",
+            "PRIVATE unknown wrapper output",
+        ):
+            for before in (True, False):
+                with self.subTest(line=line, before=before):
+                    action = json.dumps(graph())
+                    provider = m.SENTINEL + json.dumps(record)
+
+                    def frame(payload):
+                        return (
+                            (line + "\n" + payload)
+                            if before
+                            else (payload + "\n" + line)
+                        )
+
+                    with self.assertRaises(m.EvidenceError):
+                        m.parse_json(frame(action))
+                    with self.assertRaises(m.EvidenceError):
+                        m.parse_provider(frame(provider), record["label"])
+
+    def test_extraction_line_preserves_duplicate_and_malformed_guards(self):
+        line = "Extracting Bazel installation...\n"
+        record = packages()[0][0]
+        for body in ("{}\n{}", '{"a":1,"a":2}', '{"actions": [', "{bad}"):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_json(line + body)
+        provider = m.SENTINEL + json.dumps(record)
+        for body in (
+            provider + "\n" + provider,
+            m.SENTINEL + '{"label":"x","label":"x"}',
+            m.SENTINEL + "{",
+        ):
+            with self.subTest(body=body), self.assertRaises(m.EvidenceError):
+                m.parse_provider(line + body, record["label"])
+
 
 class GraphTests(unittest.TestCase):
     def test_complete_graph_paths_and_arguments_retained_env_values_removed(self):
