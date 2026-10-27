@@ -33,6 +33,7 @@ if "info" in sys.argv:
     print("/nonexistent-owned-testlogs")
     raise SystemExit(0)
 print("stub: no Bazel build or repository access was performed")
+print("stub stderr proof", file=sys.stderr)
 raise SystemExit(int(os.environ.get("BAZEL_STUB_EXIT", "0")))
 """
 
@@ -143,6 +144,13 @@ class RunBazelCiTest(unittest.TestCase):
                 newline="\n",
             )
             stub.chmod(0o755)
+            if real_wrapper:
+                (root / "voice_metadata_owned_job.py").write_text(
+                    SCRIPT.with_name("voice_metadata_owned_job.py").read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
             record = root / "calls.jsonl"
             tools = root / "voice tools"
             if provision:
@@ -197,7 +205,22 @@ class RunBazelCiTest(unittest.TestCase):
                     GITHUB_JOB="voice-runtime-diagnostic",
                     RUNNER_TEMP=str(root),
                     BAZEL_OUTPUT_USER_ROOT=str(metadata_root),
+                    VOICE_METADATA_STATUS_NONCE="a" * 32,
+                    VOICE_METADATA_STATUS_PHASE="provider-0",
+                    VOICE_METADATA_STATUS_PATH=str(
+                        root / "evidence/private/launcher-provider-0.json"
+                    ),
+                    VOICE_METADATA_PRIVATE_DIR=str(root / "evidence/private"),
+                    VOICE_METADATA_DEADLINE="99999999999",
+                    RUNNER_TOOL_CACHE=str(root / "toolcache"),
+                    GITHUB_WORKSPACE=str(root / "workspace"),
                 )
+                (root / "evidence/private").mkdir(parents=True)
+                (root / "toolcache").mkdir()
+                (root / "workspace").mkdir()
+                import time
+
+                environment["VOICE_METADATA_DEADLINE"] = str(time.monotonic() + 120)
             if real_wrapper:
                 # ROOT runs this native Git Bash probe after source review. The
                 # fixture exports only equality/binding booleans, never PATH/argv.
@@ -270,6 +293,23 @@ class RunBazelCiTest(unittest.TestCase):
             self.assertIn("--noexperimental_remote_repo_contents_cache", args)
             self.assertIn(DECLARATION, args)
             self.assertIn("GNU cross compilation is not exercised", result.stdout)
+            self.assertIn("stub stderr proof", result.stderr)
+
+    def test_metadata_rejects_runtime_log_options_before_any_child(self):
+        for option in (
+            "--print-failed-test-logs",
+            "--print-failed-action-summary",
+            "--remote-download-toplevel",
+            "--windows-msvc-host-platform",
+        ):
+            result, calls = self.invoke(
+                metadata=True,
+                command="cquery",
+                startup=("--batch",),
+                flags=("--windows-cross-compile", option),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(calls, [])
 
     def test_metadata_mode_rejects_wrong_context_missing_sdk_and_path_overrides(self):
         for environment in (
@@ -344,7 +384,7 @@ class RunBazelCiTest(unittest.TestCase):
                 self.assertNotIn(option + "=PATH", args)
 
     @unittest.skipUnless(os.name == "nt", "ROOT native Windows Git Bash probe")
-    def test_real_git_bash_python_wrapper_fake_bazel_receives_exact_selected_path(self):
+    def test_real_git_bash_rejects_unapproved_fake_bazel_before_child(self):
         result, calls = self.invoke(
             metadata=True,
             real_wrapper=True,
@@ -352,18 +392,11 @@ class RunBazelCiTest(unittest.TestCase):
             startup=("--batch",),
             flags=("--windows-cross-compile",),
         )
-        self.assertEqual(result.returncode, 0, "Native fake-Bazel probe failed")
-        self.assertEqual(
-            calls,
-            [
-                {
-                    "path_matches_selected": True,
-                    "named_bindings": True,
-                    "no_path_values": True,
-                    "batch_query": True,
-                }
-            ],
-        )
+        # The prior PATH positive is covered by the real-main unit test with
+        # a mocked lock. An unapproved native fake may no longer pass attestation.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("launcher attestation failed", result.stderr)
 
     def successful_call(self, **kwargs):
         result, calls = self.invoke(**kwargs)

@@ -301,7 +301,13 @@ if [[ -z "${VOICE_CONFIGURED_METADATA_MODE+x}" ]]; then
 else
   if [[ "${VOICE_CONFIGURED_METADATA_MODE}" != bounded-v1 || $metadata_context -ne 1 ||
         $metadata_query -ne 1 || $metadata_batch -ne 1 || $metadata_private_root -ne 1 ||
-        $windows_cross_compile -ne 1 || -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+        $windows_cross_compile -ne 1 || -n "${BUILDBUDDY_API_KEY:-}" ||
+        $print_failed_bazel_test_logs -ne 0 || $print_failed_bazel_action_summary -ne 0 ||
+        $remote_download_toplevel -ne 0 || $windows_msvc_host_platform -ne 0 ||
+        ! "${VOICE_METADATA_STATUS_NONCE:-}" =~ ^[0-9a-f]{32}$ ||
+        ! "${VOICE_METADATA_STATUS_PHASE:-}" =~ ^(provider-[0-6]|actions)$ ||
+        -z "${VOICE_METADATA_STATUS_PATH:-}" || -z "${VOICE_METADATA_PRIVATE_DIR:-}" ||
+        -z "${VOICE_METADATA_DEADLINE:-}" ]]; then
     echo "Invalid configured metadata PATH context." >&2
     exit 1
   fi
@@ -621,6 +627,19 @@ else
 fi
 if (( ${#post_config_bazel_args[@]} > 0 )); then
   bazel_run_args+=("${post_config_bazel_args[@]}")
+fi
+if [[ $metadata_path_mode -eq 1 ]]; then
+  # Only the parent-owned metadata capture may observe separate private streams.
+  # Preserve arguments and exit status; ordinary runtime still uses tee below.
+  set +e
+  run_bazel_with_startup_args \
+    --noexperimental_remote_repo_contents_cache \
+    "${bazel_run_args[@]}" \
+    -- \
+    "${bazel_targets[@]}"
+  bazel_status=$?
+  set -e
+  exit "$bazel_status"
 fi
 set +e
 # Work around Bazel 9 remote repo contents cache / overlay materialization

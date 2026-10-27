@@ -8,6 +8,7 @@ import ctypes as c
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -36,6 +37,36 @@ def diagnostic_parent(directory):
         }
     )
     return env
+
+
+def completed_capture_fixture(output, env, stderr_destination, **overrides):
+    """Explicit complete split/status fixtures, without launching any process."""
+    if not stderr_destination.exists():
+        stderr_destination.write_bytes(b"")
+    status = {
+        "schema": "voice-launcher-status-v1",
+        "nonce": env["VOICE_METADATA_STATUS_NONCE"],
+        "phase": env["VOICE_METADATA_STATUS_PHASE"],
+        "completed": True,
+        "approved_launcher_sha256_match": True,
+        "approved_release_identity_match": True,
+    }
+    with Path(env["VOICE_METADATA_STATUS_PATH"]).open("xb") as stream:
+        stream.write(json.dumps(status).encode("ascii"))
+    result = {
+        "capture_format": "separate-v1",
+        "bytes_observed": output.stat().st_size + stderr_destination.stat().st_size,
+        "retained_bytes": output.stat().st_size + stderr_destination.stat().st_size,
+        "oversize": False,
+        "timeout": False,
+        "exit_code": 0,
+        "assigned_before_resume": True,
+        "reader_closed": True,
+        "active_job_processes_after_cleanup": 0,
+        "operation_failed": False,
+    }
+    result.update(overrides)
+    return result
 
 
 def graph():
@@ -679,9 +710,7 @@ class RejectedLineShapeTests(unittest.TestCase):
             for before in (True, False):
                 for provider in (True, False):
                     with self.subTest(line=line, before=before, provider=provider):
-                        payload = (
-                            m.SENTINEL + json.dumps(record) if provider else "{}"
-                        )
+                        payload = m.SENTINEL + json.dumps(record) if provider else "{}"
                         text = (
                             line + "\n" + payload if before else payload + "\n" + line
                         )
@@ -793,7 +822,16 @@ class RejectedLineShapeTests(unittest.TestCase):
             else line
         )
 
-        def capture(command, output, budget, timeout=45, *, env=None):
+        def capture(
+            command,
+            output,
+            budget,
+            timeout=45,
+            *,
+            env=None,
+            stderr_destination=None,
+            status_reserve=0,
+        ):
             captured.append(command)
             if "cquery" in command:
                 payload = m.SENTINEL + json.dumps(records[command[-1]])
@@ -805,7 +843,7 @@ class RejectedLineShapeTests(unittest.TestCase):
                 rejected.append(True)
                 payload = "INFO: ACCEPTED_SECRET\n" + secret_line + "\n" + payload
             output.write_text(payload, encoding="utf-8")
-            return {"oversize": False, "timeout": False, "exit_code": 0}
+            return completed_capture_fixture(output, env, stderr_destination)
 
         def git(*args):
             if args == ("rev-parse", "HEAD"):
@@ -1480,12 +1518,21 @@ class QueryBudgetTests(unittest.TestCase):
     def run_deadline_failure(self, clock, expected, expected_captures):
         records = {p["label"]: p for p in packages()[0]}
 
-        def capture(command, output, budget, timeout=45, *, env=None):
+        def capture(
+            command,
+            output,
+            budget,
+            timeout=45,
+            *,
+            env=None,
+            stderr_destination=None,
+            status_reserve=0,
+        ):
             if "cquery" in command:
                 output.write_text(m.SENTINEL + json.dumps(records[command[-1]]))
             else:
                 output.write_text(json.dumps(graph()))
-            return {"oversize": False, "timeout": False, "exit_code": 0}
+            return completed_capture_fixture(output, env, stderr_destination)
 
         with tempfile.TemporaryDirectory() as directory:
             shell, root = Path(directory) / "bash.exe", Path(directory) / "evidence"
@@ -1730,19 +1777,32 @@ class CaptureTests(unittest.TestCase):
         raw = b"ERROR: " + secret + b"\n" + b"x" * (45467 - len(secret) - 8)
         self.assertEqual(len(raw), 45467)
         accounting = {
+            "capture_format": "separate-v1",
             "exit_code": 37,
-            "observed_bytes": 45467,
+            "bytes_observed": 45467,
             "retained_bytes": 45467,
             "oversize": False,
             "timeout": False,
             "assigned_before_resume": True,
             "reader_closed": True,
             "active_job_processes_after_cleanup": 0,
+            "operation_failed": False,
         }
 
-        def capture(command, output, budget, timeout=45, *, env=None):
+        def capture(
+            command,
+            output,
+            budget,
+            timeout=45,
+            *,
+            env=None,
+            stderr_destination=None,
+            status_reserve=0,
+        ):
             output.write_bytes(raw)
-            return accounting.copy()
+            return completed_capture_fixture(
+                output, env, stderr_destination, **accounting
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             shell = Path(directory) / "bash.exe"
@@ -1867,7 +1927,16 @@ class CaptureTests(unittest.TestCase):
         records = {p["label"]: p for p in packages()[0]}
         seen = []
 
-        def capture(command, output, budget, timeout=45, *, env=None):
+        def capture(
+            command,
+            output,
+            budget,
+            timeout=45,
+            *,
+            env=None,
+            stderr_destination=None,
+            status_reserve=0,
+        ):
             seen.append((command, timeout, env["BAZEL_OUTPUT_USER_ROOT"]))
             self.assertEqual(
                 os.environ["BAZEL_OUTPUT_USER_ROOT"], "ordinary-runtime-root"
@@ -1879,7 +1948,7 @@ class CaptureTests(unittest.TestCase):
                 output.write_text(m.SENTINEL + json.dumps(records[command[-1]]))
             else:
                 output.write_text(json.dumps(graph()))
-            return {"oversize": False, "timeout": False, "exit_code": 0}
+            return completed_capture_fixture(output, env, stderr_destination)
 
         with tempfile.TemporaryDirectory() as directory:
             shell = Path(directory) / "bash.exe"
@@ -1999,6 +2068,536 @@ class CaptureTests(unittest.TestCase):
             m.capture(["qualified.exe"], Path("unused"), budget)
             self.assertEqual(capture.call_args.args[2:], (3, 45))
             self.assertEqual(budget[0], m.TOTAL - m.MANIFEST_RESERVE - 1)
+
+
+class SplitFakeAPI(FakeAPI):
+    def __init__(self, stdout=b"stdout", stderr=b"stderr", fail=None):
+        super().__init__(payload=b"", code=0)
+        self.stdout, self.stderr, self.fail = stdout, stderr, fail
+        self.writers, self.duplicates = [], []
+
+    def __getattr__(self, name):
+        original = super().__getattr__(name)
+
+        def call(*args):
+            if name == self.fail:
+                self.events.append(name)
+                return 0xFFFFFFFF if name == "ResumeThread" else 0
+            if name == "UpdateProcThreadAttribute":
+                self.allowed_handles = list(args[3])
+            if name == "DuplicateHandle":
+                self.events.append(name)
+                value = 8000 + len(self.duplicates)
+                self.duplicates.append((value, args[4:]))
+                c.cast(args[3], c.POINTER(owned.w.HANDLE))[0] = value
+                return 1
+            result = original(*args)
+            if name == "CreateProcessW":
+                si = c.cast(args[-2], c.POINTER(owned.SIEX)).contents
+                self.writers = [
+                    os.dup(si.startup.hStdOutput),
+                    os.dup(si.startup.hStdError),
+                ]
+            if name == "ResumeThread":
+                self.duplicates_before_resume = len(self.duplicates)
+                for fd, payload in zip(self.writers, (self.stdout, self.stderr)):
+                    os.write(fd, payload)
+                    os.close(fd)
+                self.writers = []
+            if name in ("TerminateJobObject", "TerminateProcess"):
+                for fd in self.writers:
+                    os.close(fd)
+                self.writers = []
+            return result
+
+        return call
+
+
+class SplitOwnedCaptureTests(unittest.TestCase):
+    def capture(self, directory, api, cap=64):
+        root = Path(directory)
+        result = owned.capture_owned(
+            ["qualified.exe"],
+            root / "stdout.raw",
+            cap,
+            5,
+            api=api,
+            stderr_destination=root / "stderr.raw",
+        )
+        return (
+            result,
+            (root / "stdout.raw").read_bytes(),
+            (root / "stderr.raw").read_bytes(),
+        )
+
+    def test_split_ready_handles_caps_and_no_fictitious_merged_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            api = SplitFakeAPI()
+            result, stdout, stderr = self.capture(directory, api)
+        self.assertEqual((stdout, stderr), (b"stdout", b"stderr"))
+        self.assertEqual(result["bytes_observed"], 12)
+        self.assertEqual(result["retained_bytes"], 12)
+        self.assertEqual(result["capture_format"], "separate-v1")
+        self.assertNotIn("retained_sha256", result)
+        self.assertFalse(result["operation_failed"])
+        self.assertTrue(result["reader_closed"])
+        self.assertEqual(len(set(api.allowed_handles)), 3)
+        self.assertEqual(api.duplicates_before_resume, 2)
+        self.assertTrue(all(options == (1, False, 0) for _, options in api.duplicates))
+        self.assertLess(
+            api.events.index("AssignProcessToJobObject"),
+            api.events.index("ResumeThread"),
+        )
+        self.assertEqual(api.events.count("CreateJobObjectW"), 1)
+
+    def test_two_streams_share_one_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, stdout, stderr = self.capture(
+                directory, SplitFakeAPI(b"x" * 40, b"y" * 40), cap=64
+            )
+        self.assertTrue(result["oversize"])
+        self.assertEqual(result["bytes_observed"], 80)
+        self.assertLessEqual(result["retained_bytes"], 64)
+        self.assertEqual(result["retained_bytes"], len(stdout) + len(stderr))
+        self.assertTrue(result["reader_closed"])
+
+    def test_partial_api_failures_clean_without_unowned_termination(self):
+        for failure in (
+            "SetInformationJobObject",
+            "UpdateProcThreadAttribute",
+            "CreateProcessW",
+            "GetProcessTimes",
+            "AssignProcessToJobObject",
+            "DuplicateHandle",
+            "ResumeThread",
+        ):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                api = SplitFakeAPI(fail=failure)
+                result, _, _ = self.capture(directory, api)
+                self.assertTrue(result["operation_failed"])
+                if failure != "ResumeThread":
+                    self.assertNotIn("ResumeThread", api.events)
+                self.assertNotIn("OpenProcess", api.events)
+                self.assertNotIn("OpenThread", api.events)
+                if failure == "AssignProcessToJobObject":
+                    self.assertIn("TerminateProcess", api.events)
+                    self.assertNotIn("TerminateJobObject", api.events)
+
+    def test_partial_second_pipe_and_reader_io_errors_never_resume(self):
+        for failure in ("second-pipe", "reader"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                api, calls, original_pipe = SplitFakeAPI(), [0], os.pipe
+
+                def pipe():
+                    calls[0] += 1
+                    if calls[0] == 2:
+                        raise OSError("fixture pipe failure")
+                    return original_pipe()
+
+                patch = (
+                    mock.patch.object(owned.os, "pipe", side_effect=pipe)
+                    if failure == "second-pipe"
+                    else mock.patch.object(
+                        owned.os, "read", side_effect=OSError("fixture reader failure")
+                    )
+                )
+                with patch:
+                    result, _, _ = self.capture(directory, api)
+                self.assertTrue(result["operation_failed"])
+                self.assertNotIn("ResumeThread", api.events)
+
+    def test_second_file_collision_leaves_first_file_closed_and_never_launches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stderr.raw").write_bytes(b"PRESERVE")
+            api = SplitFakeAPI()
+            result = owned.capture_owned(
+                ["qualified.exe"],
+                root / "stdout.raw",
+                64,
+                5,
+                api=api,
+                stderr_destination=root / "stderr.raw",
+            )
+            self.assertTrue(result["operation_failed"])
+            self.assertEqual((root / "stderr.raw").read_bytes(), b"PRESERVE")
+            self.assertNotIn("CreateProcessW", api.events)
+            with (root / "stdout.raw").open("ab") as stream:
+                stream.write(b"closed")
+
+    def test_second_thread_start_failure_cleans_suspended_root_and_first_reader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            api = SplitFakeAPI()
+            original = threading.Thread.start
+            count = 0
+
+            def start(thread):
+                nonlocal count
+                count += 1
+                if count == 2:
+                    raise RuntimeError("fixture second reader failure")
+                return original(thread)
+
+            with mock.patch.object(threading.Thread, "start", start):
+                result, _, _ = self.capture(directory, api)
+            self.assertTrue(result["operation_failed"])
+            self.assertNotIn("ResumeThread", api.events)
+            self.assertIn("TerminateJobObject", api.events)
+
+    def test_blocked_reader_uses_retained_handle_and_quarantines_live_fds(self):
+        release, blocked = threading.Event(), threading.Event()
+        original_read, clock = os.read, [0]
+        blocked_fd, select_lock = [], threading.Lock()
+
+        def read(fd, count):
+            with select_lock:
+                first = not blocked_fd
+                if first:
+                    blocked_fd.append(fd)
+            if fd == blocked_fd[0]:
+                blocked.set()
+                release.wait(5)
+            return original_read(fd, count)
+
+        class ClockAPI(SplitFakeAPI):
+            def __getattr__(self, name):
+                original = super().__getattr__(name)
+
+                def call(*args):
+                    if name == "ResumeThread":
+                        blocked.wait(1)
+                    result = original(*args)
+                    if name == "TerminateJobObject":
+                        clock[0] = 100
+                    return result
+
+                return call
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root, api = Path(directory), ClockAPI()
+                with (
+                    mock.patch.object(owned.os, "read", side_effect=read),
+                    mock.patch.object(
+                        owned.time, "monotonic", side_effect=lambda: clock[0]
+                    ),
+                ):
+                    result = owned.capture_owned(
+                        ["qualified.exe"],
+                        root / "stdout.raw",
+                        64,
+                        5,
+                        api=api,
+                        stderr_destination=root / "stderr.raw",
+                    )
+                self.assertTrue(blocked.is_set())
+                self.assertFalse(result["reader_closed"])
+                self.assertTrue(result["operation_failed"])
+                self.assertIn("CancelSynchronousIo", api.events)
+                self.assertNotIn("OpenThread", api.events)
+                quarantined = [
+                    state
+                    for state in owned._QUARANTINED_READERS
+                    if state["read_fd"] == blocked_fd[0]
+                ]
+                self.assertEqual(len(quarantined), 1)
+                self.assertTrue(quarantined[0]["thread"].is_alive())
+                os.fstat(quarantined[0]["read_fd"])
+                release.set()
+                quarantined[0]["thread"].join(2)
+                self.assertFalse(quarantined[0]["thread"].is_alive())
+        finally:
+            release.set()
+
+    @unittest.skipUnless(os.name == "nt", "ROOT native owned Windows process")
+    def test_real_owned_split_chunks_and_descendant_writer_eof(self):
+        code = (
+            "import os,subprocess,sys;"
+            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],stdout=sys.stdout,stderr=sys.stderr);"
+            "os.write(1,b'VOICE_PROV');os.write(1,b'IDER_JSON:{}\\n');"
+            "os.write(2,b'WARNING: fixture\\n')"
+        )
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name.upper() in {"SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PATH"}
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = owned.capture_owned(
+                [sys.executable, "-u", "-c", code],
+                root / "stdout.raw",
+                65536,
+                5,
+                env=environment,
+                stderr_destination=root / "stderr.raw",
+            )
+            self.assertEqual(
+                (root / "stdout.raw").read_bytes(), b"VOICE_PROVIDER_JSON:{}\n"
+            )
+            self.assertEqual((root / "stderr.raw").read_bytes(), b"WARNING: fixture\n")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["operation_failed"])
+        self.assertTrue(result["reader_closed"])
+        self.assertEqual(result["active_job_processes_after_cleanup"], 0)
+
+
+class ProvenanceStatusTests(unittest.TestCase):
+    def test_status_reservation_fits_existing_aggregate_cap_before_launch(self):
+        with mock.patch.object(
+            m, "capture_owned", return_value={"retained_bytes": 2}
+        ) as captured:
+            budget = [0]
+            m.capture(
+                ["qualified.exe"],
+                Path("unused"),
+                budget,
+                stderr_destination=Path("unused.stderr"),
+                status_reserve=512,
+            )
+            self.assertEqual(captured.call_args.args[2], m.LIMIT - 512)
+            self.assertEqual(budget[0], 2)
+            captured.reset_mock()
+            with self.assertRaises(m.EvidenceError):
+                m.capture(
+                    ["qualified.exe"],
+                    Path("unused"),
+                    [m.TOTAL - m.MANIFEST_RESERVE - 511],
+                    stderr_destination=Path("unused.stderr"),
+                    status_reserve=512,
+                )
+            captured.assert_not_called()
+
+    def test_valid_status_charges_actual_private_bytes_without_exporting_association(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            private = Path(directory) / "private"
+            private.mkdir()
+            path = private / "launcher-provider-0.json"
+            status = {
+                "schema": "voice-launcher-status-v1",
+                "nonce": "a" * 32,
+                "phase": "provider-0",
+                "completed": True,
+                "approved_launcher_sha256_match": True,
+                "approved_release_identity_match": True,
+            }
+            path.write_text(json.dumps(status), encoding="ascii")
+            budget = [17]
+            result = m.read_launcher_status(
+                path, private, "a" * 32, "provider-0", budget
+            )
+            self.assertEqual(budget[0], 17 + path.stat().st_size)
+            self.assertEqual(
+                result,
+                {
+                    "approved_launcher_sha256_match": True,
+                    "approved_release_identity_match": True,
+                },
+            )
+            self.assertNotIn("nonce", json.dumps(result))
+
+    def main_fixture(
+        self, stderr, *, both_fail=False, status_failure=None, reader_closed=True
+    ):
+        records = {record["label"]: record for record in packages()[0]}
+
+        def capture(
+            command,
+            output,
+            budget,
+            timeout=45,
+            *,
+            env=None,
+            stderr_destination=None,
+            status_reserve=0,
+        ):
+            self.assertEqual(status_reserve, 512)
+            self.assertIsNotNone(stderr_destination)
+            output.write_text(
+                ("FIRST_PRIVATE_UNKNOWN\n" if both_fail else "")
+                + (
+                    m.SENTINEL + json.dumps(records[command[-1]])
+                    if "cquery" in command
+                    else json.dumps(graph())
+                ),
+                encoding="utf-8",
+            )
+            stderr_destination.write_bytes(stderr)
+            result = completed_capture_fixture(
+                output,
+                env,
+                stderr_destination,
+                reader_closed=reader_closed,
+                private_result_bait="PRIVATE_NEVER_UPLOAD",
+            )
+            status = Path(env["VOICE_METADATA_STATUS_PATH"])
+            if status_failure == "missing":
+                status.unlink()
+            if status_failure == "nonce":
+                data = json.loads(status.read_bytes())
+                data["nonce"] = "0" * 32
+                status.write_text(json.dumps(data), encoding="ascii")
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            shell = Path(directory) / "bash.exe"
+            shell.touch()
+            root = Path(directory) / "evidence"
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "capture",
+                        "--git-bash",
+                        str(shell),
+                        "--root",
+                        str(root),
+                        "--expected-head",
+                        "head",
+                        "--expected-tree",
+                        "tree",
+                    ],
+                ),
+                mock.patch.dict(os.environ, diagnostic_parent(directory), clear=True),
+                mock.patch.object(
+                    m,
+                    "git",
+                    side_effect=lambda *args: (
+                        "head"
+                        if args == ("rev-parse", "HEAD")
+                        else "tree"
+                        if args == ("rev-parse", "HEAD^{tree}")
+                        else ""
+                    ),
+                ),
+                mock.patch.object(m, "capture", side_effect=capture),
+                mock.patch("builtins.print"),
+            ):
+                with self.assertRaises(m.EvidenceError):
+                    m.main()
+            manifest = root / "upload/manifest.json"
+            if not reader_closed:
+                self.assertFalse(manifest.exists())
+                self.assertEqual(list((root / "upload").iterdir()), [])
+                return None
+            raw = manifest.read_bytes()
+            self.assertNotIn(b"PRIVATE", raw)
+            self.assertNotIn(b"nonce", raw)
+            self.assertNotIn(str(root).encode(), raw)
+            self.assertEqual(
+                [item.name for item in (root / "upload").iterdir()], ["manifest.json"]
+            )
+            return json.loads(raw)
+
+    def test_valid_stdout_never_hides_unknown_stderr_json_sentinel_or_encoding(self):
+        for stderr in (
+            b"SECOND_PRIVATE_UNKNOWN",
+            b"{}",
+            b"VOICE_PROVIDER_JSON:{}",
+            b"\xff",
+        ):
+            with self.subTest(stderr=stderr):
+                manifest = self.main_fixture(stderr)
+                self.assertEqual(manifest["rejected_stage"], "query-stderr-validation")
+                self.assertEqual(manifest["rejected_stream"], "stderr")
+                self.assertEqual(manifest["status"], "failed")
+
+    def test_both_fail_uses_stdout_validation_order_not_emitter_chronology(self):
+        manifest = self.main_fixture(b"SECOND_PRIVATE_UNKNOWN", both_fail=True)
+        self.assertEqual(manifest["rejected_stage"], "query-stdout-validation")
+        self.assertEqual(manifest["rejected_stream"], "stdout")
+
+    def test_exit_zero_missing_or_stale_status_never_attests_launcher(self):
+        for failure in ("missing", "nonce"):
+            with self.subTest(failure=failure):
+                manifest = self.main_fixture(b"", status_failure=failure)
+                self.assertEqual(
+                    manifest["rejected_stage"], "launcher-status-validation"
+                )
+                self.assertEqual(manifest["rejected_stream"], "none")
+                self.assertNotIn(
+                    "approved_launcher_sha256_match", manifest["phases"][0]
+                )
+
+    def test_unclosed_reader_prevents_any_publication(self):
+        self.main_fixture(b"", reader_closed=False)
+
+    def test_status_missing_duplicate_oversize_stale_and_private_fields_fail(self):
+        for failure in (
+            "missing",
+            "duplicate",
+            "oversize",
+            "nonce",
+            "phase",
+            "extra",
+            "unfinished",
+        ):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                private = Path(directory) / "private"
+                private.mkdir()
+                path = private / "launcher-provider-0.json"
+                status = {
+                    "schema": "voice-launcher-status-v1",
+                    "nonce": "a" * 32,
+                    "phase": "provider-0",
+                    "completed": True,
+                    "approved_launcher_sha256_match": True,
+                    "approved_release_identity_match": True,
+                }
+                if failure == "nonce":
+                    status["nonce"] = "b" * 32
+                if failure == "phase":
+                    status["phase"] = "actions"
+                if failure == "extra":
+                    status["PRIVATE"] = "SECRET"
+                if failure == "unfinished":
+                    status["completed"] = False
+                if failure != "missing":
+                    payload = json.dumps(status)
+                    if failure == "duplicate":
+                        payload = payload[:-1] + ',"completed":true}'
+                    if failure == "oversize":
+                        payload += " " * 513
+                    path.write_text(payload, encoding="ascii")
+                with self.assertRaises(m.EvidenceError) as raised:
+                    m.read_launcher_status(path, private, "a" * 32, "provider-0", [0])
+                self.assertNotIn("SECRET", str(raised.exception))
+
+    def test_public_capture_whitelist_never_serializes_private_result_additions(self):
+        result = {
+            "capture_format": "separate-v1",
+            "bytes_observed": 3,
+            "retained_bytes": 3,
+            "oversize": False,
+            "private_path": "SECRET",
+            "stdout_sha256": "SECRET",
+            "nonce": "SECRET",
+        }
+        self.assertEqual(
+            m.public_capture(result),
+            {
+                key: result[key]
+                for key in (
+                    "capture_format",
+                    "bytes_observed",
+                    "retained_bytes",
+                    "oversize",
+                )
+            },
+        )
+        self.assertNotIn("SECRET", json.dumps(m.public_capture(result)))
 
 
 if __name__ == "__main__":

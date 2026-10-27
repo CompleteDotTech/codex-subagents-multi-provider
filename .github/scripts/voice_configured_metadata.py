@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -552,6 +553,7 @@ CHILD_ENV_SPELLINGS.update(
 REQUIRED_CHILD_ENV = SDK_ENV | frozenset(
     """PATH SYSTEMROOT PROCESSOR_ARCHITECTURE
 HOME USERPROFILE TEMP TMP RUNNER_OS RUNNER_TEMP GITHUB_ACTIONS GITHUB_REPOSITORY
+RUNNER_TOOL_CACHE
 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_REF GITHUB_RUN_ID GITHUB_JOB GITHUB_WORKSPACE
 VOICE_DIAGNOSTIC_HEAD VOICE_DIAGNOSTIC_TREE CODEX_BAZEL_WINDOWS_PATH
 VOICE_WINDOWS_SYSTEM_ROOT VOICE_WINDOWS_HOST_ARCH VOICE_WINDOWS_BAZEL_REPOSITORY""".split()
@@ -637,6 +639,7 @@ def diagnostic_environment(parent, query_root, expected_head, expected_tree):
         raise EvidenceError("Invalid diagnostic child environment") from None
     metrics = {
         "parent": environment_accounting(parent),
+        "child_scope": "base-before-private-query-status-channel",
         "child": environment_accounting(child),
         "child_block_utf16_units": len(block) // 2,
         "included_values_unchanged": all(
@@ -654,11 +657,168 @@ def diagnostic_environment(parent, query_root, expected_head, expected_tree):
     return child, metrics
 
 
-def capture(command, destination, budget, timeout=45, *, env=None):
-    cap = max(0, min(LIMIT, TOTAL - MANIFEST_RESERVE - budget[0]))
-    result = capture_owned(command, destination, cap, timeout, env=env)
+def capture(
+    command,
+    destination,
+    budget,
+    timeout=45,
+    *,
+    env=None,
+    stderr_destination=None,
+    status_reserve=0,
+):
+    available = min(LIMIT, TOTAL - MANIFEST_RESERVE - budget[0])
+    if status_reserve:
+        require(
+            status_reserve == 512 and available >= status_reserve,
+            "Insufficient aggregate budget for launcher status",
+        )
+    cap = max(0, available - status_reserve)
+    if stderr_destination is None:
+        result = capture_owned(command, destination, cap, timeout, env=env)
+    else:
+        result = capture_owned(
+            command,
+            destination,
+            cap,
+            timeout,
+            env=env,
+            stderr_destination=stderr_destination,
+        )
     budget[0] += result["retained_bytes"]
     return result
+
+
+LAUNCHER_STATUS_CAP = 512
+PUBLIC_CAPTURE_FIELDS = frozenset(
+    {
+        "capture_format",
+        "bytes_observed",
+        "retained_bytes",
+        "oversize",
+        "timeout",
+        "assigned_before_resume",
+        "exit_code",
+        "reader_closed",
+        "operation_failed",
+        "active_job_processes_after_cleanup",
+        "root_identity",
+    }
+)
+
+
+def public_capture(result):
+    # Never automatically expand a private capture result into an upload.
+    require(type(result) is dict, "Invalid owned capture record")
+    value = {name: result[name] for name in PUBLIC_CAPTURE_FIELDS if name in result}
+    for name in {
+        "oversize",
+        "timeout",
+        "assigned_before_resume",
+        "reader_closed",
+        "operation_failed",
+    } & value.keys():
+        require(type(value[name]) is bool, "Invalid owned capture boolean")
+    for name in {
+        "bytes_observed",
+        "retained_bytes",
+        "active_job_processes_after_cleanup",
+    } & value.keys():
+        require(
+            type(value[name]) is int and value[name] >= 0,
+            "Invalid owned capture accounting",
+        )
+    if "exit_code" in value:
+        require(
+            value["exit_code"] is None or type(value["exit_code"]) is int,
+            "Invalid owned capture exit",
+        )
+    if "capture_format" in value:
+        require(value["capture_format"] == "separate-v1", "Invalid capture format")
+    if "root_identity" in value:
+        identity = value["root_identity"]
+        require(
+            isinstance(identity, dict)
+            and set(identity) == {"pid", "creation_filetime"}
+            and all(type(item) is int and item >= 0 for item in identity.values()),
+            "Invalid owned capture identity",
+        )
+    return value
+
+
+def read_launcher_status(path, private, nonce, phase, budget):
+    from voice_metadata_owned_job import plain_ancestors
+
+    try:
+        plain_ancestors(private)
+        plain_ancestors(path)
+        require(path.parent == private, "Invalid private launcher status")
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            require(
+                before.st_size <= LAUNCHER_STATUS_CAP,
+                "Private launcher status exceeds cap",
+            )
+            payload = stream.read(LAUNCHER_STATUS_CAP)
+            after = os.fstat(stream.fileno())
+        require(
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            and len(payload) == before.st_size,
+            "Private launcher status changed",
+        )
+        budget[0] += len(payload)
+        require(
+            len(payload) <= LAUNCHER_STATUS_CAP, "Private launcher status exceeds cap"
+        )
+        status = json.loads(payload.decode("ascii"), object_pairs_hook=unique_object)
+        expected = {
+            "schema": "voice-launcher-status-v1",
+            "nonce": nonce,
+            "phase": phase,
+            "completed": True,
+            "approved_launcher_sha256_match": True,
+            "approved_release_identity_match": True,
+        }
+        require(
+            type(status) is dict and set(status) == set(expected),
+            "Invalid private launcher status",
+        )
+        require(
+            all(
+                type(status[key]) is type(value) and status[key] == value
+                for key, value in expected.items()
+            ),
+            "Private launcher association mismatch",
+        )
+        return {
+            "approved_launcher_sha256_match": True,
+            # Derived from approved release bytes; no separate version process.
+            "approved_release_identity_match": True,
+        }
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        raise EvidenceError("Private launcher status unavailable or invalid") from None
+
+
+def query_environment(environment, private, phase, timeout, started):
+    path = private / ("launcher-" + phase + ".json")
+    from voice_metadata_owned_job import plain_ancestors
+
+    plain_ancestors(private)
+    plain_ancestors(path, missing_leaf=True)
+    require(not path.exists(), "Private launcher status must be fresh")
+    nonce = secrets.token_hex(16)
+    child = dict(environment)
+    child.update(
+        {
+            "VOICE_METADATA_STATUS_PATH": str(path),
+            "VOICE_METADATA_STATUS_NONCE": nonce,
+            "VOICE_METADATA_STATUS_PHASE": phase,
+            "VOICE_METADATA_PRIVATE_DIR": str(private),
+            "VOICE_METADATA_DEADLINE": str(started + timeout),
+        }
+    )
+    return child, path, nonce
 
 
 # Output is a closed vocabulary of observations, never excerpts or causal claims.
@@ -1032,10 +1192,12 @@ def git(*args):
 def admit_query(query_deadline, timeout):
     # Admit only a FULL fixed window plus owned cleanup. Never shorten a query,
     # extend a deadline, retry or treat an unlaunched phase as accepted evidence.
+    started = time.monotonic()
     require(
-        time.monotonic() + timeout + OWNED_CLEANUP_RESERVE_SECONDS <= query_deadline,
+        started + timeout + OWNED_CLEANUP_RESERVE_SECONDS <= query_deadline,
         "Insufficient global budget for complete configured query",
     )
+    return started
 
 
 def main():
@@ -1103,6 +1265,77 @@ def main():
         ],
     }
     budget, providers = [0], []
+    publication_safe = True
+    validation = {"stage": "none", "stream": "none"}
+
+    def take_capture(command, output, phase, timeout, started):
+        nonlocal publication_safe
+        validation.update(stage="owned-query-capture", stream="none")
+        environment, status_path, nonce = query_environment(
+            child_environment, private, phase, timeout, started
+        )
+        stderr_output = private / (phase + ".stderr.raw")
+        result = capture(
+            command,
+            output,
+            budget,
+            timeout=timeout,
+            env=environment,
+            stderr_destination=stderr_output,
+            status_reserve=LAUNCHER_STATUS_CAP,
+        )
+        publication_safe = (
+            publication_safe
+            and type(result) is dict
+            and result.get("reader_closed") is True
+        )
+        entry = {"phase": phase, **public_capture(result)}
+        manifest["phases"].append(entry)
+        require(
+            result.get("capture_format") == "separate-v1"
+            and result.get("reader_closed") is True
+            and result.get("assigned_before_resume") is True
+            and result.get("active_job_processes_after_cleanup") == 0
+            and result.get("operation_failed") is False
+            and not result["oversize"]
+            and not result["timeout"],
+            "Configured capture failed; streams retained privately",
+        )
+        # Fixed stdout-then-stderr observation order, not merged chronology.
+        with output.open("rb") as stream:
+            stdout_bytes = stream.read(LIMIT)
+        with stderr_output.open("rb") as stream:
+            stderr_bytes = stream.read(max(0, LIMIT - len(stdout_bytes)))
+        require(
+            len(stdout_bytes) + len(stderr_bytes) == result["retained_bytes"],
+            "Private capture size mismatch",
+        )
+        entry["failure_classification"] = classify_failure(
+            stdout_bytes + b"\n" + stderr_bytes
+        )
+        require(
+            result["exit_code"] == 0,
+            "Action capture failed; raw output retained privately"
+            if phase == "actions"
+            else "Provider capture failed; raw output retained privately",
+        )
+        validation.update(stage="launcher-status-validation", stream="none")
+        entry.update(read_launcher_status(status_path, private, nonce, phase, budget))
+        validation.update(stage="query-stdout-validation", stream="stdout")
+        try:
+            stdout = stdout_bytes.decode("utf-8")
+        except UnicodeError:
+            raise EvidenceError("Invalid configured stdout encoding") from None
+        return stdout, stderr_bytes
+
+    def validate_stderr(raw):
+        validation.update(stage="query-stderr-validation", stream="stderr")
+        try:
+            stderr = raw.decode("utf-8")
+        except UnicodeError:
+            raise EvidenceError("Invalid configured stderr encoding") from None
+        require(parse_json(stderr + "\n{}") == {}, "Invalid configured stderr framing")
+
     try:
         child_environment, accounting = diagnostic_environment(
             parent_environment, query_root, args.expected_head, args.expected_tree
@@ -1127,24 +1360,13 @@ def main():
                 label,
             ]
             timeout = FIRST_PROVIDER_SECONDS if i == 0 else LATER_PROVIDER_SECONDS
-            admit_query(query_deadline, timeout)
-            result = capture(
-                cmd, output, budget, timeout=timeout, env=child_environment
+            started = admit_query(query_deadline, timeout)
+            stdout, stderr = take_capture(
+                cmd, output, f"provider-{i}", timeout, started
             )
-            manifest["phases"].append(
-                {
-                    "phase": f"provider-{i}",
-                    **result,
-                    "failure_classification": failure_classification(output),
-                }
-            )
-            require(
-                not result["oversize"]
-                and not result["timeout"]
-                and result["exit_code"] == 0,
-                "Provider capture failed; raw output retained privately",
-            )
-            providers.append(parse_provider(output.read_text(encoding="utf-8"), label))
+            provider = parse_provider(stdout, label)
+            validate_stderr(stderr)
+            providers.append(provider)
         output = private / "actions.raw"
         cmd = [
             str(args.git_bash),
@@ -1165,24 +1387,10 @@ def main():
             "--",
             QUERY,
         ]
-        admit_query(query_deadline, ACTIONS_SECONDS)
-        result = capture(
-            cmd, output, budget, timeout=ACTIONS_SECONDS, env=child_environment
-        )
-        manifest["phases"].append(
-            {
-                "phase": "actions",
-                **result,
-                "failure_classification": failure_classification(output),
-            }
-        )
-        require(
-            not result["oversize"]
-            and not result["timeout"]
-            and result["exit_code"] == 0,
-            "Action capture failed; raw output retained privately",
-        )
-        graph, actions = graph_metadata(parse_json(output.read_text(encoding="utf-8")))
+        started = admit_query(query_deadline, ACTIONS_SECONDS)
+        stdout, stderr = take_capture(cmd, output, "actions", ACTIONS_SECONDS, started)
+        graph, actions = graph_metadata(parse_json(stdout))
+        validate_stderr(stderr)
         proof = package_proof(providers, actions)
         artifacts = {
             "providers.json": [sanitize_provider(p) for p in providers],
@@ -1212,6 +1420,8 @@ def main():
         manifest["status"] = "configured-graph-and-package-structure-validated"
     except EvidenceError as error:
         manifest["failure"] = str(error)
+        manifest["rejected_stage"] = validation["stage"]
+        manifest["rejected_stream"] = validation["stream"]
         if isinstance(error, RejectedWrapperLine):
             manifest["rejected_wrapper_line_shape"] = error.shape.copy()
         raise
@@ -1231,7 +1441,8 @@ def main():
         if not within_deadline:
             manifest["status"] = "failed-deadline"
             manifest["failure"] = "Configured metadata invocation deadline exhausted"
-        (upload / "manifest.json").write_bytes(encode(manifest))
+        if publication_safe:
+            (upload / "manifest.json").write_bytes(encode(manifest))
         require(within_deadline, "Configured metadata invocation deadline exhausted")
         require(unchanged, "Pinned source or lock changed")
     print("Configured metadata validated; sanitized evidence ready.")

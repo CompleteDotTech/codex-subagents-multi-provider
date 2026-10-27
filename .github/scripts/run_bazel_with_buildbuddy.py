@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 
 import json
+import contextlib
+import ctypes as c
+from ctypes import wintypes as w
+import hashlib
+import math
 import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from collections.abc import Sequence
 from pathlib import Path
@@ -194,6 +200,17 @@ METADATA_SDK_NAMES = """PATH INCLUDE LIB LIBPATH UCRTVersion UniversalCRTSdkDir
 VCINSTALLDIR VCToolsInstallDir WindowsLibPath WindowsSdkBinPath WindowsSdkDir
 WindowsSDKLibVersion WindowsSDKVersion""".upper().split()
 METADATA_PATH_OPTIONS = ("--action_env", "--host_action_env", "--test_env")
+METADATA_STATUS_CAP = 512
+METADATA_APPROVED_LAUNCHER_SHA256 = (
+    "b9d65a1f7c2d7af885a96a4fd5aa36b40fb41816d30944390569eef908bdc954"
+)
+METADATA_STATUS_ENV = (
+    "VOICE_METADATA_STATUS_PATH",
+    "VOICE_METADATA_STATUS_NONCE",
+    "VOICE_METADATA_STATUS_PHASE",
+    "VOICE_METADATA_PRIVATE_DIR",
+    "VOICE_METADATA_DEADLINE",
+)
 
 
 def metadata_path_mode(args: Sequence[str], env: Mapping[str, str]) -> bool:
@@ -293,9 +310,188 @@ def metadata_bazel_launch(command: list[str], env: Mapping[str, str]):
     executable = shutil.which(command[0], path=env.get("PATH"))
     if executable is None:
         raise ValueError("Metadata Bazel executable is unavailable")
+    from voice_metadata_owned_job import plain_ancestors
+
+    plain_ancestors(Path(executable).absolute())
     child = dict(env)
     child["PATH"] = env["CODEX_BAZEL_WINDOWS_PATH"]
+    for name in METADATA_STATUS_ENV:
+        child.pop(name, None)
     return [str(Path(executable).resolve(strict=True)), *command[1:]], child
+
+
+def metadata_status_context(env):
+    """Parent-owned association only; trusted source/host, not authentication."""
+    import re
+    from voice_metadata_owned_job import plain_ancestors
+
+    nonce = env.get("VOICE_METADATA_STATUS_NONCE", "")
+    phase = env.get("VOICE_METADATA_STATUS_PHASE", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce) or not re.fullmatch(
+        r"provider-[0-6]|actions", phase
+    ):
+        raise ValueError("Invalid metadata status association")
+    directory = Path(env.get("VOICE_METADATA_PRIVATE_DIR", ""))
+    path = Path(env.get("VOICE_METADATA_STATUS_PATH", ""))
+    temp = Path(env["RUNNER_TEMP"])
+    plain_ancestors(directory)
+    plain_ancestors(path, missing_leaf=True)
+    plain_ancestors(temp)
+    if (
+        directory.name != "private"
+        or directory.parent.parent.resolve(strict=True) != temp.resolve(strict=True)
+        or path.parent != directory
+        or path.name != "launcher-" + phase + ".json"
+        or path.exists()
+    ):
+        raise ValueError("Invalid metadata status path")
+    deadline = float(env.get("VOICE_METADATA_DEADLINE", "nan"))
+    window = 90 if phase == "actions" else 120 if phase == "provider-0" else 45
+    if not math.isfinite(deadline) or not 0 < deadline - time.monotonic() <= window:
+        raise ValueError("Invalid metadata launch deadline")
+    return path, nonce, phase, deadline
+
+
+class LauncherInfo(c.Structure):
+    _fields_ = [
+        ("attributes", w.DWORD),
+        ("created", w.FILETIME),
+        ("accessed", w.FILETIME),
+        ("written", w.FILETIME),
+        ("volume", w.DWORD),
+        ("size_hi", w.DWORD),
+        ("size_lo", w.DWORD),
+        ("links", w.DWORD),
+        ("index_hi", w.DWORD),
+        ("index_lo", w.DWORD),
+    ]
+
+
+class LauncherAPI:
+    def __init__(self):
+        kernel = c.WinDLL("kernel32", use_last_error=True)
+        signatures = {
+            "CreateFileW": (
+                w.HANDLE,
+                [w.LPCWSTR, w.DWORD, w.DWORD, c.c_void_p, w.DWORD, w.DWORD, w.HANDLE],
+            ),
+            "GetFileInformationByHandle": (w.BOOL, [w.HANDLE, c.POINTER(LauncherInfo)]),
+            "GetFinalPathNameByHandleW": (
+                w.DWORD,
+                [w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD],
+            ),
+            "ReadFile": (
+                w.BOOL,
+                [w.HANDLE, c.c_void_p, w.DWORD, c.POINTER(w.DWORD), c.c_void_p],
+            ),
+            "CloseHandle": (w.BOOL, [w.HANDLE]),
+        }
+        for name, (result, args) in signatures.items():
+            function = getattr(kernel, name)
+            function.restype, function.argtypes = result, args
+            setattr(self, name, function)
+
+
+@contextlib.contextmanager
+def metadata_launcher_lock(executable, env, deadline, *, api=None):
+    """Pin bytes under a noninherited deny-write/delete handle through return.
+
+    The host-owned toolcache ancestors are trusted stable. This file lock does
+    NOT defend against a malicious same-user actor renaming those ancestors.
+    """
+    from voice_metadata_owned_job import plain_ancestors
+
+    def require(ok):
+        if not ok:
+            raise ValueError("Configured metadata launcher identity rejected")
+
+    path = Path(executable)
+    toolcache = Path(env.get("RUNNER_TOOL_CACHE", ""))
+    plain_ancestors(path)
+    plain_ancestors(toolcache)
+    chosen = path.resolve(strict=True)
+    require(chosen.is_relative_to(toolcache.resolve(strict=True)))
+    for name in ("GITHUB_WORKSPACE", "RUNNER_TEMP"):
+        other = Path(env.get(name, ""))
+        require(
+            other.is_absolute()
+            and not chosen.is_relative_to(other.resolve(strict=True))
+        )
+    require(path == chosen and time.monotonic() < deadline)
+    api = LauncherAPI() if api is None else api
+    # GENERIC_READ, FILE_SHARE_READ only, NULL SECURITY_ATTRIBUTES => noninherit.
+    handle = api.CreateFileW(str(chosen), 0x80000000, 1, None, 3, 0x80, None)
+    require(handle not in (None, 0, c.c_void_p(-1).value))
+
+    def identity():
+        info = LauncherInfo()
+        require(api.GetFileInformationByHandle(handle, c.byref(info)))
+        require(not info.attributes & (0x400 | 0x10))
+        final = c.create_unicode_buffer(32768)
+        length = api.GetFinalPathNameByHandleW(handle, final, len(final), 0)
+        require(0 < length < len(final))
+        require(
+            os.path.normcase(final.value.removeprefix("\\\\?\\"))
+            == os.path.normcase(str(chosen))
+        )
+        return (
+            info.volume,
+            info.index_hi,
+            info.index_lo,
+            info.size_hi,
+            info.size_lo,
+            info.written.dwHighDateTime,
+            info.written.dwLowDateTime,
+        )
+
+    try:
+        before = identity()
+        require(0 < (before[3] << 32) + before[4] <= 16 * 1024 * 1024)
+        digest, total = hashlib.sha256(), 0
+        buffer = c.create_string_buffer(65536)
+        while True:
+            require(time.monotonic() < deadline)
+            count = w.DWORD()
+            require(api.ReadFile(handle, buffer, len(buffer), c.byref(count), None))
+            if count.value == 0:
+                break
+            total += count.value
+            require(total <= 16 * 1024 * 1024)
+            digest.update(buffer.raw[: count.value])
+        require(total == (before[3] << 32) + before[4])
+        require(digest.hexdigest() == METADATA_APPROVED_LAUNCHER_SHA256)
+        require(identity() == before)
+        plain_ancestors(path)
+        require(path.resolve(strict=True) == chosen and time.monotonic() < deadline)
+        yield
+        require(identity() == before)
+        plain_ancestors(path)
+        require(path.resolve(strict=True) == chosen and time.monotonic() < deadline)
+    finally:
+        require(api.CloseHandle(handle))
+
+
+def run_metadata_launcher(command, child_environment):
+    path, nonce, phase, deadline = metadata_status_context(os.environ)
+    # Exclusive noninheritable status channel, not a stdout/stderr marker.
+    with path.open("xb", buffering=0) as status:
+        os.set_inheritable(status.fileno(), False)
+        with metadata_launcher_lock(command[0], os.environ, deadline):
+            result = subprocess.run(command, check=False, env=child_environment)
+        record = {
+            "schema": "voice-launcher-status-v1",
+            "nonce": nonce,
+            "phase": phase,
+            "completed": True,
+            "approved_launcher_sha256_match": True,
+            "approved_release_identity_match": True,
+        }
+        payload = json.dumps(record, sort_keys=True).encode("ascii")
+        if len(payload) > METADATA_STATUS_CAP or time.monotonic() >= deadline:
+            raise ValueError("Configured metadata status rejected")
+        if status.write(payload) != len(payload):
+            raise ValueError("Configured metadata status rejected")
+    return result
 
 
 def main() -> None:
@@ -331,7 +527,13 @@ def main() -> None:
                     "Configured metadata Bazel executable unavailable.", file=sys.stderr
                 )
                 raise SystemExit(1) from None
-            result = subprocess.run(command, check=False, env=child_environment)
+            try:
+                result = run_metadata_launcher(command, child_environment)
+            except (OSError, ValueError):
+                print(
+                    "Configured metadata launcher attestation failed.", file=sys.stderr
+                )
+                raise SystemExit(1) from None
         else:
             result = subprocess.run(command, check=False)
         raise SystemExit(result.returncode)

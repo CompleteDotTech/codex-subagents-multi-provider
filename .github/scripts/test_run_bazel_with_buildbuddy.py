@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 import json
+import contextlib
+import hashlib
+import ctypes as c
 import os
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -292,6 +296,8 @@ class MetadataPathModeTest(unittest.TestCase):
         temp = Path(directory)
         root = temp / "voice-metadata-bazel-fixture"
         root.mkdir(exist_ok=True)
+        private = temp / "evidence" / "private"
+        private.mkdir(parents=True, exist_ok=True)
         env = {name: "fixture" for name in run_bazel_with_buildbuddy.METADATA_SDK_NAMES}
         env.update(
             {
@@ -310,6 +316,11 @@ class MetadataPathModeTest(unittest.TestCase):
                 "VOICE_WINDOWS_HOST_ARCH": "AMD64",
                 "VOICE_WINDOWS_BAZEL_REPOSITORY": "fixture-tools",
                 "PATH": "original-tool-search-path",
+                "VOICE_METADATA_PRIVATE_DIR": str(private),
+                "VOICE_METADATA_STATUS_PATH": str(private / "launcher-provider-0.json"),
+                "VOICE_METADATA_STATUS_NONCE": "a" * 32,
+                "VOICE_METADATA_STATUS_PHASE": "provider-0",
+                "VOICE_METADATA_DEADLINE": str(time.monotonic() + 120),
             }
         )
         args = [
@@ -339,6 +350,11 @@ class MetadataPathModeTest(unittest.TestCase):
                     "run",
                     return_value=mock.Mock(returncode=37),
                 ) as launched,
+                mock.patch.object(
+                    run_bazel_with_buildbuddy,
+                    "metadata_launcher_lock",
+                    return_value=contextlib.nullcontext(),
+                ),
                 mock.patch("builtins.print"),
             ):
                 original = dict(os.environ)
@@ -356,8 +372,18 @@ class MetadataPathModeTest(unittest.TestCase):
             )
             self.assertEqual(
                 {k: v for k, v in child.items() if k != "PATH"},
-                {k: v for k, v in env.items() if k != "PATH"},
+                {
+                    k: v
+                    for k, v in env.items()
+                    if k != "PATH"
+                    and k not in run_bazel_with_buildbuddy.METADATA_STATUS_ENV
+                },
             )
+            for name in run_bazel_with_buildbuddy.METADATA_STATUS_ENV:
+                self.assertNotIn(name, child)
+            status = json.loads(Path(env["VOICE_METADATA_STATUS_PATH"]).read_text())
+            self.assertIs(status["approved_launcher_sha256_match"], True)
+            self.assertEqual(status["nonce"], "a" * 32)
             for option in run_bazel_with_buildbuddy.METADATA_PATH_OPTIONS:
                 self.assertEqual(command.count(option + "=PATH"), 1)
                 self.assertFalse(
@@ -521,6 +547,155 @@ class MetadataPathModeTest(unittest.TestCase):
                 launched.call_args.args[0], ["bazel", command, "//fixture:target"]
             )
             which.assert_not_called()
+
+
+class FakeLauncherAPI:
+    def __init__(self, path, payload):
+        self.path, self.payload, self.offset = str(path), payload, 0
+        self.closed, self.changed, self.size_override = False, False, None
+        self.calls = []
+
+    def CreateFileW(self, *args):
+        self.calls.append(("open", args))
+        return 1234
+
+    def GetFileInformationByHandle(self, handle, pointer):
+        info = c.cast(
+            pointer, c.POINTER(run_bazel_with_buildbuddy.LauncherInfo)
+        ).contents
+        info.attributes, info.volume, info.index_lo = 0x80, 7, 10 + self.changed
+        info.size_lo = (
+            len(self.payload) if self.size_override is None else self.size_override
+        )
+        return True
+
+    def GetFinalPathNameByHandleW(self, handle, output, capacity, flags):
+        output.value = self.path
+        return len(self.path)
+
+    def ReadFile(self, handle, output, capacity, count, overlapped):
+        chunk = self.payload[self.offset : self.offset + capacity]
+        c.memmove(output, chunk, len(chunk))
+        c.cast(count, c.POINTER(run_bazel_with_buildbuddy.w.DWORD))[0] = len(chunk)
+        self.offset += len(chunk)
+        return True
+
+    def CloseHandle(self, handle):
+        self.closed = True
+        return True
+
+
+class MetadataAttestationTest(unittest.TestCase):
+    def fixture(self, directory):
+        root = Path(directory)
+        for leaf in ("toolcache", "runner-temp", "workspace"):
+            (root / leaf).mkdir()
+        path = root / "toolcache/bazel.exe"
+        path.write_bytes(b"APPROVED-SYNTHETIC-LAUNCHER")
+        env = {
+            "RUNNER_TOOL_CACHE": str(path.parent),
+            "RUNNER_TEMP": str(root / "runner-temp"),
+            "GITHUB_WORKSPACE": str(root / "workspace"),
+        }
+        return path, env, FakeLauncherAPI(path, path.read_bytes())
+
+    def test_exact_file_lock_hash_and_lifetime(self):
+        with TemporaryDirectory() as directory:
+            path, env, api = self.fixture(directory)
+            with mock.patch.object(
+                run_bazel_with_buildbuddy,
+                "METADATA_APPROVED_LAUNCHER_SHA256",
+                hashlib.sha256(api.payload).hexdigest(),
+            ):
+                with run_bazel_with_buildbuddy.metadata_launcher_lock(
+                    str(path), env, time.monotonic() + 10, api=api
+                ):
+                    self.assertFalse(api.closed)
+                    self.assertEqual(api.offset, len(api.payload))
+                self.assertTrue(api.closed)
+            args = api.calls[0][1]
+            self.assertEqual(args[1:5], (0x80000000, 1, None, 3))
+
+    def test_hash_size_deadline_and_identity_change_fail_closed(self):
+        for failure in ("hash", "size", "identity", "deadline"):
+            with self.subTest(failure=failure), TemporaryDirectory() as directory:
+                path, env, api = self.fixture(directory)
+                if failure == "size":
+                    api.size_override = 16 * 1024 * 1024 + 1
+                expected = (
+                    "0" * 64
+                    if failure == "hash"
+                    else hashlib.sha256(api.payload).hexdigest()
+                )
+                with mock.patch.object(
+                    run_bazel_with_buildbuddy,
+                    "METADATA_APPROVED_LAUNCHER_SHA256",
+                    expected,
+                ):
+                    with self.assertRaises(ValueError):
+                        with run_bazel_with_buildbuddy.metadata_launcher_lock(
+                            str(path),
+                            env,
+                            time.monotonic() + (-1 if failure == "deadline" else 10),
+                            api=api,
+                        ):
+                            self.assertEqual(failure, "identity")
+                            api.changed = True
+                self.assertTrue(api.closed or failure == "deadline")
+
+    def test_untrusted_workspace_or_temp_selection_never_opens_file(self):
+        with TemporaryDirectory() as directory:
+            path, env, api = self.fixture(directory)
+            env["GITHUB_WORKSPACE"] = str(path.parent)
+            with self.assertRaises(ValueError):
+                with run_bazel_with_buildbuddy.metadata_launcher_lock(
+                    str(path), env, time.monotonic() + 10, api=api
+                ):
+                    self.fail("workspace launcher cannot be admitted")
+            self.assertEqual(api.calls, [])
+
+    def test_status_finalizes_only_after_locked_launch_returns(self):
+        with TemporaryDirectory() as directory:
+            args, env = MetadataPathModeTest().invocation(directory)
+            command = [sys.executable, *args]
+            child = {
+                key: value
+                for key, value in env.items()
+                if key not in run_bazel_with_buildbuddy.METADATA_STATUS_ENV
+            }
+            path = Path(env["VOICE_METADATA_STATUS_PATH"])
+
+            def launched(*args, **kwargs):
+                self.assertEqual(path.read_bytes(), b"")
+                self.assertFalse(
+                    any(
+                        name in kwargs["env"]
+                        for name in run_bazel_with_buildbuddy.METADATA_STATUS_ENV
+                    )
+                )
+                return mock.Mock(returncode=9)
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(
+                    run_bazel_with_buildbuddy,
+                    "metadata_launcher_lock",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    run_bazel_with_buildbuddy.subprocess, "run", side_effect=launched
+                ),
+            ):
+                result = run_bazel_with_buildbuddy.run_metadata_launcher(command, child)
+            self.assertEqual(result.returncode, 9)
+            status = json.loads(path.read_bytes())
+            self.assertIs(status["completed"], True)
+            self.assertLessEqual(path.stat().st_size, 512)
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                self.assertRaises(ValueError),
+            ):
+                run_bazel_with_buildbuddy.metadata_status_context(env)
 
 
 if __name__ == "__main__":
