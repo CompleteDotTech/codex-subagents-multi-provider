@@ -217,11 +217,11 @@ def diagnose(config, env, output):
     unrelated.mkdir()
     copied = fixture(Path(env["TEST_TMPDIR"]) / "installed-fixture", helper, runtime)
     output["probes"] = [
-        run([str(path), arg], env, unrelated)
-        for path, arg in (
-            (helper, "--build-commit"),
-            (copied, "--build-commit"),
-            (unit, "--list"),
+        run([str(path), arg], env, unrelated, limit)
+        for path, arg, limit in (
+            (helper, "--build-commit", 4096),
+            (copied, "--build-commit", 4096),
+            (unit, "--list", 65536),
         )
     ]
     output["environment_identical"] = True

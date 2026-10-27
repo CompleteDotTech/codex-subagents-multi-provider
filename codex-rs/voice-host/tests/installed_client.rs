@@ -141,7 +141,15 @@ async fn installed_client_rejects_mixed_builds_and_missing_helper() -> Result<()
         .close()
         .await?;
     assert!(VoiceHost::connect(&package, "wrong-build").await.is_err());
-    // Startup libraries permit handshakes; the missing runtime receipt prevents readiness.
+    // Unix startup libraries omit the plugin directory. Windows copies plugins
+    // beside the helper, so remove one required plugin to prevent readiness.
+    #[cfg(all(windows, target_env = "msvc"))]
+    fs::remove_file(
+        helper
+            .parent()
+            .context("helper directory")?
+            .join("gstrtpmanager.dll"),
+    )?;
     let host = VoiceHost::connect(&package, &build_commit().await?).await?;
     assert!(host.initialize_runtime().await.is_err());
     // The same executable elsewhere in the package must not become a fallback.

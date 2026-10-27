@@ -192,6 +192,54 @@ class DiagnosticTests(unittest.TestCase):
             )
             self.assertEqual(output["packaging"]["helper"]["declared_dll_count"], 1)
 
+    def test_unit_list_larger_than_build_commit_output_is_bounded_and_required(self):
+        import io
+
+        real_run = diagnostic.run
+        for size, valid in [(5000, True), (65537, False)]:
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                files, config = self.packaged_fixture(root)
+                limits = []
+
+                def runner(command, environment, cwd, *args):
+                    if "--list" in command:
+                        child = unittest.mock.Mock(
+                            stdout=io.BytesIO(b"x" * size), stderr=io.BytesIO(b"")
+                        )
+                        child.wait.return_value = 0
+                        with patch.object(
+                            diagnostic.subprocess, "Popen", return_value=child
+                        ):
+                            return real_run(command, environment, cwd, *args)
+                    if "--build-commit" in command:
+                        limits.append(args)
+                        text = "a" * 40
+                    else:
+                        text = "8664 machine (x64)\nFile Type: EXECUTABLE IMAGE"
+                    return {
+                        "code": 0,
+                        "stdout": text,
+                        "stderr": "",
+                        "truncated": False,
+                    }
+
+                with (
+                    patch.object(
+                        diagnostic, "resolve", side_effect=lambda key, _: files[key]
+                    ),
+                    patch.object(diagnostic, "run", side_effect=runner),
+                ):
+                    output = {}
+                    self.assertEqual(
+                        diagnostic.diagnose(config, {"TEST_TMPDIR": str(root)}, output),
+                        valid,
+                    )
+                unit = output["probes"][2]
+                self.assertEqual(len(unit["stdout"]), min(size, 65536))
+                self.assertEqual(unit["truncated"], not valid)
+                self.assertEqual(limits, [(4096,), (4096,)])
+
     def test_package_check_rejects_missing_modified_dll_and_executable_bytes(self):
         for change in ["missing", "DLL bytes", "EXE bytes", "receipt"]:
             with (
