@@ -8664,3 +8664,312 @@ async fn hold_synchronous_read_barrier<T: Send + Sync + 'static>(
         .expect("synchronous thread must acquire the real read barrier");
     barrier
 }
+
+struct PendingFreshRevocationPersistence {
+    thread_id: ThreadId,
+    context: codex_thread_store::PersistContext,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+struct FreshRevocationPersistenceGate {
+    inner: InMemoryThreadStore,
+    armed: std::sync::Mutex<Option<ThreadId>>,
+    entered: tokio::sync::mpsc::UnboundedSender<PendingFreshRevocationPersistence>,
+}
+
+macro_rules! delegate_fresh_revocation_store {
+    ($(fn $name:ident($param:ident: $params:ty) -> $result:ty;)*) => {
+        $(fn $name(&self, $param: $params) -> codex_thread_store::ThreadStoreFuture<'_, $result> {
+            ThreadStore::$name(&self.inner, $param)
+        })*
+    };
+}
+
+impl ThreadStore for FreshRevocationPersistenceGate {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    delegate_fresh_revocation_store! {
+        fn create_thread(params: codex_thread_store::CreateThreadParams) -> ();
+        fn resume_thread(params: codex_thread_store::ResumeThreadParams) -> Arc<Vec<RolloutItem>>;
+        fn append_items(params: codex_thread_store::AppendThreadItemsParams) -> ();
+        fn discard_thread(thread_id: ThreadId) -> ();
+        fn load_history(params: codex_thread_store::LoadThreadHistoryParams) -> codex_thread_store::StoredThreadHistory;
+        fn load_latest_model_context(params: codex_thread_store::LoadThreadHistoryParams) -> codex_thread_store::StoredModelContext;
+        fn read_thread(params: codex_thread_store::ReadThreadParams) -> codex_thread_store::StoredThread;
+        fn read_thread_by_rollout_path(params: codex_thread_store::ReadThreadByRolloutPathParams) -> codex_thread_store::StoredThread;
+        fn list_threads(params: codex_thread_store::ListThreadsParams) -> codex_thread_store::ThreadPage;
+        fn update_thread_metadata(params: codex_thread_store::UpdateThreadMetadataParams) -> Option<codex_thread_store::StoredThread>;
+        fn archive_thread(params: codex_thread_store::ArchiveThreadParams) -> ();
+        fn unarchive_thread(params: codex_thread_store::ArchiveThreadParams) -> codex_thread_store::StoredThread;
+        fn delete_thread(params: codex_thread_store::DeleteThreadParams) -> ();
+        fn flush_thread(thread_id: ThreadId) -> ();
+        fn shutdown_thread(thread_id: ThreadId) -> ();
+    }
+
+    fn persist_thread(
+        &self,
+        thread_id: ThreadId,
+        context: codex_thread_store::PersistContext,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let pause = {
+                let mut armed = self.armed.lock().unwrap();
+                if *armed == Some(thread_id) {
+                    armed.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if pause {
+                let (release, released) = tokio::sync::oneshot::channel();
+                self.entered
+                    .send(PendingFreshRevocationPersistence {
+                        thread_id,
+                        context,
+                        release,
+                    })
+                    .expect("actual persistence gate receiver");
+                released
+                    .await
+                    .expect("release actual caller persistence before shutdown submission");
+            }
+            self.inner.persist_thread(thread_id, context).await
+        })
+    }
+}
+
+#[test_case::test_case(0; "current fresh caller remains authorized")]
+#[test_case::test_case(1; "actual explicit close revokes still running fresh caller")]
+#[test_case::test_case(2; "actual tree shutdown cannot miss fresh child after revocation")]
+#[tokio::test]
+async fn fresh_revoked_running_caller_cannot_cross_final_admission(stage: u8) {
+    use crate::agent::child_provider_authorization::RetainedAgentAuthority;
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.model = Some("gpt-5.6-sol".into());
+    let (entered_store, mut pending_store) = tokio::sync::mpsc::unbounded_channel();
+    let store = Arc::new(FreshRevocationPersistenceGate {
+        inner: InMemoryThreadStore::default(),
+        armed: std::sync::Mutex::new(None),
+        entered: entered_store,
+    });
+    let factory_armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let factory_entered = Arc::new(tokio::sync::Notify::new());
+    let factory_release = Arc::new(tokio::sync::Notify::new());
+    let startup_control = Arc::new(std::sync::OnceLock::<LocalAgentControl>::new());
+    let root_identity = Arc::new(std::sync::OnceLock::<codex_protocol::SessionId>::new());
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        store.clone(),
+        /*agent_graph_store*/ None,
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    )
+    .with_agent_control_factory({
+        let factory_armed = Arc::clone(&factory_armed);
+        let factory_entered = Arc::clone(&factory_entered);
+        let factory_release = Arc::clone(&factory_release);
+        let startup_control = Arc::clone(&startup_control);
+        let root_identity = Arc::clone(&root_identity);
+        move |thread_id| {
+            let control: Arc<dyn AgentControl> = Arc::new(
+                startup_control
+                    .get()
+                    .unwrap()
+                    .runtime
+                    .control(*root_identity.get_or_init(|| thread_id.into())),
+            );
+            let pause = factory_armed.swap(false, Ordering::SeqCst);
+            let entered = Arc::clone(&factory_entered);
+            let release = Arc::clone(&factory_release);
+            async move {
+                if pause {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Ok(control)
+            }
+        }
+    });
+    let control = manager.agent_control();
+    assert!(startup_control.set(control.clone()).is_ok());
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db: None,
+        manager,
+        control,
+    };
+    let (caller_id, caller) = harness.start_thread().await;
+    assert_eq!(
+        root_identity.get().copied(),
+        Some(caller.session.session_id())
+    );
+    caller.ensure_rollout_materialized().await;
+    caller.session.flush_rollout().await.unwrap();
+    let epoch = RetainedAgentAuthority::capture(&caller.session, &caller.session_source).await;
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &caller, "revocation_fenced_worker").await;
+    factory_armed.store(true, Ordering::SeqCst);
+    let child_start = fresh_lifetime_lower_start(&harness, &caller, prepared, source, permit);
+    tokio::pin!(child_start);
+    tokio::select! {
+        result = &mut child_start => panic!("actual fresh start must reach late factory barrier: {}", result.is_ok()),
+        entered = timeout(Duration::from_secs(/*secs*/ 10), factory_entered.notified()) => {
+            entered.expect("actual fresh start reaches factory await");
+        }
+    }
+    assert!(!factory_armed.load(Ordering::SeqCst));
+    assert_eq!(harness.manager.list_thread_ids().await, vec![caller_id]);
+    if stage == 0 {
+        factory_release.notify_one();
+        let child = timeout(Duration::from_secs(/*secs*/ 10), child_start)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(caller.is_running());
+        assert!(child.thread.is_running());
+        child.thread.shutdown_and_wait().await.unwrap();
+        harness
+            .manager
+            .remove_thread(&child.thread_id)
+            .await
+            .unwrap();
+        caller.shutdown_and_wait().await.unwrap();
+        return;
+    }
+
+    *store.armed.lock().unwrap() = Some(caller_id);
+    // Both real routes reach shutdown_live_agent's caller persistence AFTER
+    // committed registry revocation and BEFORE submitting Op::Shutdown. For the
+    // tree route its descendant snapshot also precedes this awaited gate.
+    let shutdown = async {
+        if stage == 1 {
+            harness.control.close_agent(caller_id).await.map(|_| ())
+        } else {
+            harness
+                .control
+                .shutdown_agent_tree(caller_id)
+                .await
+                .map(|_| ())
+        }
+    };
+    tokio::pin!(shutdown);
+    let blocked = tokio::select! {
+        result = &mut shutdown => panic!("actual close/shutdown must block before Op::Shutdown: {result:?}"),
+        entered = timeout(Duration::from_secs(/*secs*/ 10), pending_store.recv()) => {
+            entered.expect("actual caller persistence reaches gate").expect("persistence gate remains live")
+        }
+    };
+    assert_eq!(blocked.thread_id, caller_id);
+    assert_eq!(
+        blocked.context,
+        codex_thread_store::PersistContext::Standard
+    );
+    assert!(
+        caller.is_running(),
+        "revocation must precede actual Session shutdown"
+    );
+    assert!(
+        *caller.session.fresh_child_admission_live.lock().unwrap(),
+        "separate fresh signal must still be live"
+    );
+    assert!(
+        harness
+            .control
+            .runtime
+            .retained_authority(caller_id)
+            .unwrap()
+            .same_registration(&epoch)
+    );
+    assert!(
+        harness
+            .control
+            .runtime
+            .with_resume_caller(&epoch, /*live*/ true, || Ok(()))
+            .is_err(),
+        "actual close must already have committed its registry tombstone"
+    );
+    let revoked_preparation = harness
+        .control
+        .prepare_spawn_fixture(
+            &harness.config,
+            &thread_spawn_source(
+                caller_id,
+                &caller.session_source,
+                next_thread_spawn_depth(&caller.session_source),
+                /*agent_role*/ None,
+                Some("revoked_capture_worker".into()),
+            )
+            .unwrap(),
+            /*full_history*/ false,
+        )
+        .await;
+    factory_release.notify_one();
+    let outcome = timeout(Duration::from_secs(/*secs*/ 10), child_start)
+        .await
+        .unwrap();
+    let started_id = outcome.as_ref().ok().map(|child| child.thread_id);
+    assert!(
+        caller.is_running(),
+        "caller remains blocked before shutdown submission during final decision"
+    );
+    blocked
+        .release
+        .send(())
+        .expect("release actual shutdown persistence");
+    timeout(Duration::from_secs(/*secs*/ 10), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!caller.is_running());
+    let surviving_child = match started_id {
+        Some(child_id) => harness.manager.get_thread(child_id).await.ok(),
+        None => None,
+    };
+    let survivor_present = surviving_child.is_some();
+    eprintln!(
+        "FRESH_REVOCATION_OBSERVED stage={stage} started={started_id:?} survivor_after_shutdown={survivor_present}"
+    );
+    if let Some(child) = surviving_child {
+        child.shutdown_and_wait().await.unwrap();
+        harness
+            .manager
+            .remove_thread(&child.session.thread_id)
+            .await
+            .unwrap();
+    }
+    let error = match outcome {
+        Ok(_) => panic!(
+            "explicitly revoked still-running caller unexpectedly authorized actual fresh startup"
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("child_provider_policy_conflict"),
+        "{error}"
+    );
+    assert!(
+        !survivor_present,
+        "completed tree shutdown must leave no child admitted after its descendant snapshot"
+    );
+    assert!(
+        revoked_preparation.is_err(),
+        "fresh capture must reject same-epoch explicit revocation before preparation I/O"
+    );
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
