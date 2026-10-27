@@ -127,6 +127,8 @@ workspace_root_test(
 # Preserve the original Cargo required-feature closures, including implicit
 # dependency features. The annotations select only these TEST metadata repos.
 _SSH_FEATURES = [
+    "cli-common",
+    "console",
     "default",
     "ssh",
     "aes",
@@ -136,6 +138,9 @@ _SSH_FEATURES = [
     "ctr",
     "curve25519-dalek",
     "num-traits",
+    "is-terminal",
+    "pinentry",
+    "rpassword",
     "rsa",
 ]
 

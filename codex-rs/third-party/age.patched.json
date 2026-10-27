@@ -1,6 +1,6 @@
 {
   "files": {
-    "Cargo.toml": "8af77b3113b873f4077f83b18ac1c8766dc2c107d6154d28ac3f44e1c14b8c0b",
+    "Cargo.toml": "2e347f731b73aa8af791ed2b7634a143b953c2914d1cd5a68ab4908e85ee9993",
     "src/native/scrypt.rs": "32ce49fdf819310b49f764156a1d31a9276d9b01b47fb7238a9e06b8c26bbfba"
   },
   "extras": {
@@ -11,7 +11,7 @@
     "rustfmt.toml": "01a8047a54e3a011a08cd12f6fcec322116bccc70da45224bff2e3e9ec8f21cc"
   },
   "integration": {
-    "BUILD.bazel": "bbd9242b9ddeb01d73ae7f484d79bc8a93de46b647c2dc5e3e2093c945449094"
+    "BUILD.bazel": "67cc882711f0a35a4da7b458ac2c685a93aee7085dddf5dc110b6f74607801d6"
   },
-  "patch_sha256": "f42d6fe95a0e452e3a5706e87b98466ec821814095843fdaf9c23ceb03ee127a"
+  "patch_sha256": "f36a06a624002d65fe4e1c3f8ebadfe13f9a60394551ea23207b0e5a3bda483b"
 }

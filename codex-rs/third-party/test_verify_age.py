@@ -164,7 +164,39 @@ class AgeIntegrityTests(unittest.TestCase):
             actual = ast.literal_eval(
                 re.search(rf"{variable} = (\[[\s\S]*?\])", source)[1]
             )
-            self.assertEqual(set(actual), closure(required) | {"default"})
+            intended = required + (
+                ["cli-common"] if test_name == "test_vectors" else []
+            )
+            self.assertTrue(set(required) <= set(actual))
+            self.assertEqual(set(actual), closure(intended) | {"default"})
+            if test_name == "test_vectors":
+                # Cargo's required-features alone would select a ZERO-test binary.
+                # Bind the intended feature set to the real pinned test function gate.
+                vectors = (self.root / "age/tests/test_vectors.rs").read_text()
+                gated_tests = re.findall(
+                    r'#\[test\]\s*#\[cfg\(feature = "([^"]+)"\)\]\s*fn (\w+)', vectors
+                )
+                active = [name for feature, name in gated_tests if feature in actual]
+                self.assertIn("age_test_vectors", active)
+                self.assertGreater(len(active), 0)
+                module = (integrity.ROOT.parents[1] / "MODULE.bazel").read_text()
+                annotations = re.findall(r"crate\.annotation\(([\s\S]*?)\n\)", module)
+                annotation = next(
+                    block
+                    for block in annotations
+                    if 'crate = "age"' in block and '"age_ssh_test_crates"' in block
+                )
+                selected = ast.literal_eval(
+                    re.search(r"crate_features = (\[[\s\S]*?\])", annotation)[1]
+                )
+                self.assertEqual(set(selected), set(intended))
+                rules = re.findall(r"rust_(?:library|test)\(([\s\S]*?)\n\)", source)
+                for target in ("age-ssh-test-lib", "age-test-vectors-ssh-bin"):
+                    rule = next(
+                        block for block in rules if f'name = "{target}"' in block
+                    )
+                    self.assertIn("crate_features = _SSH_FEATURES", rule)
+                    self.assertIn("deps = ssh_deps(", rule)
         self.assertEqual(manifest["features"]["default"], [])
 
     def test_archive_traversal_is_rejected_before_extraction(self):

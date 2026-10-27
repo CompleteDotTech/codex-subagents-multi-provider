@@ -74,7 +74,10 @@ Verification reads the archive without extracting it or accessing the network.
 
 The explicit default unit-test library preserves upstream empty default features.
 Original integration requirements remain feature-qualified: `test_vectors`
-requires `ssh`; `testkit` requires `armor` and `async`. They read fixture paths
+requires `ssh` and `cli-common`: Cargo declares `ssh`, and the vector function
+itself is gated by `cfg(feature = "cli-common")`. Both are enabled only in the
+SSH test metadata/library/binary; zero registered vector tests is a failure.
+`testkit` requires `armor` and `async`. They read fixture paths
 relative to this crate root. Never enable all features on the production library
 to make integration tests compile, and never claim omitted or pending
 feature-qualified tests as passed. `Cargo.lock` in this standalone crate and
@@ -89,8 +92,8 @@ third-party crates and orphan source remain covered by the normal checks.
 
 The source, resolver metadata, build targets and actual compiler inputs must be
 validated together before delivery. Reverting this integration means restoring
-the former immutable `age` Git override, removing this exact workspace member
-and its scoped integration/policy additions, and regenerating reviewed lock
+the former immutable `age` Git override, removing the local path override,
+standalone exclusion and scoped integration/policy additions, and regenerating reviewed lock
 metadata. Do not remove `age-core`'s existing pin or unrelated vendor guards.
 
 Refs #65, #35, #18.
