@@ -353,3 +353,217 @@ fn run_diagnostic(grant: HostGrant) {
             "case={grant:?} stdout={stdout:?} stderr={stderr:?}\n{}", sandbox_log(codex_home.path()));
     });
 }
+
+// Paired discriminator: retain every old case above unchanged, including failures.
+#[derive(Clone, Copy, Debug)]
+enum ParentDeleteChildControl {
+    Restricted,
+    Unrestricted,
+}
+
+#[test]
+fn legacy_delete_diagnostic_owner_without_directory_delete_child() {
+    run_parent_delete_child_control(ParentDeleteChildControl::Restricted);
+}
+
+#[test]
+fn legacy_delete_diagnostic_unrestricted_owner_without_directory_delete_child() {
+    run_parent_delete_child_control(ParentDeleteChildControl::Unrestricted);
+}
+
+fn set_owner_without_directory_delete_child(root: &Path, path: &Path, owner: &str) {
+    assert_plain_owned(root, path);
+    assert!(
+        fs::symlink_metadata(path)
+            .expect("owned directory metadata")
+            .is_dir()
+    );
+    let protection =
+        if path.canonicalize().expect("owned path") == root.canonicalize().expect("owned root") {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
+    // CI governs effective directory rights. OI+IO supplies unchanged full file
+    // rights only to files; its full mask is never effective on a directory.
+    let sddl = crate::winutil::to_wide(format!(
+        "D:(A;CI;0x001f01bf;;;{owner})(A;OIIO;FA;;;{owner})"
+    ));
+    unsafe {
+        let mut descriptor = std::ptr::null_mut();
+        assert_ne!(
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                /*SecurityDescriptorSize*/ std::ptr::null_mut()
+            ),
+            0,
+            "private directory control descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        let result = SetFileSecurityW(
+            crate::winutil::to_wide(path).as_ptr(),
+            DACL_SECURITY_INFORMATION | protection,
+            descriptor,
+        );
+        let error = std::io::Error::last_os_error();
+        LocalFree(descriptor as HLOCAL);
+        assert_ne!(result, 0, "set private directory owner mask: {error}");
+    }
+}
+
+fn verify_owner_directory_mask(paths: &[&Path], owner: &[u8]) {
+    let owner_sid = owner.as_ptr().cast_mut().cast();
+    for path in paths {
+        assert!(
+            crate::acl::path_mask_allows(
+                path,
+                &[owner_sid],
+                windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS & !FILE_DELETE_CHILD,
+                /*require_all_bits*/ true
+            )
+            .expect("read owner directory grants"),
+            "owner recovery/directory rights changed beyond DELETE_CHILD"
+        );
+        assert!(
+            !crate::acl::path_mask_allows(
+                path,
+                &[owner_sid],
+                FILE_DELETE_CHILD,
+                /*require_all_bits*/ false
+            )
+            .expect("inspect effective parent delete-child grant"),
+            "owner DELETE_CHILD was reintroduced through inheritance"
+        );
+        eprintln!(
+            "LEGACY_DELETE_DIRECTORY_OWNER_MASK path={path:?} expected_effective=0x001f01bf delete_child=false {}",
+            acl_observation(path)
+        );
+    }
+}
+
+fn run_parent_delete_child_control(control: ParentDeleteChildControl) {
+    let grant = control;
+    let _guard = legacy_process_test_guard();
+    current_thread_runtime().block_on(async move {
+        let test_root = TempDir::new_in(sandbox_cwd()).expect("new private diagnostic root");
+        let root = test_root.path();
+        assert_plain_owned(root, root);
+        let codex_home = sandbox_home("legacy-delete-no-parent-child");
+        let workspace = root.join("workspace");
+        let temp_root = root.join("temp");
+        let tmp_root = root.join("tmp");
+        let outside_root = root.join("outside");
+        for path in [&workspace, &temp_root, &tmp_root, &outside_root] {
+            fs::create_dir(path).expect("new private fixture directory");
+        }
+        let git = workspace.join(".git");
+        fs::create_dir(&git).expect("new protected fixture directory");
+        let workspace_file = workspace.join("workspace-delete.txt");
+        let temp_file = temp_root.join("temp-delete.txt");
+        let tmp_file = tmp_root.join("tmp-delete.txt");
+        let outside_file = outside_root.join("outside-delete.txt");
+        for (path, contents) in [(&workspace_file, "workspace"), (&temp_file, "temp"), (&tmp_file, "tmp"), (&outside_file, "outside")] {
+            fs::write(path, contents).expect("seed new private fixture");
+        }
+        let script = workspace.join("delete-fixtures.cmd");
+        fs::write(&script, concat!(
+            "@echo off\r\n",
+            "del /f /q \"%WORKSPACE_DELETE%\"\r\necho WORKSPACE_STATUS=%errorlevel%\r\n",
+            "del /f /q \"%TEMP_DELETE%\"\r\necho TEMP_STATUS=%errorlevel%\r\n",
+            "del /f /q \"%TMP_DELETE%\"\r\necho TMP_STATUS=%errorlevel%\r\n",
+            "del /f /q \"%OUTSIDE_DELETE%\"\r\necho OUTSIDE_STATUS=%errorlevel%\r\n",
+            "rmdir \"%PROTECTED_GIT_DIR%\"\r\necho GIT_STATUS=%errorlevel%\r\n",
+            "exit /b 0\r\n",
+        )).expect("write owned diagnostic script");
+        let token = unsafe {
+            OwnedHandle::from_raw_handle(crate::token::get_current_token_for_restriction().expect("current token").cast())
+        };
+        let user = unsafe { crate::token::get_user_sid_bytes(token.as_raw_handle() as _).expect("current owner SID") };
+        let logon = unsafe { crate::token::get_logon_sid_bytes(token.as_raw_handle() as _).expect("actual logon SID") };
+        let owner = crate::winutil::string_from_sid_bytes(&user).expect("owner SID text");
+        eprintln!(
+            "LEGACY_DELETE_DIAGNOSTIC case={grant:?} base_owner={owner} base_logon={}",
+            crate::winutil::string_from_sid_bytes(&logon).expect("logon SID text")
+        );
+        let objects = [root, &workspace, &temp_root, &tmp_root, &outside_root, &git, &workspace_file, &temp_file, &tmp_file, &outside_file, &script];
+        for path in objects {
+            if fs::symlink_metadata(path).expect("new owned object metadata").is_dir() {
+                set_owner_without_directory_delete_child(root, path, &owner);
+            } else {
+                set_owner_only(root, path, &owner);
+            }
+        }
+        verify_owner_directory_mask(&[root, &workspace, &temp_root, &tmp_root, &outside_root, &git], &user);
+        for path in [&workspace_file, &temp_file, &tmp_file, &outside_file, &script] {
+            assert!(crate::acl::path_mask_allows(path, &[user.as_ptr().cast_mut().cast()], windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS, /*require_all_bits*/ true).expect("owner file rights"));
+        }
+        for path in objects {
+            eprintln!("LEGACY_DELETE_DIAGNOSTIC before case={grant:?} path={path:?} {} {}", object_observation(path), acl_observation(path));
+        }
+        let env_map = HashMap::from([
+            ("SystemRoot".to_string(), std::env::var("SystemRoot").expect("host SystemRoot")),
+            ("TEMP".to_string(), temp_root.to_string_lossy().into_owned()),
+            ("TMP".to_string(), tmp_root.to_string_lossy().into_owned()),
+            ("WORKSPACE_DELETE".to_string(), workspace_file.to_string_lossy().into_owned()),
+            ("TEMP_DELETE".to_string(), temp_file.to_string_lossy().into_owned()),
+            ("TMP_DELETE".to_string(), tmp_file.to_string_lossy().into_owned()),
+            ("OUTSIDE_DELETE".to_string(), outside_file.to_string_lossy().into_owned()),
+            ("PROTECTED_GIT_DIR".to_string(), git.to_string_lossy().into_owned()),
+        ]);
+        let spawned = match control {
+            ParentDeleteChildControl::Restricted => { spawn_windows_sandbox_session_legacy(
+            &PermissionProfile::workspace_write(),
+            &workspace_roots_for(&workspace),
+            codex_home.path(),
+            vec!["C:\\Windows\\System32\\cmd.exe".to_string(), "/d".to_string(), "/c".to_string(), script.display().to_string()],
+            &workspace,
+            env_map,
+            /*timeout_ms*/ Some(5_000),
+            /*additional_deny_write_paths*/ &[],
+            /*additional_deny_read_paths*/ &[],
+            /*tty*/ false,
+            /*stdin_open*/ false,
+        ).await.expect("actual legacy diagnostic session") },
+            ParentDeleteChildControl::Unrestricted => codex_utils_pty::spawn_pipe_process_no_stdin(
+                "C:\\Windows\\System32\\cmd.exe",
+                &["/d".to_string(), "/c".to_string(), script.display().to_string()],
+                &workspace,
+                &env_map,
+                /*arg0*/ &None,
+                /*inherited_fds*/ &[],
+            ).await.expect("ordinary host-token piped control"),
+        };
+        let (stdout, stderr, exit_code) = collect_diagnostic(spawned).await;
+        for path in objects {
+            eprintln!("LEGACY_DELETE_DIAGNOSTIC after case={grant:?} path={path:?} {} {}", object_observation(path), acl_observation(path));
+        }
+        // Read only: fail if owner directory DELETE_CHILD was reintroduced by inheritance.
+        verify_owner_directory_mask(&[root, &workspace, &temp_root, &tmp_root, &outside_root], &user);
+        if git.try_exists().expect("observe protected directory existence") {
+            verify_owner_directory_mask(&[&git], &user);
+        }
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        eprintln!("LEGACY_DELETE_DIAGNOSTIC case={grant:?} exit={exit_code} stdout={stdout:?} stderr={stderr:?}");
+        for marker in ["WORKSPACE_STATUS=", "TEMP_STATUS=", "TMP_STATUS=", "OUTSIDE_STATUS=", "GIT_STATUS="] {
+            assert!(stdout.contains(marker), "missing command observation {marker}");
+        }
+        match control {
+            ParentDeleteChildControl::Restricted => {
+                assert_eq!((exit_code, workspace_file.exists(), temp_file.exists(), tmp_file.exists(), fs::read_to_string(&outside_file).ok(), git.is_dir()),
+                    (0, false, false, false, Some("outside".to_string()), true),
+                    "case={grant:?} stdout={stdout:?} stderr={stderr:?}\n{}", sandbox_log(codex_home.path()));
+            },
+            ParentDeleteChildControl::Unrestricted => {
+                assert_eq!((exit_code, workspace_file.exists(), temp_file.exists(), tmp_file.exists(), fs::read_to_string(&outside_file).ok(), git.is_dir()),
+                    (0, false, false, false, None, false),
+                    "ordinary host-token control could not perform the same five owned operations: stdout={stdout:?} stderr={stderr:?}");
+                for path in [&workspace_file, &temp_file, &tmp_file, &outside_file, &git] {
+                    assert_eq!(fs::symlink_metadata(path).expect_err("host control deletes owned target").raw_os_error(), Some(2));
+                }
+            },
+        }
+    });
+}
