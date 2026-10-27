@@ -15,6 +15,7 @@ use codex_config::child_provider::VerifiedChildProviderOrigin;
 use codex_history::InitialHistory;
 use codex_history::RolloutItem;
 use codex_protocol::ThreadId;
+use codex_protocol::error::AgentErrorContext;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::models::PermissionProfile;
@@ -354,9 +355,14 @@ impl FreshChildCaller {
             .lock()
             .map_err(|_| invalid("fresh child caller admission state is unavailable"))?;
         let runtime = &caller.session.services.local_agent_runtime;
+        if runtime.shutdown.is_cancelled() {
+            return Err(
+                CodexErr::InvalidRequest("agent runtime is shutting down".to_owned())
+                    .with_agent_context(AgentErrorContext::RuntimeShutdown),
+            );
+        }
         if !*live
             || !caller.is_running()
-            || runtime.shutdown.is_cancelled()
             || !Arc::ptr_eq(&self.live, &caller.session.fresh_child_admission_live)
             || !runtime
                 .retained_authority(caller.session.thread_id)
