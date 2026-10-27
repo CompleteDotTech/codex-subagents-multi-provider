@@ -119,8 +119,7 @@ def verify(root: Path = ROOT, archive: Path | None = None) -> None:
     )
     require(set(patched["style"]) == {"rustfmt.toml"}, "unexpected vendor style scope")
     require(
-        "BUILD.bazel" in patched["integration"]
-        and set(patched["integration"]) <= {"BUILD.bazel", "Cargo.lock"},
+        set(patched["integration"]) == {"BUILD.bazel", "Cargo.lock"},
         "unexpected integration scope",
     )
     expected = (

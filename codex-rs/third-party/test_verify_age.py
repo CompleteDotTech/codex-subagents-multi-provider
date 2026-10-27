@@ -44,6 +44,7 @@ class AgeIntegrityTests(unittest.TestCase):
             "tests/testdata/testkit/scrypt",
             "rustfmt.toml",
             "BUILD.bazel",
+            "Cargo.lock",
         ):
             with self.subTest(name=name):
                 path = self.root / "age" / name
@@ -198,6 +199,49 @@ class AgeIntegrityTests(unittest.TestCase):
                     self.assertIn("crate_features = _SSH_FEATURES", rule)
                     self.assertIn("deps = ssh_deps(", rule)
         self.assertEqual(manifest["features"]["default"], [])
+
+    def test_exact_test_dependency_closures_exclude_benchmark_only_deps(self):
+        import re
+
+        source = (self.root / "age/BUILD.bazel").read_text()
+        expected = {
+            "age-unit-tests-bin": ("unit", ["proptest-1.11.0", "i18n-embed-0.16.0"]),
+            "age-test-vectors-ssh-bin": ("ssh", ["i18n-embed-0.16.0"]),
+            "age-testkit-armor-async-bin": (
+                "async",
+                [
+                    "flate2-1.1.9",
+                    "hex-0.4.3",
+                    "test-case-3.3.1",
+                    "tokio-1.52.3",
+                    "i18n-embed-0.16.0",
+                ],
+            ),
+        }
+        locked = tomllib.loads((self.root / "age/Cargo.lock").read_text())["package"]
+        identities = {f"{row['name']}-{row['version']}" for row in locked}
+        rules = re.findall(r"rust_test\(([\s\S]*?)\n\)", source)
+        for target, (hub, labels) in expected.items():
+            rule = next(block for block in rules if f'name = "{target}"' in block)
+            self.assertIn(f"{hub}_deps(normal = True)", rule)
+            actual = re.findall(r'"@([^"]+)//:([^"]+)"', rule)
+            self.assertEqual(
+                set(actual), {(f"age_{hub}_test_crates", label) for label in labels}
+            )
+            self.assertTrue(set(labels) <= identities)
+            self.assertNotIn("normal_dev", rule)
+            for name in ("criterion", "pprof", "inferno", "futures-test"):
+                self.assertNotIn(f"//:{name}-", rule)
+        manifest = tomllib.loads((self.root / "age/Cargo.toml").read_text())
+        self.assertIn("criterion", manifest["dev-dependencies"])
+        self.assertTrue((self.root / "age/benches").is_dir())
+
+    def test_standalone_lock_cannot_be_dropped_from_integrity_scope(self):
+        self.update_metadata(
+            "age.patched.json", lambda data: data["integration"].pop("Cargo.lock")
+        )
+        with self.assertRaisesRegex(ValueError, "integration scope"):
+            self.verify()
 
     def test_archive_traversal_is_rejected_before_extraction(self):
         import tarfile

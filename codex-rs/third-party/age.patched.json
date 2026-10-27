@@ -11,7 +11,8 @@
     "rustfmt.toml": "01a8047a54e3a011a08cd12f6fcec322116bccc70da45224bff2e3e9ec8f21cc"
   },
   "integration": {
-    "BUILD.bazel": "67cc882711f0a35a4da7b458ac2c685a93aee7085dddf5dc110b6f74607801d6"
+    "BUILD.bazel": "cf761ab26604f208205cf1b05a155afca9bdd970dce75c174fd5164c7f0787fb",
+    "Cargo.lock": "6e04d9b80727ef6385789ed8e4bbc799dc0a3cf65665f09117a4da67c10f8c7f"
   },
   "patch_sha256": "f36a06a624002d65fe4e1c3f8ebadfe13f9a60394551ea23207b0e5a3bda483b"
 }

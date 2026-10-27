@@ -8,7 +8,8 @@ the unchanged Git dependency at the same immutable upstream revision.
 
 `age.upstream.json` records the 174 original source/license file hashes.
 `age.patched.json` allows exactly two modified upstream files, two provenance
-copies, one style file and one Bazel integration file. `age.patch` reconstructs
+copies, one style file and two integration files (Bazel rules and standalone
+lock). `age.patch` reconstructs
 the manifest normalization and the native calibration change against the pinned
 original bytes. The offline verifier checks the exact file set, aliases, hashes,
 normalization and reverse patch before a style or manifest exception applies.
@@ -80,10 +81,36 @@ SSH test metadata/library/binary; zero registered vector tests is a failure.
 `testkit` requires `armor` and `async`. They read fixture paths
 relative to this crate root. Never enable all features on the production library
 to make integration tests compile, and never claim omitted or pending
-feature-qualified tests as passed. `Cargo.lock` in this standalone crate and
-generated application/Bazel metadata must be resolved and audited separately
-before build execution; a code-only checkpoint with pending locks is not a
-passing or publishable build candidate.
+feature-qualified tests as passed. Only default unit tests, SSH vectors and
+armor/async testkit are mapped here. Async unit tests, SSH unit tests and
+benchmarks remain unqualified; this does not claim all upstream features.
+The three test binaries request normal dependencies plus explicit same-hub,
+source-required dev dependencies. Benchmark-only criterion, pprof and inferno
+must be absent from their actual configured/action closures before qualification.
+All upstream benchmark files and original dev dependency requirements remain.
+
+The standalone test lock starts from upstream Git commit
+`b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f` Cargo.lock blob
+`a0ec1011123ada718ca3edfba4292b8e9a82f9fd`, SHA256
+`b0a8b4ae058e50916e3361dc6cd03096b85e2d674bfa4c38605ff9cf4fa8b2b4`.
+It is minimally pruned/remapped for this standalone crate and the existing
+age-core Git pin. Four explicit existing-application-version test-only
+exceptions replace yanked versions and a required companion: chacha20 0.10.2, crypto-bigint
+0.7.10, its required ctutils 0.4.6 companion, and wnaf 0.14.1 (whose added
+primefield edge uses the existing application version/source/checksum).
+The same-version tempfile 3.27.0 edge selects already-present getrandom 0.3.4,
+compatible with its original >=0.3,<0.5 requirement. Other original upstream
+package identities are preserved; this lock is not byte-identical to upstream.
+These test-lock exceptions require Rust 1.87; retained upstream metadata 1.85
+has not been validated. Offline metadata used pinned toolchain 1.99.1.
+
+Full standalone metadata includes benchmark-only inferno under CDDL-1.0.
+It is a preserved reference dependency, not a standalone license-gate pass.
+The existing application cargo-deny scope and license policy are unchanged.
+Accepted application metadata parity excludes the standalone dev graph.
+Generated Bazel metadata, configured closures and actual compiler inputs still
+require separate resolution/audit/build gates; metadata and code checks alone
+are not a passing or publishable build candidate.
 
 Rust formatting preserves upstream import style and checks vendor bytes without
 writing them. First-party source remains subject to strict formatting. Only
