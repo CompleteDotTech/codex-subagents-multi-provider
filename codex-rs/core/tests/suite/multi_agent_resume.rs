@@ -7,7 +7,6 @@ use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_login::CodexAuth;
-use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -70,8 +69,7 @@ const INTERRUPT_PROMPT: &str = "release the interrupted worker";
 const SIBLING_NAME: &str = "survivor";
 const ROLE_NAME: &str = "durable_worker";
 const ROLE_MODEL: &str = "gpt-5.6-sol";
-// A named synthetic provider keeps the public builtin reserved and the mock SSE-only.
-const ROLE_MODEL_PROVIDER_ID: &str = "cold-fixture-openai";
+const ROLE_MODEL_PROVIDER_ID: &str = "openai";
 const ROLE_DEVELOPER_INSTRUCTIONS: &str = "Keep the durable worker role configuration.";
 const SUBAGENT_DEVELOPER_INSTRUCTIONS: &str = "Use the default durable worker instructions.";
 
@@ -153,16 +151,31 @@ async fn mount_root_collaboration_call(
 }
 
 fn managed_cold_provider_loader(server: &wiremock::MockServer) -> Result<CloudConfigBundleLoader> {
-    // Match the test harness's actual provider without importing any credentials.
-    let mut provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
-    provider.base_url = Some(format!("{}/v1", server.uri()));
-    provider.supports_websockets = false;
-    Ok(CloudConfigBundleFixture::loader_with_enterprise_config(
-        format!(
-            "model_provider='{ROLE_MODEL_PROVIDER_ID}'\n[agents]\nallowed_model_providers=['{ROLE_MODEL_PROVIDER_ID}']\n[model_providers.{ROLE_MODEL_PROVIDER_ID}]\n{}",
-            toml::to_string(&provider)?
+    let configuration = toml::Table::from_iter([
+        (
+            "openai_base_url".into(),
+            toml::Value::String(format!("{}/v1", server.uri())),
         ),
+        (
+            "agents".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "allowed_model_providers".into(),
+                toml::Value::Array(vec![toml::Value::String(ROLE_MODEL_PROVIDER_ID.into())]),
+            )])),
+        ),
+    ]);
+    Ok(CloudConfigBundleFixture::loader_with_enterprise_config(
+        toml::to_string(&configuration)?,
     ))
+}
+
+async fn mount_standard_http_fallback(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(wiremock::matchers::header("upgrade", "websocket"))
+        .respond_with(wiremock::ResponseTemplate::new(426))
+        .mount(server)
+        .await;
 }
 
 async fn local_scope_descriptor(thread: &codex_core::CodexThread) -> Result<Value> {
@@ -201,6 +214,12 @@ fn configure_multi_agent_v2_with_role(
     config: &mut codex_core::config::Config,
     _model_provider_base_url: &str,
 ) {
+    // Restore the actual configured builtin after the generic harness's SSE override.
+    config.model_provider = config
+        .model_providers
+        .get(ROLE_MODEL_PROVIDER_ID)
+        .expect("actual managed builtin fixture provider")
+        .clone();
     config
         .features
         .enable(Feature::Collab)
@@ -239,6 +258,7 @@ sandbox_mode = "read-only"
 // The protected memory owner survives a NEW runtime; this is not disk/process durability.
 async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Result<()> {
     let server = start_mock_server().await;
+    mount_standard_http_fallback(&server).await;
     let spawn_args = serde_json::to_string(&json!({
         "message": INITIAL_TASK,
         "task_name": "worker",
@@ -350,6 +370,10 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     assert_eq!(
         initial.codex.config_snapshot().await.model_provider_id,
         ROLE_MODEL_PROVIDER_ID
+    );
+    assert_eq!(
+        initial.codex.config().await.model_provider,
+        initial.config.model_providers[ROLE_MODEL_PROVIDER_ID]
     );
     let root_session_id = initial.session_configured.session_id;
     initial
@@ -978,6 +1002,7 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
     const PROMPT: &str = "create the writable-store child";
     const TASK: &str = "initial writable-store task";
     let server = start_mock_server().await;
+    mount_standard_http_fallback(&server).await;
     mount_root_collaboration_call(
         &server,
         PROMPT,

@@ -7,6 +7,7 @@ use super::configure_multi_agent_v2_with_role;
 use super::local_scope_descriptor;
 use super::managed_cold_provider_loader;
 use super::mount_root_collaboration_call;
+use super::mount_standard_http_fallback;
 use super::request_has_input_type;
 use super::request_has_model;
 use anyhow::Context;
@@ -197,6 +198,7 @@ impl ThreadStore for GatedChildMetadataStore {
 async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_order() -> Result<()>
 {
     let server = start_mock_server().await;
+    mount_standard_http_fallback(&server).await;
     let initial_url = format!("{}/v1", server.uri());
     let initial = test_codex()
         .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
