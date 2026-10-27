@@ -323,6 +323,29 @@ pub(crate) fn model_fingerprint(config: &Config, model: &ModelInfo) -> Option<St
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
+// Project only typed executable grants. Command rules and MCP matchers can
+// contain credentials, so even an explicitly empty opaque policy has no proof.
+fn attachment_grants(ready: &EnvironmentConfig) -> Option<serde_json::Value> {
+    if ready.exec_policy.is_some() || ready.mcp_policy.is_some() {
+        return None;
+    }
+    let network = ready.network_policy.as_ref().map(|policy| {
+        json!({
+            "requires_proxy":policy.requires_proxy,"domains":policy.domains,
+            "unix_sockets":policy.unix_sockets,"allow_upstream_proxy":policy.allow_upstream_proxy,
+            "dangerously_allow_all_unix_sockets":policy.dangerously_allow_all_unix_sockets,
+            "allow_local_binding":policy.allow_local_binding,
+            "managed_allowed_domains_only":policy.managed_allowed_domains_only,
+        })
+    });
+    Some(json!({
+        "network":network,"capability_roots":ready.selected_capability_roots,
+        "windows_sandbox_level":ready.windows_sandbox_level,
+        "windows_sandbox_type":ready.windows_sandbox_type,
+        "use_legacy_landlock":ready.use_legacy_landlock,
+    }))
+}
+
 /// Grant-only projection. No provider/auth definition, transport, environment
 /// value, prompt text or credential-derived hash enters this value.
 pub(crate) fn fingerprint(
@@ -380,9 +403,27 @@ pub(crate) fn fingerprint(
             scope.cwd.as_path(),
         )
         .ok()?;
+        // An omitted attachment uses the local Config-inferred defaults, just
+        // as candidate_scope and SessionConfiguration do at startup. Include
+        // backend grants here as well as on explicit Ready attachments.
+        let ready = EnvironmentConfig {
+            allow_login_shell: config.permissions.allow_login_shell,
+            workspace_roots: Vec::new(),
+            permission_profile: config.permissions.permission_profile_state().snapshot(),
+            shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::from_config(
+                config,
+            ),
+            windows_sandbox_type: config.effective_local_windows_sandbox_type(),
+            use_legacy_landlock: config.features.use_legacy_landlock(),
+            exec_policy: None,
+            mcp_policy: None,
+            network_policy: None,
+            selected_capability_roots: Vec::new(),
+        };
         grants.push(
             json!({"cwd":scope.cwd,"roots":scope.roots,"profile":profile,
-            "login_shell":config.permissions.allow_login_shell}),
+            "login_shell":config.permissions.allow_login_shell,"attachment":attachment_grants(&ready)?}),
         );
     } else {
         for (selection, ready) in &scope.environments {
@@ -405,7 +446,7 @@ pub(crate) fn fingerprint(
                 cwd.as_path(),
             )
             .ok()?;
-            grants.push(json!({"cwd":cwd,"roots":paths,"profile":profile,"login_shell":ready.allow_login_shell}));
+            grants.push(json!({"cwd":cwd,"roots":paths,"profile":profile,"login_shell":ready.allow_login_shell,"attachment":attachment_grants(ready)?}));
         }
     }
     let mut grants = grants
