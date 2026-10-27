@@ -42,7 +42,10 @@ fn compatible(name: &'static str, base_url: String, retries: u64) -> TestCodexBu
                 Feature::ToolSearch,
                 Feature::CodeModeToolSearch,
             ] {
-                config.features.disable(feature).unwrap();
+                config
+                    .features
+                    .disable(feature)
+                    .expect("stateless fixture feature must be configurable");
             }
             config.model_provider_id = name.into();
             config.model_provider = ModelProviderInfo {
