@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -533,6 +534,122 @@ KNOWN_EXCEPTION_CLASSES = (
 KNOWN_OS_EXCEPTION_CODES = (0xC0000005, 0xC0000017, 0xC00000FD, 0xC0000409)
 
 
+# Pinned Bazel 9.2.0 blaze.cc, blaze_util_windows.cc, native/windows/file.cc
+# and util.cc literals. OS phrases are English FormatMessage observations only;
+# absence may reflect localization. These never identify a cause or prove a site.
+LINE_LITERALS = {
+    "installation_symlink": b"failed to create installation symlink '",
+    "symlink_directories": b"symlinkdirectories(",
+    "junction_call": b"): createjunction: ",
+    "createfilew": b"): createfilew(",
+    "getfileinformationbyhandle": b"): getfileinformationbyhandle(",
+    "deviceiocontrol": b"): deviceiocontrol(",
+    "createjunction": b"): createjunction(",
+    "junction_name_validation": b"expected an absolute windows path for junction_name",
+    "junction_target_validation": b"expected an absolute windows path for junction_target",
+    "junction_target_too_long": b"target path is too long",
+    "os_memory_resources": b"not enough memory resources are available to process this command",
+    "os_storage_operation": b"not enough storage is available to complete this operation",
+    "out_of_memory": b"out of memory",
+    "native_memory_allocation": b"native memory allocation",
+    "failed": b"failed",
+}
+
+
+def classify_lines(lowered):
+    """One bounded line pass, fixed searches per nonempty line, fixed output.
+
+    Keep whole-buffer observations distinct from same-line co-occurrence.
+    Even exact literals can occur in help text or an arbitrary path/message.
+    Only booleans escape; line contents and line numbers are never retained.
+    """
+    result = {
+        "any_line_installation_symlink_literal": False,
+        "fatal_installation_symlink_line": False,
+        "junction_api_line": False,
+        **{
+            f"junction_{name}_line": False
+            for name in (
+                "createfilew",
+                "getfileinformationbyhandle",
+                "deviceiocontrol",
+                "name_validation",
+                "target_validation",
+                "target_too_long",
+            )
+        },
+        **{
+            f"{relation}{name}_line": False
+            for name in (
+                "os_memory_resources",
+                "os_storage_operation",
+                "out_of_memory",
+                "native_memory_allocation_failed",
+            )
+            for relation in ("", "fatal_", "junction_", "api_")
+        },
+    }
+    # BytesIO iteration visits each LF-delimited line once, including a final
+    # unterminated line. Empty-line floods do no literal searches. CR is not a
+    # cross-line gap: split CR-only input too, without building a list of lines.
+    for lf_line in io.BytesIO(lowered):
+        if lf_line in (b"\n", b"\r\n"):
+            continue
+        for match in re.finditer(rb"[^\r\n]+", lf_line):
+            line = match[0]
+            present = {name: needle in line for name, needle in LINE_LITERALS.items()}
+            fatal = line.startswith(b"fatal:")
+            junction = present["symlink_directories"] and present["junction_call"]
+            api = b"error: " in line and any(
+                present[name]
+                for name in (
+                    "createfilew",
+                    "getfileinformationbyhandle",
+                    "deviceiocontrol",
+                    "createjunction",
+                )
+            )
+            result["any_line_installation_symlink_literal"] |= present[
+                "installation_symlink"
+            ]
+            result["fatal_installation_symlink_line"] |= (
+                fatal and present["installation_symlink"]
+            )
+            result["junction_api_line"] |= junction
+            for name in (
+                "createfilew",
+                "getfileinformationbyhandle",
+                "deviceiocontrol",
+            ):
+                result[f"junction_{name}_line"] |= junction and present[name]
+            for name in ("name_validation", "target_validation", "target_too_long"):
+                result[f"junction_{name}_line"] |= (
+                    junction
+                    and present["createjunction"]
+                    and present[f"junction_{name}"]
+                )
+            phrases = {
+                name: present[name]
+                for name in (
+                    "os_memory_resources",
+                    "os_storage_operation",
+                    "out_of_memory",
+                )
+            }
+            phrases["native_memory_allocation_failed"] = (
+                present["native_memory_allocation"] and present["failed"]
+            )
+            for name, found in phrases.items():
+                for relation, associated in (
+                    ("", True),
+                    ("fatal_", fatal),
+                    ("junction_", junction),
+                    ("api_", api),
+                ):
+                    result[f"{relation}{name}_line"] |= found and associated
+    return result
+
+
 def classify_failure(raw):
     """Observe at most LIMIT private bytes; emit only selected constants.
 
@@ -591,6 +708,7 @@ def classify_failure(raw):
         if any((signatures, exceptions, win32_codes, os_codes, error, fatal))
         else "unknown",
         "cause": "unknown",
+        "line_evidence": classify_lines(lowered),
         "error_prefix": error,
         "fatal_prefix": fatal,
         "jvm_fatal_signature": "java_fatal_signature" in signatures,

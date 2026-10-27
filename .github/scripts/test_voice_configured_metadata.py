@@ -365,6 +365,118 @@ class FailureClassificationTests(unittest.TestCase):
         raw = b"Win32 error:" + b" " * (m.LIMIT - len(b"Win32 error:"))
         self.assertEqual(m.classify_failure(raw), m.classify_failure(b""))
 
+    def test_line_sites_phrases_and_private_material(self):
+        private = b"https://private.invalid/PRIVATE_TOKEN C:/private/PASSWORD"
+        prefix = (
+            b"ERROR: SymlinkDirectories("
+            + private
+            + b"): CreateJunction: ERROR: file.cc(123): "
+        )
+        for api in (b"CreateFileW", b"GetFileInformationByHandle", b"DeviceIoControl"):
+            raw = (
+                prefix
+                + api
+                + b"("
+                + private
+                + b"): Not enough memory resources are available to process this command"
+            )
+            result = m.classify_failure(raw)
+            evidence = result["line_evidence"]
+            self.assertTrue(evidence["junction_api_line"])
+            self.assertTrue(evidence["junction_" + api.decode().lower() + "_line"])
+            self.assertTrue(evidence["junction_os_memory_resources_line"])
+            self.assertTrue(evidence["api_os_memory_resources_line"])
+            self.assertFalse(evidence["fatal_os_memory_resources_line"])
+            self.assertEqual(result["cause"], "unknown")
+            self.assertNotIn("PRIVATE_TOKEN", json.dumps(result))
+            self.assertNotIn("https://", json.dumps(result))
+        for name, phrase in (
+            ("name_validation", b"expected an absolute Windows path for junction_name"),
+            (
+                "target_validation",
+                b"expected an absolute Windows path for junction_target",
+            ),
+            ("target_too_long", b"target path is too long"),
+        ):
+            evidence = m.classify_failure(
+                prefix + b"CreateJunction(" + private + b"): " + phrase
+            )["line_evidence"]
+            self.assertTrue(evidence["junction_" + name + "_line"])
+        fatal = (
+            b"FATAL: failed to create installation symlink '"
+            + private
+            + b"': Not enough storage is available to complete this operation"
+        )
+        evidence = m.classify_failure(fatal)["line_evidence"]
+        self.assertTrue(evidence["fatal_installation_symlink_line"])
+        self.assertTrue(evidence["fatal_os_storage_operation_line"])
+        self.assertFalse(evidence["junction_os_storage_operation_line"])
+
+    def test_each_memory_phrase_has_independent_same_line_relations(self):
+        prefix = b"FATAL: SymlinkDirectories(private): CreateJunction: ERROR: file.cc(1): CreateFileW(private): "
+        for name, phrase in (
+            (
+                "os_memory_resources",
+                b"not enough memory resources are available to process this command",
+            ),
+            (
+                "os_storage_operation",
+                b"not enough storage is available to complete this operation",
+            ),
+            ("out_of_memory", b"out of memory"),
+            (
+                "native_memory_allocation_failed",
+                b"native memory allocation private failed",
+            ),
+        ):
+            evidence = m.classify_failure(prefix + phrase)["line_evidence"]
+            for relation in ("", "fatal_", "junction_", "api_"):
+                self.assertTrue(evidence[relation + name + "_line"])
+            self.assertFalse(evidence["fatal_installation_symlink_line"])
+
+    def test_line_relations_do_not_cross_line_boundaries(self):
+        for separator in (b"\n", b"\r\n", b"\r"):
+            raw = separator.join(
+                (
+                    b"FATAL: unrelated",
+                    b"failed to create installation symlink 'private'",
+                    b"SymlinkDirectories(private",
+                    b"): CreateJunction: ERROR: file.cc(1): CreateFileW(private): unrelated",
+                    b"not enough memory resources are available to process this command",
+                    b"not enough storage is available to complete this operation",
+                    b"native memory allocation",
+                    b"failed",
+                )
+            )
+            evidence = m.classify_failure(raw)["line_evidence"]
+            self.assertTrue(evidence["any_line_installation_symlink_literal"])
+            self.assertTrue(evidence["os_memory_resources_line"])
+            self.assertFalse(evidence["fatal_installation_symlink_line"])
+            self.assertFalse(evidence["junction_api_line"])
+            self.assertFalse(evidence["native_memory_allocation_failed_line"])
+            for relation in ("fatal_", "junction_", "api_"):
+                self.assertFalse(evidence[relation + "os_memory_resources_line"])
+        # Arbitrary help text can reproduce the exact constants. Record only
+        # literal observations; never claim that it identifies an actual site.
+        result = m.classify_failure(
+            b"help: SymlinkDirectories(x): CreateJunction: documentation"
+        )
+        self.assertTrue(result["line_evidence"]["junction_api_line"])
+        self.assertEqual(result["cause"], "unknown")
+        evidence = m.classify_failure(
+            b"FATAL: memoire insuffisante CreateFileW(private)"
+        )["line_evidence"]
+        self.assertFalse(evidence["os_memory_resources_line"])
+        self.assertFalse(evidence["api_os_memory_resources_line"])
+
+    def test_line_classifier_large_linecount_and_unterminated_prefixes(self):
+        unknown = m.classify_lines(b"")
+        self.assertEqual(m.classify_lines(b"\n" * m.LIMIT), unknown)
+        prefix = b"SymlinkDirectories( CreateFileW( native memory allocation "
+        raw = (prefix * (m.LIMIT // len(prefix) + 1))[: m.LIMIT]
+        self.assertEqual(len(raw), 32 * 1024 * 1024)
+        self.assertEqual(m.classify_lines(raw.lower()), unknown)
+
     def test_arbitrary_bytes_and_secret_text_cannot_escape(self):
         import random
 
