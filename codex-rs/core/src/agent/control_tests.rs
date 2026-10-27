@@ -6907,8 +6907,25 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
     persist_thread_for_tree_resume(&root.thread, "root attachment receipt fixture").await;
     persist_thread_for_tree_resume(&target_thread, "target attachment restriction fixture").await;
     wait_for_live_thread_spawn_children(&control, root.thread_id, &[target]).await;
-    let stored_target = target_thread.read_thread(true, true).await.unwrap();
-    assert!(!stored_target.history.unwrap().items.is_empty());
+    let target_rollout = target_thread
+        .rollout_path()
+        .expect("persisted target rollout");
+    let (target_items, recorded_target, parse_errors) =
+        codex_rollout::RolloutRecorder::load_rollout_items(&target_rollout)
+            .await
+            .expect("read actual flushed target rollout");
+    assert_eq!(recorded_target, Some(target));
+    assert_eq!(parse_errors, 0);
+    assert!(
+        history_contains_text(
+            target_items.iter().filter_map(|item| match item {
+                RolloutItem::ResponseItem(envelope) => Some(&envelope.item),
+                _ => None,
+            }),
+            "target attachment restriction fixture"
+        ),
+        "actual target fixture message must be durable before sealing"
+    );
     let stored_root = root.thread.read_thread(true, true).await.unwrap();
     let initial = InitialHistory::Resumed(ResumedHistory {
         history_revision: None,
