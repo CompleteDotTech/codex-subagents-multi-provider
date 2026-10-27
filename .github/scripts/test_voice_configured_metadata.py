@@ -14,6 +14,25 @@ import voice_configured_metadata as m
 import voice_metadata_owned_job as owned
 
 
+def diagnostic_parent(directory):
+    env = {name: "fixture-" + name for name in m.REQUIRED_CHILD_ENV}
+    env.update(
+        {
+            "RUNNER_TEMP": directory,
+            "RUNNER_OS": "Windows",
+            "GITHUB_ACTIONS": "true",
+            "PROCESSOR_ARCHITECTURE": "AMD64",
+            "VOICE_WINDOWS_HOST_ARCH": "AMD64",
+            "SYSTEMROOT": "C:/Windows",
+            "VOICE_WINDOWS_SYSTEM_ROOT": "C:/Windows",
+            "VOICE_DIAGNOSTIC_HEAD": "head",
+            "VOICE_DIAGNOSTIC_TREE": "tree",
+            "GITHUB_SHA": "head",
+        }
+    )
+    return env
+
+
 def graph():
     return {
         "pathFragments": [
@@ -280,6 +299,13 @@ class FakeAPI:
             if name == "InitializeProcThreadAttributeList":
                 c.cast(args[3], c.POINTER(c.c_size_t))[0] = 64
             if name == "CreateProcessW":
+                self.creation_flags = args[5]
+                self.creation_cwd = args[7]
+                self.child_environment_block = (
+                    None
+                    if args[6] is None
+                    else c.string_at(args[6], self.environment_size)
+                )
                 pi = c.cast(args[-1], c.POINTER(owned.PI)).contents
                 pi.process, pi.thread, pi.pid = 1002, 1003, 1004
                 si = c.cast(args[-2], c.POINTER(owned.SIEX)).contents
@@ -589,6 +615,163 @@ class FailureClassificationTests(unittest.TestCase):
         )
 
 
+class EnvironmentTests(unittest.TestCase):
+    def test_encoding_sorting_astral_values_and_empty_block(self):
+        env = {"z": "last", "ProgramFiles(x86)": "C:/tools", "A": "astral-\U0001f642"}
+        expected = "A=astral-\U0001f642\0ProgramFiles(x86)=C:/tools\0z=last\0\0".encode(
+            "utf-16-le"
+        )
+        self.assertEqual(owned.environment_block(env), expected)
+        self.assertEqual(owned.environment_block({}), b"\0\0\0\0")
+        self.assertEqual(env["A"], "astral-\U0001f642")
+
+    def test_invalid_environment_fails_before_owned_resource_creation(self):
+        for env in (
+            {"bad=key": "PRIVATE"},
+            {"Path": "a", "PATH": "b"},
+            {"A": "PRIVATE\0value"},
+            {"A": "\ud800"},
+            {"\u00e9": "PRIVATE"},
+            {"A": 3},
+            {3: "PRIVATE"},
+        ):
+            api = FakeAPI()
+            with (
+                self.subTest(env=repr(env)),
+                self.assertRaisesRegex(
+                    ValueError, "^Invalid explicit child environment$"
+                ),
+            ):
+                owned.capture_owned(
+                    ["qualified.exe"], Path("unused"), 1, 1, api=api, env=env
+                )
+            self.assertEqual(api.events, [])
+
+    def test_required_preservation_policy_secrets_identity_and_accounting(self):
+        parent = diagnostic_parent("C:/temp")
+        parent.update(
+            {
+                "https_proxy": "https://PRIVATE-proxy",
+                "SSL_CERT_FILE": "C:/PRIVATE-cert",
+                "ProgramFiles(x86)": "C:/PRIVATE-tools",
+                "PYTHONPATH": "C:/\U0001f642",
+                "UNRELATED_SECRET": "PRIVATE-irrelevant",
+                "BUILDBUDDY_API_KEY": "PRIVATE-key",
+                "CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR": "PRIVATE-log",
+                "BAZEL_OUTPUT_USER_ROOT": "ordinary-root",
+            }
+        )
+        original = parent.copy()
+        child, metrics = m.diagnostic_environment(
+            parent, Path("unique-root"), "head", "tree"
+        )
+        self.assertEqual(parent, original)
+        for name, value in parent.items():
+            if name.upper() in m.REQUIRED_CHILD_ENV | m.OPTIONAL_CHILD_ENV:
+                self.assertEqual(
+                    child[m.CHILD_ENV_SPELLINGS.get(name.upper(), name)].encode(
+                        "utf-16-le"
+                    ),
+                    value.encode("utf-16-le"),
+                )
+        self.assertEqual(child["BAZEL_OUTPUT_USER_ROOT"], "unique-root")
+        for name in (
+            "UNRELATED_SECRET",
+            "BUILDBUDDY_API_KEY",
+            "CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR",
+        ):
+            self.assertNotIn(name, child)
+        self.assertEqual(metrics["child"]["entry_count"], len(child))
+        self.assertEqual(
+            metrics["child"]["block_utf16_units"],
+            len(owned.environment_block(child)) // 2,
+        )
+        self.assertEqual(
+            metrics["child_block_utf16_units"], metrics["child"]["block_utf16_units"]
+        )
+        self.assertEqual(
+            metrics["child"]["unescaped_client_env_utf16_units"],
+            sum(
+                len(("--client_env=" + k + "=" + v + " ").encode("utf-16-le")) // 2
+                for k, v in child.items()
+            ),
+        )
+        self.assertNotIn("PRIVATE", json.dumps(metrics))
+        self.assertNotIn("https://", json.dumps(metrics))
+        # A large configured PATH is preserved. Projection is not a final Bazel
+        # argv budget gate; rc/JVM and Git Bash transformations remain unknown.
+        parent["PATH"] = "p" * 40000
+        child, metrics = m.diagnostic_environment(parent, Path("root"), "head", "tree")
+        self.assertEqual(child["PATH"], parent["PATH"])
+        self.assertGreater(metrics["child"]["unescaped_client_env_utf16_units"], 32768)
+        self.assertEqual(
+            metrics["client_env_accounting"],
+            "unescaped-projection-not-final-command-length",
+        )
+
+    def test_windows_normalized_names_keep_bash_sdk_and_proxy_consumers(self):
+        parent = diagnostic_parent("temp")
+        parent["HTTPS_PROXY"] = "PRIVATE-proxy"
+        child, metrics = m.diagnostic_environment(parent, Path("root"), "head", "tree")
+        for spelling in m.SDK_ENV_NAMES:
+            self.assertEqual(child[spelling], parent[spelling.upper()])
+        self.assertEqual(child["https_proxy"], parent["HTTPS_PROXY"])
+        self.assertNotIn("HTTPS_PROXY", child)
+        self.assertTrue(metrics["included_values_unchanged"])
+
+    def test_every_required_input_missing_and_identity_mismatch_fail_closed(self):
+        for name in m.REQUIRED_CHILD_ENV:
+            for value in (None, ""):
+                parent = diagnostic_parent("temp")
+                if value is None:
+                    del parent[name]
+                else:
+                    parent[name] = value
+                with (
+                    self.subTest(name=name, value=value),
+                    self.assertRaisesRegex(
+                        m.EvidenceError, "Missing required diagnostic environment"
+                    ),
+                ):
+                    m.diagnostic_environment(parent, Path("root"), "head", "tree")
+        for name in (
+            "VOICE_DIAGNOSTIC_HEAD",
+            "VOICE_DIAGNOSTIC_TREE",
+            "GITHUB_SHA",
+            "VOICE_WINDOWS_SYSTEM_ROOT",
+            "VOICE_WINDOWS_HOST_ARCH",
+        ):
+            parent = diagnostic_parent("temp")
+            parent[name] = "PRIVATE-mismatch"
+            with self.assertRaises(m.EvidenceError):
+                m.diagnostic_environment(parent, Path("root"), "head", "tree")
+        parent = diagnostic_parent("temp")
+        parent["Path"] = "PRIVATE-conflict"
+        with self.assertRaisesRegex(
+            m.EvidenceError, "Conflicting diagnostic environment aliases"
+        ):
+            m.diagnostic_environment(parent, Path("root"), "head", "tree")
+
+    def test_mock_win32_receives_explicit_bytes_unicode_flag_and_same_cwd(self):
+        env = {"SystemRoot": "C:/Windows", "PRIVATE_FIXTURE": "\U0001f642"}
+        expected = owned.environment_block(env)
+        api = FakeAPI()
+        api.environment_size = len(expected)
+        parent = dict(os.environ)
+        with tempfile.TemporaryDirectory() as directory:
+            owned.capture_owned(
+                ["qualified.exe"], Path(directory) / "raw", 64, 60, api=api, env=env
+            )
+        self.assertEqual(api.child_environment_block, expected)
+        self.assertTrue(api.creation_flags & 0x400)
+        self.assertIsNone(api.creation_cwd)
+        self.assertEqual(dict(os.environ), parent)
+        self.assertLess(
+            api.events.index("AssignProcessToJobObject"),
+            api.events.index("ResumeThread"),
+        )
+
+
 class CaptureTests(unittest.TestCase):
     def test_main_exit37_records_only_accounting_and_safe_classification(self):
         secret = b"PRIVATE_NEVER_UPLOAD_62"
@@ -605,7 +788,7 @@ class CaptureTests(unittest.TestCase):
             "active_job_processes_after_cleanup": 0,
         }
 
-        def capture(command, output, budget, timeout=45):
+        def capture(command, output, budget, timeout=45, *, env=None):
             output.write_bytes(raw)
             return accounting.copy()
 
@@ -631,7 +814,8 @@ class CaptureTests(unittest.TestCase):
                 ),
                 mock.patch.dict(
                     os.environ,
-                    {"RUNNER_TEMP": directory, "PROCESSOR_ARCHITECTURE": "AMD64"},
+                    diagnostic_parent(directory),
+                    clear=True,
                 ),
                 mock.patch.object(
                     m,
@@ -648,8 +832,10 @@ class CaptureTests(unittest.TestCase):
                 mock.patch.object(m, "parse_provider") as parsed,
                 mock.patch.object(m, "parse_json") as parsed_graph,
             ):
+                original_parent = dict(os.environ)
                 with self.assertRaisesRegex(m.EvidenceError, "Provider capture failed"):
                     m.main()
+                self.assertEqual(dict(os.environ), original_parent)
             captured.assert_called_once()
             parsed.assert_not_called()
             parsed_graph.assert_not_called()
@@ -673,12 +859,69 @@ class CaptureTests(unittest.TestCase):
             )
             self.assertEqual((root / "private" / "provider-0.raw").read_bytes(), raw)
 
+    def test_main_missing_required_environment_stops_before_any_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shell = Path(directory) / "bash.exe"
+            shell.touch()
+            root = Path(directory) / "evidence"
+            parent = diagnostic_parent(directory)
+            del parent["INCLUDE"]
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "capture",
+                        "--git-bash",
+                        str(shell),
+                        "--root",
+                        str(root),
+                        "--expected-head",
+                        "head",
+                        "--expected-tree",
+                        "tree",
+                    ],
+                ),
+                mock.patch.dict(os.environ, parent, clear=True),
+                mock.patch.object(
+                    m,
+                    "git",
+                    side_effect=lambda *args: (
+                        "head"
+                        if args == ("rev-parse", "HEAD")
+                        else "tree"
+                        if args == ("rev-parse", "HEAD^{tree}")
+                        else ""
+                    ),
+                ),
+                mock.patch.object(m, "capture") as captured,
+            ):
+                before = dict(os.environ)
+                with self.assertRaisesRegex(
+                    m.EvidenceError, "^Missing required diagnostic environment$"
+                ):
+                    m.main()
+                self.assertEqual(dict(os.environ), before)
+            captured.assert_not_called()
+            manifest = json.loads((root / "upload" / "manifest.json").read_bytes())
+            self.assertEqual(manifest["phases"], [])
+            self.assertEqual(
+                manifest["failure"], "Missing required diagnostic environment"
+            )
+            self.assertTrue(manifest["source_unchanged"])
+            self.assertEqual(list((root / "private").iterdir()), [])
+
     def test_main_emits_batch_queries_with_absolute_shell_and_unique_private_root(self):
         records = {p["label"]: p for p in packages()[0]}
         seen = []
 
-        def capture(command, output, budget, timeout=45):
-            seen.append((command, timeout, os.environ["BAZEL_OUTPUT_USER_ROOT"]))
+        def capture(command, output, budget, timeout=45, *, env=None):
+            seen.append((command, timeout, env["BAZEL_OUTPUT_USER_ROOT"]))
+            self.assertEqual(
+                os.environ["BAZEL_OUTPUT_USER_ROOT"], "ordinary-runtime-root"
+            )
+            self.assertNotIn("BUILDBUDDY_API_KEY", env)
+            self.assertNotIn("CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR", env)
             if "cquery" in command:
                 output.write_text(m.SENTINEL + json.dumps(records[command[-1]]))
             else:
@@ -708,10 +951,12 @@ class CaptureTests(unittest.TestCase):
                     mock.patch.dict(
                         os.environ,
                         {
-                            "RUNNER_TEMP": directory,
-                            "PROCESSOR_ARCHITECTURE": "AMD64",
+                            **diagnostic_parent(directory),
                             "BAZEL_OUTPUT_USER_ROOT": "ordinary-runtime-root",
+                            "BUILDBUDDY_API_KEY": "PRIVATE-credential",
+                            "CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR": "ordinary-log-dir",
                         },
+                        clear=True,
                     ),
                     mock.patch.object(
                         m,
@@ -728,7 +973,9 @@ class CaptureTests(unittest.TestCase):
                     mock.patch.object(m, "package_proof", return_value=[]),
                     mock.patch("builtins.print"),
                 ):
+                    original_parent = dict(os.environ)
                     m.main()
+                    self.assertEqual(dict(os.environ), original_parent)
             self.assertEqual(len(seen), 16)
             self.assertNotEqual(seen[0][2], seen[8][2])
             for command, timeout, root in seen:
@@ -762,6 +1009,8 @@ class CaptureTests(unittest.TestCase):
             api.events.index("QueryInformationJobObject"),
         )
         self.assertNotIn("TerminateProcess", api.events)
+        self.assertIsNone(api.child_environment_block)
+        self.assertFalse(api.creation_flags & 0x400)
 
     def test_failed_assignment_never_resumes_and_terminates_only_retained_root(self):
         api = FakeAPI(fail_assign=True)

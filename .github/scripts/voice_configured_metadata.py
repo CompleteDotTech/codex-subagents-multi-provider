@@ -441,9 +441,127 @@ def package_proof(providers, actions):
     return proofs
 
 
-def capture(command, destination, budget, timeout=45):
+# Independent from the metadata sanitizer: only diagnostic child-process inputs.
+# Python normalizes os.environ keys to uppercase on Windows. Git Bash's
+# indirect SDK lookups are case sensitive: emit the exact source spellings.
+SDK_ENV_NAMES = """INCLUDE LIB LIBPATH UCRTVersion UniversalCRTSdkDir
+VCINSTALLDIR VCToolsInstallDir WindowsLibPath WindowsSdkBinPath WindowsSdkDir
+WindowsSDKLibVersion WindowsSDKVersion""".split()
+SDK_ENV = frozenset(name.upper() for name in SDK_ENV_NAMES)
+CHILD_ENV_SPELLINGS = {name.upper(): name for name in SDK_ENV_NAMES}
+# Canonical lowercase proxy aliases preserve Windows' case-insensitive values
+# while making HTTP proxy policy visible to case-sensitive Git Bash/curl tools.
+CHILD_ENV_SPELLINGS.update(
+    {
+        name.upper(): name
+        for name in (
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        )
+    }
+)
+# PATH is the thirteenth exported SDK input in setup-bazel-ci/action.yml.
+REQUIRED_CHILD_ENV = SDK_ENV | frozenset(
+    """PATH SYSTEMROOT PROCESSOR_ARCHITECTURE
+HOME USERPROFILE TEMP TMP RUNNER_OS RUNNER_TEMP GITHUB_ACTIONS GITHUB_REPOSITORY
+GITHUB_EVENT_NAME GITHUB_SHA GITHUB_REF GITHUB_RUN_ID GITHUB_JOB GITHUB_WORKSPACE
+VOICE_DIAGNOSTIC_HEAD VOICE_DIAGNOSTIC_TREE CODEX_BAZEL_WINDOWS_PATH
+VOICE_WINDOWS_SYSTEM_ROOT VOICE_WINDOWS_HOST_ARCH VOICE_WINDOWS_BAZEL_REPOSITORY""".split()
+)
+OPTIONAL_CHILD_ENV = frozenset(
+    """SYSTEMDRIVE WINDIR COMSPEC PATHEXT
+PROCESSOR_ARCHITEW6432 OS HOMEDRIVE HOMEPATH APPDATA LOCALAPPDATA TMPDIR TEMPDIR
+PROGRAMFILES PROGRAMFILES(X86) PROGRAMW6432 SHELL MSYSTEM MSYS MSYS2_PATH_TYPE
+MSYS2_ARG_CONV_EXCL MSYS2_ENV_CONV_EXCL MSYS_NO_PATHCONV CHERE_INVOKING BASH_ENV ENV LANG LC_ALL
+LC_CTYPE TZ PYTHONHOME PYTHONPATH PYTHONUTF8 PYTHONIOENCODING PYTHONNOUSERSITE
+CODEX_BAZEL_BIN CODEX_REPO_ROOT CI_BUILD_ROOT CARGO_TARGET_DIR
+CARGO_NET_GIT_FETCH_WITH_CLI BAZEL_OUTPUT_BASE
+BAZEL_REPOSITORY_CACHE BAZEL_REPO_CONTENTS_CACHE BAZEL_SH BAZEL_VC
+BAZEL_VC_FULL_VERSION BAZEL_WINSDK_FULL_VERSION BAZELISK_HOME USE_BAZEL_VERSION
+JAVA_HOME JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS VOICE_CYGWIN_ROOT
+VOICE_PKG_CONFIG GITHUB_EVENT_PATH HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO
+GIT_SSL_CAPATH GIT_SSL_NO_VERIFY CURL_HOME NODE_EXTRA_CA_CERTS""".split()
+)
+
+
+def utf16_units(value):
+    try:
+        return len(value.encode("utf-16-le")) // 2
+    except (UnicodeError, AttributeError):
+        raise EvidenceError("Invalid diagnostic environment encoding") from None
+
+
+def environment_accounting(environment):
+    return {
+        "entry_count": len(environment),
+        "block_utf16_units": (1 if environment else 2)
+        + sum(utf16_units(k + "=" + v) + 1 for k, v in environment.items()),
+        # Projection only: Git Bash may transform paths, and Bazel adds rc/JVM
+        # arguments downstream. This is never a final-command acceptance gate.
+        "unescaped_client_env_utf16_units": sum(
+            utf16_units("--client_env=" + k + "=" + v) + 1
+            for k, v in environment.items()
+        ),
+    }
+
+
+def diagnostic_environment(parent, query_root, expected_head, expected_tree):
+    child, indexed = {}, {}
+    for name, value in parent.items():
+        upper = name.upper()
+        if upper in REQUIRED_CHILD_ENV | OPTIONAL_CHILD_ENV:
+            require(upper not in indexed, "Conflicting diagnostic environment aliases")
+            indexed[upper] = value
+            child[CHILD_ENV_SPELLINGS.get(upper, name)] = value
+    require(
+        all(indexed.get(name) for name in REQUIRED_CHILD_ENV),
+        "Missing required diagnostic environment",
+    )
+    require(
+        indexed["RUNNER_OS"] == "Windows"
+        and indexed["GITHUB_ACTIONS"] == "true"
+        and indexed["PROCESSOR_ARCHITECTURE"] == "AMD64"
+        and indexed["VOICE_WINDOWS_HOST_ARCH"]
+        == indexed.get("PROCESSOR_ARCHITEW6432", indexed["PROCESSOR_ARCHITECTURE"])
+        and indexed["VOICE_WINDOWS_SYSTEM_ROOT"] == indexed["SYSTEMROOT"],
+        "Diagnostic environment identity mismatch",
+    )
+    require(
+        indexed["VOICE_DIAGNOSTIC_HEAD"] == expected_head
+        and indexed["VOICE_DIAGNOSTIC_TREE"] == expected_tree
+        and indexed["GITHUB_SHA"] == expected_head,
+        "Diagnostic checkout environment identity mismatch",
+    )
+    # Only this child receives the unique output root. Credentials and execution
+    # log settings are absent from the explicit allowlist, never popped globally.
+    child["BAZEL_OUTPUT_USER_ROOT"] = str(query_root)
+    from voice_metadata_owned_job import environment_block
+
+    try:
+        block = environment_block(child)
+    except ValueError:
+        raise EvidenceError("Invalid diagnostic child environment") from None
+    metrics = {
+        "parent": environment_accounting(parent),
+        "child": environment_accounting(child),
+        "child_block_utf16_units": len(block) // 2,
+        "included_values_unchanged": all(
+            indexed[k.upper()] == v
+            for k, v in child.items()
+            if k != "BAZEL_OUTPUT_USER_ROOT"
+        ),
+        "client_env_accounting": "unescaped-projection-not-final-command-length",
+        "windows_command_line_limit_utf16_units": 32768,
+    }
+    return child, metrics
+
+
+def capture(command, destination, budget, timeout=45, *, env=None):
     cap = max(0, min(LIMIT, TOTAL - MANIFEST_RESERVE - budget[0]))
-    result = capture_owned(command, destination, cap, timeout)
+    result = capture_owned(command, destination, cap, timeout, env=env)
     budget[0] += result["retained_bytes"]
     return result
 
@@ -792,7 +910,7 @@ def main():
     # mkdtemp guarantees this invocation cannot attach to a reusable server or
     # the ordinary runtime output root. Batch further forbids daemon reuse.
     query_root = Path(tempfile.mkdtemp(prefix="voice-metadata-bazel-", dir=runner_temp))
-    os.environ["BAZEL_OUTPUT_USER_ROOT"] = str(query_root)
+    parent_environment = dict(os.environ)
     require(
         git("rev-parse", "HEAD") == args.expected_head
         and git("rev-parse", "HEAD^{tree}") == args.expected_tree,
@@ -815,8 +933,6 @@ def main():
             Path("third_party/voice/windows_executable.bzl"),
         )
     }
-    env = os.environ.pop("BUILDBUDDY_API_KEY", None)
-    os.environ.pop("CODEX_BAZEL_EXECUTION_LOG_COMPACT_DIR", None)
     manifest = {
         "head": args.expected_head,
         "tree": args.expected_tree,
@@ -837,6 +953,10 @@ def main():
     }
     budget, providers = [0], []
     try:
+        child_environment, accounting = diagnostic_environment(
+            parent_environment, query_root, args.expected_head, args.expected_tree
+        )
+        manifest["environment_accounting"] = accounting
         for i, label in enumerate(LABELS):
             output = private / f"provider-{i}.raw"
             cmd = [
@@ -854,7 +974,7 @@ def main():
                 "--",
                 label,
             ]
-            result = capture(cmd, output, budget)
+            result = capture(cmd, output, budget, env=child_environment)
             manifest["phases"].append(
                 {
                     "phase": f"provider-{i}",
@@ -888,7 +1008,7 @@ def main():
             "--",
             QUERY,
         ]
-        result = capture(cmd, output, budget, timeout=90)
+        result = capture(cmd, output, budget, timeout=90, env=child_environment)
         manifest["phases"].append(
             {
                 "phase": "actions",
@@ -942,8 +1062,6 @@ def main():
         if not unchanged:
             manifest["status"] = "failed-source-changed"
         (upload / "manifest.json").write_bytes(encode(manifest))
-        if env is not None:
-            os.environ["BUILDBUDDY_API_KEY"] = env
         require(unchanged, "Pinned source or lock changed")
     print("Configured metadata validated; sanitized evidence ready.")
 

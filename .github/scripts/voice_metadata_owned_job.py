@@ -8,6 +8,7 @@ import ctypes as c
 from ctypes import wintypes as w
 import hashlib
 import os
+import re
 import subprocess
 import threading
 import time
@@ -163,7 +164,38 @@ def check(ok):
         raise OSError("Owned metadata process operation failed")
 
 
-def capture_owned(command, destination, cap, timeout, *, api=None):
+def environment_block(environment):
+    """Encode an explicit Windows child environment without logging input.
+
+    UTF-16LE is independent of ctypes wchar_t width in pure encoding tests.
+    Strict encoding rejects unpaired surrogates while preserving astral values.
+    """
+    entries, names = [], set()
+    for name, value in environment.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9()]*", name)
+            or name.upper() in names
+            or "\0" in value
+        ):
+            raise ValueError("Invalid explicit child environment")
+        names.add(name.upper())
+        entries.append((name, value))
+    entries.sort(key=lambda item: item[0].upper())
+    try:
+        return (
+            "\0".join(name + "=" + value for name, value in entries) + "\0\0"
+        ).encode("utf-16-le")
+    except UnicodeError:
+        raise ValueError("Invalid explicit child environment") from None
+
+
+def capture_owned(command, destination, cap, timeout, *, api=None, env=None):
+    # Validate before creating a Job, pipes or a process. Keep this byte buffer
+    # alive through CreateProcessW; callers never mutate their parent environment.
+    block = None if env is None else environment_block(env)
+    child_block = None if block is None else c.create_string_buffer(block, len(block))
     api = WinAPI() if api is None else api
     job = api.CreateJobObjectW(None, None)
     check(job)
@@ -213,8 +245,8 @@ def capture_owned(command, destination, cap, timeout, *, api=None):
                 None,
                 None,
                 True,
-                0x4 | 0x08000000 | 0x80000,
-                None,
+                0x4 | 0x08000000 | 0x80000 | (0x400 if child_block is not None else 0),
+                None if child_block is None else c.cast(child_block, c.c_void_p),
                 None,
                 c.byref(si),
                 c.byref(pi),
