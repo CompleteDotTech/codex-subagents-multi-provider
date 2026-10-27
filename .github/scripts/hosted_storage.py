@@ -4,6 +4,8 @@
 import json
 import os
 from pathlib import Path
+import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -12,6 +14,7 @@ import uuid
 from run_bazel_with_buildbuddy import (
     REMOTE_EXECUTION_CONFIGS,
     bazel_args_without_remote_execution,
+    bazel_command,
 )
 
 FORK = "CompleteDotTech/codex-subagents-multi-provider"
@@ -37,6 +40,7 @@ def scoped(env):
         and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
         and env.get("RUNNER_OS") in ("Linux", "macOS")
         and not env.get("BUILDBUDDY_API_KEY")
+        and env.get("HOSTED_STORAGE_REMOTE_CREDENTIALS") != "true"
     )
 
 
@@ -179,7 +183,85 @@ def measure(path):
     return result
 
 
-def receipt(phase, args, env, status=None):
+def bounded_query(command, env, timeout=15, limit=16384):
+    """Bound the query client, stdout and pipe lifetime on Linux and macOS."""
+    child = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    data = bytearray()
+    deadline = time.monotonic() + timeout
+    finished = False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    return "timeout", None
+                chunk = os.read(child.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                if len(data) + len(chunk) > limit:
+                    return "output-limit", None
+                data.extend(chunk)
+        code = child.wait(timeout=max(0.01, deadline - time.monotonic()))
+        finished = True
+        return ("ok", bytes(data)) if code == 0 else ("failed", None)
+    except subprocess.TimeoutExpired:
+        return "timeout", None
+    finally:
+        try:
+            if not finished:
+                # Bazelisk may spawn a client. The new process group belongs
+                # only to this query, not the existing build server/session.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if child.poll() is None:
+                    child.wait(timeout=2)
+        finally:
+            child.stdout.close()
+
+
+def actual_paths(args, env):
+    if not scoped(env):
+        return "out-of-scope", None
+    keys = ("output_base", "output_path", "execution_root")
+    # Same backend/startup normalization, cwd and effective local configuration
+    # as BUILD. Only safe info-compatible options, never arbitrary build flags.
+    command = bazel_command(
+        "--noexperimental_remote_repo_contents_cache",
+        "info",
+        *info_options(effective_arguments(args, env)),
+        *keys,
+        env=env,
+    )
+    try:
+        state, raw = bounded_query(command, env)
+        if state != "ok":
+            return state, None
+        values = {}
+        for line in raw.decode("utf-8").splitlines():
+            key, separator, value = line.partition(": ")
+            if (
+                key not in keys
+                or not separator
+                or key in values
+                or not Path(value).is_absolute()
+            ):
+                return "invalid-output", None
+            values[key] = value
+        return ("ok", values) if set(values) == set(keys) else ("incomplete", None)
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired):
+        return "unavailable", None
+
+
+def receipt(phase, args, env, status=None, verified=None, query_state=None):
     output = {
         "schema": 1,
         "phase": phase,
@@ -192,12 +274,20 @@ def receipt(phase, args, env, status=None):
         "run_id": env.get("GITHUB_RUN_ID"),
         "attempt": env.get("GITHUB_RUN_ATTEMPT"),
         "job": env.get("GITHUB_JOB"),
-        "paths_are": "declared; rc/config overrides unverified",
+        "paths_are": "actual bounded bazel info"
+        if verified
+        else "declared; rc/config overrides unverified",
+        "query_state": query_state,
+        "cache_save_requested": env.get("HOSTED_STORAGE_CACHE_SAVE") == "true"
+        if "HOSTED_STORAGE_CACHE_SAVE" in env
+        else None,
         "cpu_count": os.cpu_count(),
         "roots": {},
     }
     seen = {}
-    for role, raw in roots(args, env).items():
+    # A path-query receipt contains only the three verified roots; other phases
+    # retain the seven declared roles. Never sum overlapping directory totals.
+    for role, raw in (verified if verified else roots(args, env)).items():
         if not raw:
             output["roots"][role] = {"disabled_or_unavailable": True}
             continue
@@ -252,6 +342,13 @@ def main():
         return
     if not scoped(env):
         return
+    if env.get("GITHUB_OUTPUT"):
+        try:
+            with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+                stream.write("enabled=true\n")
+        except OSError:
+            # An exhausted output filesystem must not prevent stdout metrics.
+            pass
     try:
         phase, status, *args = args
         if phase not in (
@@ -259,9 +356,15 @@ def main():
             "after-build",
             "before-restore",
             "after-restore",
+            "before-cache-save",
+            "after-cache-save",
+            "after-build-paths",
         ):
             raise ValueError("unknown phase")
-        output = receipt(phase, args, env, None if status == "none" else int(status))
+        state, verified = actual_paths(args, env) if mode == "resolve" else (None, None)
+        output = receipt(
+            phase, args, env, None if status == "none" else int(status), verified, state
+        )
         text = json.dumps(output, sort_keys=True)
         if len(text.encode()) > 32768:
             raise ValueError("receipt bound exceeded")

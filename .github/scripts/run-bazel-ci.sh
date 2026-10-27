@@ -594,6 +594,7 @@ set -e
 # Capture filesystem state before any follow-up Bazel information request.
 if [[ $hosted_storage -eq 1 ]]; then
   python3 "$storage_script" observe after-build "$bazel_status" "${bazel_run_args[@]}" || echo "Hosted storage observation unavailable" >&2
+  python3 "$storage_script" resolve after-build-paths "$bazel_status" "${bazel_run_args[@]}" || echo "Hosted Bazel paths unavailable" >&2
 fi
 
 if [[ ${bazel_status:-0} -ne 0 ]]; then

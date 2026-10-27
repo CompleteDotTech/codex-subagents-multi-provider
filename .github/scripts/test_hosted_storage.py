@@ -5,13 +5,14 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import hosted_storage as storage
 import run_bazel_with_buildbuddy as backend
@@ -258,7 +259,246 @@ class ProjectionTests(unittest.TestCase):
         )
 
 
+class ActualPathTests(unittest.TestCase):
+    def test_query_client_nonzero_exit_is_failure_without_output_payload(self):
+        child = Mock()
+        child.poll.return_value = 9
+        child.wait.return_value = 9
+        selector = Mock()
+        selector.select.return_value = [object()]
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=selector)
+        manager.__exit__ = Mock(return_value=False)
+        with (
+            patch.object(storage.subprocess, "Popen", return_value=child),
+            patch.object(storage.selectors, "DefaultSelector", return_value=manager),
+            patch.object(storage.os, "read", return_value=b""),
+        ):
+            self.assertEqual(
+                storage.bounded_query(["fake-bazel"], {}), ("failed", None)
+            )
+        child.kill.assert_not_called()
+        child.stdout.close.assert_called_once_with()
+
+    def test_actual_backend_query_uses_build_startup_and_effective_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {
+                key: str(Path(directory) / key)
+                for key in ("output_base", "output_path", "execution_root")
+            }
+            raw = "".join(
+                key + ": " + value + "\n" for key, value in paths.items()
+            ).encode()
+            env = dict(ENV, BAZEL_OUTPUT_USER_ROOT=directory)
+            with patch.object(
+                storage, "bounded_query", return_value=("ok", raw)
+            ) as query:
+                state, found = storage.actual_paths(
+                    [
+                        "test",
+                        "--config",
+                        "ci-linux",
+                        "-c",
+                        "opt",
+                        "--platforms",
+                        "//:custom",
+                        "--",
+                        "--test_env=SECRET",
+                    ],
+                    env,
+                )
+            self.assertEqual((state, found), ("ok", paths))
+            command, actual_env = query.call_args.args
+            self.assertIs(actual_env, env)
+            self.assertIn("--output_user_root=" + directory, command)
+            self.assertIn("--noexperimental_remote_repo_contents_cache", command)
+            self.assertIn("--compilation_mode=opt", command)
+            self.assertIn("--platforms=//:custom", command)
+            self.assertIn("--disk_cache=", command)
+            self.assertNotIn("ci-linux", command)
+            self.assertFalse(any("SECRET" in arg for arg in command))
+
+    def test_query_failures_do_not_invent_actual_or_zero_metrics(self):
+        for failure in ("timeout", "failed", "output-limit"):
+            with patch.object(storage, "bounded_query", return_value=(failure, None)):
+                self.assertEqual(storage.actual_paths(["test"], ENV), (failure, None))
+        for raw in (
+            b"SECRET ERROR",
+            b"output_base: relative\n",
+            b"output_base: /a\noutput_base: /b\n",
+        ):
+            with patch.object(storage, "bounded_query", return_value=("ok", raw)):
+                state, found = storage.actual_paths(["test"], ENV)
+                self.assertNotEqual(state, "ok")
+                self.assertIsNone(found)
+
+    def test_query_cannot_run_outside_hosted_keyless_scope(self):
+        for change in (
+            {"RUNNER_OS": "Windows"},
+            {"BUILDBUDDY_API_KEY": "synthetic"},
+            {"GITHUB_REPOSITORY": "openai/codex"},
+            {"RUNNER_ENVIRONMENT": "self-hosted"},
+            {"HOSTED_STORAGE_REMOTE_CREDENTIALS": "true"},
+        ):
+            with patch.object(storage, "bounded_query") as query:
+                self.assertEqual(
+                    storage.actual_paths(["test"], dict(ENV, **change)),
+                    ("out-of-scope", None),
+                )
+                query.assert_not_called()
+
+    def test_query_timeout_and_output_limit_clean_up_only_owned_client(self):
+        for ready, chunk, expected in (
+            ([], b"", "timeout"),
+            ([object()], b"x" * 17, "output-limit"),
+        ):
+            child = Mock()
+            child.poll.return_value = None
+            selector = Mock()
+            selector.select.return_value = ready
+            manager = Mock()
+            manager.__enter__ = Mock(return_value=selector)
+            manager.__exit__ = Mock(return_value=False)
+            with (
+                patch.object(storage.subprocess, "Popen", return_value=child) as spawn,
+                patch.object(
+                    storage.selectors, "DefaultSelector", return_value=manager
+                ),
+                patch.object(storage.os, "read", return_value=chunk),
+                patch.object(storage.os, "killpg", create=True) as kill_group,
+                patch.object(storage.signal, "SIGKILL", 9, create=True),
+            ):
+                self.assertEqual(
+                    storage.bounded_query(["fake-bazel"], {}, limit=16),
+                    (expected, None),
+                )
+            kill_group.assert_called_once_with(child.pid, 9)
+            child.kill.assert_not_called()
+            child.wait.assert_called_once_with(timeout=2)
+            child.stdout.close.assert_called_once_with()
+            self.assertEqual(spawn.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+
+    def test_verified_receipt_has_only_three_actual_roots_with_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            verified = dict(
+                output_base=directory,
+                output_path=str(Path(directory) / "out"),
+                execution_root=str(Path(directory) / "exec"),
+            )
+            with (
+                patch.object(storage, "measure", return_value={"available_bytes": 42}),
+                patch.object(storage.subprocess, "run", side_effect=OSError),
+            ):
+                result = storage.receipt(
+                    "after-build-paths", ["test"], ENV, 37, verified, "ok"
+                )
+        self.assertEqual(set(result["roots"]), set(verified))
+        self.assertEqual(result["paths_are"], "actual bounded bazel info")
+        self.assertIn("output_base", result["roots"]["output_path"]["overlaps"])
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_cache_save_and_upload_are_scoped_without_changing_save_gate(self):
+        workflow = (Path(__file__).parents[1] / "workflows/bazel.yml").read_text()
+        jobs = dict(
+            re.findall(
+                r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)",
+                workflow.split("jobs:\n", 1)[1],
+                re.M | re.S,
+            )
+        )
+        for name, block in jobs.items():
+            if name not in ("test", "clippy", "verify-release-build"):
+                self.assertNotIn("hosted_storage", block)
+                continue
+            before = block.index("- name: Observe storage before cache archive")
+            save = block.index("- name: Save bazel repository cache")
+            after = block.index("- name: Observe storage after cache archive")
+            upload = block.index("- name: Upload hosted storage observations")
+            self.assertLess(before, save)
+            self.assertLess(save, after)
+            self.assertLess(after, upload)
+            self.assertIn(
+                "if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'",
+                block[save:after],
+            )
+            self.assertIn("continue-on-error: true", block[save:after])
+            self.assertIn("runner.environment == 'github-hosted'", block[before:save])
+            self.assertIn(
+                "runner.os == 'Linux' || runner.os == 'macOS'", block[before:save]
+            )
+            self.assertIn(
+                "github.repository == '" + storage.FORK + "'", block[before:save]
+            )
+            self.assertIn(
+                "HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ secrets.BUILDBUDDY_API_KEY != '' }}",
+                block[before:save],
+            )
+            self.assertIn(
+                "steps.hosted_storage.outputs.enabled == 'true'", block[after:upload]
+            )
+            self.assertIn(
+                "steps.prepare_bazel.outputs.repository-cache-hit != 'true'",
+                block[after:upload],
+            )
+            self.assertIn(
+                "steps.hosted_storage.outputs.enabled == 'true'", block[upload:]
+            )
+            self.assertIn(
+                "actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f",
+                block[upload:],
+            )
+            self.assertIn(
+                "path: ${{ runner.temp }}/hosted-storage/*.json", block[upload:]
+            )
+
+
 class ObservationTests(unittest.TestCase):
+    def test_remote_credential_boolean_blocks_workflow_outputs_and_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "step-output"
+            with (
+                patch.dict(
+                    os.environ,
+                    dict(
+                        ENV,
+                        HOSTED_STORAGE_REMOTE_CREDENTIALS="true",
+                        GITHUB_OUTPUT=str(output),
+                    ),
+                    clear=True,
+                ),
+                patch.object(
+                    sys, "argv", ["script", "observe", "before-cache-save", "none"]
+                ),
+                patch.object(storage, "receipt") as collect,
+            ):
+                storage.main()
+            collect.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_step_output_failure_does_not_hide_numeric_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = {"exit_code": 37, "roots": {"output_base": {"available_bytes": 7}}}
+            out = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ,
+                    dict(ENV, RUNNER_TEMP=directory, GITHUB_OUTPUT=directory),
+                    clear=True,
+                ),
+                patch.object(
+                    sys, "argv", ["script", "observe", "after-build", "37", "test"]
+                ),
+                patch.object(storage, "receipt", return_value=result),
+                contextlib.redirect_stdout(out),
+            ):
+                storage.main()
+            self.assertIn('"output_base": 7', out.getvalue())
+            self.assertEqual(
+                len(list((Path(directory) / "hosted-storage").glob("*.json"))), 1
+            )
+
     def test_numeric_capacity_and_bounded_du(self):
         fs = SimpleNamespace(
             f_blocks=100, f_bfree=30, f_bavail=20, f_frsize=4096, f_favail=12
@@ -372,14 +612,15 @@ class ShellTests(unittest.TestCase):
             # Mock just filesystem observations; use real defaults/projection.
             (root / "hosted_storage.py").write_text(
                 "import json, os, sys\nimport policy\n"
-                "if sys.argv[1] == 'observe':\n"
+                "if sys.argv[1] in ('observe', 'resolve'):\n"
                 " with open(os.environ['RECORD'], 'a') as f: f.write(json.dumps(sys.argv[2:4])+'\\n')\n"
+                " if sys.argv[1] == 'resolve': sys.exit(41)\n"
                 "else: policy.main()\n",
                 encoding="utf-8",
             )
             (root / "run_bazel_with_buildbuddy.py").write_text(
                 "#!/usr/bin/env python3\nimport json, os, sys\n"
-                "from backend import REMOTE_EXECUTION_CONFIGS, bazel_args_without_remote_execution\n"
+                "from backend import REMOTE_EXECUTION_CONFIGS, bazel_args_without_remote_execution, bazel_command\n"
                 "if __name__ == '__main__':\n"
                 " with open(os.environ['RECORD'], 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
                 " if 'info' in sys.argv: print('/nonexistent-testlogs'); sys.exit(0)\n"
@@ -423,11 +664,13 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 37, result.stderr)
         self.assertEqual(calls[0], ["before-build", "none"])
         self.assertEqual(calls[2], ["after-build", "37"])
-        self.assertIn("info", calls[3])
+        self.assertEqual(calls[3], ["after-build-paths", "37"])
+        self.assertIn("Hosted Bazel paths unavailable", result.stderr)
+        self.assertIn("info", calls[4])
         self.assertIn("--disk_cache=", calls[1])
-        self.assertIn("--disk_cache=", calls[3])
-        self.assertIn("--compilation_mode=opt", calls[3])
-        self.assertIn("--platforms=//:custom", calls[3])
+        self.assertIn("--disk_cache=", calls[4])
+        self.assertIn("--compilation_mode=opt", calls[4])
+        self.assertIn("--platforms=//:custom", calls[4])
 
     def test_explicit_split_cache_and_payload_are_not_changed(self):
         result, calls = self.invoke(
@@ -439,15 +682,15 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(
             build[build.index("--") + 1 :], ["//target", "--disk_cache=payload"]
         )
-        self.assertIn("--disk_cache=cache with spaces", calls[3])
-        self.assertNotIn("--disk_cache=payload", calls[3])
+        self.assertIn("--disk_cache=cache with spaces", calls[4])
+        self.assertNotIn("--disk_cache=payload", calls[4])
 
     def test_both_remote_ci_spellings_are_removed_before_shell_dispatch(self):
         for name in ("ci-linux", "ci-macos", "ci-v8"):
             for flags in (["--config=" + name], ["--config", name]):
                 result, calls = self.invoke(flags, ["--config=" + name])
                 self.assertEqual(result.returncode, 37, result.stderr)
-                build, info = calls[1], calls[3]
+                build, info = calls[1], calls[4]
                 self.assertIn("--disk_cache=", build)
                 self.assertIn("--disk_cache=", info)
                 self.assertNotIn("--config=" + name, build[: build.index("--")])
