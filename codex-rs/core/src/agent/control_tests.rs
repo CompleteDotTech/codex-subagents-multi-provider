@@ -983,7 +983,7 @@ async fn prepared_fresh_spawn_rejects_stopped_or_replaced_caller(replace: bool) 
         parent_id,
         &parent.session_source,
         next_thread_spawn_depth(&parent.session_source),
-        None,
+        /*agent_role*/ None,
         Some("stale_preparation_worker".into()),
     )
     .expect("source for original actual parent");
