@@ -1112,6 +1112,23 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
             .permission_profile,
         PermissionProfile::Disabled
     );
+    // A regular root turn consumes its startup warmup before measuring the
+    // separate denied child admission. The measured interval permits no requests.
+    let baseline_turn = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, "prepare restored root before denied child reload")
+        },
+        sse(vec![ev_completed("writable-store-root-ready")]),
+    )
+    .await;
+    resumed
+        .submit_turn("prepare restored root before denied child reload")
+        .await?;
+    assert_eq!(
+        baseline_turn.single_request().body_json()["client_metadata"]["thread_id"],
+        json!(root)
+    );
     let before = server
         .received_requests()
         .await
@@ -1130,13 +1147,19 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
         "{error}"
     );
     assert_eq!(resumed.thread_manager.list_thread_ids().await, vec![root]);
+    let after = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    let request_delta = after
+        .iter()
+        .skip(before)
+        .map(|request| (request.method.to_string(), request.url.path().to_string()))
+        .collect::<Vec<_>>();
     assert_eq!(
-        server
-            .received_requests()
-            .await
-            .expect("request recording is enabled")
-            .len(),
-        before
+        after.len(),
+        before,
+        "request method/path delta: {request_delta:?}"
     );
     assert_eq!(
         resumed
