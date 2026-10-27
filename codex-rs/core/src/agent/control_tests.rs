@@ -6762,7 +6762,6 @@ async fn cold_reload_cannot_forget_a_sealed_effective_role_ceiling(
 #[test_case::test_case(true; "attachment MCP restriction")]
 #[tokio::test]
 async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(mcp: bool) {
-    use codex_protocol::protocol::EnvironmentConfigState;
     use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
     use codex_protocol::mcp_policy::McpServerIdentity;
     use codex_protocol::mcp_policy::McpServerRequirement;
@@ -6823,6 +6822,10 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
         spawn_v2_reload_test_child(&control, harness.config.clone(), &root.thread, "worker").await;
     let target = child.thread_id;
     let target_thread = harness.manager.get_thread(target).await.unwrap();
+    target_thread
+        .session
+        .abort_all_tasks(TurnAbortReason::Interrupted)
+        .await;
     let (before_config, before_settings, before_environments) = target_thread
         .session
         .native_agent_authority_snapshot()
@@ -6853,18 +6856,10 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
             .unwrap();
         restricted.exec_policy = Some(codex_execpolicy::RequirementsExecPolicy::new(policy));
     }
-    let mut selection = ready.selection();
-    selection.config = EnvironmentConfigState::Ready(restricted.clone());
     target_thread
-        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
-            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
-                before_settings.cwd.clone(),
-                vec![selection.into_request()],
-            )),
-            ..Default::default()
-        })
+        .environment_ready(&ready.selection(), restricted.clone())
         .await
-        .unwrap();
+        .expect("host owner must install the attachment restriction");
     let activated = target_thread
         .session
         .new_turn_with_default_settings("attachment-only-restriction".into(), Default::default())
