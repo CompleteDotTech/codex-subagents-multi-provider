@@ -8634,7 +8634,7 @@ async fn hold_synchronous_read_barrier<T: Send + Sync + 'static>(
         // Bounded nonblocking acquisition also makes cancellation cleanup safe
         // on a current-thread runtime: joining cannot wait for that runtime to
         // run a task that releases a competing lock.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(/*secs*/ 10);
         loop {
             match released.try_recv() {
                 Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
@@ -8643,7 +8643,7 @@ async fn hold_synchronous_read_barrier<T: Send + Sync + 'static>(
             if let Ok(guard) = lock.try_read() {
                 let _ = ready.send(());
                 assert!(
-                    released.recv_timeout(Duration::from_secs(30)).is_ok(),
+                    released.recv_timeout(Duration::from_secs(/*secs*/ 30)).is_ok(),
                     "synchronous read barrier must be explicitly released"
                 );
                 drop(guard);
@@ -8652,7 +8652,7 @@ async fn hold_synchronous_read_barrier<T: Send + Sync + 'static>(
             if std::time::Instant::now() >= deadline {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(/*millis*/ 1));
         }
     });
     let barrier = SynchronousReadBarrier {
