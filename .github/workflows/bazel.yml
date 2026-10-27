@@ -625,12 +625,20 @@ jobs:
         run: |
           "VOICE_DIAGNOSTIC_HEAD=$(git rev-parse HEAD)" >> $env:GITHUB_ENV
           "VOICE_DIAGNOSTIC_TREE=$(git rev-parse 'HEAD^{tree}')" >> $env:GITHUB_ENV
+      - name: Observe resources before preparation
+        shell: pwsh
+        run: python .github/scripts/observe_windows_ci_resources.py before-prepare
       - name: Prepare Bazel CI
         uses: ./.github/actions/prepare-bazel-ci
         with:
           target: x86_64-pc-windows-gnullvm
           native-windows-voice: true
+          windows-resource-observation: true
           cache-scope: bazel-test
+      - name: Observe resources after preparation and input installation
+        if: always() && !cancelled()
+        shell: pwsh
+        run: python .github/scripts/observe_windows_ci_resources.py after-prepare
       - name: Diagnose native MSVC voice runtime
         timeout-minutes: 45
         shell: bash
@@ -638,7 +646,7 @@ jobs:
         # its native MSVC route. This is not GNU cross-compile evidence.
         run: |
           unset BUILDBUDDY_API_KEY
-          ./.github/scripts/run-bazel-ci.sh \
+          python .github/scripts/observe_windows_ci_resources.py supervise -- bash ./.github/scripts/run-bazel-ci.sh \
             --print-failed-test-logs --print-failed-action-summary \
             --windows-cross-compile -- test --nocache_test_results --test_output=all --zip_undeclared_test_outputs=false \
             --test_env=VOICE_DIAGNOSTIC_HEAD --test_env=VOICE_DIAGNOSTIC_TREE \
@@ -654,6 +662,10 @@ jobs:
           for file in bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.outputs/voice-runtime-diagnostic.json bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.log; do
             if [[ -f "$file" ]]; then cp "$file" "${RUNNER_TEMP}/voice-runtime-diagnostic/"; fi
           done
+      - name: Observe resources after text artifact collection
+        if: always() && !cancelled()
+        shell: pwsh
+        run: python .github/scripts/observe_windows_ci_resources.py after-artifacts
       - name: Upload diagnostic text evidence
         if: always() && !cancelled()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

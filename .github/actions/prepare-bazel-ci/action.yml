@@ -11,6 +11,10 @@ inputs:
     description: Provision pinned tools for the authorized native Windows fallback.
     required: false
     default: "false"
+  windows-resource-observation:
+    description: Observe bounded hosted Windows diagnostic resources.
+    required: false
+    default: "false"
 outputs:
   repository-cache-path:
     description: Filesystem path used for the Bazel repository cache.
@@ -36,6 +40,7 @@ runs:
       with:
         target: ${{ inputs.target }}
         native-windows-voice: ${{ inputs.native-windows-voice }}
+        windows-resource-observation: ${{ inputs.windows-resource-observation }}
 
     - name: Compute bazel repository cache key
       id: cache_bazel_repository_key
