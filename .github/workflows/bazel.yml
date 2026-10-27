@@ -60,6 +60,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
 
@@ -207,6 +208,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: x86_64-pc-windows-gnullvm
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && secrets.BUILDBUDDY_API_KEY == '' }}
           # Reuse the former monolithic Windows test cache for restores. Do
@@ -313,6 +315,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: x86_64-pc-windows-msvc
           cache-scope: bazel-${{ github.job }}
 
@@ -411,6 +414,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && matrix.target == 'x86_64-pc-windows-gnullvm' && secrets.BUILDBUDDY_API_KEY == '' }}
@@ -549,6 +553,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && matrix.target == 'x86_64-pc-windows-gnullvm' && secrets.BUILDBUDDY_API_KEY == '' }}

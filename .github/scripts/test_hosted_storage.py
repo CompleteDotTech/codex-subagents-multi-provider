@@ -454,6 +454,120 @@ class WorkflowTests(unittest.TestCase):
             )
 
 
+class RestoreCredentialTests(unittest.TestCase):
+    def test_every_prepare_caller_explicitly_reports_credential_availability(self):
+        github = Path(__file__).parents[1]
+        found = []
+        for directory in (github / "workflows", github / "actions"):
+            for path in sorted(directory.rglob("*.yml")):
+                content = path.read_text(encoding="utf-8")
+                calls = list(
+                    re.finditer(
+                        r"uses: \./\.github/actions/prepare-bazel-ci\n( +)with:\n((?:\1  [^\n]*\n)+)",
+                        content,
+                    )
+                )
+                self.assertEqual(
+                    len(calls),
+                    content.count("uses: ./.github/actions/prepare-bazel-ci"),
+                    str(path),
+                )
+                for call in calls:
+                    params = call.group(2)
+                    if directory.name == "workflows":
+                        expected = "${{ secrets.BUILDBUDDY_API_KEY != '' }}"
+                    elif path.parent.name == "run-argument-comment-lint":
+                        expected = "${{ inputs.buildbuddy-api-key != '' }}"
+                    else:
+                        expected = "${{ inputs.remote-credentials }}"
+                    self.assertIn("remote-credentials: " + expected, params, str(path))
+                    found.append(path)
+        self.assertTrue(found, "expected prepare-bazel-ci callers to audit")
+        package = (github / "actions/build-codex-packages/action.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            package,
+            r"uses: \./\.github/actions/build-bazel-package-binaries\n +with:\n +remote-credentials: \$\{\{ inputs.remote-credentials \}\}",
+        )
+
+    def test_composite_boolean_defaults_and_both_phase_env_connections(self):
+        actions = Path(__file__).parents[1] / "actions"
+        for name in (
+            "prepare-bazel-ci",
+            "build-bazel-package-binaries",
+            "build-codex-packages",
+        ):
+            content = (actions / name / "action.yml").read_text(encoding="utf-8")
+            field = re.search(
+                r"^  remote-credentials:\n(.*?)(?=^  [\w-]+:|^outputs:|^runs:)",
+                content,
+                re.M | re.S,
+            ).group(1)
+            self.assertIn('default: "false"', field)
+            self.assertIn("required: false", field)
+        prepare = (actions / "prepare-bazel-ci/action.yml").read_text(encoding="utf-8")
+        steps = dict(
+            re.findall(
+                r"^    - name: ([^\n]+)\n(.*?)(?=^    - |\Z)", prepare, re.M | re.S
+            )
+        )
+        for when in ("before", "after"):
+            block = steps["Observe storage " + when + " repository restore"]
+            self.assertIn(
+                "HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ inputs.remote-credentials }}",
+                block,
+            )
+            self.assertIn("observe " + when + "-restore none", block)
+            self.assertIn("continue-on-error: true", block)
+            self.assertNotIn("BUILDBUDDY_API_KEY:", block)
+
+    def test_prepare_keyed_emits_nothing_and_keyless_retains_both_phases(self):
+        for available in ("true", "false"):
+            with (
+                self.subTest(available=available),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                step_output = Path(directory) / "output"
+                env = dict(
+                    ENV,
+                    HOSTED_STORAGE_REMOTE_CREDENTIALS=available,
+                    RUNNER_TEMP=directory,
+                    GITHUB_OUTPUT=str(step_output),
+                )
+                with (
+                    patch.dict(os.environ, env, clear=True),
+                    patch.object(
+                        storage,
+                        "receipt",
+                        return_value={"exit_code": None, "roots": {}},
+                    ) as collect,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    for phase in ("before-restore", "after-restore"):
+                        with patch.object(
+                            sys, "argv", ["script", "observe", phase, "none"]
+                        ):
+                            storage.main()
+                if available == "true":
+                    collect.assert_not_called()
+                    self.assertFalse(step_output.exists())
+                    self.assertFalse((Path(directory) / "hosted-storage").exists())
+                else:
+                    self.assertEqual(
+                        [call.args[0] for call in collect.call_args_list],
+                        ["before-restore", "after-restore"],
+                    )
+                    self.assertEqual(
+                        step_output.read_text().splitlines(),
+                        ["enabled=true", "enabled=true"],
+                    )
+                    self.assertEqual(
+                        len(list((Path(directory) / "hosted-storage").glob("*.json"))),
+                        2,
+                    )
+
+
 class ObservationTests(unittest.TestCase):
     def test_remote_credential_boolean_blocks_workflow_outputs_and_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
