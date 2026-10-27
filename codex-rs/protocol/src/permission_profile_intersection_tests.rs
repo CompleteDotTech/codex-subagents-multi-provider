@@ -240,7 +240,7 @@ fn readonly_workspace_intersections_compose_in_both_orders() {
             !policy
                 .entries
                 .iter()
-                .any(|entry| entry.skips_missing_path())
+                .any(FileSystemSandboxEntry::skips_missing_path)
         );
         for ceiling in [&readonly, &writable] {
             for (left, right) in [(&first, ceiling), (ceiling, &first)] {
