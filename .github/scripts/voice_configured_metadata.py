@@ -447,6 +447,100 @@ def capture(command, destination, budget, timeout=45):
     return result
 
 
+# Output is a closed vocabulary of observations, never excerpts or causal claims.
+FAILURE_PATTERNS = {
+    "memory_signature": rb"outofmemoryerror|out of memory|cannot allocate memory|native memory allocation.*failed",
+    "paging_signature": rb"paging file is too small|paging file.*minimum",
+    "disk_full_signature": rb"no space left on device|disk is full|not enough space on the disk",
+    "path_too_long_signature": rb"filename or extension is too long|path too long|filename too long",
+    "symlink_signature": rb"cannot create symbolic link|failed to create symbolic link|symlink.*(?:failed|error)",
+    "lock_signature": rb"failed to acquire.*lock|cannot acquire.*lock|another command.*running",
+    "server_signature": rb"server terminated abruptly|server crashed|unable to start.*server",
+    "connect_signature": rb"connection refused|failed to connect|could not connect|cannot connect",
+    "invalid_option_signature": rb"unrecognized (?:option|vm option)|unknown (?:option|startup option)|invalid (?:option|flag)",
+    "starlark_evaluation_signature": rb"error evaluating starlark|starlark evaluation error|traceback \(most recent call last\):",
+    "formatter_signature": rb"error evaluating.*(?:format|starlark expression)|invalid.*starlark.*expression|formatter.*(?:failed|error)",
+    "java_fatal_signature": rb"a fatal error has been detected by the java runtime environment|error occurred during initialization of vm|could not create the java virtual machine",
+}
+KNOWN_EXCEPTION_CLASSES = (
+    "java.lang.OutOfMemoryError",
+    "java.lang.IllegalStateException",
+    "java.lang.IllegalArgumentException",
+    "java.lang.NullPointerException",
+    "java.lang.RuntimeException",
+    "java.lang.ExceptionInInitializerError",
+    "java.io.IOException",
+    "java.nio.file.FileSystemException",
+    "java.nio.file.AccessDeniedException",
+    "java.nio.file.NoSuchFileException",
+    "com.google.devtools.build.lib.util.AbruptExitException",
+    "net.starlark.java.eval.EvalException",
+)
+KNOWN_OS_EXCEPTION_CODES = (0xC0000005, 0xC0000017, 0xC00000FD, 0xC0000409)
+
+
+def classify_failure(raw):
+    """Observe at most LIMIT private bytes; regex matches only select constants.
+
+    A matching signature may occur in arbitrary text, so it identifies evidence
+    only. Neither a match nor exit 37 establishes an underlying failure cause.
+    No captured group, decoded line, or arbitrary input reaches the result.
+    """
+    raw = raw[:LIMIT]
+    signatures = [
+        name
+        for name, pattern in FAILURE_PATTERNS.items()
+        if re.search(pattern, raw, re.IGNORECASE)
+    ]
+    exceptions = [
+        name
+        for name in KNOWN_EXCEPTION_CLASSES
+        if re.search(rb"(?<![\w.$])" + re.escape(name.encode()) + rb"(?![\w.$])", raw)
+    ]
+    # Decimal Win32 codes require an explicit marker and are bounded to DWORD.
+    # Conversion is bounded before int(); numbers in arbitrary text are ignored.
+    win32_codes = sorted(
+        {
+            int(match[1])
+            for match in re.finditer(
+                rb"(?i)\b(?:win32(?: error)?|getlasterror|createprocess(?:w)? failed(?: with error)?)\s*[:=(]?\s*([0-9]{1,10})(?![0-9])",
+                raw,
+            )
+            if int(match[1]) <= 0xFFFFFFFF
+        }
+    )[:16]
+    os_codes = [
+        code
+        for code in KNOWN_OS_EXCEPTION_CODES
+        if re.search(
+            rb"(?i)(?<![0-9a-z])0x" + f"{code:08x}".encode() + rb"(?![0-9a-z])",
+            raw,
+        )
+    ]
+    error = bool(re.search(rb"(?m)^ERROR:", raw))
+    fatal = bool(re.search(rb"(?m)^FATAL:", raw))
+    return {
+        "schema": "static-failure-signatures-v1",
+        "evidence": "recognized-signatures"
+        if any((signatures, exceptions, win32_codes, os_codes, error, fatal))
+        else "unknown",
+        "cause": "unknown",
+        "error_prefix": error,
+        "fatal_prefix": fatal,
+        "jvm_fatal_signature": "java_fatal_signature" in signatures,
+        "signatures": signatures,
+        "exception_classes": exceptions,
+        "win32_decimal_codes": win32_codes,
+        "known_os_exception_codes": os_codes,
+    }
+
+
+def failure_classification(output):
+    # The owned capture enforces its own cap; also bound this independent read.
+    with output.open("rb") as stream:
+        return classify_failure(stream.read(LIMIT))
+
+
 def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip()
 
@@ -535,7 +629,13 @@ def main():
                 label,
             ]
             result = capture(cmd, output, budget)
-            manifest["phases"].append({"phase": f"provider-{i}", **result})
+            manifest["phases"].append(
+                {
+                    "phase": f"provider-{i}",
+                    **result,
+                    "failure_classification": failure_classification(output),
+                }
+            )
             require(
                 not result["oversize"]
                 and not result["timeout"]
@@ -563,7 +663,13 @@ def main():
             QUERY,
         ]
         result = capture(cmd, output, budget, timeout=90)
-        manifest["phases"].append({"phase": "actions", **result})
+        manifest["phases"].append(
+            {
+                "phase": "actions",
+                **result,
+                "failure_classification": failure_classification(output),
+            }
+        )
         require(
             not result["oversize"]
             and not result["timeout"]

@@ -301,7 +301,166 @@ class FakeAPI:
         return call
 
 
+class FailureClassificationTests(unittest.TestCase):
+    def test_closed_signature_fixtures(self):
+        fixtures = {
+            "memory_signature": b"java.lang.OutOfMemoryError: private",
+            "paging_signature": b"The paging file is too small",
+            "disk_full_signature": b"No space left on device",
+            "path_too_long_signature": b"filename or extension is too long",
+            "symlink_signature": b"cannot create symbolic link private",
+            "lock_signature": b"failed to acquire private lock",
+            "server_signature": b"Server terminated abruptly",
+            "connect_signature": b"Connection refused",
+            "invalid_option_signature": b"Unrecognized VM option private",
+            "starlark_evaluation_signature": b"Error evaluating Starlark",
+            "formatter_signature": b"formatter failed private",
+            "java_fatal_signature": b"A fatal error has been detected by the Java Runtime Environment",
+        }
+        self.assertEqual(set(fixtures), set(m.FAILURE_PATTERNS))
+        for name, raw in fixtures.items():
+            with self.subTest(name=name):
+                result = m.classify_failure(raw)
+                self.assertIn(name, result["signatures"])
+                self.assertEqual(result["cause"], "unknown")
+                self.assertEqual(result["jvm_fatal_signature"], name == "java_fatal_signature")
+        for name in m.KNOWN_EXCEPTION_CLASSES:
+            self.assertEqual(
+                m.classify_failure(name.encode())["exception_classes"], [name]
+            )
+        for code in m.KNOWN_OS_EXCEPTION_CODES:
+            self.assertEqual(
+                m.classify_failure(f"0x{code:08X}".encode())[
+                    "known_os_exception_codes"
+                ],
+                [code],
+            )
+        result = m.classify_failure(
+            b"ERROR: private\nFATAL: private\nWin32 error: 1455\nGetLastError=112"
+        )
+        self.assertTrue(result["error_prefix"])
+        self.assertTrue(result["fatal_prefix"])
+        self.assertEqual(result["win32_decimal_codes"], [112, 1455])
+
+    def test_arbitrary_bytes_and_secret_text_cannot_escape(self):
+        import random
+
+        rng = random.Random(62)
+        unknown = m.classify_failure(b"")
+        for _ in range(100):
+            secret = "PRIVATE_" + rng.randbytes(32).hex()
+            raw = rng.randbytes(1000) + secret.encode()
+            result = m.classify_failure(raw)
+            self.assertNotIn(secret, json.dumps(result))
+            raw += (
+                b"\nERROR: "
+                + secret.encode()
+                + b"\njava.lang.OutOfMemoryError: "
+                + secret.encode()
+            )
+            result = m.classify_failure(raw)
+            self.assertNotIn(secret, json.dumps(result))
+            self.assertEqual(
+                result["exception_classes"], ["java.lang.OutOfMemoryError"]
+            )
+        self.assertEqual(unknown["evidence"], "unknown")
+        result = m.classify_failure(
+            b"Win32 error: 4294967296 Win32 error: 99999999999999999 1455 0xDEADBEEF java.lang.PrivateException"
+        )
+        self.assertEqual(result, unknown)
+        self.assertEqual(m.classify_failure(b"x" * m.LIMIT + b"ERROR: hidden"), unknown)
+        self.assertEqual(
+            m.classify_failure(b"java.lang.OutOfMemoryErrorPrivate")[
+                "exception_classes"
+            ],
+            [],
+        )
+
+
 class CaptureTests(unittest.TestCase):
+    def test_main_exit37_records_only_accounting_and_safe_classification(self):
+        secret = b"PRIVATE_NEVER_UPLOAD_62"
+        raw = b"ERROR: " + secret + b"\n" + b"x" * (45467 - len(secret) - 8)
+        self.assertEqual(len(raw), 45467)
+        accounting = {
+            "exit_code": 37,
+            "observed_bytes": 45467,
+            "retained_bytes": 45467,
+            "oversize": False,
+            "timeout": False,
+            "assigned_before_resume": True,
+            "reader_closed": True,
+            "active_job_processes_after_cleanup": 0,
+        }
+
+        def capture(command, output, budget, timeout=45):
+            output.write_bytes(raw)
+            return accounting.copy()
+
+        with tempfile.TemporaryDirectory() as directory:
+            shell = Path(directory) / "bash.exe"
+            shell.touch()
+            root = Path(directory) / "evidence"
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "capture",
+                        "--git-bash",
+                        str(shell),
+                        "--root",
+                        str(root),
+                        "--expected-head",
+                        "head",
+                        "--expected-tree",
+                        "tree",
+                    ],
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"RUNNER_TEMP": directory, "PROCESSOR_ARCHITECTURE": "AMD64"},
+                ),
+                mock.patch.object(
+                    m,
+                    "git",
+                    side_effect=lambda *args: (
+                        "head"
+                        if args == ("rev-parse", "HEAD")
+                        else "tree"
+                        if args == ("rev-parse", "HEAD^{tree}")
+                        else ""
+                    ),
+                ),
+                mock.patch.object(m, "capture", side_effect=capture) as captured,
+                mock.patch.object(m, "parse_provider") as parsed,
+                mock.patch.object(m, "parse_json") as parsed_graph,
+            ):
+                with self.assertRaisesRegex(m.EvidenceError, "Provider capture failed"):
+                    m.main()
+            captured.assert_called_once()
+            parsed.assert_not_called()
+            parsed_graph.assert_not_called()
+            self.assertEqual(
+                [p.name for p in (root / "upload").iterdir()], ["manifest.json"]
+            )
+            uploaded = (root / "upload" / "manifest.json").read_bytes()
+            self.assertNotIn(secret, uploaded)
+            manifest = json.loads(uploaded)
+            self.assertEqual(manifest["status"], "failed")
+            self.assertTrue(manifest["source_unchanged"])
+            self.assertEqual(
+                manifest["phases"],
+                [
+                    {
+                        "phase": "provider-0",
+                        **accounting,
+                        "failure_classification": m.classify_failure(raw),
+                    }
+                ],
+            )
+            self.assertEqual((root / "private" / "provider-0.raw").read_bytes(), raw)
+
     def test_main_emits_batch_queries_with_absolute_shell_and_unique_private_root(self):
         records = {p["label"]: p for p in packages()[0]}
         seen = []
