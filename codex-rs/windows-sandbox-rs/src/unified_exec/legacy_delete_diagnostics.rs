@@ -1,6 +1,7 @@
 //! Test-only host-DACL controls; every mutation and command target is newly owned.
 
 use super::*;
+use pretty_assertions::assert_eq;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 use windows_sys::Win32::Foundation::HLOCAL;
