@@ -101,3 +101,55 @@ impl Localizer for AgeLocalizer {
         Ok(supported_languages)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FluentLanguageLoader, LanguageIdentifier, LanguageLoader, Localizations};
+    use i18n_embed::fluent::fluent_language_loader;
+
+    #[test]
+    fn localization_resources_and_fallback_are_available() {
+        let mut resources: Vec<_> = Localizations::iter()
+            .map(|path| path.into_owned())
+            .collect();
+        resources.sort();
+        assert_eq!(
+            resources,
+            [
+                "en-US/age.ftl",
+                "es-AR/age.ftl",
+                "fr/age.ftl",
+                "it/age.ftl",
+                "ru/age.ftl",
+                "zh-CN/age.ftl",
+                "zh-TW/age.ftl",
+            ]
+        );
+        for path in resources {
+            let resource = Localizations::get(&path).expect("localization resource is available");
+            let text = std::str::from_utf8(resource.data.as_ref()).expect("valid Fluent UTF-8");
+            assert!(text.contains("cli-secret-input-required ="), "{path}");
+        }
+
+        // Use a fresh loader so this test cannot change the process-wide locale.
+        let loader: FluentLanguageLoader = fluent_language_loader!();
+        let fallback: LanguageIdentifier = "en-US".parse().unwrap();
+        loader.load_languages(&Localizations, &[fallback]).unwrap();
+        assert_eq!(loader.get("cli-secret-input-required"), "Input is required");
+
+        // An unavailable requested locale must still resolve through the real fallback.
+        let unavailable: LanguageIdentifier = "de-DE".parse().unwrap();
+        i18n_embed::select(&loader, &Localizations, &[unavailable]).unwrap();
+        assert_eq!(loader.get("cli-secret-input-required"), "Input is required");
+    }
+
+    #[test]
+    fn french_localization_loads_from_resources() {
+        let loader: FluentLanguageLoader = fluent_language_loader!();
+        let french: LanguageIdentifier = "fr".parse().unwrap();
+        let selected =
+            i18n_embed::select(&loader, &Localizations, std::slice::from_ref(&french)).unwrap();
+        assert!(selected.contains(&french));
+        assert_eq!(loader.get("cli-secret-input-required"), "Entrée requise");
+    }
+}

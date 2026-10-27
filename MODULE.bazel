@@ -404,6 +404,42 @@ crate.annotation(
     ],
     repositories = ["age_async_test_crates"],
 )
+
+# Bazel debug builds must embed age's localization resources: compiler sandboxes
+# do not survive into runtime test sandboxes. Keep Cargo's debug behavior intact.
+# Configure both the public iterator API and its derive implementation together.
+crate.annotation(
+    crate = "rust-embed",
+    crate_features = ["debug-embed"],
+    repositories = ["crates"],
+    version = "8.11.0",
+)
+crate.annotation(
+    crate = "rust-embed-impl",
+    crate_features = ["debug-embed"],
+    repositories = ["crates"],
+    version = "8.11.0",
+)
+crate.annotation(
+    crate = "rust-embed",
+    crate_features = ["debug-embed"],
+    repositories = [
+        "age_unit_test_crates",
+        "age_ssh_test_crates",
+        "age_async_test_crates",
+    ],
+    version = "8.12.0",
+)
+crate.annotation(
+    crate = "rust-embed-impl",
+    crate_features = ["debug-embed"],
+    repositories = [
+        "age_unit_test_crates",
+        "age_ssh_test_crates",
+        "age_async_test_crates",
+    ],
+    version = "8.12.0",
+)
 use_repo(crate, "age_async_test_crates", "age_ssh_test_crates", "age_unit_test_crates")
 
 crate.from_cargo(
