@@ -21,6 +21,7 @@ use codex_features::Feature;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -116,16 +117,26 @@ pub(crate) async fn prepare_agent_spawn_config(
     step_context: &StepContext,
     options: SpawnConfigOptions<'_>,
 ) -> Result<PreparedSpawnConfig, String> {
-    let caller_fence =
-        crate::agent::child_provider_authorization::FreshChildCaller::capture(session)
-            .await
-            .map_err(|error| error.to_string())?;
-    let turn = step_context.turn.as_ref();
-    let mut config =
-        build_agent_spawn_config(&session.get_base_instructions().await, step_context)?;
+    // Reject this invalid request before caller lookup or any preparation I/O.
+    // Validation cannot mint a proof or bypass the subsequent live caller fence.
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
+    let caller_fence =
+        crate::agent::child_provider_authorization::FreshChildCaller::capture(session)
+            .await
+            .map_err(|error| match error.details() {
+                CodexErrorDetails::UnsupportedOperation(message)
+                    if message == "thread manager dropped" =>
+                {
+                    // Capture now detects this before the tool's spawn error mapper.
+                    "collab manager unavailable".to_owned()
+                }
+                _ => error.to_string(),
+            })?;
+    let turn = step_context.turn.as_ref();
+    let mut config =
+        build_agent_spawn_config(&session.get_base_instructions().await, step_context)?;
     let (parent_base, parent_settings, current_environments) =
         session.native_agent_authority_snapshot().await;
     if parent_base.config_layer_stack != config.config_layer_stack
