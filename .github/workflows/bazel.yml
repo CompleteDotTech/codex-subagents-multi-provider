@@ -6,15 +6,21 @@ name: Bazel
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      voice_runtime_diagnostic:
+        description: Run only the bounded native MSVC voice loader diagnostic
+        type: boolean
+        default: false
 
 concurrency:
   # Cancel previous actions from the same PR or branch except 'main' branch.
   # See https://docs.github.com/en/actions/using-jobs/using-concurrency and https://docs.github.com/en/actions/learn-github-actions/contexts for more info.
-  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}
+  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}::${{ github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && 'voice-diagnostic' || 'normal' }}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 jobs:
   test:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     # PRs use the sharded Windows cross-compiled test jobs below. Post-merge
     # pushes to main also run the native Windows test job for broader Windows
     # signal without putting PR latency back on the critical path. When
@@ -140,6 +146,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   test-windows-shard:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     # Split the Windows Bazel test leg across separate Windows hosts. Jobs with
     # BuildBuddy credentials use Linux RBE for build actions; test execution
     # remains on a Windows runner.
@@ -248,7 +255,7 @@ jobs:
   test-windows:
     # Preserve the existing required-check surface while the real work happens
     # in the sharded Windows jobs above.
-    if: always()
+    if: always() && !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic)
     needs: test-windows-shard
     runs-on: ubuntu-24.04
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm
@@ -266,7 +273,7 @@ jobs:
     # Native Windows Bazel tests are slower and frequently approach the
     # 30-minute PR budget. Run this only for post-merge commits to main and give
     # it a larger timeout. Also allow manual runs for native toolchain changes.
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
     timeout-minutes: 40
     runs-on: ${{ github.repository == 'openai/codex' && fromJSON(format('{{"group":"{0}-runners","labels":"{0}-windows-x64"}}', github.event.repository.name)) || 'windows-2025' }}
     name: Bazel test on windows-latest for x86_64-pc-windows-msvc (native main)
@@ -348,6 +355,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   clippy:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -465,6 +473,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   verify-release-build:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -593,3 +602,62 @@ jobs:
       - name: Check for a clean worktree
         if: always() && !cancelled()
         uses: ./.github/actions/check-clean-worktree
+
+  voice-runtime-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    environment:
+      name: bazel
+      deployment: false
+    steps:
+      - name: Enable long paths for Windows checkout
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Record actual checkout provenance
+        shell: pwsh
+        run: |
+          "VOICE_DIAGNOSTIC_HEAD=$(git rev-parse HEAD)" >> $env:GITHUB_ENV
+          "VOICE_DIAGNOSTIC_TREE=$(git rev-parse 'HEAD^{tree}')" >> $env:GITHUB_ENV
+      - name: Prepare Bazel CI
+        uses: ./.github/actions/prepare-bazel-ci
+        with:
+          target: x86_64-pc-windows-gnullvm
+          native-windows-voice: true
+          cache-scope: bazel-test
+      - name: Diagnose native MSVC voice runtime
+        timeout-minutes: 45
+        shell: bash
+        # Deliberately no BuildBuddy credential: the existing wrapper selects
+        # its native MSVC route. This is not GNU cross-compile evidence.
+        run: |
+          unset BUILDBUDDY_API_KEY
+          ./.github/scripts/run-bazel-ci.sh \
+            --print-failed-test-logs --print-failed-action-summary \
+            --windows-cross-compile -- test --nocache_test_results --test_output=all --zip_undeclared_test_outputs=false \
+            --test_env=VOICE_DIAGNOSTIC_HEAD --test_env=VOICE_DIAGNOSTIC_TREE \
+            --test_env=GITHUB_SHA --test_env=GITHUB_EVENT_NAME --test_env=GITHUB_REF --test_env=GITHUB_RUN_ID \
+            --build_metadata=COMMIT_SHA=${GITHUB_SHA} -- \
+            //codex-rs/voice-host:voice-host-windows-runtime-diagnostic-test
+      - name: Collect diagnostic text outputs
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/voice-runtime-diagnostic"
+          # Copy only the named text result/log, never executables or runfiles.
+          for file in bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.outputs/voice-runtime-diagnostic.json bazel-testlogs/codex-rs/voice-host/voice-host-windows-runtime-diagnostic-test/test.log; do
+            if [[ -f "$file" ]]; then cp "$file" "${RUNNER_TEMP}/voice-runtime-diagnostic/"; fi
+          done
+      - name: Upload diagnostic text evidence
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: voice-runtime-diagnostic-${{ github.sha }}
+          path: ${{ runner.temp }}/voice-runtime-diagnostic
+          if-no-files-found: warn
