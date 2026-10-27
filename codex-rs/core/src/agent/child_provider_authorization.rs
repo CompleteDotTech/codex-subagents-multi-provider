@@ -410,13 +410,13 @@ impl PreparedChildAuthorization {
         session: &Session,
         config: &Config,
         full_history: bool,
-        parent_settings: ThreadSettingsSnapshot,
-        parent_base: Arc<Config>,
+        parent_authority: (Arc<Config>, ThreadSettingsSnapshot),
         role_name: Option<String>,
         execution_scope: ChildProviderScope,
         caller_fence: FreshChildCaller,
     ) -> Self {
         debug_assert!(config.prepared_child_authorization.is_none());
+        let (parent_base, parent_settings) = parent_authority;
         Self {
             caller: session.thread_id,
             caller_fence,

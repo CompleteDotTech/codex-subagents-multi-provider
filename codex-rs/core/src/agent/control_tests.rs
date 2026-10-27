@@ -7593,13 +7593,13 @@ async fn fresh_lifetime_permit(
         parent_id,
         &parent.session_source,
         next_thread_spawn_depth(&parent.session_source),
-        None,
+        /*agent_role*/ None,
         Some(name.into()),
     )
     .unwrap();
     let mut prepared = harness
         .control
-        .prepare_spawn_fixture(&harness.config, &source, false)
+        .prepare_spawn_fixture(&harness.config, &source, /*full_history*/ false)
         .await
         .expect("prepare on actual registered caller");
     if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) = &mut source {
@@ -7617,7 +7617,7 @@ async fn fresh_lifetime_permit(
             &harness.control.runtime,
             parent_id,
             &prepared,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await
@@ -7645,7 +7645,7 @@ async fn fresh_lifetime_lower_start(
             },
             harness.control.clone(),
             Some(parent.session.thread_id),
-            None,
+            /*inherited_exec_policy*/ None,
             permit,
         )
         .await
@@ -7670,7 +7670,12 @@ async fn consumed_fresh_permit_rejects_stopped_or_replaced_caller(replace: bool)
     let parent = started.thread;
     let parent_id = started.thread_id;
     persist_thread_for_tree_resume(&parent, "post consume caller lifetime").await;
-    let stored = parent.read_thread(true, true).await.unwrap();
+    let stored = parent
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     let initial = InitialHistory::Resumed(ResumedHistory {
         history_revision: None,
         conversation_id: parent_id,
@@ -7877,7 +7882,12 @@ async fn idle_fresh_capacity_resident(
     let membership = harness.control.runtime.admit_start().unwrap();
     let slot = harness
         .control
-        .reserve_v2_residency_slot(&state, &harness.config, &membership, None)
+        .reserve_v2_residency_slot(
+            &state,
+            &harness.config,
+            &membership,
+            /*protected_thread_id*/ None,
+        )
         .await
         .unwrap();
     let (prepared, source, permit) = fresh_lifetime_permit(harness, root, name).await;
@@ -7935,7 +7945,7 @@ async fn fresh_host_idle_caller_is_protected_during_capacity_reservation(alterna
     // proof, whereas this case must cross the production fresh capacity path.
     prepared = harness
         .control
-        .prepare_spawn_fixture(&prepared, &source, false)
+        .prepare_spawn_fixture(&prepared, &source, /*full_history*/ false)
         .await
         .unwrap();
     let outcome = harness
