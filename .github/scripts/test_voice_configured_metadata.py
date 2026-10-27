@@ -250,6 +250,87 @@ class ParsingTests(unittest.TestCase):
                 m.parse_provider(line + body, record["label"])
 
 
+class ProviderLabelMismatchTests(unittest.TestCase):
+    def assert_mismatch(self, observed, expected, kind):
+        self.assertEqual(m.provider_label_mismatch_kind(observed, expected), kind)
+        record = copy.deepcopy(packages()[0][0])
+        record["label"] = observed
+        with self.assertRaises(m.ProviderLabelMismatch) as caught:
+            m.parse_provider(m.SENTINEL + json.dumps(record), expected)
+        self.assertEqual(str(caught.exception), "Provider label mismatch")
+        self.assertEqual(vars(caught.exception), {"kind": kind})
+        self.assertEqual(caught.exception.args, ("Provider label mismatch",))
+
+    def test_all_requested_apparent_positive_and_canonical_still_rejected(self):
+        for label in m.LABELS:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    m.provider_label_mismatch_kind(label, label), "expected-apparent"
+                )
+                record = copy.deepcopy(packages()[0][0])
+                record["label"] = label
+                self.assertEqual(
+                    m.parse_provider(m.SENTINEL + json.dumps(record), label), record
+                )
+                self.assert_mismatch("@@" + label, label, "requested-canonical")
+
+    def test_only_source_fixed_native_alias_forms_are_classified_and_rejected(self):
+        self.assert_mismatch(m.LABELS[2], m.LABELS[0], "approved-alias-apparent")
+        self.assert_mismatch(
+            "@@" + m.LABELS[2], m.LABELS[0], "approved-alias-canonical"
+        )
+        self.assert_mismatch(m.LABELS[1], m.LABELS[0], "unrecognized")
+        for expected in m.LABELS[1:]:
+            for observed in (m.LABELS[0], "@@" + m.LABELS[0]):
+                with self.subTest(expected=expected, observed=observed):
+                    self.assert_mismatch(observed, expected, "unrecognized")
+
+    def test_other_repositories_labels_prefixes_trailing_and_types_stay_unrecognized(
+        self,
+    ):
+        for observed in (
+            "@@external+" + m.LABELS[0],
+            "@@external+" + m.LABELS[2],
+            "@external" + m.LABELS[0],
+            "@@@@" + m.LABELS[0],
+            m.LABELS[0] + " PRIVATE_TOKEN",
+            m.LABELS[0] + "\n",
+            "PRIVATE_UNKNOWN",
+            None,
+            7,
+            False,
+            [],
+            {"PRIVATE": "TOKEN"},
+        ):
+            with self.subTest(observed=observed):
+                self.assert_mismatch(observed, m.LABELS[0], "unrecognized")
+        for observed in (m.LABELS[3], "@@" + m.LABELS[3]):
+            self.assert_mismatch(observed, m.LABELS[1], "unrecognized")
+
+    def test_classifier_requires_exact_string_types_and_fixed_expected_catalog(self):
+        class StringSubclass(str):
+            pass
+
+        class PrivateObject:
+            def __str__(self):
+                raise AssertionError("Private values must not be coerced")
+
+        for observed, expected in (
+            (StringSubclass(m.LABELS[0]), m.LABELS[0]),
+            (m.LABELS[0], StringSubclass(m.LABELS[0])),
+            ("//PRIVATE:label", "//PRIVATE:label"),
+            (m.LABELS[0], None),
+            (PrivateObject(), m.LABELS[0]),
+            (m.LABELS[0], PrivateObject()),
+        ):
+            with self.subTest(
+                observed_type=type(observed), expected_type=type(expected)
+            ):
+                error = m.ProviderLabelMismatch(observed, expected)
+                self.assertEqual(vars(error), {"kind": "unrecognized"})
+                self.assertEqual(str(error), "Provider label mismatch")
+
+
 class ActualWrapperFramingTests(unittest.TestCase):
     def keyless_wrapper_stderr(self, query):
         env = {"CODEX_BAZEL_BIN": "fixture-bazel"}
@@ -2536,6 +2617,29 @@ class ProvenanceStatusTests(unittest.TestCase):
         manifest = self.main_fixture(b"SECOND_PRIVATE_UNKNOWN", both_fail=True)
         self.assertEqual(manifest["rejected_stage"], "query-stdout-validation")
         self.assertEqual(manifest["rejected_stream"], "stdout")
+
+    def test_main_emits_only_finite_label_mismatch_kind_and_still_fails(self):
+        for observed, kind in (
+            ("@@" + m.LABELS[0], "requested-canonical"),
+            (m.LABELS[2], "approved-alias-apparent"),
+            ("@@" + m.LABELS[2], "approved-alias-canonical"),
+            ("PRIVATE_TOKEN_URL", "unrecognized"),
+        ):
+            with (
+                self.subTest(kind=kind),
+                mock.patch.object(
+                    m,
+                    "parse_provider",
+                    side_effect=m.ProviderLabelMismatch(observed, m.LABELS[0]),
+                ),
+            ):
+                manifest = self.main_fixture(b"")
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(manifest["failure"], "Provider label mismatch")
+                self.assertEqual(manifest["provider_label_mismatch_kind"], kind)
+                self.assertNotIn("artifacts", manifest)
+        manifest = self.main_fixture(b"PRIVATE_UNKNOWN_STDERR")
+        self.assertNotIn("provider_label_mismatch_kind", manifest)
 
     def test_exit_zero_missing_or_stale_status_never_attests_launcher(self):
         for failure in ("missing", "nonce"):

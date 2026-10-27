@@ -84,6 +84,31 @@ class EvidenceError(Exception):
     """Intentionally contains only static diagnostics, never raw query content."""
 
 
+def provider_label_mismatch_kind(observed, expected):
+    """Classify exact source-public spellings without accepting any mismatch."""
+    if type(observed) is not str or type(expected) is not str or expected not in LABELS:
+        return "unrecognized"
+    if observed == expected:
+        return "expected-apparent"
+    if observed == "@@" + expected:
+        return "requested-canonical"
+    # Only this native-MSVC alias selects the source-public runtime package.
+    if expected == LABELS[0]:
+        if observed == LABELS[2]:
+            return "approved-alias-apparent"
+        if observed == "@@" + LABELS[2]:
+            return "approved-alias-canonical"
+    return "unrecognized"
+
+
+class ProviderLabelMismatch(EvidenceError):
+    """Retain only a finite diagnostic, never either private input value."""
+
+    def __init__(self, observed, expected):
+        super().__init__("Provider label mismatch")
+        self.kind = provider_label_mismatch_kind(observed, expected)
+
+
 class RejectedWrapperLine(EvidenceError):
     """One fixed shape observation; never retains the rejected private line."""
 
@@ -225,7 +250,8 @@ def parse_provider(text, label):
         record = json.loads(records[0], object_pairs_hook=unique_object)
     except ValueError:
         raise EvidenceError("Malformed provider record") from None
-    require(record.get("label") == label, "Provider label mismatch")
+    if record.get("label") != label:
+        raise ProviderLabelMismatch(record.get("label"), label)
     require(isinstance(record.get("provider_keys"), list), "Missing provider keys")
     require("default" in record, "Missing DefaultInfo")
     require(
@@ -1424,6 +1450,8 @@ def main():
         manifest["rejected_stream"] = validation["stream"]
         if isinstance(error, RejectedWrapperLine):
             manifest["rejected_wrapper_line_shape"] = error.shape.copy()
+        if isinstance(error, ProviderLabelMismatch):
+            manifest["provider_label_mismatch_kind"] = error.kind
         raise
     finally:
         unchanged = (
