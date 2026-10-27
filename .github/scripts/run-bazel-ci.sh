@@ -552,15 +552,8 @@ bazel_console_log="$(mktemp)"
 trap 'rm -f "$bazel_console_log"' EXIT
 
 bazel_run_args=(
-  "${bazel_args[0]}"
+  "${bazel_args[@]}"
 )
-if [[ $hosted_storage -eq 1 ]]; then
-  # Early default only: explicit caller flags (including empty/split) win.
-  while IFS= read -r -d '' arg; do
-    bazel_run_args+=("$arg")
-  done < <(python3 "$storage_script" defaults "${bazel_args[@]}")
-fi
-bazel_run_args+=("${bazel_args[@]:1}")
 if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
   echo "BuildBuddy API key is available; using remote Bazel configuration."
   bazel_run_args+=("--config=${ci_config}")
@@ -571,6 +564,17 @@ if (( ${#post_config_bazel_args[@]} > 0 )); then
   bazel_run_args+=("${post_config_bazel_args[@]}")
 fi
 if [[ $hosted_storage -eq 1 ]]; then
+  # Use the backend's keyless config classification before deciding defaults;
+  # BUILD and INFO must see the same effective local arguments.
+  effective_bazel_args=()
+  while IFS= read -r -d '' arg; do
+    effective_bazel_args+=("$arg")
+  done < <(python3 "$storage_script" effective "${bazel_run_args[@]}")
+  if (( ${#effective_bazel_args[@]} == 0 )); then
+    echo "Could not normalize hosted Bazel arguments" >&2
+    exit 1
+  fi
+  bazel_run_args=("${effective_bazel_args[@]}")
   python3 "$storage_script" observe before-build none "${bazel_run_args[@]}" || echo "Hosted storage observation unavailable" >&2
 fi
 set +e

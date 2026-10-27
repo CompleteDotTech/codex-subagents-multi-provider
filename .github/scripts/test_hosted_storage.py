@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import hosted_storage as storage
+import run_bazel_with_buildbuddy as backend
 
 ENV = dict(
     GITHUB_ACTIONS="true",
@@ -57,11 +58,100 @@ class PolicyTests(unittest.TestCase):
             ["--remote_executor=grpcs://synthetic"],
             ["--remote_cache", "https://synthetic"],
             ["--config", "buildbuddy-generic-rbe"],
-            ["--config=ci-linux"],
-            ["--strategy=remote"],
+            ["--strategy=Rustc=remote"],
         ):
             self.assertEqual(storage.defaults(["test", *flags], ENV), [])
 
+    def test_local_only_strategies_and_last_value_for_same_mnemonic(self):
+        for flags in (
+            ["--strategy=Rustc=local"],
+            ["--strategy", "Rustc=local,sandboxed"],
+            ["--strategy=Rustc=remote", "--strategy=Rustc=local"],
+        ):
+            args = ["test", *flags]
+            self.assertEqual(
+                storage.effective_arguments(args, ENV),
+                ["test", "--disk_cache=", *flags],
+            )
+        for flags in (
+            ["--strategy=Rustc=local", "--strategy=Rustc=remote,sandboxed"],
+            ["--strategy=Rustc=local", "--strategy=Genrule=remote"],
+        ):
+            self.assertEqual(storage.defaults(["test", *flags], ENV), [])
+
+
+class BackendInteractionTests(unittest.TestCase):
+    def test_keyless_configs_have_identical_local_build_and_info_routes(self):
+        for name in ("ci-linux", "ci-macos", "ci-v8"):
+            for flags in (["--config=" + name], ["--config", name]):
+                with self.subTest(flags=flags):
+                    payload = ["//target", "--config=" + name, "--config", name]
+                    effective = storage.effective_arguments(
+                        ["test", *flags, "--", *payload], ENV
+                    )
+                    build = backend.bazel_command(*effective, env=ENV)
+                    info = backend.bazel_command(
+                        "info",
+                        *storage.info_options(effective),
+                        "bazel-testlogs",
+                        env=ENV,
+                    )
+                    self.assertIn("--disk_cache=", build)
+                    self.assertIn("--disk_cache=", info)
+                    self.assertNotIn("--config=" + name, build[: build.index("--")])
+                    self.assertNotIn("--config=" + name, info)
+                    self.assertNotIn(name, build[: build.index("--")])
+                    self.assertEqual(build[build.index("--") + 1 :], payload)
+                    self.assertEqual(
+                        storage.effective_arguments(effective, ENV), effective
+                    )
+
+    def test_explicit_cache_remains_owned_after_real_backend_fallback(self):
+        for cache in (
+            ["--disk_cache=first", "--disk_cache", "last"],
+            ["--disk_cache", ""],
+            ["--disk_cache="],
+        ):
+            effective = storage.effective_arguments(
+                ["test", "--config", "ci-linux", *cache, "--", "//target"], ENV
+            )
+            command = backend.bazel_command(*effective, env=ENV)
+            self.assertEqual(
+                command[command.index("test") + 1 : command.index("--")], cache
+            )
+
+    def test_new_normalization_does_not_change_other_routes(self):
+        for change in (
+            {"BUILDBUDDY_API_KEY": "synthetic-key"},
+            {"GITHUB_REPOSITORY": "openai/codex"},
+            {"RUNNER_OS": "Windows"},
+            {"GITHUB_ACTIONS": "false"},
+        ):
+            env = dict(ENV, **change)
+            for flags in (["--config=ci-linux"], ["--config", "ci-linux"]):
+                args = ["test", *flags, "--", "//target"]
+                effective = storage.effective_arguments(args, env)
+                self.assertEqual(effective, args)
+                self.assertEqual(
+                    backend.bazel_command(*effective, env=env),
+                    backend.bazel_command(*args, env=env),
+                )
+
+    def test_real_remote_endpoints_are_retained_by_actual_backend(self):
+        for flags in (
+            ["--remote_executor=grpcs://synthetic"],
+            ["--remote_cache", "https://synthetic"],
+        ):
+            effective = storage.effective_arguments(
+                ["test", "--config=ci-linux", *flags, "--", "//target"], ENV
+            )
+            command = backend.bazel_command(*effective, env=ENV)
+            self.assertNotIn("--disk_cache=", command)
+            for flag in flags:
+                self.assertIn(flag, command)
+
+
+class ProjectionTests(unittest.TestCase):
     def test_info_projection_preserves_order_and_actual_configuration(self):
         args = [
             "test",
@@ -204,6 +294,9 @@ class ShellTests(unittest.TestCase):
             source = Path(__file__).parent
             shutil.copyfile(source / "run-bazel-ci.sh", root / "run-bazel-ci.sh")
             shutil.copyfile(source / "hosted_storage.py", root / "policy.py")
+            shutil.copyfile(
+                source / "run_bazel_with_buildbuddy.py", root / "backend.py"
+            )
             # Mock just filesystem observations; use real defaults/projection.
             (root / "hosted_storage.py").write_text(
                 "import json, os, sys\nimport policy\n"
@@ -214,9 +307,11 @@ class ShellTests(unittest.TestCase):
             )
             (root / "run_bazel_with_buildbuddy.py").write_text(
                 "#!/usr/bin/env python3\nimport json, os, sys\n"
-                "with open(os.environ['RECORD'], 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
-                "if 'info' in sys.argv: print('/nonexistent-testlogs'); sys.exit(0)\n"
-                "sys.exit(37)\n",
+                "from backend import REMOTE_EXECUTION_CONFIGS, bazel_args_without_remote_execution\n"
+                "if __name__ == '__main__':\n"
+                " with open(os.environ['RECORD'], 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                " if 'info' in sys.argv: print('/nonexistent-testlogs'); sys.exit(0)\n"
+                " sys.exit(37)\n",
                 encoding="utf-8",
             )
             (root / "run_bazel_with_buildbuddy.py").chmod(0o755)
@@ -274,6 +369,21 @@ class ShellTests(unittest.TestCase):
         )
         self.assertIn("--disk_cache=cache with spaces", calls[3])
         self.assertNotIn("--disk_cache=payload", calls[3])
+
+    def test_both_remote_ci_spellings_are_removed_before_shell_dispatch(self):
+        for name in ("ci-linux", "ci-macos", "ci-v8"):
+            for flags in (["--config=" + name], ["--config", name]):
+                result, calls = self.invoke(flags, ["--config=" + name])
+                self.assertEqual(result.returncode, 37, result.stderr)
+                build, info = calls[1], calls[3]
+                self.assertIn("--disk_cache=", build)
+                self.assertIn("--disk_cache=", info)
+                self.assertNotIn("--config=" + name, build[: build.index("--")])
+                self.assertNotIn(name, build[: build.index("--")])
+                self.assertNotIn("--config=" + name, info)
+                self.assertEqual(
+                    build[build.index("--") + 1 :], ["//target", "--config=" + name]
+                )
 
 
 if __name__ == "__main__":

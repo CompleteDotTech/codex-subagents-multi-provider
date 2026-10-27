@@ -9,6 +9,11 @@ import sys
 import time
 import uuid
 
+from run_bazel_with_buildbuddy import (
+    REMOTE_EXECUTION_CONFIGS,
+    bazel_args_without_remote_execution,
+)
+
 FORK = "CompleteDotTech/codex-subagents-multi-provider"
 INFO_OPTIONS = {
     "--config",
@@ -50,26 +55,63 @@ def options(args, names=INFO_OPTIONS):
 
 
 def defaults(args, env):
+    args = local_arguments(args, env)
     explicit = list(options(args, INFO_OPTIONS | REMOTE_OPTIONS))
+    # --strategy is a per-mnemonic map: later values replace the same mnemonic.
+    # A local/sandboxed override does not select a remote execution strategy.
+    strategies = {}
+    for name, value in explicit:
+        mnemonic, equal, choices = value.partition("=")
+        if name == "--strategy" and equal:
+            strategies[mnemonic] = choices.split(",")
     if (
         scoped(env)
         and args
         and args[0] in ("build", "test", "coverage", "run", "info")
         and not any(name == "--disk_cache" for name, _ in explicit)
         and not any(
-            (name in REMOTE_OPTIONS and value)
-            or (
-                name == "--config"
-                and (
-                    "buildbuddy" in value
-                    or value in ("remote", "ci-linux", "ci-macos", "ci-v8")
-                )
-            )
+            (name in ("--remote_executor", "--remote_cache") and value)
+            or (name == "--config" and ("buildbuddy" in value or value == "remote"))
             for name, value in explicit
         )
+        and not any("remote" in choices for choices in strategies.values())
     ):
         return ["--disk_cache="]
     return []
+
+
+def local_arguments(args, env):
+    """Match the existing keyless backend, including known split CI configs.
+
+    Other routes retain their original bytes. Only configs already classified by
+    the backend as credential-dependent remote CI are canonicalized and removed.
+    """
+    if not scoped(env):
+        return list(args)
+    normalized = []
+    index = 0
+    while index < len(args):
+        if args[index] == "--":
+            normalized.extend(args[index:])
+            break
+        if (
+            args[index] == "--config"
+            and index + 1 < len(args)
+            and "--config=" + args[index + 1] in REMOTE_EXECUTION_CONFIGS
+        ):
+            normalized.append("--config=" + args[index + 1])
+            index += 2
+        else:
+            normalized.append(args[index])
+            index += 1
+    return bazel_args_without_remote_execution(normalized)
+
+
+def effective_arguments(args, env):
+    args = local_arguments(args, env)
+    if not args:
+        return args
+    return [args[0], *defaults(args, env), *args[1:]]
 
 
 def info_options(args):
@@ -192,8 +234,13 @@ def receipt(phase, args, env, status=None):
 def main():
     mode, *args = sys.argv[1:]
     env = dict(os.environ)
-    if mode in ("defaults", "info"):
-        values = defaults(args, env) if mode == "defaults" else info_options(args)
+    if mode in ("defaults", "effective", "info"):
+        if mode == "defaults":
+            values = defaults(args, env)
+        elif mode == "effective":
+            values = effective_arguments(args, env)
+        else:
+            values = info_options(effective_arguments(args, env))
         for value in values:
             sys.stdout.buffer.write(value.encode() + b"\0")
         return
