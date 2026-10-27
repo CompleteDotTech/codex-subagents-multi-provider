@@ -568,12 +568,16 @@ def classify_lines(lowered):
 
     Keep whole-buffer observations distinct from same-line co-occurrence.
     Even exact literals can occur in help text or an arbitrary path/message.
-    Only booleans escape; line contents and line numbers are never retained.
+    Only fixed booleans and two bounded claimed command lengths escape; line
+    contents, source line numbers and command suffixes are never retained.
     """
     result = {
         "any_line_installation_symlink_literal": False,
         "fatal_installation_symlink_line": False,
         "junction_api_line": False,
+        "fatal_command_line_too_long_line": False,
+        "command_line_claimed_length": None,
+        "command_line_claimed_limit": None,
         **{
             f"junction_{name}_line": False
             for name in (
@@ -608,6 +612,23 @@ def classify_lines(lowered):
             line = match[0]
             present = {name: needle in line for name, needle in LINE_LITERALS.items()}
             fatal = line.startswith(b"fatal:")
+            # Bazel 9.2.0 blaze_util_windows.cc CreateCommandLine; the source
+            # checks >=32768 although its fixed diagnostic prints " > ".
+            # Anchor at the fatal message start. Never search into appended argv
+            # for another prefix, and never capture or export the argv suffix.
+            command_line_prefix = b"fatal: command line too long ("
+            if line.startswith(command_line_prefix):
+                result["fatal_command_line_too_long_line"] = True
+                claimed = re.match(
+                    rb"^fatal: command line too long \(([0-9]{1,8}) > ([0-9]{1,8})\): ",
+                    line,
+                )
+                if (
+                    claimed is not None
+                    and result["command_line_claimed_length"] is None
+                ):
+                    result["command_line_claimed_length"] = int(claimed[1])
+                    result["command_line_claimed_limit"] = int(claimed[2])
             junction = present["symlink_directories"] and present["junction_call"]
             api = b"error: " in line and any(
                 present[name]
@@ -718,6 +739,18 @@ def classify_failure(raw):
         else "unknown",
         "cause": "unknown",
         "line_evidence": classify_lines(lowered),
+        "memory_alternatives": {
+            "outofmemoryerror_token": present[b"outofmemoryerror"],
+            "out_of_memory_phrase": present[b"out of memory"],
+            "cannot_allocate_memory_phrase": present[b"cannot allocate memory"],
+            "native_memory_allocation_and_failed_tokens": present[
+                b"native memory allocation"
+            ]
+            and present[b"failed"],
+        },
+        # startup_options.cc 9.2.0 emits this ordinary JVM argument; observing
+        # its embedded token alone is not an observed OutOfMemoryError event.
+        "known_jvm_oom_option_marker": b"-xx:onoutofmemoryerror=touch " in lowered,
         "error_prefix": error,
         "fatal_prefix": fatal,
         "jvm_fatal_signature": "java_fatal_signature" in signatures,

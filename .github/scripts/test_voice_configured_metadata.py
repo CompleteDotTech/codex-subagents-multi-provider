@@ -498,6 +498,62 @@ class FailureClassificationTests(unittest.TestCase):
                     self.assertTrue(evidence["out_of_memory_line"])
                     self.assertFalse(evidence["fatal_out_of_memory_line"])
 
+    def test_fatal_command_length_grammar_never_exports_argv(self):
+        suffix = b"C:/PRIVATE_PASSWORD https://private.invalid/?token=PRIVATE_TOKEN --authorization=PRIVATE_AUTH"
+        for length in (32768, 45000, 99999999):
+            raw = f"FATAL: Command line too long ({length} > 32768): ".encode() + suffix
+            result = m.classify_failure(raw)
+            evidence = result["line_evidence"]
+            self.assertTrue(evidence["fatal_command_line_too_long_line"])
+            self.assertEqual(evidence["command_line_claimed_length"], length)
+            self.assertEqual(evidence["command_line_claimed_limit"], 32768)
+            self.assertEqual(result["cause"], "unknown")
+            self.assertNotIn("PRIVATE_", json.dumps(result))
+            self.assertNotIn("https://", json.dumps(result))
+        for raw in (
+            b"FATAL: Command line too long (999999999 > 32768): private",
+            b"FATAL: Command line too long (45000 > 999999999): private",
+            b"FATAL: Command line too long (-1 > 32768): private",
+            b"FATAL: Command line too long (45000>32768): private",
+            b"FATAL: Command line too long (45000 > 32768):private",
+            b"FATAL: unrelated Command line too long (45000 > 32768): private",
+            b"help: FATAL: Command line too long (45000 > 32768): private",
+            b"FATAL: Command line too long (45000 >\n32768): private",
+            b"FATAL: unrelated\nCommand line too long (45000 > 32768): private",
+        ):
+            with self.subTest(raw=raw):
+                evidence = m.classify_failure(raw)["line_evidence"]
+                self.assertIsNone(evidence["command_line_claimed_length"])
+                self.assertIsNone(evidence["command_line_claimed_limit"])
+        # Oversized digits and repeated near-prefixes on a full-limit line must
+        # not cause restarting searches or capture anything from private argv.
+        prefix = b"FATAL: Command line too long (999999999 > 32768): private "
+        raw = (prefix * (m.LIMIT // len(prefix) + 1))[: m.LIMIT]
+        evidence = m.classify_lines(raw.lower())
+        self.assertTrue(evidence["fatal_command_line_too_long_line"])
+        self.assertIsNone(evidence["command_line_claimed_length"])
+        self.assertIsNone(evidence["command_line_claimed_limit"])
+
+    def test_memory_alternatives_and_known_normal_jvm_option(self):
+        fixtures = {
+            "outofmemoryerror_token": b"OutOfMemoryError",
+            "out_of_memory_phrase": b"out of memory",
+            "cannot_allocate_memory_phrase": b"cannot allocate memory",
+            "native_memory_allocation_and_failed_tokens": b"native memory allocation private failed",
+        }
+        for name, raw in fixtures.items():
+            result = m.classify_failure(raw)
+            self.assertEqual(
+                result["memory_alternatives"], {key: key == name for key in fixtures}
+            )
+            self.assertFalse(result["known_jvm_oom_option_marker"])
+        result = m.classify_failure(b"-XX:OnOutOfMemoryError=touch C:/PRIVATE_PATH")
+        self.assertTrue(result["known_jvm_oom_option_marker"])
+        self.assertTrue(result["memory_alternatives"]["outofmemoryerror_token"])
+        self.assertEqual(result["exception_classes"], [])
+        self.assertEqual(result["cause"], "unknown")
+        self.assertNotIn("PRIVATE_PATH", json.dumps(result))
+
     def test_arbitrary_bytes_and_secret_text_cannot_escape(self):
         import random
 
