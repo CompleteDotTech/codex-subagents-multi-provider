@@ -113,7 +113,7 @@ class RustFormatPolicyTests(unittest.TestCase):
         driver = runpy.run_path(str(formatting.ROOT / "scripts/format.py"))
         for check in (True, False):
             group = driver["rust_formatter_group"](check=check)
-            self.assertEqual(len(group.commands), 2)
+            self.assertGreaterEqual(len(group.commands), 2)
             self.assertEqual(group.commands[1].args[0], "rustfmt")
             self.assertIn(
                 "imports_granularity=Item,skip_children=true", group.commands[1].args

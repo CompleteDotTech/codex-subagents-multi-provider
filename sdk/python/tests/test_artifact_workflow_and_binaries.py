@@ -1535,3 +1535,45 @@ def test_root_rust_file_formatter_runs_after_verified_helper(
     assert len(calls) == 2
     assert result.returncode == writer_status
     assert ("file formatting result" in result.output) == bool(writer_status)
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_root_rust_batches_bound_quoted_utf16_and_preserve_paths(monkeypatch, check):
+    script = _load_root_format_script_module()
+    monkeypatch.setattr(script, "RUSTFMT_COMMAND_LIMIT", 180)
+    prefix = ["rustfmt", "--config", "imports_granularity=Item,skip_children=true"]
+    if check:
+        prefix.append("--check")
+    paths = [f'folder with spaces/{index}\U0001f600quoted"tail\\.rs' for index in range(12)]
+    batches = script.rustfmt_batches(prefix, paths)
+    assert len(batches) > 1
+    assert [path for batch in batches for path in batch[len(prefix) :]] == paths
+    for batch in batches:
+        assert list(batch[: len(prefix)]) == prefix
+        units = len(subprocess.list2cmdline(batch).encode("utf-16-le")) // 2 + 1
+        assert units <= 180
+    with pytest.raises(ValueError, match="path exceeds command-line limit"):
+        script.rustfmt_batches(prefix, ["\U0001f600" * 180])
+
+
+def test_root_rust_integrity_failure_blocks_all_batches(monkeypatch, tmp_path):
+    script = _load_root_format_script_module()
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(script, "RUSTFMT_COMMAND_LIMIT", 400)
+    paths = [f"orphan {index:03}.rs" for index in range(80)]
+    for path in paths:
+        (tmp_path / path).write_text("fn main() {}")
+    monkeypatch.setattr(
+        script.subprocess, "check_output", lambda *a, **kw: ("\0".join(paths) + "\0").encode()
+    )
+    group = script.rust_formatter_group(check=False)
+    assert len(group.commands) > 2
+    calls = []
+
+    def reject(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1, "bad vendor pin")
+
+    monkeypatch.setattr(script.subprocess, "run", reject)
+    assert script.run_formatter_group(group).returncode == 1
+    assert calls == [group.commands[0].args]

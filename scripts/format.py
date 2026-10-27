@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+RUSTFMT_COMMAND_LIMIT = 16_000
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,37 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
     if check:
         args.append("--check")
     return FormatterGroup("Just", (Command(tuple(args)),))
+
+
+def rustfmt_batches(prefix: list[str], paths: list[str]) -> list[tuple[str, ...]]:
+    """Bound Windows quoting and UTF-16 size, including the terminating NUL."""
+
+    def fits(args: list[str]) -> bool:
+        return (
+            len(
+                subprocess.list2cmdline(args).encode(
+                    "utf-16-le", errors="surrogatepass"
+                )
+            )
+            // 2
+            + 1
+            <= RUSTFMT_COMMAND_LIMIT
+        )
+
+    batches = []
+    batch = prefix.copy()
+    for path in paths:
+        if not fits([*prefix, path]):
+            raise ValueError(
+                f"Rust formatter path exceeds command-line limit: {path!r}"
+            )
+        if not fits([*batch, path]):
+            batches.append(tuple(batch))
+            batch = prefix.copy()
+        batch.append(path)
+    if len(batch) > len(prefix):
+        batches.append(tuple(batch))
+    return batches
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
@@ -85,7 +117,10 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
         ]
         if check:
             rustfmt_args.append("--check")
-        commands.append(Command(tuple([*rustfmt_args, *rust_files]), workspace))
+        commands.extend(
+            Command(batch, workspace)
+            for batch in rustfmt_batches(rustfmt_args, rust_files)
+        )
     return FormatterGroup("Rust", tuple(commands))
 
 
