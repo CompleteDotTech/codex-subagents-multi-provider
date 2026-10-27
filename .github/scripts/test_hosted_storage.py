@@ -472,23 +472,34 @@ class RestoreCredentialTests(unittest.TestCase):
                     content.count("uses: ./.github/actions/prepare-bazel-ci"),
                     str(path),
                 )
-                diagnostic = (
-                    re.search(
-                        r"^  voice-runtime-diagnostic:\n(.*?)(?=^  [\w-]+:|\Z)",
-                        content,
-                        re.M | re.S,
+                diagnostics = (
+                    list(
+                        re.finditer(
+                            r"^  (?:voice|pty)-runtime-diagnostic:\n(.*?)(?=^  [\w-]+:|\Z)",
+                            content,
+                            re.M | re.S,
+                        )
                     )
                     if path == github / "workflows/bazel.yml"
-                    else None
+                    else []
                 )
                 for call in calls:
                     params = call.group(2)
-                    if (
-                        diagnostic
-                        and diagnostic.start() < call.start() < diagnostic.end()
-                    ):
+                    diagnostic = next(
+                        (
+                            job
+                            for job in diagnostics
+                            if job.start() < call.start() < job.end()
+                        ),
+                        None,
+                    )
+                    if diagnostic is not None:
                         expected = "false"
                         # This isolated route never receives a BuildBuddy secret.
+                        self.assertIn(
+                            "github.event_name == 'workflow_dispatch'",
+                            diagnostic.group(1),
+                        )
                         self.assertNotIn("secrets.", diagnostic.group(1))
                         self.assertIn("unset BUILDBUDDY_API_KEY", diagnostic.group(1))
                     elif directory.name == "workflows":

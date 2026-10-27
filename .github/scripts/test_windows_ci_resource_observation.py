@@ -266,8 +266,16 @@ class ObservationTests(unittest.TestCase):
 
     def test_workflow_only_diagnostic_job_uses_observer(self):
         workflow = Path(__file__).parents[1] / "workflows" / "bazel.yml"
-        before, job = workflow.read_text().split("  voice-runtime-diagnostic:", 1)
-        self.assertNotIn("observe_windows_ci_resources", before)
+        text = workflow.read_text()
+        match = re.search(
+            r"^  voice-runtime-diagnostic:\n(.*?)(?=^  [\w-]+:|\Z)",
+            text,
+            re.M | re.S,
+        )
+        self.assertIsNotNone(match)
+        job = match.group(1)
+        self.assertNotIn("observe_windows_ci_resources", text[: match.start()])
+        self.assertNotIn("observe_windows_ci_resources", text[match.end() :])
         self.assertIn(
             'python .github/scripts/observe_windows_ci_resources.py supervise -- "$git_bash" ./.github/scripts/run-bazel-ci.sh',
             job,

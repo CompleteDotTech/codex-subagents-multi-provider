@@ -11,16 +11,20 @@ on:
         description: Run only the bounded native MSVC voice loader diagnostic
         type: boolean
         default: false
+      pty_runtime_diagnostic:
+        description: Run only the original Windows PTY suite with bounded evidence
+        type: boolean
+        default: false
 
 concurrency:
   # Cancel previous actions from the same PR or branch except 'main' branch.
   # See https://docs.github.com/en/actions/using-jobs/using-concurrency and https://docs.github.com/en/actions/learn-github-actions/contexts for more info.
-  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}::${{ github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && 'voice-diagnostic' || 'normal' }}
+  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}::${{ github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && inputs.pty_runtime_diagnostic && 'invalid-diagnostic' || github.event_name == 'workflow_dispatch' && inputs.pty_runtime_diagnostic && 'pty-diagnostic' || github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && 'voice-diagnostic' || 'normal' }}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 jobs:
   test:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.pty_runtime_diagnostic)) }}
     # PRs use the sharded Windows cross-compiled test jobs below. Post-merge
     # pushes to main also run the native Windows test job for broader Windows
     # signal without putting PR latency back on the critical path. When
@@ -172,7 +176,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   test-windows-shard:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.pty_runtime_diagnostic)) }}
     # Split the Windows Bazel test leg across separate Windows hosts. Jobs with
     # BuildBuddy credentials use Linux RBE for build actions; test execution
     # remains on a Windows runner.
@@ -282,7 +286,7 @@ jobs:
   test-windows:
     # Preserve the existing required-check surface while the real work happens
     # in the sharded Windows jobs above.
-    if: always() && !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic)
+    if: always() && !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.pty_runtime_diagnostic))
     needs: test-windows-shard
     runs-on: ubuntu-24.04
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm
@@ -300,7 +304,7 @@ jobs:
     # Native Windows Bazel tests are slower and frequently approach the
     # 30-minute PR budget. Run this only for post-merge commits to main and give
     # it a larger timeout. Also allow manual runs for native toolchain changes.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.pty_runtime_diagnostic)) && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
     timeout-minutes: 40
     runs-on: ${{ github.repository == 'openai/codex' && fromJSON(format('{{"group":"{0}-runners","labels":"{0}-windows-x64"}}', github.event.repository.name)) || 'windows-2025' }}
     name: Bazel test on windows-latest for x86_64-pc-windows-msvc (native main)
@@ -383,7 +387,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   clippy:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.pty_runtime_diagnostic)) }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -527,7 +531,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   verify-release-build:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.pty_runtime_diagnostic)) }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -684,7 +688,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   voice-runtime-diagnostic:
-    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic
+    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && !inputs.pty_runtime_diagnostic
     runs-on: windows-2025
     timeout-minutes: 60
     permissions:
@@ -777,3 +781,104 @@ jobs:
           name: voice-runtime-diagnostic-${{ github.sha }}
           path: ${{ runner.temp }}/voice-runtime-diagnostic
           if-no-files-found: warn
+
+  invalid-diagnostic-selection:
+    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && inputs.pty_runtime_diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Reject overlapping diagnostic modes
+        shell: bash
+        run: |
+          echo 'Select at most one diagnostic mode.' >&2
+          exit 1
+
+  pty-runtime-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.pty_runtime_diagnostic && !inputs.voice_runtime_diagnostic
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    environment:
+      name: bazel
+      deployment: false
+    steps:
+      - name: Enable long paths for Windows checkout
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Record bounded source and host provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse HEAD).Trim()
+          $tree = (git rev-parse 'HEAD^{tree}').Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) { throw 'Checkout identity mismatch' }
+          $version = $PSVersionTable.PSVersion
+          $record = [ordered]@{
+            head = $head
+            tree = $tree
+            run_id = [long]$env:GITHUB_RUN_ID
+            windows_build = [Environment]::OSVersion.Version.Build
+            powershell_major = $version.Major
+            powershell_minor = $version.Minor
+            powershell_patch = $version.Patch
+          }
+          $json = $record | ConvertTo-Json -Compress
+          Write-Output $json
+          $directory = Join-Path $env:RUNNER_TEMP 'pty-runtime-diagnostic'
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          $json | Set-Content -LiteralPath (Join-Path $directory 'provenance.json') -Encoding utf8
+      - name: Prepare Bazel CI
+        uses: ./.github/actions/prepare-bazel-ci
+        with:
+          remote-credentials: false
+          target: x86_64-pc-windows-gnullvm
+          native-windows-voice: true
+          cache-scope: bazel-test
+      - name: Run original Windows PTY suite
+        timeout-minutes: 45
+        shell: bash
+        # Match the failed keyless shard's actual native MSVC fallback.
+        # Keep original libtest concurrency; nocapture changes output only.
+        run: |
+          unset BUILDBUDDY_API_KEY
+          ./.github/scripts/run-bazel-ci.sh \
+            --print-failed-test-logs --print-failed-action-summary \
+            --windows-cross-compile --remote-download-toplevel -- \
+            test --nocache_test_results --test_output=all --test_arg=--nocapture \
+            --test_tag_filters=-argument-comment-lint --test_verbose_timeout_warnings \
+            --build_metadata=COMMIT_SHA=${GITHUB_SHA} -- \
+            //codex-rs/utils/pty:pty-unit-tests
+      - name: Collect bounded PTY text evidence
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/pty-runtime-diagnostic"
+          for name in test.log test.xml; do
+            file="bazel-testlogs/codex-rs/utils/pty/pty-unit-tests/${name}"
+            if [[ -f "$file" ]]; then
+              head -c 8388608 "$file" > "${RUNNER_TEMP}/pty-runtime-diagnostic/${name}"
+              if [[ $(wc -c < "$file") -gt 8388608 ]]; then
+                echo "${name}: retained first 8388608 bytes; original was larger"
+                printf '%s\n' 'Retained first 8388608 bytes.' > "${RUNNER_TEMP}/pty-runtime-diagnostic/${name}.truncated.txt"
+              fi
+            fi
+          done
+      - name: Upload bounded PTY text evidence
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pty-runtime-diagnostic-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/pty-runtime-diagnostic
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
