@@ -223,6 +223,139 @@ fn exact_denies_nested_read_carveouts_and_reopened_writes_are_preserved() {
 }
 
 #[test]
+fn readonly_workspace_intersections_compose_in_both_orders() {
+    let temp = TempDir::new().expect("workspace");
+    let root = canonical(&temp);
+    let writable = workspace(&root, Enabled);
+    let readonly = PermissionProfile::read_only();
+    for (left, right) in [(&writable, &readonly), (&readonly, &writable)] {
+        let first = intersection(left, right, &root);
+        let policy = first.file_system_sandbox_policy();
+        assert!(
+            policy
+                .get_writable_roots_with_cwd(root.as_path())
+                .is_empty()
+        );
+        assert!(
+            !policy
+                .entries
+                .iter()
+                .any(|entry| entry.skips_missing_path())
+        );
+        for ceiling in [&readonly, &writable] {
+            for (left, right) in [(&first, ceiling), (ceiling, &first)] {
+                let composed = intersection(left, right, &root);
+                let policy = composed.file_system_sandbox_policy();
+                assert!(
+                    policy
+                        .get_writable_roots_with_cwd(root.as_path())
+                        .is_empty()
+                );
+                for path in [&root, &root.join(".git"), &root.join(".codex")] {
+                    assert_eq!(
+                        policy
+                            .resolve_access_for_local_path_with_cwd(path.as_path(), root.as_path()),
+                        Read
+                    );
+                }
+                assert_eq!(composed.network_sandbox_policy(), Restricted);
+            }
+        }
+    }
+}
+
+#[test]
+fn composition_keeps_missing_metadata_and_later_reopened_write_boundaries() {
+    let temp = TempDir::new().expect("workspace");
+    let root = canonical(&temp);
+    let shared = root.join("shared");
+    let editable = shared.join("editable");
+    let secret = root.join("secret");
+    std::fs::create_dir_all(editable.as_path()).expect("nested workspace");
+    std::fs::create_dir(secret.as_path()).expect("denied path");
+    let writable = workspace(&root, Restricted);
+    let nested = rooted(
+        &root,
+        Write,
+        [
+            entry(shared.as_path(), Read),
+            entry(editable.as_path(), Write),
+            entry(secret.as_path(), Deny),
+        ],
+    );
+    let first = intersection(&writable, &nested, &root);
+    let policy = first.file_system_sandbox_policy();
+    assert!(
+        policy
+            .entries
+            .contains(&skipped(root.join(".codex").into(), Read))
+    );
+    assert!(!root.join(".codex").as_path().exists());
+    for ceiling in [&writable, &nested, &PermissionProfile::read_only()] {
+        for (left, right) in [(&first, ceiling), (ceiling, &first)] {
+            let composed = intersection(left, right, &root);
+            let policy = composed.file_system_sandbox_policy();
+            let expected_write = ceiling
+                .file_system_sandbox_policy()
+                .can_write_local_path_with_cwd(editable.as_path(), root.as_path());
+            assert_eq!(
+                policy.can_write_local_path_with_cwd(editable.as_path(), root.as_path()),
+                expected_write
+            );
+            assert!(!policy.can_write_local_path_with_cwd(shared.as_path(), root.as_path()));
+            assert!(
+                !policy
+                    .can_write_local_path_with_cwd(root.join(".codex").as_path(), root.as_path())
+            );
+            assert!(!policy.can_read_local_path_with_cwd(secret.as_path(), root.as_path()));
+            // A further writable ceiling must not restore removed authority.
+            let again = intersection(&composed, &writable, &root).file_system_sandbox_policy();
+            assert_eq!(
+                again.can_write_local_path_with_cwd(editable.as_path(), root.as_path()),
+                expected_write
+            );
+            assert!(!again.can_read_local_path_with_cwd(secret.as_path(), root.as_path()));
+        }
+    }
+}
+
+#[test]
+fn common_tmpdir_write_keeps_optional_workspace_metadata() {
+    let temp = TempDir::new().expect("workspace inside temporary directory");
+    let root = canonical(&temp);
+    let writable = workspace(&root, Restricted);
+    let temporary_only = managed(vec![root_read(), special(Tmpdir, Write)]);
+    for (left, right) in [(&writable, &temporary_only), (&temporary_only, &writable)] {
+        let policy = intersection(left, right, &root).file_system_sandbox_policy();
+        assert!(policy.entries.contains(&special(Tmpdir, Write)));
+        assert!(
+            policy
+                .entries
+                .contains(&skipped(root.join(".codex").into(), Read))
+        );
+        assert!(!root.join(".codex").as_path().exists());
+    }
+}
+
+#[test]
+fn redundant_optional_nonmetadata_reads_still_fail_closed() {
+    let temp = TempDir::new().expect("workspace");
+    let root = canonical(&temp);
+    let readonly = PermissionProfile::read_only();
+    for path in [root.join("ordinary"), root.join(".codex")] {
+        let unsupported = managed(vec![root_read(), skipped(path.into(), Read)]);
+        for (left, right) in [(&unsupported, &readonly), (&readonly, &unsupported)] {
+            assert_eq!(
+                intersect_effective_permission_profiles(left, right, root.as_path()),
+                Err(PermissionIntersectionError::UnsupportedPath(
+                    "non-metadata optional permissions".to_string()
+                ))
+            );
+        }
+    }
+}
+
+#[test]
 fn temporary_directory_restrictions_fail_closed() {
     let temp = TempDir::new().expect("workspace");
     let root = canonical(&temp);
