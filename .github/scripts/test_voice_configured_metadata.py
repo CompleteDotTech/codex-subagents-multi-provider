@@ -542,13 +542,13 @@ class RejectedLineShapeTests(unittest.TestCase):
 
     def test_every_shape_keeps_secret_bait_and_message_private(self):
         secret = "PRIVATE_URL_https://private.invalid/C:/private?token=SECRET"
-        for prefix, four, whitespace, esc, continuation in (
-            ("    ", True, False, False, "none"),
-            ("\t", False, True, False, "none"),
-            (" ", False, True, False, "none"),
-            ("\x1b[32m", False, False, True, "none"),
-            ("    Fetching ", True, False, False, "fetch-detail"),
-            ("unknown ", False, False, False, "none"),
+        for prefix, four, whitespace, esc, continuation, control in (
+            ("    ", True, False, False, "none", False),
+            ("\t", False, True, False, "none", True),
+            (" ", False, True, False, "none", False),
+            ("\x1b[32m", False, False, True, "none", True),
+            ("    Fetching ", True, False, False, "fetch-detail", False),
+            ("unknown ", False, False, False, "none", False),
         ):
             with self.subTest(prefix=prefix):
                 error = m.RejectedWrapperLine(prefix + secret)
@@ -558,16 +558,163 @@ class RejectedLineShapeTests(unittest.TestCase):
                 self.assertEqual(
                     error.shape,
                     {
-                        "schema": "rejected-wrapper-line-shape-v1",
+                        "schema": "rejected-wrapper-line-shape-v2",
                         "starts_with_four_ascii_spaces": four,
                         "other_ascii_leading_whitespace": whitespace,
                         "esc_control_in_prefix": esc,
                         "fixed_bazel_continuation": continuation,
+                        "public_emitter_prefix": "none",
+                        "leading_unicode_bom": False,
+                        "unicode_replacement_in_prefix": False,
+                        "non_ascii_in_prefix": False,
+                        "ascii_control_in_prefix": control,
                     },
                 )
                 self.assertEqual(set(vars(error)), {"shape"})
                 self.assertNotIn("PRIVATE", json.dumps(vars(error)))
                 self.assertNotIn("SECRET", str(error))
+
+    def test_fixed_public_prefixes_export_no_timestamp_or_warning_body(self):
+        cases = (
+            ("OpenJDK 64-Bit Server VM warning: ", "openjdk-64bit-server-vm-warning"),
+            ("2004/02/29 04:05:06 ", "go-standard-datetime-header"),
+            ("2012/12/31 23:59:59 ", "go-standard-datetime-header"),
+            ("unknown ", "none"),
+        )
+        headers = []
+        for prefix, emitter in cases:
+            with self.subTest(emitter=emitter, prefix=prefix):
+                error = m.RejectedWrapperLine(
+                    prefix + "PRIVATE_https://private.invalid/C:/private?token=SECRET"
+                )
+                expected = {
+                    "schema": "rejected-wrapper-line-shape-v2",
+                    "starts_with_four_ascii_spaces": False,
+                    "other_ascii_leading_whitespace": False,
+                    "esc_control_in_prefix": False,
+                    "fixed_bazel_continuation": "none",
+                    "public_emitter_prefix": emitter,
+                    "leading_unicode_bom": False,
+                    "unicode_replacement_in_prefix": False,
+                    "non_ascii_in_prefix": False,
+                    "ascii_control_in_prefix": False,
+                }
+                self.assertEqual(error.shape, expected)
+                self.assertEqual(set(vars(error)), {"shape"})
+                self.assertEqual(
+                    error.args, ("Unexpected wrapper output outside JSON",)
+                )
+                serialized = json.dumps(vars(error))
+                for bait in ("PRIVATE", "SECRET", "2004", "2012", "private.invalid"):
+                    self.assertNotIn(bait, serialized)
+                if emitter == "go-standard-datetime-header":
+                    headers.append(error.shape)
+        self.assertEqual(headers[0], headers[1])
+
+    def test_public_prefix_near_misses_and_invalid_calendars_are_none(self):
+        for prefix in (
+            "openjdk 64-Bit Server VM warning: ",
+            "OpenJDK 64-Bit Server VM warning:",
+            "OpenJDK 64-Bit Server VM warning:PRIVATE",
+            "2001/02/29 04:05:06 ",
+            "0000/01/01 04:05:06 ",
+            "2004/13/01 04:05:06 ",
+            "2004/04/31 04:05:06 ",
+            "2004/02/29 24:05:06 ",
+            "2004/02/29 04:60:06 ",
+            "2004/02/29 04:05:60 ",
+            "2004/2/29 04:05:06 ",
+            "２００４/02/29 04:05:06 ",
+            "2004/02/29 04:05:06Z ",
+            "2004/02/29 04:05:06\t",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    m.RejectedWrapperLine(prefix + "SECRET").shape[
+                        "public_emitter_prefix"
+                    ],
+                    "none",
+                )
+        # Classification covers the header only; text after its separator is
+        # untrusted body, including a timezone-looking word or arbitrary URL.
+        self.assertEqual(
+            m.RejectedWrapperLine("2004/02/29 04:05:06 Z SECRET").shape[
+                "public_emitter_prefix"
+            ],
+            "go-standard-datetime-header",
+        )
+
+    def test_unicode_and_control_observations_are_bounded_properties(self):
+        for character, field in (
+            ("\ufeff", "non_ascii_in_prefix"),
+            ("\ufffd", "unicode_replacement_in_prefix"),
+            ("é", "non_ascii_in_prefix"),
+            ("\x00", "ascii_control_in_prefix"),
+            ("\x7f", "ascii_control_in_prefix"),
+            ("\x1b", "esc_control_in_prefix"),
+        ):
+            for offset in (63, 64):
+                with self.subTest(character=character, offset=offset):
+                    error = m.RejectedWrapperLine("x" * offset + character + "SECRET")
+                    self.assertEqual(error.shape[field], offset == 63)
+                    self.assertFalse(error.shape["leading_unicode_bom"])
+                    self.assertNotIn("SECRET", json.dumps(vars(error)))
+        for body in (
+            "OpenJDK 64-Bit Server VM warning: SECRET",
+            "2004/02/29 04:05:06 SECRET",
+        ):
+            error = m.RejectedWrapperLine("\ufeff" + body)
+            self.assertTrue(error.shape["leading_unicode_bom"])
+            self.assertTrue(error.shape["non_ascii_in_prefix"])
+            self.assertEqual(error.shape["public_emitter_prefix"], "none")
+
+    def test_new_shapes_do_not_accept_spoofed_provider_or_action_framing(self):
+        record = packages()[0][0]
+        for line in (
+            "OpenJDK 64-Bit Server VM warning: PRIVATE_SECRET",
+            "2004/02/29 04:05:06 PRIVATE_SECRET",
+            "\ufeffINFO: PRIVATE_SECRET",
+            "\ufffdPRIVATE_SECRET",
+        ):
+            for before in (True, False):
+                for provider in (True, False):
+                    with self.subTest(line=line, before=before, provider=provider):
+                        payload = (
+                            m.SENTINEL + json.dumps(record) if provider else "{}"
+                        )
+                        text = (
+                            line + "\n" + payload if before else payload + "\n" + line
+                        )
+                        with self.assertRaises(m.RejectedWrapperLine):
+                            if provider:
+                                m.parse_provider(text, record["label"])
+                            else:
+                                m.parse_json(text)
+
+    def test_new_diagnostic_fields_come_only_from_first_rejected_line(self):
+        record = packages()[0][0]
+        for provider in (True, False):
+            with self.subTest(provider=provider):
+                payload = m.SENTINEL + json.dumps(record) if provider else "{}"
+                text = (
+                    "OpenJDK 64-Bit Server VM warning: FIRST_SECRET\n"
+                    "\ufeff\ufffdSECOND_SECRET\n" + payload
+                )
+                with self.assertRaises(m.RejectedWrapperLine) as raised:
+                    if provider:
+                        m.parse_provider(text, record["label"])
+                    else:
+                        m.parse_json(text)
+                self.assertEqual(
+                    raised.exception.shape["public_emitter_prefix"],
+                    "openjdk-64bit-server-vm-warning",
+                )
+                self.assertFalse(raised.exception.shape["leading_unicode_bom"])
+                self.assertFalse(
+                    raised.exception.shape["unicode_replacement_in_prefix"]
+                )
+                self.assertFalse(raised.exception.shape["non_ascii_in_prefix"])
+                self.assertNotIn("SECRET", json.dumps(vars(raised.exception)))
 
     def test_only_fixed_64_code_point_prefix_is_inspected(self):
         class PrefixOnly(str):
@@ -631,16 +778,20 @@ class RejectedLineShapeTests(unittest.TestCase):
         self.assertEqual(len(text), m.LIMIT)
         with self.assertRaises(m.RejectedWrapperLine) as raised:
             m.parse_json(text)
-        self.assertLess(len(json.dumps(raised.exception.shape)), 300)
+        self.assertLess(len(json.dumps(raised.exception.shape)), 1024)
         self.assertNotIn("SECRET", json.dumps(raised.exception.shape))
         self.assertLess(time.monotonic() - start, 10)
 
     def run_main_rejection(
-        self, provider, *, source_changed=False, deadline_expired=False
+        self, provider, *, source_changed=False, deadline_expired=False, line=None
     ):
         records = {p["label"]: p for p in packages()[0]}
         captured, statuses, rejected = [], [], []
-        secret_line = "    Fetching https://PRIVATE.invalid/?token=SECRET"
+        secret_line = (
+            "    Fetching https://PRIVATE.invalid/?token=SECRET"
+            if line is None
+            else line
+        )
 
         def capture(command, output, budget, timeout=45, *, env=None):
             captured.append(command)
@@ -720,6 +871,32 @@ class RejectedLineShapeTests(unittest.TestCase):
                 self.assertEqual(
                     manifest["failure"], "Unexpected wrapper output outside JSON"
                 )
+
+    def test_real_main_propagates_new_fixed_fields_without_private_values(self):
+        for prefix, emitter, bom, replacement in (
+            (
+                "OpenJDK 64-Bit Server VM warning: ",
+                "openjdk-64bit-server-vm-warning",
+                False,
+                False,
+            ),
+            ("2004/02/29 04:05:06 ", "go-standard-datetime-header", False, False),
+            ("\ufeff", "none", True, False),
+            ("\ufffd", "none", False, True),
+        ):
+            for provider in (True, False):
+                with self.subTest(provider=provider, emitter=emitter, bom=bom):
+                    manifest = self.run_main_rejection(
+                        provider, line=prefix + "PRIVATE_URL?token=SECRET"
+                    )
+                    shape = manifest["rejected_wrapper_line_shape"]
+                    self.assertEqual(shape["schema"], "rejected-wrapper-line-shape-v2")
+                    self.assertEqual(shape["public_emitter_prefix"], emitter)
+                    self.assertEqual(shape["leading_unicode_bom"], bom)
+                    self.assertEqual(
+                        shape["unicode_replacement_in_prefix"], replacement
+                    )
+                    self.assertNotIn("2004", json.dumps(manifest))
 
     def test_shape_does_not_bypass_source_or_final_deadline_guards(self):
         self.assertEqual(

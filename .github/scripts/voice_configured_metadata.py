@@ -94,8 +94,23 @@ class RejectedWrapperLine(EvidenceError):
         # authorizes the line. Absence excludes only these exact prefix shapes.
         prefix = line[:64]
         four_spaces = prefix.startswith("    ")
+        # OpenJDK 25 debug.cpp:138 and Go 1.24 log.go:114..146 ground
+        # these fixed shapes only. A match cannot authenticate an emitter.
+        emitter = "none"
+        if prefix.startswith("OpenJDK 64-Bit Server VM warning: "):
+            emitter = "openjdk-64bit-server-vm-warning"
+        elif re.fullmatch(
+            r"[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ",
+            prefix[:20],
+        ):
+            try:
+                datetime.datetime.strptime(prefix[:19], "%Y/%m/%d %H:%M:%S")
+            except ValueError:
+                pass
+            else:
+                emitter = "go-standard-datetime-header"
         self.shape = {
-            "schema": "rejected-wrapper-line-shape-v1",
+            "schema": "rejected-wrapper-line-shape-v2",
             "starts_with_four_ascii_spaces": four_spaces,
             "other_ascii_leading_whitespace": bool(prefix)
             and prefix[0] in " \t\r\n\v\f"
@@ -104,6 +119,13 @@ class RejectedWrapperLine(EvidenceError):
             "fixed_bazel_continuation": "fetch-detail"
             if prefix.startswith("    Fetching ")
             else "none",
+            "public_emitter_prefix": emitter,
+            "leading_unicode_bom": prefix.startswith("\ufeff"),
+            "unicode_replacement_in_prefix": "\ufffd" in prefix,
+            "non_ascii_in_prefix": any(ord(character) > 127 for character in prefix),
+            "ascii_control_in_prefix": any(
+                ord(character) < 32 or ord(character) == 127 for character in prefix
+            ),
         }
 
 
