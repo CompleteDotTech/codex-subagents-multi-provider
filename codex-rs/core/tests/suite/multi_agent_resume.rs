@@ -1000,6 +1000,11 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
         .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &initial_url);
+            config
+                .permissions
+                .approval_policy
+                .set(AskForApproval::Never)
+                .expect("fixture approval mode");
             config.features.enable(Feature::Sqlite).unwrap();
             config
                 .permissions
@@ -1023,6 +1028,10 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
     })
     .await;
     assert_eq!(child_request.requests().len(), 1);
+    assert_eq!(
+        child.config_snapshot().await.approval_policy,
+        AskForApproval::Never
+    );
     assert_eq!(
         child.config_snapshot().await.permission_profile,
         PermissionProfile::Disabled
@@ -1049,6 +1058,11 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
         .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &resume_url);
+            config
+                .permissions
+                .approval_policy
+                .set(AskForApproval::Never)
+                .expect("fixture approval mode");
             config.features.enable(Feature::Sqlite).unwrap();
             config
                 .permissions
@@ -1057,6 +1071,10 @@ async fn disabled_local_sqlite_cold_reload_fails_without_requests_or_permission_
         })
         .restart_in_same_local_workspace(&server, &initial)
         .await?;
+    assert_eq!(
+        resumed.codex.config_snapshot().await.approval_policy,
+        AskForApproval::Never
+    );
     assert!(!Arc::ptr_eq(
         &initial.thread_manager,
         &resumed.thread_manager
