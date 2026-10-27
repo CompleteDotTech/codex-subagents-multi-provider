@@ -32,6 +32,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
@@ -295,9 +296,89 @@ impl RetainedAgentAuthority {
     }
 }
 
+/// Fresh launch authority follows one actual caller allocation until final admission.
+/// Weak ownership avoids Config -> proof -> Session -> Config cycles.
+#[derive(Clone)]
+pub(crate) struct FreshChildCaller {
+    caller: Weak<CodexThread>,
+    registration_id: Uuid,
+    live: Arc<Mutex<bool>>,
+}
+
+impl FreshChildCaller {
+    pub(crate) async fn capture(session: &Session) -> Result<Self> {
+        let runtime = &session.services.local_agent_runtime;
+        let manager = runtime.upgrade()?;
+        let caller = manager.get_thread(session.thread_id).await?;
+        if !std::ptr::eq(caller.session.as_ref(), session) {
+            return Err(invalid(
+                "fresh child caller is no longer the registered runtime",
+            ));
+        }
+        let authority = runtime
+            .retained_authority(session.thread_id)
+            .filter(|authority| authority.session_allocation == session as *const Session as usize)
+            .ok_or_else(|| invalid("fresh child caller registration is unavailable"))?;
+        let fence = Self {
+            caller: Arc::downgrade(&caller),
+            registration_id: authority.registration_id,
+            live: Arc::clone(&session.fresh_child_admission_live),
+        };
+        fence.check_current()?;
+        Ok(fence)
+    }
+
+    pub(crate) fn check_prepared(&self) -> std::result::Result<(), String> {
+        self.check_current().map_err(|error| error.to_string())
+    }
+
+    fn matches_registered(&self, registered: &Arc<CodexThread>) -> bool {
+        self.caller
+            .upgrade()
+            .is_some_and(|caller| Arc::ptr_eq(&caller, registered))
+    }
+
+    fn check_current(&self) -> Result<()> {
+        self.with_current(|| Ok(()))
+    }
+
+    fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let caller = self
+            .caller
+            .upgrade()
+            .ok_or_else(|| invalid("fresh child caller runtime is unavailable"))?;
+        // Revocation takes this same lock before stopping or removing this exact
+        // allocation. Keep it through the synchronous grant decision, never an await.
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| invalid("fresh child caller admission state is unavailable"))?;
+        let runtime = &caller.session.services.local_agent_runtime;
+        if !*live
+            || !caller.is_running()
+            || runtime.shutdown.is_cancelled()
+            || !Arc::ptr_eq(&self.live, &caller.session.fresh_child_admission_live)
+            || !runtime
+                .retained_authority(caller.session.thread_id)
+                .is_some_and(|authority| {
+                    authority.registration_id == self.registration_id
+                        && authority.session_allocation == Arc::as_ptr(&caller.session) as usize
+                })
+        {
+            return Err(invalid(
+                "fresh child caller stopped or changed before startup admission",
+            ));
+        }
+        let result = admit();
+        drop(live);
+        result
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PreparedChildAuthorization {
     caller: ThreadId,
+    caller_fence: FreshChildCaller,
     origins: Arc<ChildProviderOrigins>,
     origin: Option<VerifiedChildProviderOrigin>,
     full_history: bool,
@@ -333,10 +414,12 @@ impl PreparedChildAuthorization {
         parent_base: Arc<Config>,
         role_name: Option<String>,
         execution_scope: ChildProviderScope,
+        caller_fence: FreshChildCaller,
     ) -> Self {
         debug_assert!(config.prepared_child_authorization.is_none());
         Self {
             caller: session.thread_id,
+            caller_fence,
             origins: Arc::clone(&session.services.local_agent_runtime.child_provider_origins),
             origin: session
                 .services
@@ -375,6 +458,12 @@ impl PreparedChildAuthorization {
         }
         let manager = runtime.upgrade()?;
         let parent = manager.get_thread(caller).await?;
+        if !self.caller_fence.matches_registered(&parent) {
+            return Err(invalid(
+                "fresh child caller is no longer the prepared runtime",
+            ));
+        }
+        self.caller_fence.check_current()?;
         let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth,
@@ -408,6 +497,7 @@ impl PreparedChildAuthorization {
         }
         let (current, settings, environments) =
             parent.session.native_agent_authority_snapshot().await;
+        self.caller_fence.check_current()?;
         if !Arc::ptr_eq(
             &self.origins,
             &parent
@@ -445,7 +535,7 @@ impl PreparedChildAuthorization {
             origins: self.origins,
             origin: self.origin,
             approved: self.approved,
-            admission: NativeChildAdmission::new(&current),
+            admission: NativeChildAdmission::for_fresh(&current, self.caller_fence),
         })
     }
 }
@@ -487,17 +577,33 @@ impl ChildLaunchPermit {
 /// Opaque, non-cloneable continuation of a real native launch authorization.
 /// Config equality cannot freeze this live managed-policy binding.
 pub(crate) struct NativeChildAdmission {
+    caller_fence: Option<FreshChildCaller>,
     binding: Option<codex_config::CloudConfigBundleBinding>,
 }
 
 impl NativeChildAdmission {
     fn new(config: &Config) -> Self {
         Self {
+            caller_fence: None,
             binding: config.config_layer_stack.cloud_config_binding().cloned(),
         }
     }
 
+    fn for_fresh(config: &Config, caller_fence: FreshChildCaller) -> Self {
+        Self {
+            caller_fence: Some(caller_fence),
+            ..Self::new(config)
+        }
+    }
+
     pub(crate) fn check_current(&self) -> Result<()> {
+        match &self.caller_fence {
+            Some(caller) => caller.with_current(|| self.check_binding()),
+            None => self.check_binding(),
+        }
+    }
+
+    fn check_binding(&self) -> Result<()> {
         let binding = self.binding.as_ref().map(|binding| binding.read());
         if binding.as_ref().is_some_and(|guard| {
             guard.status != codex_config::CloudConfigBundleBindingStatus::Current
@@ -510,10 +616,10 @@ impl NativeChildAdmission {
     }
 
     pub(crate) fn admit(self) -> Result<()> {
-        // This synchronous live-binding read is the native startup admission
-        // linearization point. Its guard never crosses an await. Revocation
-        // observed before this point rejects the startup, including after all
-        // controller/manager preparation awaits.
+        // For fresh launches the caller signal lock spans the epoch/liveness
+        // checks and managed binding read. Admission and exact-caller revocation
+        // therefore have a shared synchronous ordering after all startup awaits.
+        // Private resume keeps its separate caller/own-eviction authorization.
         self.check_current()
     }
 }

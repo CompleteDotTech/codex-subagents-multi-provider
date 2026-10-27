@@ -872,12 +872,13 @@ impl LocalAgentControl {
                 .is_some_and(is_v2_resident_session_source);
         let (residency_slot, residency_reservation) = if spawn_uses_v2_residency {
             let residency_reservation_started_at = Instant::now();
+            // A fresh grant cannot survive eviction of its authorizing caller.
             let residency_slot = self
                 .reserve_v2_residency_slot(
                     &state,
                     &config,
                     &membership,
-                    /*protected_thread_id*/ None,
+                    /*protected_thread_id*/ parent_thread_id,
                 )
                 .await?;
             (

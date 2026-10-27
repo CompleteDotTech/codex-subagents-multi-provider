@@ -107,6 +107,9 @@ impl ThreadManagerState {
             runtime
                 .registry
                 .save_evicted_environments(thread_id, environments);
+            if threads.contains_key(&thread_id) {
+                thread.session.revoke_fresh_child_admission();
+            }
             let removed = threads.remove(&thread_id).is_some();
             if removed {
                 runtime.registry.retain_authority(authority);

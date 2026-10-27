@@ -59,6 +59,8 @@ type McpToolApprovalMetadataMap =
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
+    /// Irrevocable, allocation-local fresh launch admission; never persisted.
+    pub(crate) fresh_child_admission_live: Arc<std::sync::Mutex<bool>>,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
@@ -663,6 +665,15 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    /// Called synchronously before stopping or publishing removal of this allocation.
+    pub(crate) fn revoke_fresh_child_admission(&self) {
+        let mut live = self
+            .fresh_child_admission_live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *live = false;
+    }
+
     pub(super) async fn effective_thread_config_snapshot(
         &self,
         configuration: &SessionConfiguration,
@@ -1854,6 +1865,7 @@ impl Session {
             };
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
+                fresh_child_admission_live: Arc::new(std::sync::Mutex::new(true)),
                 thread_id,
                 installation_id,
                 tx_event: tx_event.clone(),

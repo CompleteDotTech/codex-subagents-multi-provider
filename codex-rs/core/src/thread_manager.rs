@@ -1484,6 +1484,7 @@ impl ThreadManager {
         {
             return Ok(None);
         }
+        current.session.revoke_fresh_child_admission();
         current
             .session
             .services
@@ -1525,6 +1526,7 @@ impl ThreadManager {
         {
             return None;
         }
+        expected.session.revoke_fresh_child_admission();
         expected
             .session
             .services
@@ -1601,6 +1603,7 @@ impl ThreadManager {
             {
                 continue;
             }
+            thread.session.revoke_fresh_child_admission();
             thread
                 .session
                 .services
@@ -2082,6 +2085,7 @@ impl ThreadManagerState {
         {
             return None;
         }
+        current.session.revoke_fresh_child_admission();
         current
             .session
             .services
@@ -2645,6 +2649,7 @@ impl ThreadManagerState {
                         .local_agent_runtime
                         .retain_authority(authority);
                 }
+                thread.session.revoke_fresh_child_admission();
                 threads.remove(&resumed.conversation_id);
                 thread.session.services.mcp_runtime.revoke_ema();
             }

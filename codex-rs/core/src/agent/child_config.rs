@@ -116,6 +116,10 @@ pub(crate) async fn prepare_agent_spawn_config(
     step_context: &StepContext,
     options: SpawnConfigOptions<'_>,
 ) -> Result<PreparedSpawnConfig, String> {
+    let caller_fence =
+        crate::agent::child_provider_authorization::FreshChildCaller::capture(session)
+            .await
+            .map_err(|error| error.to_string())?;
     let turn = step_context.turn.as_ref();
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, step_context)?;
@@ -347,6 +351,7 @@ pub(crate) async fn prepare_agent_spawn_config(
             .then_some(DEFAULT_ROLE_NAME)
         })
         .map(str::to_owned);
+    caller_fence.check_prepared()?;
     config.prepared_child_authorization = Some(PreparedChildAuthorization::capture(
         session,
         &config,
@@ -355,6 +360,7 @@ pub(crate) async fn prepare_agent_spawn_config(
         parent_base,
         role_name.clone(),
         execution_scope,
+        caller_fence,
     ));
     Ok(PreparedSpawnConfig { config, role_name })
 }

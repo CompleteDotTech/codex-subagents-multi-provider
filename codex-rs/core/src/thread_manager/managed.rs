@@ -98,6 +98,7 @@ impl ThreadManager {
                     .get(&thread_id)
                     .is_some_and(|thread| Arc::ptr_eq(&thread.session, session))
                 {
+                    session.revoke_fresh_child_admission();
                     threads.remove(&thread_id);
                 }
             }

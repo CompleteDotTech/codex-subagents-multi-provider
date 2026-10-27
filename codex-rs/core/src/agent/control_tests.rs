@@ -7576,3 +7576,461 @@ async fn denied_final_cold_admission_preserves_receipt_for_a_current_policy_retr
         assert!(report.timed_out.is_empty());
     }
 }
+
+// These fixtures keep the original prepared proof and cross the real lower
+// manager boundary; no forged origin, map entry, or admission object is used.
+async fn fresh_lifetime_permit(
+    harness: &AgentControlHarness,
+    parent: &Arc<CodexThread>,
+    name: &str,
+) -> (
+    Config,
+    SessionSource,
+    crate::agent::child_provider_authorization::ChildLaunchPermit,
+) {
+    let parent_id = parent.session.thread_id;
+    let mut source = thread_spawn_source(
+        parent_id,
+        &parent.session_source,
+        next_thread_spawn_depth(&parent.session_source),
+        None,
+        Some(name.into()),
+    )
+    .unwrap();
+    let mut prepared = harness
+        .control
+        .prepare_spawn_fixture(&harness.config, &source, false)
+        .await
+        .expect("prepare on actual registered caller");
+    if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) = &mut source {
+        *agent_role = prepared
+            .prepared_child_authorization
+            .as_ref()
+            .unwrap()
+            .role_name();
+    }
+    let permit = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &harness.control.runtime,
+            parent_id,
+            &prepared,
+            false,
+            &source,
+        )
+        .await
+        .expect("consume proof while original caller is live");
+    (prepared, source, permit)
+}
+
+async fn fresh_lifetime_lower_start(
+    harness: &AgentControlHarness,
+    parent: &Arc<CodexThread>,
+    prepared: Config,
+    source: SessionSource,
+    permit: crate::agent::child_provider_authorization::ChildLaunchPermit,
+) -> CodexResult<crate::thread_manager::NewThread> {
+    harness
+        .control
+        .runtime
+        .upgrade()
+        .unwrap()
+        .spawn_child_thread(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                session_source: Some(source),
+                ..StartThreadOptions::new(prepared)
+            },
+            harness.control.clone(),
+            Some(parent.session.thread_id),
+            None,
+            permit,
+        )
+        .await
+}
+
+#[test_case::test_case(false; "stopped after permit consumption")]
+#[test_case::test_case(true; "same ID replaced after permit consumption")]
+#[tokio::test]
+async fn consumed_fresh_permit_rejects_stopped_or_replaced_caller(replace: bool) {
+    let harness = AgentControlHarness::new().await;
+    let started = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .unwrap();
+    let parent = started.thread;
+    let parent_id = started.thread_id;
+    persist_thread_for_tree_resume(&parent, "post consume caller lifetime").await;
+    let stored = parent.read_thread(true, true).await.unwrap();
+    let initial = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: parent_id,
+        history: Arc::new(stored.history.unwrap().items),
+        rollout_path: stored.rollout_path,
+    });
+    let original = harness
+        .control
+        .runtime
+        .retained_authority(parent_id)
+        .unwrap();
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &parent, "post_consume_worker").await;
+    parent.shutdown_and_wait().await.unwrap();
+    assert!(!parent.is_running());
+    let replacement = if replace {
+        let removed = harness.manager.remove_thread(&parent_id).await.unwrap();
+        assert!(Arc::ptr_eq(&removed, &parent));
+        let replacement = harness
+            .manager
+            .start_thread_with_control_for_tests(
+                StartThreadOptions {
+                    initial_history: initial,
+                    history_mode: Some(ThreadHistoryMode::Legacy),
+                    session_source: Some(parent.session_source.clone()),
+                    ..StartThreadOptions::new(harness.config.clone())
+                },
+                harness.control.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replacement.thread_id, parent_id);
+        assert!(!Arc::ptr_eq(&replacement.thread, &parent));
+        assert_ne!(
+            harness
+                .control
+                .runtime
+                .retained_authority(parent_id)
+                .unwrap()
+                .epoch()
+                .generation,
+            original.epoch().generation
+        );
+        assert!(Arc::ptr_eq(
+            &parent
+                .session
+                .services
+                .local_agent_runtime
+                .child_provider_origins,
+            &replacement
+                .thread
+                .session
+                .services
+                .local_agent_runtime
+                .child_provider_origins
+        ));
+        Some(replacement.thread)
+    } else {
+        None
+    };
+    let mut created = harness.manager.subscribe_thread_created();
+    let outcome = fresh_lifetime_lower_start(&harness, &parent, prepared, source, permit).await;
+    if let Ok(child) = &outcome {
+        child.thread.shutdown_and_wait().await.unwrap();
+        harness
+            .manager
+            .remove_thread(&child.thread_id)
+            .await
+            .unwrap();
+    }
+    let error = outcome
+        .err()
+        .expect("old consumed permit must not authorize lower startup");
+    assert!(
+        error.to_string().contains("child_provider_policy_conflict"),
+        "{error}"
+    );
+    assert!(matches!(
+        created.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(harness.manager.list_thread_ids().await, vec![parent_id]);
+    if let Some(replacement) = replacement {
+        let (prepared, source, permit) =
+            fresh_lifetime_permit(&harness, &replacement, "current_replacement_worker").await;
+        let child = fresh_lifetime_lower_start(&harness, &replacement, prepared, source, permit)
+            .await
+            .expect("new preparation on actual live replacement remains authorized");
+        assert!(child.thread.is_running());
+        child.thread.shutdown_and_wait().await.unwrap();
+        replacement.shutdown_and_wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn consumed_fresh_permit_accepts_current_live_caller_at_lower_startup() {
+    let harness = AgentControlHarness::new().await;
+    let (_, parent) = harness.start_thread().await;
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &parent, "current_live_worker").await;
+    let child = fresh_lifetime_lower_start(&harness, &parent, prepared, source, permit)
+        .await
+        .unwrap();
+    assert!(parent.is_running());
+    assert!(child.thread.is_running());
+    assert_eq!(
+        child.thread.session.session_id(),
+        parent.session.session_id()
+    );
+    assert_eq!(harness.manager.list_thread_ids().await.len(), 2);
+    child.thread.shutdown_and_wait().await.unwrap();
+    parent.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn fresh_caller_revocation_during_real_host_factory_await_blocks_final_admission() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let startup_control = Arc::new(std::sync::OnceLock::<LocalAgentControl>::new());
+    let root_identity = Arc::new(std::sync::OnceLock::<codex_protocol::SessionId>::new());
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    )
+    .with_agent_control_factory({
+        let armed = Arc::clone(&armed);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let startup_control = Arc::clone(&startup_control);
+        let root_identity = Arc::clone(&root_identity);
+        move |thread_id| {
+            let control: Arc<dyn AgentControl> = Arc::new(
+                startup_control
+                    .get()
+                    .unwrap()
+                    .runtime
+                    .control(*root_identity.get_or_init(|| thread_id.into())),
+            );
+            let pause = armed.swap(false, Ordering::SeqCst);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                if pause {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Ok(control)
+            }
+        }
+    });
+    let control = manager.agent_control();
+    assert!(startup_control.set(control.clone()).is_ok());
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db: None,
+        manager,
+        control,
+    };
+    let (_, parent) = harness.start_thread().await;
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &parent, "factory_paused_worker").await;
+    armed.store(true, Ordering::SeqCst);
+    let start = fresh_lifetime_lower_start(&harness, &parent, prepared, source, permit);
+    tokio::pin!(start);
+    tokio::select! {
+        result = &mut start => { panic!("startup must reach real host factory before completion: {}", result.is_ok()); }
+        reached = timeout(Duration::from_secs(10), entered.notified()) => {
+            reached.expect("actual lower startup must reach the host factory await");
+        }
+    }
+    assert!(
+        !armed.load(Ordering::SeqCst),
+        "factory must have consumed its real await barrier"
+    );
+    parent.shutdown_and_wait().await.unwrap();
+    assert!(!parent.is_running());
+    release.notify_one();
+    let outcome = timeout(Duration::from_secs(10), start).await.unwrap();
+    let error = outcome
+        .err()
+        .expect("revoked caller must fail final admission after factory await");
+    assert!(
+        error.to_string().contains("child_provider_policy_conflict"),
+        "{error}"
+    );
+    assert_eq!(
+        harness.manager.list_thread_ids().await,
+        vec![parent.session.thread_id]
+    );
+}
+
+async fn idle_fresh_capacity_resident(
+    harness: &AgentControlHarness,
+    root: &Arc<CodexThread>,
+    name: &str,
+) -> Arc<CodexThread> {
+    let state = harness.control.runtime.upgrade().unwrap();
+    let membership = harness.control.runtime.admit_start().unwrap();
+    let slot = harness
+        .control
+        .reserve_v2_residency_slot(&state, &harness.config, &membership, None)
+        .await
+        .unwrap();
+    let (prepared, source, permit) = fresh_lifetime_permit(harness, root, name).await;
+    let child = fresh_lifetime_lower_start(harness, root, prepared, source, permit)
+        .await
+        .unwrap();
+    slot.commit(child.thread_id);
+    // This lower fixture has no task runner; publish an actual terminal status
+    // without fabricating a manager registration or retained authority.
+    let turn = child.thread.session.new_default_turn().await;
+    child
+        .thread
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
+                turn_id: turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("idle capacity fixture".into()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert!(child.thread.session.active_turn.lock().await.is_none());
+    child.thread
+}
+
+#[test_case::test_case(false; "sole idle caller remains resident on capacity error")]
+#[test_case::test_case(true; "alternate idle resident is evicted instead of caller")]
+#[tokio::test]
+async fn fresh_host_idle_caller_is_protected_during_capacity_reservation(alternate: bool) {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.multi_agent_v2.max_concurrent_threads_per_session = if alternate { 3 } else { 2 };
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, root) = harness.start_thread().await;
+    let caller = idle_fresh_capacity_resident(&harness, &root, "idle_authorizing_caller").await;
+    let other = if alternate {
+        Some(idle_fresh_capacity_resident(&harness, &root, "alternate_idle_resident").await)
+    } else {
+        None
+    };
+    assert!(caller.is_running());
+    assert!(matches!(
+        caller.agent_status().await,
+        AgentStatus::Completed(_)
+    ));
+    let (mut prepared, source, _) =
+        fresh_lifetime_permit(&harness, &caller, "capacity_worker").await;
+    // Obtain a new real one-shot proof: the lower-boundary fixture consumed its
+    // proof, whereas this case must cross the production fresh capacity path.
+    prepared = harness
+        .control
+        .prepare_spawn_fixture(&prepared, &source, false)
+        .await
+        .unwrap();
+    let outcome = harness
+        .control
+        .spawn(SpawnRequest {
+            caller: caller.session.thread_id,
+            config: prepared,
+            input: AgentInput::UserInput(text_input("fresh capacity fixture")),
+            source,
+            options: SpawnAgentOptions {
+                parent_thread_id: Some(caller.session.thread_id),
+                ..Default::default()
+            },
+        })
+        .await;
+    let actual = harness
+        .manager
+        .get_thread(caller.session.thread_id)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&actual, &caller));
+    assert!(
+        caller.is_running(),
+        "fresh reservation must not stop its own authorizing caller"
+    );
+    if let Some(other) = other {
+        let (agent, _) = outcome.expect("alternate idle resident makes room for fresh child");
+        assert!(
+            harness
+                .manager
+                .get_thread(other.session.thread_id)
+                .await
+                .is_err()
+        );
+        assert!(!other.is_running());
+        let child = harness.manager.get_thread(agent.thread_id).await.unwrap();
+        child.shutdown_and_wait().await.unwrap();
+    } else {
+        let error = outcome
+            .err()
+            .expect("sole protected caller leaves no capacity");
+        assert!(
+            matches!(error.details(), CodexErrorDetails::AgentLimitReached { .. }),
+            "{error}"
+        );
+        assert_eq!(harness.manager.list_thread_ids().await.len(), 2);
+    }
+    caller.shutdown_and_wait().await.unwrap();
+    root.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn consumed_fresh_permit_rejects_removed_but_still_running_caller() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_id, parent) = harness.start_thread().await;
+    let original = harness
+        .control
+        .runtime
+        .retained_authority(parent_id)
+        .unwrap();
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &parent, "removed_live_caller_worker").await;
+    let removed = harness.manager.remove_thread(&parent_id).await.unwrap();
+    assert!(Arc::ptr_eq(&removed, &parent));
+    assert!(
+        parent.is_running(),
+        "manager removal alone does not stop held Session"
+    );
+    assert_eq!(
+        harness
+            .control
+            .runtime
+            .retained_authority(parent_id)
+            .unwrap()
+            .epoch()
+            .generation,
+        original.epoch().generation,
+        "retained UUID alone cannot establish registration"
+    );
+    let outcome = fresh_lifetime_lower_start(&harness, &parent, prepared, source, permit).await;
+    if let Ok(child) = &outcome {
+        child.thread.shutdown_and_wait().await.unwrap();
+        harness
+            .manager
+            .remove_thread(&child.thread_id)
+            .await
+            .unwrap();
+    }
+    parent.shutdown_and_wait().await.unwrap();
+    let error = outcome
+        .err()
+        .expect("live removed caller must not admit its old permit");
+    assert!(
+        error.to_string().contains("child_provider_policy_conflict"),
+        "{error}"
+    );
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
