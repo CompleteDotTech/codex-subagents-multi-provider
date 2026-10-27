@@ -1126,9 +1126,10 @@ async fn prepared_fresh_spawn_rejects_stopped_or_replaced_caller(replace: bool) 
             .await
             .expect("clean replacement caller");
     }
-    let error = outcome
-        .err()
-        .expect("stale preparation unexpectedly authorized actual child startup");
+    let error = match outcome {
+        Ok(_) => panic!("stale preparation unexpectedly authorized actual child startup"),
+        Err(error) => error,
+    };
     assert!(
         error.to_string().contains("child_provider_policy_conflict"),
         "{error}"
@@ -7984,9 +7985,10 @@ async fn fresh_host_idle_caller_is_protected_during_capacity_reservation(alterna
         let child = harness.manager.get_thread(agent.thread_id).await.unwrap();
         child.shutdown_and_wait().await.unwrap();
     } else {
-        let error = outcome
-            .err()
-            .expect("sole protected caller leaves no capacity");
+        let error = match outcome {
+            Ok(_) => panic!("sole protected caller leaves no capacity"),
+            Err(error) => error,
+        };
         assert!(
             matches!(error.details(), CodexErrorDetails::AgentLimitReached { .. }),
             "{error}"
@@ -8341,9 +8343,12 @@ async fn private_cold_resume_keeps_original_caller_through_final_factory_admissi
         assert!(target_loaded.is_some());
         caller.shutdown_and_wait().await.unwrap();
     } else {
-        let error = result
-            .err()
-            .expect("late stale private caller unexpectedly authorized actual cold target startup");
+        let error = match result {
+            Ok(_) => panic!(
+                "late stale private caller unexpectedly authorized actual cold target startup"
+            ),
+            Err(error) => error,
+        };
         assert!(
             error.to_string().contains("child_provider_policy_conflict"),
             "{error}"
@@ -8404,7 +8409,7 @@ async fn real_private_resume_caller_lifecycle_distinguishes_eviction_and_revocat
     );
     // Busy is not successful residency removal and cannot manufacture a stopped
     // caller exception. The original caller still runs with the same real epoch.
-    let busy_guard = caller.residency_gate.read().await;
+    let busy_barrier = hold_synchronous_read_barrier(Arc::clone(&caller.residency_gate)).await;
     assert_eq!(
         harness
             .manager
@@ -8418,13 +8423,14 @@ async fn real_private_resume_caller_lifecycle_distinguishes_eviction_and_revocat
             .with_resume_caller(&epoch, /*live*/ false, || Ok(()))
             .is_err()
     );
-    drop(busy_guard);
+    busy_barrier.release();
 
     if stage == 1 {
         let state = runtime.upgrade().unwrap();
-        // A real read guard allows eviction's initial lookup and shutdown, but
-        // blocks its exact map removal/completion transaction. No state is forged.
-        let map_guard = state.threads.read().await;
+        // A real read guard on a synchronous thread allows eviction's initial
+        // lookup and shutdown, but blocks exact map removal/completion. The
+        // async test owns only its release/join handle, never the lock guard.
+        let map_barrier = hold_synchronous_read_barrier(Arc::clone(&state.threads)).await;
         let eviction = harness.manager.try_evict_v2_thread(Arc::clone(&caller));
         tokio::pin!(eviction);
         tokio::select! {
@@ -8441,7 +8447,7 @@ async fn real_private_resume_caller_lifecycle_distinguishes_eviction_and_revocat
             Poll::Ready(_) => panic!("actual close must await map removal behind read barrier"),
         })
         .await;
-        drop(map_guard);
+        map_barrier.release();
         let (evicted, closed) = tokio::join!(eviction, close);
         assert!(matches!(
             evicted.unwrap(),
@@ -8584,4 +8590,77 @@ async fn real_private_resume_caller_lifecycle_distinguishes_eviction_and_revocat
         }
     }
     root.shutdown_and_wait().await.unwrap();
+}
+
+// The actual guard lives solely on the synchronous OS thread. This handle owns
+// only channels/join cleanup; it cannot conceal a guard across an async await.
+struct SynchronousReadBarrier {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SynchronousReadBarrier {
+    fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        self.thread
+            .take()
+            .unwrap()
+            .join()
+            .expect("synchronous read barrier thread must finish cleanly");
+    }
+}
+
+impl Drop for SynchronousReadBarrier {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            // On assertion failure/cancellation, release before joining. A
+            // secondary thread panic must not double-panic during unwinding.
+            let _ = thread.join();
+        }
+    }
+}
+
+async fn hold_synchronous_read_barrier<T: Send + Sync + 'static>(
+    lock: Arc<tokio::sync::RwLock<T>>,
+) -> SynchronousReadBarrier {
+    let (ready, acquired) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        // Bounded nonblocking acquisition also makes cancellation cleanup safe
+        // on a current-thread runtime: joining cannot wait for that runtime to
+        // run a task that releases a competing lock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match released.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if let Ok(guard) = lock.try_read() {
+                let _ = ready.send(());
+                assert!(
+                    released.recv_timeout(Duration::from_secs(30)).is_ok(),
+                    "synchronous read barrier must be explicitly released"
+                );
+                drop(guard);
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let barrier = SynchronousReadBarrier {
+        release: Some(release),
+        thread: Some(thread),
+    };
+    acquired
+        .await
+        .expect("synchronous thread must acquire the real read barrier");
+    barrier
 }
