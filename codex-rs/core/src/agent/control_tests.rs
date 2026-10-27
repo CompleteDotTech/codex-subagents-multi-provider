@@ -8044,3 +8044,322 @@ async fn consumed_fresh_permit_rejects_removed_but_still_running_caller() {
     );
     assert!(harness.manager.list_thread_ids().await.is_empty());
 }
+
+#[test_case::test_case(0; "current caller reaches final cold admission")]
+#[test_case::test_case(1; "caller stops during late cold startup await")]
+#[test_case::test_case(2; "equal authority same ID caller replaced during late cold startup await")]
+#[tokio::test]
+async fn private_cold_resume_keeps_original_caller_through_final_factory_admission(stage: u8) {
+    use crate::agent::child_provider_authorization::RetainedAgentAuthority;
+    let (home, mut config) = test_config_with_host_configuration(
+        Vec::new(),
+        Some("[agents]\nallowed_model_providers=['openai']\n"),
+    )
+    .await;
+    for feature in [Feature::Sqlite, Feature::MultiAgentV2] {
+        config.features.enable(feature).unwrap();
+    }
+    config.model = Some("gpt-5.6-sol".into());
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let root = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        )
+        .await
+        .unwrap();
+    let child = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("persist private caller lifetime target"),
+            thread_spawn_source(
+                root.thread_id,
+                &root.thread.session_source,
+                /*depth*/ 1,
+                /*agent_role*/ None,
+                Some("private_cold_lifetime_target".into()),
+            )
+            .unwrap(),
+            SpawnAgentOptions {
+                parent_thread_id: Some(root.thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let target = harness.manager.get_thread(child.thread_id).await.unwrap();
+    persist_thread_for_tree_resume(&root.thread, "cold lifetime root").await;
+    persist_thread_for_tree_resume(&target, "cold lifetime target").await;
+    let turn = target.session.new_default_turn().await;
+    assert!(
+        target
+            .session
+            .persist_rollout_items(&[RolloutItem::TurnContext(turn.to_turn_context_item())])
+            .await
+    );
+    target.session.flush_rollout().await.unwrap();
+    assert_eq!(
+        target
+            .read_thread(
+                /*include_archived*/ false, /*include_history*/ false
+            )
+            .await
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("gpt-5.6-sol")
+    );
+    let stored_root = root
+        .thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
+    let root_history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: root.thread_id,
+        history: Arc::new(stored_root.history.unwrap().items),
+        rollout_path: stored_root.rollout_path,
+    });
+    let original_state = harness.control.runtime.upgrade().unwrap();
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.timed_out.is_empty());
+    let receipt = original_state
+        .read_native_authority_receipt(child.thread_id)
+        .await
+        .unwrap()
+        .expect("actual stopped target must have a sealed host receipt");
+    assert_eq!(receipt.epoch.parent_thread_id, Some(root.thread_id));
+    assert_eq!(receipt.epoch.root_thread_id, root.thread_id);
+
+    // New manager/runtime: target has no retained ceiling, live Session or evicted
+    // snapshot. The production host factory is the only pause introduced here.
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let startup_control = Arc::new(std::sync::OnceLock::<LocalAgentControl>::new());
+    let root_identity = Arc::new(std::sync::OnceLock::<codex_protocol::SessionId>::new());
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        harness.config.model_provider.clone(),
+        harness.config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        harness.state_db.clone(),
+    )
+    .with_agent_control_factory({
+        let armed = Arc::clone(&armed);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let startup_control = Arc::clone(&startup_control);
+        let root_identity = Arc::clone(&root_identity);
+        move |thread_id| {
+            let control: Arc<dyn AgentControl> = Arc::new(
+                startup_control
+                    .get()
+                    .unwrap()
+                    .runtime
+                    .control(*root_identity.get_or_init(|| thread_id.into())),
+            );
+            let pause = armed.swap(false, Ordering::SeqCst);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                if pause {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Ok(control)
+            }
+        }
+    });
+    let control = manager.agent_control();
+    assert!(startup_control.set(control.clone()).is_ok());
+    let resumed_root = manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions {
+                initial_history: root_history.clone(),
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                session_source: Some(root.thread.session_source.clone()),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            control.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed_root.thread_id, root.thread_id);
+    let caller = resumed_root.thread;
+    let runtime = &caller.session.services.local_agent_runtime;
+    assert!(Arc::ptr_eq(
+        &runtime.child_provider_origins,
+        &control.runtime.child_provider_origins
+    ));
+    assert!(runtime.retained_authority(child.thread_id).is_none());
+    assert!(
+        runtime
+            .registry
+            .evicted_environments(child.thread_id)
+            .is_none()
+    );
+    assert!(manager.get_thread(child.thread_id).await.is_err());
+    let state = runtime.upgrade().unwrap();
+    assert_eq!(
+        state
+            .read_native_authority_receipt(child.thread_id)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    let original_caller =
+        RetainedAgentAuthority::capture(&caller.session, &caller.session_source).await;
+    let original_origin = runtime
+        .child_provider_origins
+        .verified(caller.session.thread_id);
+    let current = harness.config.clone();
+    let resume_control = runtime.control(caller.session.session_id());
+    armed.store(true, Ordering::SeqCst);
+    let mut created = manager.subscribe_thread_created();
+    let resume = resume_control.resume_agent_from_rollout(
+        current,
+        child.thread_id,
+        target.session_source.clone(),
+    );
+    tokio::pin!(resume);
+    tokio::select! {
+        result = &mut resume => panic!("cold resume must reach actual factory await before completing: {}", result.is_ok()),
+        reached = timeout(Duration::from_secs(10), entered.notified()) => {
+            reached.expect("actual cold resume must reach late factory barrier");
+        }
+    }
+    assert!(!armed.load(Ordering::SeqCst));
+    assert!(runtime.retained_authority(child.thread_id).is_none());
+    assert!(manager.get_thread(child.thread_id).await.is_err());
+    assert_eq!(
+        state
+            .read_native_authority_receipt(child.thread_id)
+            .await
+            .unwrap(),
+        Some(receipt.clone()),
+        "pause must precede target startup fencing"
+    );
+    let replacement = if stage > 0 {
+        caller.shutdown_and_wait().await.unwrap();
+        assert!(!caller.is_running());
+        assert!(Arc::ptr_eq(
+            &manager.get_thread(caller.session.thread_id).await.unwrap(),
+            &caller
+        ));
+        if stage == 2 {
+            let removed = manager
+                .remove_thread(&caller.session.thread_id)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&removed, &caller));
+            let replacement = manager
+                .start_thread_with_control_for_tests(
+                    StartThreadOptions {
+                        initial_history: root_history,
+                        history_mode: Some(ThreadHistoryMode::Legacy),
+                        session_source: Some(caller.session_source.clone()),
+                        ..StartThreadOptions::new(harness.config.clone())
+                    },
+                    control.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement.thread_id, caller.session.thread_id);
+            assert!(replacement.thread.is_running());
+            assert!(!Arc::ptr_eq(&replacement.thread, &caller));
+            let current = RetainedAgentAuthority::capture(
+                &replacement.thread.session,
+                &replacement.thread.session_source,
+            )
+            .await;
+            assert_ne!(
+                current.epoch().generation,
+                original_caller.epoch().generation
+            );
+            assert_eq!(current.config.as_ref(), original_caller.config.as_ref());
+            assert_eq!(current.settings, original_caller.settings);
+            assert!(current.scope == original_caller.scope);
+            assert_eq!(
+                runtime
+                    .child_provider_origins
+                    .verified(caller.session.thread_id),
+                original_origin
+            );
+            assert!(Arc::ptr_eq(
+                &runtime.child_provider_origins,
+                &replacement
+                    .thread
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .child_provider_origins
+            ));
+            Some(replacement.thread)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    release.notify_one();
+    let result = timeout(Duration::from_secs(15), resume).await.unwrap();
+    let target_loaded = manager.get_thread(child.thread_id).await.ok();
+    let receipt_after = state
+        .read_native_authority_receipt(child.thread_id)
+        .await
+        .unwrap();
+    let publication = created.try_recv();
+    // Clean even a pre-fix unauthorized successful target before recording RED.
+    if let Some(target) = target_loaded.as_ref() {
+        target.shutdown_and_wait().await.unwrap();
+        manager.remove_thread(&child.thread_id).await.unwrap();
+    }
+    if let Some(replacement) = replacement {
+        replacement.shutdown_and_wait().await.unwrap();
+    }
+    if stage == 0 {
+        assert_eq!(
+            result.unwrap(),
+            child.thread_id,
+            "unchanged real cold caller must still resume"
+        );
+        assert!(target_loaded.is_some());
+        caller.shutdown_and_wait().await.unwrap();
+    } else {
+        let error = result
+            .err()
+            .expect("late stale private caller unexpectedly authorized actual cold target startup");
+        assert!(
+            error.to_string().contains("child_provider_policy_conflict"),
+            "{error}"
+        );
+        assert!(
+            target_loaded.is_none(),
+            "stale private caller cannot publish target Session"
+        );
+        assert!(matches!(
+            publication,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            receipt_after,
+            Some(receipt),
+            "denied final admission preserves cold target receipt"
+        );
+    }
+}
