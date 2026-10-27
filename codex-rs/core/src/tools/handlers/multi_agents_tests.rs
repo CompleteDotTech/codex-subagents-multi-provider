@@ -206,7 +206,7 @@ impl RecordingHostControl {
     fn local(&self) -> &crate::agent::LocalAgentControl {
         self.local
             .get()
-            .expect("actual root must bind the host backend before operations")
+            .expect("the factory must bind the actual host control before startup operations")
     }
 }
 
@@ -335,23 +335,11 @@ impl crate::agent::api::AgentControl for RecordingHostControl {
     }
 
     fn service_tier(&self) -> Option<String> {
-        self.local
-            .get()
-            .and_then(|local| crate::agent::api::AgentControl::service_tier(local))
+        crate::agent::api::AgentControl::service_tier(self.local())
     }
 
     fn propagate_config_update(&self, update: crate::agent::api::AgentConfigUpdate) {
-        if let Some(local) = self.local.get() {
-            crate::agent::api::AgentControl::propagate_config_update(local, update);
-        } else {
-            assert!(
-                matches!(
-                    update,
-                    crate::agent::api::AgentConfigUpdate::ServiceTier(None)
-                ),
-                "only empty startup metadata may precede actual root binding"
-            );
-        }
+        crate::agent::api::AgentControl::propagate_config_update(self.local(), update);
     }
 
     fn get_guardian_package(
@@ -1354,7 +1342,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
     config.features.enable(Feature::MultiAgentV2).unwrap();
     assert_eq!(
         config.service_tier, None,
-        "the unbound factory may receive only empty startup metadata"
+        "the host fixture begins with no shared service tier"
     );
     let backend = Arc::new(RecordingHostControl {
         identity: std::sync::OnceLock::new(),
@@ -1363,29 +1351,40 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         sends: std::sync::atomic::AtomicUsize::new(0),
         world_state: std::sync::atomic::AtomicUsize::new(0),
     });
+    let startup_control = Arc::new(std::sync::OnceLock::<crate::agent::LocalAgentControl>::new());
+    // Install the factory before allocating controls with Weak manager references.
+    // Root startup below uses this exact host runtime, including its private origins.
     let manager = thread_manager().with_agent_control_factory({
         let backend = Arc::clone(&backend);
+        let startup_control = Arc::clone(&startup_control);
         move |thread_id| {
-            backend.identity.get_or_init(|| thread_id.into());
+            let root_identity = backend.identity.get_or_init(|| thread_id.into());
+            backend.local.get_or_init(|| {
+                startup_control
+                    .get()
+                    .expect("host control allocated before starting the actual root")
+                    .runtime
+                    .control(*root_identity)
+            });
             let control: Arc<dyn crate::agent::api::AgentControl> = backend.clone();
             async move { Ok(control) }
         }
     });
+    let control = manager.agent_control();
+    assert!(startup_control.set(control.clone()).is_ok());
     let root = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread_with_control_for_tests(StartThreadOptions::new(config), control)
         .await
         .expect("actual provided-backend root");
     let session = Arc::clone(&root.thread.session);
-    assert!(
-        backend
-            .local
-            .set(
-                session
-                    .services
-                    .local_agent_runtime
-                    .control(session.session_id())
-            )
-            .is_ok()
+    assert_eq!(
+        backend.identity.get().copied(),
+        Some(session.session_id()),
+        "the backend identity must be the registered root's actual identity"
+    );
+    assert_eq!(
+        crate::agent::api::AgentControl::identity(backend.local()),
+        session.session_id()
     );
     let turn = session.new_default_turn().await;
     let spawn_output = SpawnAgentHandlerV2::default()
