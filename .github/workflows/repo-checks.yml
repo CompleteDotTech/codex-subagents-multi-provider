@@ -43,6 +43,11 @@ jobs:
       - name: Test Ollama qualification guards without provider calls
         run: python3 -m unittest discover -s .github/scripts -p 'test_qualify_ollama.py'
 
+      - name: Test Bazel CI command boundaries without builds
+        run: python3 -m unittest discover -s .github/scripts -p 'test_run_bazel_ci.py'
+      - name: Test Windows workspace provenance capture
+        run: python3 -m unittest discover -s .github/scripts -p 'test_capture_windows_workspace_provenance.py'
+
       - name: Test disposable macOS CI descriptor provisioning
         run: python3 -m unittest discover -s .github/scripts -p 'test_provision_macos_ci_descriptors.py'
 
