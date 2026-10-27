@@ -626,10 +626,13 @@ mod calibration_tests {
                     stanza.body.pop();
                 }
             }
-            assert!(matches!(
-                crate::Identity::unwrap_stanza(&identity, &stanza),
-                Some(Err(DecryptError::InvalidHeader))
-            ));
+            assert!(
+                matches!(
+                    crate::Identity::unwrap_stanza(&identity, &stanza),
+                    Some(Err(DecryptError::InvalidHeader))
+                ),
+                "malformed stanza variation {variation}"
+            );
         }
         assert_eq!(guard.derivations(), 0);
     }

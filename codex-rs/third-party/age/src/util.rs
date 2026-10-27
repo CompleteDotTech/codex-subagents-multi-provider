@@ -227,7 +227,23 @@ pub(crate) mod read {
         verify::<_, _, (), _, _>(digit1, |n: &str| !n.starts_with('0'))
             .parse_complete(arg)
             .ok()
+            .filter(|(remaining, _)| remaining.is_empty())
             .and_then(|(_, n)| n.parse_to())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::decimal_digit_arg;
+
+        #[test]
+        fn decimal_digit_arg_requires_a_complete_canonical_number() {
+            for (arg, expected) in [("1", 1u8), ("14", 14), ("63", 63), ("255", 255)] {
+                assert_eq!(decimal_digit_arg::<u8>(arg), Some(expected), "{arg:?}");
+            }
+            for arg in ["", "0", "01", "+14", "-14", "14x", "14 ", "256"] {
+                assert_eq!(decimal_digit_arg::<u8>(arg), None, "{arg:?}");
+            }
+        }
     }
 }
 
