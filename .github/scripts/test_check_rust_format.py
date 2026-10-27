@@ -113,7 +113,18 @@ class RustFormatPolicyTests(unittest.TestCase):
         driver = runpy.run_path(str(formatting.ROOT / "scripts/format.py"))
         for check in (True, False):
             group = driver["rust_formatter_group"](check=check)
-            self.assertEqual(len(group.commands), 1)
+            self.assertGreaterEqual(len(group.commands), 2)
+            self.assertEqual(group.commands[1].args[0], "rustfmt")
+            self.assertIn(
+                "imports_granularity=Item,skip_children=true", group.commands[1].args
+            )
+            self.assertEqual("--check" in group.commands[1].args, check)
+            self.assertFalse(
+                any(
+                    "third-party/aws-config" in arg.replace("\\", "/")
+                    for arg in group.commands[1].args
+                )
+            )
             command = group.commands[0]
             self.assertEqual(
                 command.args[:2],
