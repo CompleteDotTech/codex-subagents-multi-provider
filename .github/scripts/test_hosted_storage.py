@@ -81,6 +81,78 @@ class PolicyTests(unittest.TestCase):
 
 
 class BackendInteractionTests(unittest.TestCase):
+    def test_final_endpoint_values_control_local_default_without_rewriting_flags(self):
+        cases = [
+            (["--remote_cache=https://synthetic", "--remote_cache="], True),
+            (["--remote_cache=", "--remote_cache", "https://synthetic"], False),
+            (["--remote_executor", "grpcs://synthetic", "--remote_executor", ""], True),
+            (["--remote_executor", "", "--remote_executor=grpcs://synthetic"], False),
+            (
+                [
+                    "--remote_cache=https://synthetic",
+                    "--remote_executor=grpcs://synthetic",
+                    "--remote_cache",
+                    "",
+                    "--remote_executor=",
+                ],
+                True,
+            ),
+            (
+                [
+                    "--remote_cache=",
+                    "--remote_executor=grpcs://synthetic",
+                    "--remote_cache=",
+                ],
+                False,
+            ),
+            (
+                [
+                    "--remote_executor=",
+                    "--remote_cache=https://synthetic",
+                    "--remote_executor",
+                    "",
+                ],
+                False,
+            ),
+        ]
+        payload = [
+            "//target",
+            "--remote_cache=https://payload",
+            "--remote_executor",
+            "payload",
+        ]
+        for flags, local in cases:
+            with self.subTest(flags=flags):
+                effective = storage.effective_arguments(
+                    ["test", *flags, "--", *payload], ENV
+                )
+                command = backend.bazel_command(*effective, env=ENV)
+                before = command[command.index("test") + 1 : command.index("--")]
+                self.assertEqual(before, (["--disk_cache="] if local else []) + flags)
+                self.assertEqual(command[command.index("--") + 1 :], payload)
+
+    def test_empty_endpoints_do_not_override_other_explicit_remote_or_cache_choices(
+        self,
+    ):
+        endpoints = [
+            "--remote_cache=https://synthetic",
+            "--remote_cache=",
+            "--remote_executor",
+            "",
+        ]
+        for choice in (
+            ["--disk_cache", "owned"],
+            ["--disk_cache="],
+            ["--config=buildbuddy-generic-rbe"],
+            ["--strategy=Rustc=remote"],
+        ):
+            effective = storage.effective_arguments(
+                ["test", *endpoints, *choice, "--", "//target"], ENV
+            )
+            command = backend.bazel_command(*effective, env=ENV)
+            before = command[command.index("test") + 1 : command.index("--")]
+            self.assertEqual(before, endpoints + choice)
+
     def test_keyless_configs_have_identical_local_build_and_info_routes(self):
         for name in ("ci-linux", "ci-macos", "ci-v8"):
             for flags in (["--config=" + name], ["--config", name]):

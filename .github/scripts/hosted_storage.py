@@ -57,6 +57,12 @@ def options(args, names=INFO_OPTIONS):
 def defaults(args, env):
     args = local_arguments(args, env)
     explicit = list(options(args, INFO_OPTIONS | REMOTE_OPTIONS))
+    # These are scalar options: each endpoint's final value is authoritative.
+    endpoints = {
+        name: value
+        for name, value in explicit
+        if name in ("--remote_executor", "--remote_cache")
+    }
     # --strategy is a per-mnemonic map: later values replace the same mnemonic.
     # A local/sandboxed override does not select a remote execution strategy.
     strategies = {}
@@ -70,10 +76,10 @@ def defaults(args, env):
         and args[0] in ("build", "test", "coverage", "run", "info")
         and not any(name == "--disk_cache" for name, _ in explicit)
         and not any(
-            (name in ("--remote_executor", "--remote_cache") and value)
-            or (name == "--config" and ("buildbuddy" in value or value == "remote"))
+            name == "--config" and ("buildbuddy" in value or value == "remote")
             for name, value in explicit
         )
+        and not any(endpoints.values())
         and not any("remote" in choices for choices in strategies.values())
     ):
         return ["--disk_cache="]
