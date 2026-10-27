@@ -1426,6 +1426,14 @@ def generate_types_from_schema_dir(schema_dir: Path, *, format_output: bool = Tr
     generate_v2_all(schema_dir, format_output=format_output)
     generate_notification_registry(schema_dir)
     generate_public_api_flat_methods(format_output=format_output)
+    # Generated Python artifacts have the same LF byte contract on every platform.
+    for relative_path in (
+        "src/openai_codex/generated/v2_all.py",
+        "src/openai_codex/generated/notification_registry.py",
+        "src/openai_codex/api.py",
+    ):
+        path = sdk_root() / relative_path
+        path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
