@@ -1,6 +1,10 @@
 name: build-codex-packages
 description: Build and smoke-test unsigned Codex CLI and app-server release packages.
 inputs:
+  remote-credentials:
+    description: Boolean credential availability; callers must explicitly report whether their Bazel credential is configured.
+    required: false
+    default: "false"
   target:
     description: Rust release target triple to build and test.
     required: true
@@ -77,6 +81,7 @@ runs:
       if: inputs.build-system == 'bazel'
       uses: ./.github/actions/build-bazel-package-binaries
       with:
+        remote-credentials: ${{ inputs.remote-credentials }}
         target: ${{ inputs.target }}
         build-mode: ${{ inputs.build-mode }}
 

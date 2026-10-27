@@ -66,6 +66,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
 
@@ -133,6 +134,16 @@ jobs:
 
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
+      - name: Observe storage before cache archive
+        id: hosted_storage
+        if: always() && !cancelled() && runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+        continue-on-error: true
+        env:
+          HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
+          HOSTED_STORAGE_CACHE_SAVE: ${{ steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe before-cache-save none
+
       - name: Save bazel repository cache
         if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
         continue-on-error: true
@@ -140,6 +151,21 @@ jobs:
         with:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
           key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
+
+      - name: Observe storage after cache archive
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe after-cache-save none
+
+      - name: Upload hosted storage observations
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: hosted-storage-${{ github.job }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/hosted-storage/*.json
+          if-no-files-found: ignore
 
       - name: Check for a clean worktree
         if: always() && !cancelled()
@@ -189,6 +215,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: x86_64-pc-windows-gnullvm
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && secrets.BUILDBUDDY_API_KEY == '' }}
           # Reuse the former monolithic Windows test cache for restores. Do
@@ -295,6 +322,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: x86_64-pc-windows-msvc
           cache-scope: bazel-${{ github.job }}
 
@@ -394,6 +422,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && matrix.target == 'x86_64-pc-windows-gnullvm' && secrets.BUILDBUDDY_API_KEY == '' }}
@@ -460,6 +489,16 @@ jobs:
 
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
+      - name: Observe storage before cache archive
+        id: hosted_storage
+        if: always() && !cancelled() && runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+        continue-on-error: true
+        env:
+          HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
+          HOSTED_STORAGE_CACHE_SAVE: ${{ steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe before-cache-save none
+
       - name: Save bazel repository cache
         if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
         continue-on-error: true
@@ -467,6 +506,21 @@ jobs:
         with:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
           key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
+
+      - name: Observe storage after cache archive
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe after-cache-save none
+
+      - name: Upload hosted storage observations
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: hosted-storage-${{ github.job }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/hosted-storage/*.json
+          if-no-files-found: ignore
 
       - name: Check for a clean worktree
         if: always() && !cancelled()
@@ -508,6 +562,7 @@ jobs:
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: ${{ matrix.target }}
           cache-scope: bazel-${{ github.job }}
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && matrix.target == 'x86_64-pc-windows-gnullvm' && secrets.BUILDBUDDY_API_KEY == '' }}
@@ -591,6 +646,16 @@ jobs:
 
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
+      - name: Observe storage before cache archive
+        id: hosted_storage
+        if: always() && !cancelled() && runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+        continue-on-error: true
+        env:
+          HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
+          HOSTED_STORAGE_CACHE_SAVE: ${{ steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe before-cache-save none
+
       - name: Save bazel repository cache
         if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
         continue-on-error: true
@@ -598,6 +663,21 @@ jobs:
         with:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
           key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
+
+      - name: Observe storage after cache archive
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: python3 .github/scripts/hosted_storage.py observe after-cache-save none
+
+      - name: Upload hosted storage observations
+        if: always() && !cancelled() && steps.hosted_storage.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: hosted-storage-${{ github.job }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/hosted-storage/*.json
+          if-no-files-found: ignore
 
       - name: Check for a clean worktree
         if: always() && !cancelled()

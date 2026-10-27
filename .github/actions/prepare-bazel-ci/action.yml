@@ -15,6 +15,10 @@ inputs:
     description: Observe bounded hosted Windows diagnostic resources.
     required: false
     default: "false"
+  remote-credentials:
+    description: Boolean credential-availability receipt from the caller; external callers must report it explicitly rather than infer keylessness from the default.
+    required: false
+    default: "false"
 outputs:
   repository-cache-path:
     description: Filesystem path used for the Bazel repository cache.
@@ -57,6 +61,14 @@ runs:
     # do not need to be re-downloaded on every CI run. Keep restore failures
     # non-fatal so transient cache-service errors degrade to a cold build
     # instead of failing the job.
+    - name: Observe storage before repository restore
+      if: runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+      continue-on-error: true
+      env:
+        HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ inputs.remote-credentials }}
+      shell: bash
+      run: python3 .github/scripts/hosted_storage.py observe before-restore none
+
     - name: Restore bazel repository cache
       id: cache_bazel_repository_restore
       continue-on-error: true
@@ -66,6 +78,14 @@ runs:
         key: ${{ steps.cache_bazel_repository_key.outputs.repository-cache-key }}
         restore-keys: |
           ${{ steps.cache_bazel_repository_key.outputs.repository-cache-restore-key }}
+
+    - name: Observe storage after repository restore
+      if: always() && !cancelled() && runner.environment == 'github-hosted' && (runner.os == 'Linux' || runner.os == 'macOS') && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+      continue-on-error: true
+      env:
+        HOSTED_STORAGE_REMOTE_CREDENTIALS: ${{ inputs.remote-credentials }}
+      shell: bash
+      run: python3 .github/scripts/hosted_storage.py observe after-restore none
 
     - name: Set up Bazel execution logs
       shell: bash

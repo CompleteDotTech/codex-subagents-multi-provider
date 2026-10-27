@@ -67,6 +67,7 @@ jobs:
         id: setup_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
+          remote-credentials: ${{ secrets.BUILDBUDDY_API_KEY != '' }}
           target: x86_64-unknown-linux-gnu
           cache-scope: sdk
 
