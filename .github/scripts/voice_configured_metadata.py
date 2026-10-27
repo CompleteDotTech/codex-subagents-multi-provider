@@ -20,12 +20,22 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from voice_metadata_owned_job import capture_owned
 
 LIMIT = 32 * 1024 * 1024
 TOTAL = 128 * 1024 * 1024
 MANIFEST_RESERVE = 64 * 1024
+# The Actions step remains 600s. Reserve 30s outside this invocation envelope
+# for shell/startup/scheduling, then 60s for final parsing/sanitization/source
+# checks. These allowances are policy, not hard OS/Git latency guarantees.
+INVOCATION_SECONDS = 570
+POSTPROCESSING_RESERVE_SECONDS = 60
+OWNED_CLEANUP_RESERVE_SECONDS = 15  # Three existing sequential waits of up to 5s.
+FIRST_PROVIDER_SECONDS = 120
+LATER_PROVIDER_SECONDS = 45
+ACTIONS_SECONDS = 90
 PREFIX = "//codex-rs/voice-host:"
 NAMES = (
     "codex-voice-host",
@@ -943,7 +953,18 @@ def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip()
 
 
+def admit_query(query_deadline, timeout):
+    # Admit only a FULL fixed window plus owned cleanup. Never shorten a query,
+    # extend a deadline, retry or treat an unlaunched phase as accepted evidence.
+    require(
+        time.monotonic() + timeout + OWNED_CLEANUP_RESERVE_SECONDS <= query_deadline,
+        "Insufficient global budget for complete configured query",
+    )
+
+
 def main():
+    invocation_deadline = time.monotonic() + INVOCATION_SECONDS
+    query_deadline = invocation_deadline - POSTPROCESSING_RESERVE_SECONDS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--expected-head", required=True)
@@ -1028,7 +1049,11 @@ def main():
                 "--",
                 label,
             ]
-            result = capture(cmd, output, budget, env=child_environment)
+            timeout = FIRST_PROVIDER_SECONDS if i == 0 else LATER_PROVIDER_SECONDS
+            admit_query(query_deadline, timeout)
+            result = capture(
+                cmd, output, budget, timeout=timeout, env=child_environment
+            )
             manifest["phases"].append(
                 {
                     "phase": f"provider-{i}",
@@ -1062,7 +1087,10 @@ def main():
             "--",
             QUERY,
         ]
-        result = capture(cmd, output, budget, timeout=90, env=child_environment)
+        admit_query(query_deadline, ACTIONS_SECONDS)
+        result = capture(
+            cmd, output, budget, timeout=ACTIONS_SECONDS, env=child_environment
+        )
         manifest["phases"].append(
             {
                 "phase": "actions",
@@ -1097,6 +1125,10 @@ def main():
             name: {"bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
             for name, value in payloads.items()
         }
+        require(
+            time.monotonic() <= invocation_deadline,
+            "Configured metadata invocation deadline exhausted",
+        )
         for name, value in payloads.items():
             (upload / name).write_bytes(value)
         manifest["status"] = "configured-graph-and-package-structure-validated"
@@ -1115,7 +1147,12 @@ def main():
         manifest["source_unchanged"] = unchanged
         if not unchanged:
             manifest["status"] = "failed-source-changed"
+        within_deadline = time.monotonic() <= invocation_deadline
+        if not within_deadline:
+            manifest["status"] = "failed-deadline"
+            manifest["failure"] = "Configured metadata invocation deadline exhausted"
         (upload / "manifest.json").write_bytes(encode(manifest))
+        require(within_deadline, "Configured metadata invocation deadline exhausted")
         require(unchanged, "Pinned source or lock changed")
     print("Configured metadata validated; sanitized evidence ready.")
 

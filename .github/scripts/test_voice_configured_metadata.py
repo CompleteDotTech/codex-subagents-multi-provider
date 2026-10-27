@@ -692,6 +692,106 @@ class ProgressObservationTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 15)
 
 
+class QueryBudgetTests(unittest.TestCase):
+    def test_full_window_and_cleanup_at_exact_admission_boundary(self):
+        for timeout in (120, 45, 90):
+            with (
+                self.subTest(timeout=timeout),
+                mock.patch.object(m.time, "monotonic", return_value=100),
+            ):
+                m.admit_query(100 + timeout + 15, timeout)
+                with self.assertRaisesRegex(
+                    m.EvidenceError, "^Insufficient global budget"
+                ):
+                    m.admit_query(100 + timeout + 15 - 0.001, timeout)
+
+    def test_same_deadline_never_extends_or_shortens_later_phase(self):
+        with mock.patch.object(m.time, "monotonic", side_effect=(0, 120, 451)):
+            m.admit_query(510, 120)
+            m.admit_query(510, 45)
+            with self.assertRaisesRegex(m.EvidenceError, "^Insufficient global budget"):
+                m.admit_query(510, 45)
+        self.assertEqual(m.INVOCATION_SECONDS, 570)
+        self.assertEqual(m.POSTPROCESSING_RESERVE_SECONDS, 60)
+        self.assertEqual(m.OWNED_CLEANUP_RESERVE_SECONDS, 15)
+
+    def run_deadline_failure(self, clock, expected, expected_captures):
+        records = {p["label"]: p for p in packages()[0]}
+
+        def capture(command, output, budget, timeout=45, *, env=None):
+            if "cquery" in command:
+                output.write_text(m.SENTINEL + json.dumps(records[command[-1]]))
+            else:
+                output.write_text(json.dumps(graph()))
+            return {"oversize": False, "timeout": False, "exit_code": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            shell, root = Path(directory) / "bash.exe", Path(directory) / "evidence"
+            shell.touch()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "capture",
+                        "--git-bash",
+                        str(shell),
+                        "--root",
+                        str(root),
+                        "--expected-head",
+                        "head",
+                        "--expected-tree",
+                        "tree",
+                    ],
+                ),
+                mock.patch.dict(os.environ, diagnostic_parent(directory), clear=True),
+                mock.patch.object(
+                    m,
+                    "git",
+                    side_effect=lambda *args: (
+                        "head"
+                        if args == ("rev-parse", "HEAD")
+                        else "tree"
+                        if args == ("rev-parse", "HEAD^{tree}")
+                        else ""
+                    ),
+                ),
+                mock.patch.object(m.time, "monotonic", side_effect=clock),
+                mock.patch.object(m, "capture", side_effect=capture) as captured,
+                mock.patch.object(m, "package_proof", return_value=[]),
+                self.assertRaisesRegex(m.EvidenceError, expected),
+            ):
+                m.main()
+            self.assertEqual(captured.call_count, expected_captures)
+            self.assertEqual(
+                [p.name for p in (root / "upload").iterdir()], ["manifest.json"]
+            )
+            return json.loads((root / "upload" / "manifest.json").read_bytes())
+
+    def test_first_window_refused_before_any_launch_and_no_partial_acceptance(self):
+        manifest = self.run_deadline_failure(
+            (0, 375.001, 375.002), "^Insufficient global budget", 0
+        )
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["phases"], [])
+        self.assertTrue(manifest["source_unchanged"])
+
+    def test_later_window_refused_without_retry_or_partial_acceptance(self):
+        manifest = self.run_deadline_failure(
+            (0, 0, 120, 451, 451), "^Insufficient global budget", 2
+        )
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(len(manifest["phases"]), 2)
+
+    def test_expired_postprocessing_never_publishes_success(self):
+        manifest = self.run_deadline_failure(
+            (0,) * 9 + (571, 571), "^Configured metadata invocation deadline", 8
+        )
+        self.assertEqual(manifest["status"], "failed-deadline")
+        self.assertEqual(len(manifest["phases"]), 8)
+        self.assertTrue(manifest["source_unchanged"])
+
+
 class EnvironmentTests(unittest.TestCase):
     def test_encoding_sorting_astral_values_and_empty_block(self):
         env = {"z": "last", "ProgramFiles(x86)": "C:/tools", "A": "astral-\U0001f642"}
@@ -1069,11 +1169,13 @@ class CaptureTests(unittest.TestCase):
                     self.assertEqual(dict(os.environ), original_parent)
             self.assertEqual(len(seen), 16)
             self.assertNotEqual(seen[0][2], seen[8][2])
-            for command, timeout, root in seen:
+            for index, (command, timeout, root) in enumerate(seen):
                 self.assertEqual(command[0], str(shell))
                 query = "cquery" if "cquery" in command else "aquery"
                 self.assertEqual(command[command.index(query) - 1], "--batch")
-                self.assertEqual(timeout, 45 if query == "cquery" else 90)
+                self.assertEqual(
+                    timeout, 120 if index % 8 == 0 else 45 if query == "cquery" else 90
+                )
                 self.assertTrue(Path(root).is_relative_to(directory))
                 self.assertNotEqual(root, "ordinary-runtime-root")
 

@@ -632,7 +632,8 @@ jobs:
           native-windows-voice: true
           cache-scope: bazel-test
       - name: Capture bounded configured voice metadata
-        # 7x45s providers + 90s actions + 8x15s cleanup < 10m.
+        # First provider: 120s; later: 45s; actions: 90s. Each full window + 15s
+        # cleanup must fit a 510s cutoff; 570s invocation reserves 60s for finalization.
         # Runtime keeps 45m; job retains 5m for preparation/uploads.
         timeout-minutes: 10
         shell: bash
