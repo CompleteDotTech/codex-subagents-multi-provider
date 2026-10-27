@@ -6765,11 +6765,18 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
     use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
     use codex_protocol::mcp_policy::McpServerIdentity;
     use codex_protocol::mcp_policy::McpServerRequirement;
-    let (home, mut config) = test_config_with_host_configuration(
+    let (home, _initial_config) = test_config_with_host_configuration(
         Vec::new(),
         Some("[agents]\nallowed_model_providers=['openai']\n"),
     )
     .await;
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .cli_overrides(vec![("agents.max_depth".into(), TomlValue::Integer(8))])
+        .build()
+        .await
+        .unwrap();
+    assert!(config.model_provider.auth.is_none());
     for feature in [Feature::Sqlite, Feature::MultiAgentV2, Feature::ShellTool] {
         config.features.enable(feature).unwrap();
     }
@@ -6778,8 +6785,8 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
         .permissions
         .set_permission_profile(PermissionProfile::read_only())
         .unwrap();
-    // The same helper is configured throughout; compare its marker immediately
-    // around the denied child send, after legitimate root startup has finished.
+    // Seal with the established API-key fixture. Install this helper only on the
+    // real restored owner, then measure invocations around the denied child send.
     let marker = home.path().join("attachment-auth-invocations");
     let script = home.path().join(if cfg!(windows) {
         "attachment-auth.cmd"
@@ -6795,11 +6802,11 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
         },
     )
     .unwrap();
-    config.model_provider.auth = Some(serde_json::from_value(if cfg!(windows) {
+    let attachment_auth = serde_json::from_value(if cfg!(windows) {
         serde_json::json!({"command":"cmd.exe","args":["/D","/C",script],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
     } else {
         serde_json::json!({"command":"sh","args":[script],"cwd":home.path(),"timeout_ms":5000,"refresh_interval_ms":0})
-    }).unwrap());
+    }).unwrap();
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let root = harness
         .manager
@@ -6955,7 +6962,8 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
             .is_none(),
         "opaque attachment restriction must produce NoProof, never a weaker sealed receipt"
     );
-    let fresh = harness.config.clone();
+    let mut fresh = harness.config.clone();
+    fresh.model_provider.auth = Some(attachment_auth);
     let state_db = harness.state_db.clone();
     let root_id = root.thread_id;
     drop(global);
