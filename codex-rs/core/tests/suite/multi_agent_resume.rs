@@ -7,6 +7,7 @@ use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -305,6 +306,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
                 permission_profile: Some(PermissionProfile::Disabled),
                 ..Default::default()
             }),
@@ -354,6 +356,11 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         "roles must inherit the parent's complete model provider",
     );
     let initial_worker_config = worker_thread.config_snapshot().await;
+    assert_eq!(initial_worker_config.approval_policy, AskForApproval::Never);
+    assert_eq!(
+        initial.codex.config_snapshot().await.approval_policy,
+        AskForApproval::Never
+    );
     let initial_worker_role_config = (
         initial_worker_config.model,
         initial_worker_config.model_provider_id,
@@ -620,6 +627,10 @@ openai_base_url = "{redirected_base_url}"
     )
     .await;
     resumed.submit_turn(QUEUE_PROMPT).await?;
+    assert_eq!(
+        resumed.codex.config_snapshot().await.approval_policy,
+        AskForApproval::Never
+    );
     let queue_output = server
         .received_requests()
         .await
