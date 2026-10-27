@@ -216,6 +216,7 @@ def codex_rust_crate(
         integration_compile_data_extra = [],
         integration_test_args = [],
         unit_test_args = [],
+        unit_test_env_inherit = [],
         unit_test_working_directory_marker = None,
         binary_test_target_compatible_with = [],
         integration_test_timeout = None,
@@ -265,6 +266,7 @@ def codex_rust_crate(
         integration_compile_data_extra: Extra compile_data for integration tests.
         integration_test_args: Optional args for integration test binaries.
         unit_test_args: Optional args for the unit test binary.
+        unit_test_env_inherit: Host environment variable names inherited only by library unit tests.
         unit_test_working_directory_marker: Optional file whose directory is the unit test cwd.
         binary_test_target_compatible_with: Platform constraints for binary unit tests.
         integration_test_timeout: Optional Bazel timeout for integration test
@@ -402,6 +404,7 @@ def codex_rust_crate(
         workspace_root_test(
             name = unit_test_name,
             env = test_env,
+            env_inherit = unit_test_env_inherit,
             runfile_env = {
                 binary: "CARGO_BIN_EXE_" + Label(binary).name
                 for binary in extra_binaries
