@@ -8942,7 +8942,7 @@ async fn fresh_revoked_running_caller_cannot_cross_final_admission(stage: u8) {
         None => None,
     };
     let survivor_present = surviving_child.is_some();
-    eprintln!(
+    tracing::info!(
         "FRESH_REVOCATION_OBSERVED stage={stage} started={started_id:?} survivor_after_shutdown={survivor_present}"
     );
     if let Some(child) = surviving_child {
