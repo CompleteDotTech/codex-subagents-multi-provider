@@ -1678,15 +1678,29 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
         "done",
         "actual owned tool must succeed, never convert a missing executable or barrier timeout into policy RED"
     );
+    child.ensure_rollout_materialized().await;
+    child.flush_rollout().await?;
     let stored = child
         .read_thread(
-            /*include_archived*/ true, /*include_history*/ true,
+            /*include_archived*/ true, /*include_history*/ false,
         )
         .await?;
     let id = stored.thread_id;
-    let history = stored
-        .history
-        .expect("actual child history including tool result");
+    let history = fixture
+        .test
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
+            thread_id: id,
+            include_archived: true,
+        })
+        .await?;
+    assert_eq!(history.thread_id, id);
+    assert!(
+        matches!(history.items.first(), Some(codex_history::RolloutItem::SessionMeta(meta))
+            if meta.meta.id == id
+                && meta.meta.parent_thread_id == Some(fixture.test.session_configured.thread_id)),
+        "actual durable model context must identify this child and its owned parent"
+    );
     let successful_tool = history.items.iter().any(|item| {
         let codex_history::RolloutItem::ResponseItem(envelope) = item else { return false; };
         matches!(&envelope.item, codex_protocol::models::ResponseItem::FunctionCallOutput {
