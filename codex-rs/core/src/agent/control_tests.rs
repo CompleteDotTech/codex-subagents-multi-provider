@@ -12927,7 +12927,9 @@ stream_idle_timeout_ms = 1000
     let mut observed = CodexThread::new(
         Arc::clone(&original.session),
         io,
-        original.startup_metadata().clone(),
+        crate::thread_startup_metadata::ThreadStartupMetadata::from(
+            &original.startup_metadata().to_session_configured_event(),
+        ),
         original.rollout_path(),
         original.session_source.clone(),
     );
