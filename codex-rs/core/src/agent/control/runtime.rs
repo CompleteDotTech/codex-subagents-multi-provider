@@ -236,6 +236,13 @@ impl LocalAgentRuntime {
             .revoke_caller_stamped(thread, explicit_graph_close)
     }
 
+    pub(crate) fn graph_close_is_current(
+        &self,
+        stamp: &crate::agent::NativeGraphCloseStamp,
+    ) -> bool {
+        self.registry.graph_close_is_current(stamp)
+    }
+
     pub(crate) fn teardown_revision(&self, thread: ThreadId) -> u64 {
         self.registry.teardown_revision(thread)
     }

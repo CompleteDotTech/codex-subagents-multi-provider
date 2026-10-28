@@ -448,7 +448,7 @@ pub(crate) struct NativeShutdownCapture {
     pub(crate) threads: Vec<(ThreadId, Arc<CodexThread>)>,
     root: ThreadId,
     root_allocation: Option<Arc<CodexThread>>,
-    graph_stamp: crate::agent::registry::NativeGraphCloseStamp,
+    graph_stamp: crate::agent::NativeGraphCloseStamp,
 }
 
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
@@ -2195,11 +2195,7 @@ impl ThreadManagerState {
             (Some(_), None) => capture.graph_stamp.can_transfer_from_loaded(),
             _ => false,
         };
-        if !compatible_residency
-            || !runtime
-                .registry
-                .graph_close_is_current(&capture.graph_stamp)
-        {
+        if !compatible_residency || !runtime.graph_close_is_current(&capture.graph_stamp) {
             return Ok(());
         }
         if let Some(store) = self.agent_graph_store() {
