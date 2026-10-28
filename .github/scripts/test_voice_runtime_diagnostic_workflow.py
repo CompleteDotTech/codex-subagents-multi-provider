@@ -180,9 +180,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("OWNERSHIP_DIAGNOSTIC_HEAD=%s", job)
         self.assertIn("OWNERSHIP_DIAGNOSTIC_TREE=%s", job)
         self.assertIn(
-            "run: python3 -m unittest discover -s .github/scripts -p test_windows_ci_resource_observation.py",
+            "run: python3 .github/scripts/diagnose_ownership_fixture_startup.py",
             job,
         )
+        self.assertIn("fail-fast: false", job)
+        self.assertIn("mode: [minimal, full]", job)
+        self.assertIn("OWNERSHIP_STARTUP_MODE: ${{ matrix.mode }}", job)
         for forbidden in (
             "secrets.",
             "prepare-bazel-ci",

@@ -916,6 +916,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_diagnostic && !inputs.voice_runtime_diagnostic
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [minimal, full]
     permissions:
       contents: read
     steps:
@@ -946,6 +950,8 @@ jobs:
             echo "TEMP=$fixture_tmp"
             echo "TMP=$fixture_tmp"
           } >> "$GITHUB_ENV"
-      - name: Run actual Linux ownership fixture module
+      - name: Run first-launch ownership control
         shell: bash
-        run: python3 -m unittest discover -s .github/scripts -p test_windows_ci_resource_observation.py
+        env:
+          OWNERSHIP_STARTUP_MODE: ${{ matrix.mode }}
+        run: python3 .github/scripts/diagnose_ownership_fixture_startup.py
