@@ -56,7 +56,9 @@ pub(crate) struct OpenAiModelsEndpoint {
     gateway_auth_manager: Option<Result<Arc<GatewayAuthManager>, String>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
     gateway_scope: RwLock<Option<String>>,
-    gateway_reconciliation: tokio::sync::Mutex<()>,
+    // A single-flight admission permit coordinates async observation; it does
+    // not guard data. Cached scope writes retain their short synchronous lock.
+    gateway_reconciliation: tokio::sync::Semaphore,
 }
 
 impl OpenAiModelsEndpoint {
@@ -76,7 +78,7 @@ impl OpenAiModelsEndpoint {
             gateway_auth_manager,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder { redirect_policy }),
             gateway_scope: RwLock::new(None),
-            gateway_reconciliation: tokio::sync::Mutex::new(()),
+            gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
         }
     }
 
@@ -231,6 +233,27 @@ impl OpenAiModelsEndpoint {
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn try_pinned_identity(&self) -> Option<codex_models_manager::manager::PinnedModelsIdentity> {
+        let _reconciliation = self.gateway_reconciliation.try_acquire().ok()?;
+        let auth = match &self.auth_manager {
+            Some(manager) => manager.try_auth_cached()?,
+            None => None,
+        };
+        // The cached snapshot pins nested token state with try-locks; all
+        // identity helpers below read only this private immutable auth copy.
+        let mut identity =
+            crate::models_identity::identity(&self.provider_info, auth.as_ref()).ok()?;
+        if self.provider_info.gateway_oauth.is_some() {
+            let scope = self.gateway_scope.try_read().ok()?;
+            identity = crate::models_identity::with_gateway_scope(identity, scope.as_deref()?);
+        }
+        Some(codex_models_manager::manager::PinnedModelsIdentity {
+            identity,
+            uses_api_key_auth: self.has_provider_api_key()
+                || matches!(auth, Some(CodexAuth::ApiKey(_))),
+        })
+    }
+
     fn requires_identity_reconciliation(&self) -> bool {
         self.provider_info.gateway_oauth.is_some()
     }
@@ -240,7 +263,13 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
             if self.provider_info.gateway_oauth.is_none() {
                 return;
             }
-            let _guard = self.gateway_reconciliation.lock().await;
+            let Ok(_admission) = self.gateway_reconciliation.acquire().await else {
+                *self
+                    .gateway_scope
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                return;
+            };
             *self
                 .gateway_scope
                 .write()
@@ -544,7 +573,7 @@ mod tests {
             let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-api-key"));
             let endpoint = Arc::new(OpenAiModelsEndpoint {
                 gateway_scope: RwLock::new(None),
-                gateway_reconciliation: tokio::sync::Mutex::new(()),
+                gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
                 provider_info: ModelProviderInfo {
                     name: name.to_string(),
                     ..ModelProviderInfo::create_openai_provider(base_url.map(str::to_string))
@@ -586,7 +615,7 @@ mod tests {
             let auth_manager = auth.map(AuthManager::from_auth_for_testing);
             let endpoint = Arc::new(OpenAiModelsEndpoint {
                 gateway_scope: RwLock::new(None),
-                gateway_reconciliation: tokio::sync::Mutex::new(()),
+                gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
                 provider_info: ModelProviderInfo {
                     experimental_bearer_token: Some("provider-key".into()),
                     ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
@@ -668,7 +697,7 @@ mod tests {
         let observed_request = Arc::new(Mutex::new(None));
         let endpoint = OpenAiModelsEndpoint {
             gateway_scope: RwLock::new(None),
-            gateway_reconciliation: tokio::sync::Mutex::new(()),
+            gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             gateway_auth_manager: None,
@@ -716,7 +745,7 @@ mod tests {
         )]));
         let endpoint = OpenAiModelsEndpoint {
             gateway_scope: RwLock::new(None),
-            gateway_reconciliation: tokio::sync::Mutex::new(()),
+            gateway_reconciliation: tokio::sync::Semaphore::new(/*permits*/ 1),
             provider_info,
             auth_manager: None,
             gateway_auth_manager: None,

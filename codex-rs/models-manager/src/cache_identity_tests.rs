@@ -12,6 +12,12 @@ struct ObservedEndpoint {
 }
 
 impl ModelsEndpointClient for ObservedEndpoint {
+    fn try_pinned_identity(&self) -> Option<PinnedModelsIdentity> {
+        Some(PinnedModelsIdentity {
+            identity: self.observed.try_lock().ok()?.clone()?,
+            uses_api_key_auth: false,
+        })
+    }
     fn identity(&self) -> Option<String> {
         self.observed.lock().unwrap().clone()
     }
@@ -40,7 +46,7 @@ impl ModelsEndpointClient for ObservedEndpoint {
                 *self.persisted.lock().unwrap() = Some("grant-b".into());
             }
             Ok(ModelsEndpointResponse {
-                models: vec![remote_model("shared", "Grant A", 0)],
+                models: vec![remote_model("shared", "Grant A", /*priority*/ 0)],
                 etag: None,
                 identity,
             })
@@ -104,8 +110,12 @@ async fn persisted_identity_changes_during_fetch_or_cache_write_cannot_publish_s
             replace_during_store: !during_fetch,
             entry: Mutex::new(None),
         });
-        let manager = OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
-            .with_provider_catalog();
+        let manager = OpenAiModelsManager::new_with_cache(
+            cache.clone(),
+            endpoint.clone(),
+            /*auth_manager*/ None,
+        )
+        .with_provider_catalog();
         assert!(
             manager
                 .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
@@ -141,7 +151,8 @@ async fn metadata_reads_observe_persisted_identity_changes_without_catalog_refre
         replace_during_fetch: false,
     });
     let manager =
-        OpenAiModelsManager::new_without_cache(endpoint.clone(), None).with_provider_catalog();
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), /*auth_manager*/ None)
+            .with_provider_catalog();
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
@@ -173,9 +184,9 @@ async fn partitioned_files_preserve_same_slug_metadata_for_each_provider_and_ten
     let path = home.path().join(MODEL_CACHE_FILE);
     let cache = FileModelsCache::partitioned(path.clone(), DEFAULT_MODEL_CACHE_TTL);
     let version = crate::client_version_to_whole();
-    let mut first = remote_model("shared", "OpenAI", 0);
+    let mut first = remote_model("shared", "OpenAI", /*priority*/ 0);
     first.context_window = Some(128_000);
-    let mut second = remote_model("shared", "GLM", 0);
+    let mut second = remote_model("shared", "GLM", /*priority*/ 0);
     second.context_window = Some(32_000);
     second.default_reasoning_level = Some(ReasoningEffort::Low);
     let entry = |identity: &str, model| ModelsCacheEntry {
@@ -334,14 +345,14 @@ impl ModelsEndpointClient for RejectedAttemptEndpoint {
             if self.reject.swap(false, Ordering::SeqCst) {
                 // The actual rejected B request differs from preflight/current A.
                 return Err(ModelsEndpointError {
-                    error: catalog_http_error(403),
+                    error: catalog_http_error(/*status*/ 403),
                     identity: Some("grant-b".into()),
                 });
             }
             Ok(ModelsEndpointResponse {
                 identity: self.identity().unwrap(),
                 etag: None,
-                models: vec![remote_model("shared", "fresh", 0)],
+                models: vec![remote_model("shared", "fresh", /*priority*/ 0)],
             })
         })
     }
@@ -350,7 +361,7 @@ impl ModelsEndpointClient for RejectedAttemptEndpoint {
 #[tokio::test]
 async fn rejection_survives_account_switches_when_persistent_invalidation_fails() {
     for load_error in [false, true] {
-        let stale = vec![remote_model("shared", "stale B", 0)];
+        let stale = vec![remote_model("shared", "stale B", /*priority*/ 0)];
         let cache = Arc::new(TestModelsCache {
             entry: Mutex::new(Some(ModelsCacheEntry {
                 fetched_at: Utc::now(),
@@ -367,8 +378,12 @@ async fn rejection_survives_account_switches_when_persistent_invalidation_fails(
             observed: Mutex::new("grant-a".into()),
             reject: std::sync::atomic::AtomicBool::new(true),
         });
-        let manager = OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
-            .with_provider_catalog();
+        let manager = OpenAiModelsManager::new_with_cache(
+            cache.clone(),
+            endpoint.clone(),
+            /*auth_manager*/ None,
+        )
+        .with_provider_catalog();
         assert!(
             manager
                 .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
@@ -415,4 +430,132 @@ async fn rejection_survives_account_switches_when_persistent_invalidation_fails(
         );
         assert!(!manager.identity_rejected("grant-b"));
     }
+}
+
+#[tokio::test]
+async fn pinned_authority_snapshot_is_nonblocking_and_never_reconciles_or_fetches() {
+    let endpoint = Arc::new(ObservedEndpoint {
+        persisted: Mutex::new(Some("grant-b".into())),
+        observed: Mutex::new(Some("grant-a".into())),
+        replace_during_fetch: false,
+    });
+    let manager =
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), /*auth_manager*/ None)
+            .with_provider_catalog();
+    manager.remote_models.write().await.models = vec![remote_model(
+        "shared",
+        "Pinned grant A",
+        /*priority*/ 0,
+    )];
+    let config = ModelsManagerConfig::default();
+    let info = manager
+        .try_pinned_authority_model("shared", &config)
+        .expect("validated pinned catalog");
+    assert_eq!(info.display_name, "Pinned grant A");
+    assert_eq!(
+        endpoint.identity().as_deref(),
+        Some("grant-a"),
+        "snapshot must not execute credential reconciliation"
+    );
+    assert!(
+        manager
+            .try_pinned_authority_model("missing", &config)
+            .is_none()
+    );
+    let held = manager.remote_models.write().await;
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "busy lock must not block"
+    );
+    drop(held);
+    let rejected = manager.rejected_identities.write().unwrap();
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "busy rejection state must not block"
+    );
+    drop(rejected);
+    let identity_guard = endpoint.observed.lock().unwrap();
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "busy identity cache must not block"
+    );
+    drop(identity_guard);
+    *endpoint.observed.lock().unwrap() = Some("grant-b".into());
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "known cached identity mismatch"
+    );
+    *endpoint.observed.lock().unwrap() = Some("grant-a".into());
+    manager.remote_models.write().await.fetched_at = chrono::DateTime::<Utc>::MIN_UTC;
+    assert!(
+        manager
+            .try_pinned_authority_model("shared", &config)
+            .is_none(),
+        "invalidated metadata is not proof"
+    );
+}
+
+#[tokio::test]
+async fn pinned_default_catalog_never_turns_identity_mismatch_into_builtin_proof() {
+    let endpoint = Arc::new(ObservedEndpoint {
+        persisted: Mutex::new(Some("grant-b".into())),
+        observed: Mutex::new(Some("grant-a".into())),
+        replace_during_fetch: false,
+    });
+    let manager =
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), /*auth_manager*/ None);
+    let slug = manager
+        .remote_models
+        .read()
+        .await
+        .models
+        .first()
+        .unwrap()
+        .slug
+        .clone();
+    let config = ModelsManagerConfig::default();
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_some());
+    *endpoint.observed.lock().unwrap() = Some("grant-b".into());
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_none());
+    *endpoint.observed.lock().unwrap() = Some("grant-a".into());
+    let held = manager.remote_models.write().await;
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_none());
+    drop(held);
+    manager.remote_models.write().await.fetched_at = chrono::DateTime::<Utc>::MIN_UTC;
+    assert!(manager.try_pinned_authority_model(&slug, &config).is_none());
+    assert_eq!(
+        endpoint.identity().as_deref(),
+        Some("grant-a"),
+        "no reconciliation or endpoint fetch"
+    );
+}
+
+#[test]
+fn pinned_static_authority_snapshot_uses_only_immutable_available_metadata() {
+    let manager = StaticModelsManager::new(
+        /*auth_manager*/ None,
+        ModelsResponse {
+            models: vec![remote_model("static", "Static", /*priority*/ 0)],
+        },
+    );
+    assert_eq!(
+        manager
+            .try_pinned_authority_model("static", &Default::default())
+            .unwrap()
+            .slug,
+        "static"
+    );
+    assert!(
+        manager
+            .try_pinned_authority_model("missing", &Default::default())
+            .is_none()
+    );
 }

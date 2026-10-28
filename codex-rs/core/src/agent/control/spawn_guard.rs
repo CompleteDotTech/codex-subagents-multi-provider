@@ -1,11 +1,11 @@
 //! Owns a provisional child until the spawn result can be returned without yielding.
 
 use super::AgentTreeMembership;
+use crate::CodexThread;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::thread_store_error_kind;
 use codex_agent_graph_store::AgentGraphStoreError;
 use codex_agent_graph_store::ThreadSpawnEdgeStatus;
-use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErrKind;
 use codex_thread_store::ThreadStoreError;
 use std::sync::Arc;
@@ -14,14 +14,14 @@ use tracing::warn;
 
 pub(super) struct PendingSpawn {
     state: Arc<ThreadManagerState>,
-    pending: Option<(ThreadId, AgentTreeMembership)>,
+    pending: Option<(Arc<CodexThread>, AgentTreeMembership)>,
     edge_write: Option<JoinHandle<()>>,
 }
 
 impl PendingSpawn {
     pub(super) fn new(
         state: Arc<ThreadManagerState>,
-        child: ThreadId,
+        child: Arc<CodexThread>,
         membership: AgentTreeMembership,
     ) -> Self {
         Self {
@@ -55,19 +55,21 @@ impl PendingSpawn {
 
 impl Drop for PendingSpawn {
     fn drop(&mut self) {
-        let Some((child, membership)) = self.pending.take() else {
+        let Some((thread, membership)) = self.pending.take() else {
             return;
         };
         let state = Arc::clone(&self.state);
+        let child = thread.session.thread_id;
         let teardown = membership.into_teardown_guard("child_spawn_cleanup", Some(child));
         let edge_write = self.edge_write.take();
         drop(tokio::spawn(async move {
-            if let Some(thread) = state.remove_thread(&child).await {
+            {
                 if let Err(error) = thread.shutdown_and_wait().await {
                     teardown
                         .record_shutdown_failure("stop_child", CodexErrKind::from(&error).into());
                     warn!("failed to stop cancelled child spawn: {error}");
                 }
+                state.remove_thread_if_matches(&child, &thread, || {}).await;
                 if let Some(live_thread) = thread.session.live_thread() {
                     match live_thread.discard().await {
                         Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
@@ -84,6 +86,22 @@ impl Drop for PendingSpawn {
             // A pending Open write must finish before cleanup writes Closed.
             if let Some(edge_write) = edge_write {
                 let _ = edge_write.await;
+            }
+            // Only this exact registration may close its edge. Keep the map
+            // ordering across this asynchronous graph write, without holding
+            // a signal or registry mutex while awaiting storage.
+            let threads = state.threads.write().await;
+            let runtime = &thread.session.services.local_agent_runtime;
+            let current = runtime
+                .retained_authority(child)
+                .is_some_and(|authority| authority.matches_session(&thread.session));
+            if !current
+                || threads
+                    .get(&child)
+                    .is_some_and(|registered| !Arc::ptr_eq(registered, &thread))
+            {
+                teardown.complete();
+                return;
             }
             if let Some(store) = state.agent_graph_store()
                 && let Err(error) = store

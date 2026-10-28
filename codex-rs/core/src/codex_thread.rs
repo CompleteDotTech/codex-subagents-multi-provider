@@ -599,6 +599,18 @@ impl CodexThread {
         self.io.submit_turn_input(request, mode).await
     }
 
+    pub(crate) async fn start_or_steer_turn_guarded(
+        &self,
+        request: TurnInputRequest,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<TurnInputSubmission> {
+        self.ensure_execution_capacity_for_turn_start(self.session.services.agent_control.as_ref())
+            .await?;
+        self.io
+            .submit_turn_input_guarded(request, TurnInputMode::StartOrSteer, guard)
+            .await
+    }
+
     /// Persist whether this thread is eligible for future memory generation.
     pub async fn set_thread_memory_mode(&self, mode: ThreadMemoryMode) -> anyhow::Result<()> {
         self.session.set_thread_memory_mode(mode).await

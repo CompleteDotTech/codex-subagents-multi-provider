@@ -834,3 +834,64 @@ fn built_in_config_file_contents_resolves_explorer_only() {
         None
     );
 }
+
+#[tokio::test]
+async fn cold_default_requires_the_actual_unmodified_builtin() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    assert!(is_unmodified_builtin_default(&config, /*role*/ None));
+    assert!(is_unmodified_builtin_default(
+        &config,
+        Some(DEFAULT_ROLE_NAME)
+    ));
+    assert!(!is_unmodified_builtin_default(&config, Some("explorer")));
+    config.agent_roles.insert(
+        DEFAULT_ROLE_NAME.into(),
+        crate::config::AgentRoleConfig {
+            config_file: None,
+            description: None,
+            nickname_candidates: None,
+        },
+    );
+    assert!(!is_unmodified_builtin_default(&config, /*role*/ None));
+    assert!(!is_unmodified_builtin_default(
+        &config,
+        Some(DEFAULT_ROLE_NAME)
+    ));
+}
+
+#[tokio::test]
+async fn retained_role_restrictions_preserve_disabled_skills_without_replacing_fresh_provider() {
+    let (_home, mut current) = test_config_with_cli_overrides(Vec::new()).await;
+    let mut old = current.clone();
+    let overrides = AgentRoleOverrides {
+        skills: Some(SkillsConfig {
+            bundled: Some(codex_config::BundledSkillsConfig { enabled: false }),
+            include_instructions: Some(false),
+            config: vec![codex_config::SkillConfig {
+                name: Some("private-skill".into()),
+                path: None,
+                enabled: false,
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    old = role_overrides::build_next_config(
+        &old,
+        TomlValue::try_from(&overrides).unwrap(),
+        &overrides,
+    )
+    .unwrap();
+    old.model_provider_id = "old-provider".into();
+    let before_provider = current.model_provider.clone();
+    let before_id = current.model_provider_id.clone();
+    preserve_retained_role_restrictions(&mut current, &old).unwrap();
+    assert_eq!(current.model_provider_id, before_id);
+    assert_eq!(current.model_provider, before_provider);
+    assert!(!current.include_skill_instructions);
+    assert!(!current.bundled_skills_enabled());
+    let rules = codex_config::skill_config_rules_from_stack(&current.config_layer_stack);
+    assert!(rules.entries.iter().any(|rule| !rule.enabled
+        && matches!(&rule.selector,
+        codex_config::SkillConfigRuleSelector::Name(name) if name == "private-skill")));
+}

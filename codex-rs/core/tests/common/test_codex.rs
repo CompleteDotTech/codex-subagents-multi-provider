@@ -208,6 +208,34 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
+    fn fresh_local_in_same_workspace(previous: &Self) -> Result<Self> {
+        anyhow::ensure!(
+            previous.exec_server_url.is_none()
+                && previous.remote_container_name.is_none()
+                && previous.selection.environment_id == codex_exec_server::LOCAL_ENVIRONMENT_ID
+                && matches!(
+                    &previous.selection.config,
+                    EnvironmentConfigState::FromThread
+                ),
+            "same-workspace restart requires an actual local FromThread fixture"
+        );
+        Ok(Self {
+            environment: codex_exec_server::Environment::create_for_tests(
+                /*exec_server_url*/ None,
+            )?,
+            exec_server_url: None,
+            cwd: previous.cwd.clone(),
+            selection: previous.selection.clone(),
+            local_cwd_temp_dir: Some(Arc::clone(
+                previous
+                    .local_cwd_temp_dir
+                    .as_ref()
+                    .context("actual local workspace owner")?,
+            )),
+            remote_container_name: None,
+        })
+    }
+
     pub async fn local() -> Result<Self> {
         Self::local_with_exec_server_url(/*exec_server_url*/ None).await
     }
@@ -422,6 +450,11 @@ pub struct TestCodexBuilder {
     history_mode: Option<ThreadHistoryMode>,
     models_manager: Option<SharedModelsManager>,
     thread_store: Option<Arc<dyn ThreadStore>>,
+    store_resume: Option<(
+        codex_history::ResumedHistory,
+        SessionSource,
+        ThreadHistoryMode,
+    )>,
     image_store: Arc<dyn AttachmentStore>,
 }
 
@@ -739,6 +772,107 @@ impl TestCodexBuilder {
             .await
     }
 
+    /// Creates a fresh runtime from an actual host store, without inventing a local rollout path.
+    /// Reusing an in-memory owner exercises cold runtime reconstruction, not process durability.
+    pub async fn restart_from_thread_store(
+        &mut self,
+        server: &MockServer,
+        previous: &TestCodex,
+    ) -> Result<TestCodex> {
+        let store = self
+            .thread_store
+            .as_ref()
+            .context("explicit restart store")?;
+        let owner = previous
+            .thread_store
+            .native_authority_storage()
+            .context("previous actual host-store owner")?;
+        anyhow::ensure!(
+            store.native_authority_storage() == Some(owner),
+            "restart must use the actual previous host-store owner"
+        );
+        previous.codex.shutdown_and_wait().await?;
+        let target = previous.session_configured.thread_id;
+        let stored = store
+            .read_thread(codex_thread_store::ReadThreadParams {
+                thread_id: target,
+                include_archived: true,
+                include_history: false,
+            })
+            .await?;
+        anyhow::ensure!(
+            stored.thread_id == target
+                && stored.parent_thread_id.is_none()
+                && matches!(&stored.source, SessionSource::Exec),
+            "only an actual stored host root may use this restart helper"
+        );
+        let context = store
+            .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
+                thread_id: target,
+                include_archived: true,
+            })
+            .await?;
+        anyhow::ensure!(
+            matches!(context.items.first(), Some(codex_history::RolloutItem::SessionMeta(meta))
+            if meta.meta.id == target && meta.meta.session_id == previous.session_configured.session_id
+                && meta.meta.parent_thread_id.is_none() && meta.meta.source == stored.source),
+            "actual host model context must identify the same stored root"
+        );
+        self.store_resume = Some((
+            codex_history::ResumedHistory {
+                conversation_id: target,
+                history: Arc::new(context.items),
+                history_revision: context.revision,
+                rollout_path: stored.rollout_path,
+            },
+            stored.source,
+            stored.history_mode,
+        ));
+        Box::pin(self.build_with_home_and_base_url(
+            format!("{}/v1", server.uri()),
+            Arc::clone(&previous.home),
+            /*resume_from*/ None,
+            TestEnv::fresh_local_in_same_workspace(&previous._test_env)?,
+            /*include_local_environment*/ false,
+        ))
+        .await
+    }
+
+    /// Restarts the actual local rollout in a fresh runtime with the same owned workspace.
+    pub async fn restart_in_same_local_workspace(
+        &mut self,
+        server: &MockServer,
+        previous: &TestCodex,
+    ) -> Result<TestCodex> {
+        // The fresh manager and its resumed root must share one actual backend,
+        // rather than allocating a second Cached-auth manager in the legacy arm.
+        let auth_manager = self.auth.manager_for_home(previous.home.path());
+        anyhow::ensure!(
+            !Arc::ptr_eq(&auth_manager, &previous.thread_manager.auth_manager()),
+            "cold fixture requires a fresh actual authentication backend"
+        );
+        self.auth = TestAuth::Manager(Arc::clone(&auth_manager));
+        let rollout_path = previous
+            .session_configured
+            .rollout_path
+            .clone()
+            .context("actual local rollout path")?;
+        previous.codex.shutdown_and_wait().await?;
+        let restored = Box::pin(self.build_with_home_and_base_url(
+            format!("{}/v1", server.uri()),
+            Arc::clone(&previous.home),
+            Some(rollout_path),
+            TestEnv::fresh_local_in_same_workspace(&previous._test_env)?,
+            /*include_local_environment*/ false,
+        ))
+        .await?;
+        assert!(Arc::ptr_eq(
+            &restored.thread_manager.auth_manager(),
+            &auth_manager
+        ));
+        Ok(restored)
+    }
+
     /// Restarts without changing the executor platform selected by the test process.
     pub async fn restart_with_auto_env(
         &mut self,
@@ -899,8 +1033,23 @@ impl TestCodexBuilder {
             )
         };
 
-        let new_conversation = match (resume_from, user_shell_override) {
-            (Some(path), Some(user_shell_override)) => {
+        let new_conversation = match (resume_from, user_shell_override, self.store_resume.take()) {
+            (None, None, Some((history, source, history_mode))) => {
+                Box::pin(thread_manager.start_thread(StartThreadOptions {
+                    initial_history: codex_history::InitialHistory::Resumed(history),
+                    session_source: Some(source),
+                    history_mode: Some(history_mode),
+                    client_mcp_extensions: client_mcp_extensions(),
+                    ..StartThreadOptions::new(config.clone())
+                }))
+                .await?
+            }
+            (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+                return Err(anyhow!(
+                    "store restart cannot also select a rollout path or shell override"
+                ));
+            }
+            (Some(path), Some(user_shell_override), None) => {
                 let auth_manager = self.auth.manager_for_home(config.codex_home.as_path());
                 Box::pin(
                     codex_core::test_support::resume_legacy_thread_from_rollout_with_user_shell_override(
@@ -914,7 +1063,7 @@ impl TestCodexBuilder {
                 )
                 .await?
             }
-            (Some(path), None) => {
+            (Some(path), None, None) => {
                 let auth_manager = self.auth.manager_for_home(config.codex_home.as_path());
                 Box::pin(thread_manager.resume_legacy_thread_from_rollout(
                     config.clone(),
@@ -925,7 +1074,7 @@ impl TestCodexBuilder {
                 ))
                 .await?
             }
-            (None, Some(user_shell_override)) => {
+            (None, Some(user_shell_override), None) => {
                 Box::pin(
                     codex_core::test_support::start_thread_with_user_shell_override(
                         thread_manager.as_ref(),
@@ -936,7 +1085,7 @@ impl TestCodexBuilder {
                 )
                 .await?
             }
-            (None, None) => {
+            (None, None, None) => {
                 let environment_requests = if test_env.selection().cwd.infer_path_convention()
                     == Some(PathConvention::Windows)
                     && PathUri::from_abs_path(&config.cwd) != test_env.selection().cwd
@@ -1550,6 +1699,7 @@ pub fn test_codex() -> TestCodexBuilder {
         history_mode: Some(ThreadHistoryMode::Legacy),
         models_manager: None,
         thread_store: None,
+        store_resume: None,
         image_store: codex_core::passthrough_image_store(),
     }
 }

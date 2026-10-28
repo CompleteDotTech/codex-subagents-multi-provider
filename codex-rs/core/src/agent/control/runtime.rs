@@ -182,6 +182,8 @@ impl Drop for AgentTreeTeardownGuard {
 /// Local tree state, kept separate from the shared agent operation interface.
 #[derive(Clone)]
 pub(crate) struct LocalAgentRuntime {
+    pub(crate) child_provider_origins:
+        Arc<crate::agent::child_provider_authorization::ChildProviderOrigins>,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form
     /// `ThreadManagerState -> CodexThread -> Session -> SessionServices -> ThreadManagerState`.
@@ -205,12 +207,124 @@ pub(crate) struct LocalAgentRuntime {
 }
 
 impl LocalAgentRuntime {
+    pub(crate) fn shares_registry_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registry, &other.registry)
+    }
+
+    pub(crate) fn register_authority(
+        &self,
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+    ) {
+        self.registry.register_authority(authority);
+    }
+
+    pub(crate) fn revoke_subtree_with_edges(
+        &self,
+        root: ThreadId,
+        edges: Vec<(ThreadId, ThreadId)>,
+        explicit_graph_close: bool,
+    ) -> (
+        std::collections::HashSet<ThreadId>,
+        crate::agent::registry::NativeGraphCloseStamp,
+    ) {
+        self.registry
+            .revoke_subtree(root, edges, explicit_graph_close)
+    }
+
+    pub(crate) fn revoke_single_caller(
+        &self,
+        thread: ThreadId,
+        explicit_graph_close: bool,
+    ) -> crate::agent::registry::NativeGraphCloseStamp {
+        self.registry
+            .revoke_caller_stamped(thread, explicit_graph_close)
+    }
+
+    pub(crate) fn graph_close_is_current(
+        &self,
+        stamp: &crate::agent::NativeGraphCloseStamp,
+    ) -> bool {
+        self.registry.graph_close_is_current(stamp)
+    }
+
+    pub(crate) fn teardown_revision(&self, thread: ThreadId) -> u64 {
+        self.registry.teardown_revision(thread)
+    }
+
+    pub(crate) fn note_session_stopped(&self, session: &crate::session::session::Session) {
+        self.registry.note_session_stopped(session);
+    }
+
+    pub(crate) fn commit_native_registration<T, G>(
+        &self,
+        caller: &crate::agent::child_provider_authorization::RetainedAgentAuthority,
+        live: bool,
+        allow_completed_eviction: bool,
+        revisions: &[(ThreadId, u64)],
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+        commit: impl FnOnce() -> CodexResult<(T, G)>,
+    ) -> CodexResult<T> {
+        self.registry.commit_native_registration(
+            caller,
+            live,
+            allow_completed_eviction,
+            revisions,
+            authority,
+            commit,
+        )
+    }
+
+    pub(crate) fn retire_authority(
+        &self,
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+    ) {
+        self.registry.retire_authority(authority);
+    }
+
+    pub(crate) fn with_fresh_caller<T>(
+        &self,
+        caller: &crate::session::session::Session,
+        registration_id: uuid::Uuid,
+        admit: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        self.registry
+            .with_fresh_caller(caller, registration_id, admit)
+    }
+
+    pub(crate) fn with_resume_caller<T>(
+        &self,
+        authority: &crate::agent::child_provider_authorization::RetainedAgentAuthority,
+        live: bool,
+        admit: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        self.registry.with_resume_caller(authority, live, admit)
+    }
+
+    pub(crate) fn with_current_native_operation<T>(
+        &self,
+        root: &crate::session::session::Session,
+        target: &crate::session::session::Session,
+        callers: &[&crate::session::session::Session],
+        admit: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        self.registry
+            .with_current_native_operation(root, target, callers, admit)
+    }
+
+    pub(crate) fn retained_authority(
+        &self,
+        target: ThreadId,
+    ) -> Option<Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>> {
+        self.registry.retained_authority(target)
+    }
+
     pub(super) fn new(
         manager: Weak<ThreadManagerState>,
         thread_id_generator: ThreadIdGenerator,
         rollout_budget: Option<RolloutBudgetConfig>,
     ) -> Self {
         let runtime = Self {
+            child_provider_origins: Arc::default(),
             manager,
             thread_id_generator,
             registry: Arc::default(),

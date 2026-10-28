@@ -59,6 +59,21 @@ impl ThreadManagerState {
         // Once shutdown is submitted, cancellation cannot release delivery or capacity early.
         tokio::spawn(async move {
             let _residency_guard = residency_guard;
+            let authority = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(&thread.session, &thread.session_source).await;
+            if !thread.session.services.local_agent_runtime.registry.begin_residency_eviction(&authority) {
+                // Revocation can fence an idle allocation before explicit close removes it.
+                // That still-counted allocation is busy, not capacity progress.
+                let current = manager
+                    .get_thread(thread_id)
+                    .await
+                    .is_ok_and(|registered| Arc::ptr_eq(&registered, &thread));
+                teardown.complete();
+                return Ok(if current {
+                    ThreadEvictionOutcome::Busy
+                } else {
+                    ThreadEvictionOutcome::NotCurrent
+                });
+            }
             thread.ensure_rollout_materialized().await;
             if let Err(err) = thread.shutdown_and_wait().await {
                 teardown.record_shutdown_failure("stop_resident", CodexErrKind::from(&err).into());
@@ -87,18 +102,25 @@ impl ThreadManagerState {
                     .turn_environments
                     .configured_snapshot_now(),
             };
+            let authority =
+                crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                    &thread.session,
+                    &thread.session_source,
+                )
+                .await;
+            if let Err(error) = crate::agent::child_provider_authorization::durable::seal_stopped(&manager, &thread, &authority).await {
+                tracing::warn!(%error, "evicted native authority remains unavailable for cold reload");
+            }
             let mut threads = manager.threads.write().await;
-            if threads
-                .get(&thread_id)
-                .is_some_and(|registered| !Arc::ptr_eq(registered, &thread))
-            {
+            if !threads.get(&thread_id).is_some_and(|registered| Arc::ptr_eq(registered, &thread)) {
                 teardown.complete();
                 return Ok(ThreadEvictionOutcome::NotCurrent);
             }
-            runtime
-                .registry
-                .save_evicted_environments(thread_id, environments);
+            thread.session.revoke_fresh_child_admission();
             let removed = threads.remove(&thread_id).is_some();
+            if removed {
+                runtime.registry.complete_residency_eviction(authority, environments);
+            }
             runtime.residency.remove(thread_id);
             teardown.complete();
             Ok(if removed {
@@ -175,7 +197,11 @@ impl LocalAgentRuntime {
         }
         let guard = Arc::clone(&thread.residency_gate).read_owned().await;
         let thread_id = thread.session.thread_id;
-        if !Arc::ptr_eq(thread, &state.get_thread(thread_id).await?) {
+        let threads = state.threads.read().await;
+        if !threads
+            .get(&thread_id)
+            .is_some_and(|registered| Arc::ptr_eq(thread, registered))
+        {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
         self.residency.touch(thread_id);
@@ -184,6 +210,18 @@ impl LocalAgentRuntime {
 }
 
 impl V2Residency {
+    #[cfg(test)]
+    pub(super) fn snapshot_for_test(&self) -> (Vec<ThreadId>, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.residents.iter().copied().collect(),
+            state.pending_slots,
+        )
+    }
+
     async fn reserve_slot(
         self: Arc<Self>,
         manager: &Arc<ThreadManagerState>,

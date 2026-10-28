@@ -42,6 +42,9 @@ pub struct LiveThread {
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
+    owner: Option<crate::ThreadWriterOwner>,
+    fresh: bool,
+    provisional: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Owns persistence acquisition and its live thread while initialization is still fallible.
@@ -58,6 +61,11 @@ pub struct LiveThreadInitGuard {
 
 impl LiveThreadInitGuard {
     pub fn new(live_thread: Option<LiveThread>) -> Self {
+        if let Some(thread) = &live_thread {
+            thread
+                .provisional
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Self {
             live_thread,
             acquiring: None,
@@ -84,7 +92,11 @@ impl LiveThreadInitGuard {
         if let Some(acquiring) = self.acquiring.as_mut() {
             let result = acquiring.await;
             self.acquiring = None;
-            self.live_thread = Some(result?);
+            let thread = result?;
+            thread
+                .provisional
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.live_thread = Some(thread);
         }
         Ok(())
     }
@@ -94,15 +106,22 @@ impl LiveThreadInitGuard {
     }
 
     pub fn commit(&mut self) {
+        if let Some(thread) = &self.live_thread {
+            thread
+                .provisional
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         self.live_thread = None;
     }
 
     pub async fn discard(&mut self) -> ThreadStoreResult<()> {
         self.finish_acquisition().await?;
-        let Some(live_thread) = self.live_thread.take() else {
+        let Some(live_thread) = self.live_thread.as_ref() else {
             return Ok(());
         };
-        live_thread.discard().await
+        live_thread.discard().await?;
+        self.live_thread = None;
+        Ok(())
     }
 }
 
@@ -122,25 +141,165 @@ impl Drop for LiveThreadInitGuard {
                 Some(acquiring) => acquiring.await.ok(),
                 None => live_thread,
             };
-            if let Some(live_thread) = live_thread
-                && let Err(err) = live_thread.discard().await
-            {
-                warn!("failed to discard thread persistence for failed session init: {err}");
+            if let Some(live_thread) = live_thread {
+                // An acquisition completed by this cancellation owner has not
+                // crossed the registration commit, just like finish_acquisition.
+                live_thread
+                    .provisional
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Err(err) = live_thread.discard().await {
+                    warn!("failed to discard thread persistence for failed session init: {err}");
+                }
             }
         });
     }
 }
 
 impl LiveThread {
+    async fn mutate<T, F, Fut>(&self, work: F) -> ThreadStoreResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut,
+        Fut: Future<Output = ThreadStoreResult<T>> + Send + 'static,
+    {
+        let Some(owner) = &self.owner else {
+            return work(self.clone()).await;
+        };
+        let operation = owner.operation().await?;
+        crate::store::complete_writer_operation(operation, work(self.clone())).await
+    }
+
+    pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let items = raw_items.to_vec();
+        self.mutate(move |thread| async move { thread.append_items_inner(&items).await })
+            .await
+    }
+
+    async fn persist_inherited_items(
+        &self,
+        raw_items: &[RolloutItem],
+    ) -> ThreadStoreResult<Vec<RolloutItem>> {
+        let items = raw_items.to_vec();
+        self.mutate(move |thread| async move { thread.persist_appended_items(&items).await })
+            .await
+    }
+
+    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        self.mutate(move |thread| async move { thread.persist_inner(context).await })
+            .await
+    }
+    pub async fn flush(&self) -> ThreadStoreResult<()> {
+        self.mutate(|thread| async move { thread.flush_inner().await })
+            .await
+    }
+    pub async fn update_memory_mode(
+        &self,
+        mode: ThreadMemoryMode,
+        include_archived: bool,
+    ) -> ThreadStoreResult<()> {
+        self.mutate(move |thread| async move {
+            thread
+                .update_memory_mode_inner(mode, include_archived)
+                .await
+        })
+        .await
+    }
+    pub async fn update_metadata(
+        &self,
+        patch: ThreadMetadataPatch,
+        include_archived: bool,
+    ) -> ThreadStoreResult<StoredThread> {
+        self.mutate(move |thread| async move {
+            thread.update_metadata_inner(patch, include_archived).await
+        })
+        .await
+    }
+
+    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+        let Some(owner) = &self.owner else {
+            return self.shutdown_inner().await;
+        };
+        // Wait for admission in the caller. No detached operation can start if
+        // that wait is cancelled. Once admitted, own metadata AND final cleanup.
+        let operation = owner.operation().await;
+        let thread = self.clone();
+        tokio::spawn(async move {
+            let metadata_result = match operation {
+                Ok(operation) => {
+                    let metadata_thread = thread.clone();
+                    crate::store::complete_writer_operation(operation, async move {
+                        if metadata_thread
+                            .provisional
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            Ok(())
+                        } else {
+                            metadata_thread
+                                .flush_pending_metadata_update_for_existing_history()
+                                .await
+                        }
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            thread.finish_shutdown(metadata_result).await
+        })
+        .await
+        .map_err(|error| ThreadStoreError::Internal {
+            message: format!("owned shutdown task failed: {error}"),
+        })?
+    }
+
+    pub async fn begin_native_authority_epoch(
+        &self,
+        epoch: crate::NativeAuthorityEpoch,
+    ) -> ThreadStoreResult<()> {
+        match &self.owner {
+            Some(owner) => {
+                self.thread_store
+                    .begin_native_authority_epoch_owned(epoch, owner.clone())
+                    .await
+            }
+            None => self.thread_store.begin_native_authority_epoch(epoch).await,
+        }
+    }
+
     pub async fn create(
         thread_store: Arc<dyn ThreadStore>,
         params: CreateThreadParams,
     ) -> ThreadStoreResult<Self> {
+        Self::create_impl(thread_store, params, false).await
+    }
+    pub async fn create_owned(
+        thread_store: Arc<dyn ThreadStore>,
+        params: CreateThreadParams,
+    ) -> ThreadStoreResult<Self> {
+        Self::create_impl(thread_store, params, true).await
+    }
+    async fn create_impl(
+        thread_store: Arc<dyn ThreadStore>,
+        params: CreateThreadParams,
+        require_owned: bool,
+    ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
         let history_mode = params.history_mode;
         let metadata_sync = ThreadMetadataSync::for_create(&params).await;
-        thread_store.create_thread(params).await?;
+        let owner = if require_owned {
+            Some(thread_store.create_thread_owned(params).await?)
+        } else {
+            thread_store.create_thread(params).await?;
+            None
+        };
+        let provisional = owner
+            .as_ref()
+            .map(crate::ThreadWriterOwner::provisional)
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        provisional.store(false, std::sync::atomic::Ordering::Release);
         Ok(Self {
+            owner,
+            fresh: true,
+            provisional,
             thread_id,
             history_mode,
             thread_store,
@@ -155,9 +314,28 @@ impl LiveThread {
     /// projection can distinguish inherited context from the child's own records immediately.
     pub async fn create_with_inherited_model_context(
         thread_store: Arc<dyn ThreadStore>,
+        params: CreateThreadParams,
+        inherited_model_context: &[RolloutItem],
+        guard: &mut LiveThreadInitGuard,
+    ) -> ThreadStoreResult<Self> {
+        Self::create_inherited_impl(thread_store, params, inherited_model_context, guard, false)
+            .await
+    }
+    pub async fn create_owned_with_inherited_model_context(
+        thread_store: Arc<dyn ThreadStore>,
+        params: CreateThreadParams,
+        inherited_model_context: &[RolloutItem],
+        guard: &mut LiveThreadInitGuard,
+    ) -> ThreadStoreResult<Self> {
+        Self::create_inherited_impl(thread_store, params, inherited_model_context, guard, true)
+            .await
+    }
+    async fn create_inherited_impl(
+        thread_store: Arc<dyn ThreadStore>,
         mut params: CreateThreadParams,
         inherited_model_context: &[RolloutItem],
         guard: &mut LiveThreadInitGuard,
+        require_owned: bool,
     ) -> ThreadStoreResult<Self> {
         let persisted_prefix_item_count =
             persisted_rollout_items(inherited_model_context, params.history_mode).len();
@@ -171,9 +349,11 @@ impl LiveThread {
                     message: "inherited model context is too large".to_string(),
                 })?,
         );
-        let live_thread = guard.acquire(Self::create(thread_store, params)).await?;
+        let live_thread = guard
+            .acquire(Self::create_impl(thread_store, params, require_owned))
+            .await?;
         live_thread
-            .persist_appended_items(inherited_model_context)
+            .persist_inherited_items(inherited_model_context)
             .await?;
         Ok(live_thread)
     }
@@ -182,8 +362,25 @@ impl LiveThread {
     pub async fn resume(
         thread_store: Arc<dyn ThreadStore>,
         history_mode: ThreadHistoryMode,
+        params: ResumeThreadParams,
+        preparation: Option<ThreadStoreResumePreparation>,
+    ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
+        Self::resume_impl(thread_store, history_mode, params, preparation, false).await
+    }
+    pub async fn resume_owned(
+        thread_store: Arc<dyn ThreadStore>,
+        history_mode: ThreadHistoryMode,
+        params: ResumeThreadParams,
+        preparation: Option<ThreadStoreResumePreparation>,
+    ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
+        Self::resume_impl(thread_store, history_mode, params, preparation, true).await
+    }
+    async fn resume_impl(
+        thread_store: Arc<dyn ThreadStore>,
+        history_mode: ThreadHistoryMode,
         mut params: ResumeThreadParams,
         resume_preparation: Option<ThreadStoreResumePreparation>,
+        require_owned: bool,
     ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
         let thread_id = params.thread_id;
         let metadata = if history_mode == ThreadHistoryMode::Paginated
@@ -199,18 +396,34 @@ impl LiveThread {
         } else {
             None
         };
-        let history = match resume_preparation {
-            Some(preparation) => {
-                thread_store
-                    .resume_thread_with_preparation(params.clone(), preparation)
-                    .await?
-            }
-            None => thread_store.resume_thread(params.clone()).await?,
+        let (history, owner) = if require_owned {
+            let (history, owner) = thread_store
+                .resume_thread_owned(params.clone(), resume_preparation)
+                .await?;
+            (history, Some(owner))
+        } else {
+            let history = match resume_preparation {
+                Some(preparation) => {
+                    thread_store
+                        .resume_thread_with_preparation(params.clone(), preparation)
+                        .await?
+                }
+                None => thread_store.resume_thread(params.clone()).await?,
+            };
+            (history, None)
         };
+        let provisional = owner
+            .as_ref()
+            .map(crate::ThreadWriterOwner::provisional)
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        provisional.store(false, std::sync::atomic::Ordering::Release);
         params.history = Some(Arc::clone(&history));
         let metadata_sync = ThreadMetadataSync::for_resume(&params, metadata.as_ref());
         Ok((
             Self {
+                owner,
+                fresh: false,
+                provisional,
                 thread_id,
                 history_mode,
                 thread_store,
@@ -226,7 +439,7 @@ impl LiveThread {
         skip_all,
         fields(item_count = raw_items.len())
     )]
-    pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+    async fn append_items_inner(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
         let items = self.persist_appended_items(raw_items).await?;
         if items.is_empty() {
             return Ok(());
@@ -280,7 +493,7 @@ impl LiveThread {
         Ok(items)
     }
 
-    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+    async fn persist_inner(&self, context: PersistContext) -> ThreadStoreResult<()> {
         if context.allows_background_persistence() {
             let update = self
                 .metadata_sync
@@ -296,17 +509,38 @@ impl LiveThread {
         self.apply_pending_metadata_update(update, context).await
     }
 
-    pub async fn flush(&self) -> ThreadStoreResult<()> {
+    async fn flush_inner(&self) -> ThreadStoreResult<()> {
         self.thread_store.flush_thread(self.thread_id).await?;
         self.flush_pending_metadata_update_for_existing_history()
             .await
     }
 
-    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
-        let metadata_result = self
-            .flush_pending_metadata_update_for_existing_history()
-            .await;
-        let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
+    async fn shutdown_inner(&self) -> ThreadStoreResult<()> {
+        let metadata_result = if self.provisional.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            self.flush_pending_metadata_update_for_existing_history()
+                .await
+        };
+        self.finish_shutdown(metadata_result).await
+    }
+
+    async fn finish_shutdown(
+        &self,
+        metadata_result: ThreadStoreResult<()>,
+    ) -> ThreadStoreResult<()> {
+        let shutdown_result = match &self.owner {
+            Some(owner) => {
+                self.thread_store
+                    .finish_thread_owned(
+                        self.thread_id,
+                        owner.clone(),
+                        self.fresh && self.provisional.load(std::sync::atomic::Ordering::Acquire),
+                    )
+                    .await
+            }
+            None => self.thread_store.shutdown_thread(self.thread_id).await,
+        };
         match (metadata_result, shutdown_result) {
             (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
                 message: format!(
@@ -319,7 +553,14 @@ impl LiveThread {
     }
 
     pub async fn discard(&self) -> ThreadStoreResult<()> {
-        self.thread_store.discard_thread(self.thread_id).await
+        match &self.owner {
+            Some(owner) => {
+                self.thread_store
+                    .finish_thread_owned(self.thread_id, owner.clone(), true)
+                    .await
+            }
+            None => self.thread_store.discard_thread(self.thread_id).await,
+        }
     }
 
     pub async fn load_history(
@@ -348,7 +589,7 @@ impl LiveThread {
             .await
     }
 
-    pub async fn update_memory_mode(
+    async fn update_memory_mode_inner(
         &self,
         mode: ThreadMemoryMode,
         include_archived: bool,
@@ -371,7 +612,7 @@ impl LiveThread {
     ///
     /// Stores may successfully return no thread for a no-op update, so this reads the thread as a
     /// fallback in that case.
-    pub async fn update_metadata(
+    async fn update_metadata_inner(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,

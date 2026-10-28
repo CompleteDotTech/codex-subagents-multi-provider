@@ -69,27 +69,36 @@ pub(super) async fn delete_thread(
 ) -> ThreadStoreResult<()> {
     let thread_id = params.thread_id;
     let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
-    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let reference_index = scan_reference_index(store).await?;
-    let thread_rollouts = ThreadRollouts::from_index(&reference_index, thread_id);
-    ensure_no_external_references(&reference_index, std::slice::from_ref(&thread_rollouts))?;
-    let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
-    if let Some(cleanup) = &store.thread_data_cleanup {
-        cleanup(vec![thread_id]).await?;
-    }
-    let found_rollout =
-        match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
-        {
-            Ok(()) => true,
-            Err(ThreadStoreError::ThreadNotFound { .. }) => false,
-            Err(err) => return Err(err),
-        };
-    let deleted_state_rows = delete_state_rows(store, &[thread_id]).await?;
-    if found_rollout || deleted_state_rows > 0 {
-        Ok(())
-    } else {
-        Err(ThreadStoreError::ThreadNotFound { thread_id })
-    }
+    let (operations, writers) = lock_delete_writers(store, &[thread_id]).await?;
+    let store = store.clone();
+    crate::store::complete_writer_operations(operations, async move {
+        let _guards = (_lifecycle_guard, writers);
+        let store = &store;
+        let reference_index = scan_reference_index(store).await?;
+        let thread_rollouts = ThreadRollouts::from_index(&reference_index, thread_id);
+        ensure_no_external_references(&reference_index, std::slice::from_ref(&thread_rollouts))?;
+        let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
+        close_delete_writers(store, &[thread_id]).await;
+        if let Some(cleanup) = &store.thread_data_cleanup {
+            cleanup(vec![thread_id]).await?;
+        }
+        let found_rollout =
+            match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards)
+                .await
+            {
+                Ok(()) => true,
+                Err(ThreadStoreError::ThreadNotFound { .. }) => false,
+                Err(err) => return Err(err),
+            };
+        let deleted_state_rows = delete_state_rows(store, &[thread_id]).await?;
+        retire_deleted_writers(store, &[thread_id]).await;
+        if found_rollout || deleted_state_rows > 0 {
+            Ok(())
+        } else {
+            Err(ThreadStoreError::ThreadNotFound { thread_id })
+        }
+    })
+    .await
 }
 
 pub(super) async fn delete_threads(
@@ -108,32 +117,37 @@ pub(super) async fn delete_threads(
     for thread_id in &lock_thread_ids {
         _lifecycle_guards.push(store.live_writer_locks.lock_lifecycle(*thread_id).await);
     }
-    let mut _live_writer_guards = Vec::with_capacity(lock_thread_ids.len());
-    for &thread_id in &lock_thread_ids {
-        _live_writer_guards.push(store.live_writer_locks.lock(thread_id).await);
-    }
+    let (operations, writers) = lock_delete_writers(store, &lock_thread_ids).await?;
+    let store = store.clone();
+    crate::store::complete_writer_operations(operations, async move {
+        let _guards = (_lifecycle_guards, writers);
+        let store = &store;
+        let reference_index = scan_reference_index(store).await?;
+        let thread_rollouts = thread_ids
+            .iter()
+            .map(|thread_id| ThreadRollouts::from_index(&reference_index, *thread_id))
+            .collect::<Vec<_>>();
+        ensure_no_external_references(&reference_index, thread_rollouts.as_slice())?;
 
-    let reference_index = scan_reference_index(store).await?;
-    let thread_rollouts = thread_ids
-        .iter()
-        .map(|thread_id| ThreadRollouts::from_index(&reference_index, *thread_id))
-        .collect::<Vec<_>>();
-    ensure_no_external_references(&reference_index, thread_rollouts.as_slice())?;
-
-    let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
-    if let Some(cleanup) = &store.thread_data_cleanup {
-        cleanup(thread_ids.clone()).await?;
-    }
-    for thread_rollouts in thread_rollouts {
-        match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
-        {
-            Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
-            Err(err) => return Err(err),
+        let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
+        close_delete_writers(store, &lock_thread_ids).await;
+        if let Some(cleanup) = &store.thread_data_cleanup {
+            cleanup(thread_ids.clone()).await?;
         }
-    }
-    // Retain the complete retry graph until every rollout has been removed.
-    delete_state_rows(store, &thread_ids).await?;
-    Ok(())
+        for thread_rollouts in thread_rollouts {
+            match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards)
+                .await
+            {
+                Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        // Retain the complete retry graph until every rollout has been removed.
+        delete_state_rows(store, &thread_ids).await?;
+        retire_deleted_writers(store, &thread_ids).await;
+        Ok(())
+    })
+    .await
 }
 
 async fn delete_state_rows(
@@ -238,23 +252,43 @@ async fn delete_thread_after_reference_check(
             });
         }
     }
+    if let Some(entry) = store.live_recorders.lock().await.get(&thread_id) {
+        entry.owner.closing();
+    }
+    // Stop queued file work before removing files, retaining ownership until cleanup finishes.
+    let live_entry = store
+        .live_recorders
+        .lock()
+        .await
+        .get(&thread_id)
+        .map(|entry| {
+            (
+                entry.recorder.clone(),
+                entry.writer_lock.clone(),
+                entry.owner.clone(),
+                entry.stopped,
+            )
+        });
+    if let Some((recorder, writer_lock, owner, stopped)) = live_entry {
+        owner.closing();
+        writer_guards.push(writer_lock);
+        if !stopped {
+            recorder
+                .discard()
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to stop thread writer before deletion: {err}"),
+                })?;
+            if let Some(entry) = store.live_recorders.lock().await.get_mut(&thread_id) {
+                entry.stopped = true;
+            }
+        }
+    }
     thread_rollouts.rollout_ids.insert(thread_id);
     for rollout_id in thread_rollouts.rollout_ids {
         super::thread_history::delete_thread(store, rollout_id).await?;
     }
 
-    // Stop queued file work before removing files, retaining ownership until cleanup finishes.
-    let live_entry = store.live_recorders.lock().await.remove(&thread_id);
-    if let Some(entry) = live_entry {
-        writer_guards.push(entry.writer_lock);
-        entry
-            .recorder
-            .discard()
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!("failed to stop thread writer before deletion: {err}"),
-            })?;
-    }
     let found_rollout_path = !thread_rollouts.paths.is_empty();
     for rollout_path in thread_rollouts.paths {
         delete_rollout_file(store, rollout_path.as_path())?;
@@ -880,5 +914,75 @@ SELECT
         .expect("parse session metadata");
         session_meta["payload"]["id"] = serde_json::to_value(thread_id).expect("thread id");
         std::fs::write(path, format!("{session_meta}\n")).expect("write session file");
+    }
+}
+
+// Lifecycle guards precede these leases. Never wait for an owner while holding
+// pending/writer/map locks; after taking writers, validate the complete selection.
+async fn lock_delete_writers(
+    store: &LocalThreadStore,
+    threads: &[codex_protocol::ThreadId],
+) -> ThreadStoreResult<(
+    Vec<crate::store::WriterOperation>,
+    Vec<tokio::sync::OwnedMutexGuard<()>>,
+)> {
+    loop {
+        let selected = {
+            let entries = store.live_recorders.lock().await;
+            threads
+                .iter()
+                .map(|thread| {
+                    (
+                        *thread,
+                        entries.get(thread).map(|entry| entry.owner.clone()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut operations = Vec::new();
+        for (_, owner) in &selected {
+            if let Some(owner) = owner {
+                operations.push(owner.lifecycle().await?);
+            }
+        }
+        let mut writers = Vec::new();
+        for thread in threads {
+            writers.push(store.live_writer_locks.lock(*thread).await);
+        }
+        let matches = {
+            let entries = store.live_recorders.lock().await;
+            selected
+                .iter()
+                .all(|(thread, owner)| match (owner, entries.get(thread)) {
+                    (None, None) => true,
+                    (Some(owner), Some(entry)) => owner.matches(&entry.owner),
+                    _ => false,
+                })
+        };
+        if matches {
+            return Ok((operations, writers));
+        }
+        drop(writers);
+        for operation in operations {
+            operation.complete();
+        }
+    }
+}
+async fn retire_deleted_writers(store: &LocalThreadStore, threads: &[codex_protocol::ThreadId]) {
+    let mut entries = store.live_recorders.lock().await;
+    for thread in threads {
+        if let Some(entry) = entries.get(thread) {
+            entry.owner.retired();
+        }
+        entries.remove(thread);
+    }
+}
+
+async fn close_delete_writers(store: &LocalThreadStore, threads: &[codex_protocol::ThreadId]) {
+    let entries = store.live_recorders.lock().await;
+    for thread in threads {
+        if let Some(entry) = entries.get(thread) {
+            entry.owner.closing();
+        }
     }
 }

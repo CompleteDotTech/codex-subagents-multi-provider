@@ -1154,6 +1154,59 @@ ON CONFLICT(id) DO UPDATE SET
         self.upsert_thread(&metadata).await
     }
 
+    /// Removes only an unpublished fresh writer's own metadata. The caller
+    /// holds its exact writer lock and proved this identity absent at creation.
+    /// Never use this for resumed history or an ID-only lifecycle operation.
+    pub async fn discard_provisional_thread_if_current(
+        &self,
+        thread: ThreadId,
+        path: &std::path::Path,
+        generation: Option<uuid::Uuid>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin_immediate().await?;
+        let id = thread.to_string();
+        let current_path: Option<String> =
+            sqlx::query_scalar("SELECT rollout_path FROM threads WHERE id = ?")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if current_path
+            .as_deref()
+            .is_some_and(|current| std::path::Path::new(current) != path)
+        {
+            return Ok(false);
+        }
+        let current_generation: Option<String> = sqlx::query_scalar(
+            "SELECT generation FROM native_authority_receipts WHERE thread_id = ?",
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if current_generation.as_deref().is_some_and(|current| {
+            generation.map(|value| value.to_string()).as_deref() != Some(current)
+        }) {
+            return Ok(false);
+        }
+        let edges: i64 = sqlx::query_scalar("SELECT count(*) FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?").bind(&id).bind(&id).fetch_one(&mut *tx).await?;
+        if edges != 0 {
+            return Ok(false);
+        }
+        for query in [
+            "DELETE FROM thread_dynamic_tools WHERE thread_id = ?",
+            "DELETE FROM native_authority_receipts WHERE thread_id = ?",
+            "DELETE FROM thread_read_receipts WHERE thread_id = ?",
+        ] {
+            sqlx::query(query).bind(&id).execute(&mut *tx).await?;
+        }
+        sqlx::query("DELETE FROM threads WHERE id = ? AND rollout_path = ?")
+            .bind(&id)
+            .bind(path.to_string_lossy().as_ref())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Delete a thread and all associated state by id.
     pub async fn delete_thread(&self, thread_id: ThreadId) -> anyhow::Result<u64> {
         self.delete_threads_strict(&[thread_id]).await
@@ -1200,6 +1253,10 @@ ON CONFLICT(id) DO UPDATE SET
         }
         let mut rows_affected = 0;
         for thread_id_string in &thread_id_strings {
+            sqlx::query("DELETE FROM native_authority_receipts WHERE thread_id = ?")
+                .bind(thread_id_string)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("DELETE FROM thread_read_receipts WHERE thread_id = ?")
                 .bind(thread_id_string)
                 .execute(&mut *tx)

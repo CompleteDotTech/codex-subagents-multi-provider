@@ -47,18 +47,48 @@ struct AgentRoleOverrides {
     skills: Option<SkillsConfig>,
 }
 
+/// A bounded role read once before provider resolution and applied once afterward.
+pub(crate) struct PreparedAgentRole {
+    overrides: AgentRoleOverrides,
+    pub(crate) model_provider: Option<String>,
+}
+
+impl PreparedAgentRole {
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.overrides.model.as_deref()
+    }
+
+    pub(crate) fn apply(&self, config: &mut Config) -> Result<(), String> {
+        let layer = TomlValue::try_from(&self.overrides)
+            .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+        if !layer.as_table().is_some_and(toml::map::Map::is_empty) {
+            *config = role_overrides::build_next_config(config, layer, &self.overrides)
+                .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+        }
+        config.agent_role_model_provider = self.model_provider.clone();
+        Ok(())
+    }
+}
+
 /// Applies typed role overrides to the existing parent-derived configuration.
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
+    prepare_role(config, role_name).await?.apply(config)
+}
+
+pub(crate) async fn prepare_role(
+    config: &Config,
+    role_name: Option<&str>,
+) -> Result<PreparedAgentRole, String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
         .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
 
-    apply_role_to_config_inner(config, role_name, &role)
+    prepare_role_inner(config, role_name, &role)
         .await
         .map_err(|err| {
             tracing::warn!("failed to apply role to config: {err}");
@@ -66,15 +96,69 @@ pub(crate) async fn apply_role_to_config(
         })
 }
 
-async fn apply_role_to_config_inner(
+/// Only the embedded no-op default can be reconstructed without a retained
+/// role ceiling. A same-named user declaration never receives this treatment.
+#[cfg(test)]
+pub(crate) fn is_unmodified_builtin_default(config: &Config, role: Option<&str>) -> bool {
+    let role = role.unwrap_or(DEFAULT_ROLE_NAME);
+    role == DEFAULT_ROLE_NAME
+        && !config.agent_roles.contains_key(role)
+        && built_in::configs()
+            .get(role)
+            .is_some_and(|role| role.config_file.is_none())
+}
+
+/// Project only restrictive retained role settings onto the fresh caller-derived
+/// config. These old layers never supply provider or managed authorization.
+pub(crate) fn preserve_retained_role_restrictions(
     config: &mut Config,
+    retained: &Config,
+) -> Result<(), String> {
+    let mut skills = SkillsConfig::default();
+    for layer in retained.config_layer_stack.all_layers_low_to_high() {
+        if let Some(value) = layer.config.get("skills") {
+            let old: SkillsConfig = value
+                .clone()
+                .try_into()
+                .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+            skills
+                .config
+                .extend(old.config.into_iter().filter(|skill| !skill.enabled));
+        }
+    }
+    if !retained.bundled_skills_enabled() {
+        skills.bundled = Some(codex_config::BundledSkillsConfig { enabled: false });
+    }
+    if !retained.include_skill_instructions {
+        skills.include_instructions = Some(false);
+    }
+    if !skills.config.is_empty()
+        || skills.bundled.is_some()
+        || skills.include_instructions.is_some()
+    {
+        let overrides = AgentRoleOverrides {
+            skills: Some(skills),
+            ..Default::default()
+        };
+        let layer = TomlValue::try_from(&overrides)
+            .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+        *config = role_overrides::build_next_config(config, layer, &overrides)
+            .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+    }
+    Ok(())
+}
+
+async fn prepare_role_inner(
+    config: &Config,
     role_name: &str,
     role: &AgentRoleConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PreparedAgentRole> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
-        config.agent_role_model_provider = None;
-        return Ok(());
+        return Ok(PreparedAgentRole {
+            overrides: AgentRoleOverrides::default(),
+            model_provider: None,
+        });
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
     let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
@@ -120,17 +204,10 @@ async fn apply_role_to_config_inner(
         }
     }
 
-    let role_layer_toml = TomlValue::try_from(&overrides)?;
-    if role_layer_toml
-        .as_table()
-        .is_some_and(toml::map::Map::is_empty)
-    {
-        config.agent_role_model_provider = model_provider;
-        return Ok(());
-    }
-    *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
-    config.agent_role_model_provider = model_provider;
-    Ok(())
+    Ok(PreparedAgentRole {
+        overrides,
+        model_provider,
+    })
 }
 
 async fn load_role_layer_toml(

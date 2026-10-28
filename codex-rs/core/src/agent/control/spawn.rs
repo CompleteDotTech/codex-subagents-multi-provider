@@ -289,11 +289,41 @@ impl LocalAgentControl {
         initial_input: Vec<UserInput>,
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
+        // Legacy fixtures still create an actual registered host root. All children
+        // then use the production preparation and guarded native launch paths.
+        let source = match session_source {
+            Some(source) => source,
+            None => {
+                let state = self.runtime.upgrade()?;
+                let root = state
+                    .start_root_with_control_for_tests(
+                        StartThreadOptions::new(config.clone()),
+                        self.clone(),
+                    )
+                    .await?;
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: root.thread_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })
+            }
+        };
+        let config = self
+            .prepare_spawn_fixture(&config, &source, /*full_history*/ false)
+            .await?;
+        let caller = source.parent_thread_id().ok_or_else(|| {
+            crate::agent::child_provider_authorization::invalid("fixture needs a native parent")
+        })?;
         let (spawned_agent, _) = Box::pin(self.spawn_agent_internal(
             config,
             SpawnInitialInput::UserInput(initial_input),
-            session_source,
-            SpawnAgentOptions::default(),
+            Some(source),
+            SpawnAgentOptions {
+                parent_thread_id: Some(caller),
+                ..Default::default()
+            },
         ))
         .await?;
         Ok(spawned_agent.thread_id)
@@ -324,12 +354,40 @@ impl LocalAgentControl {
     /// Keep the returned residency pin until the caller has submitted its input.
     pub(crate) async fn ensure_v2_agent_loaded(
         &self,
-        mut config: Config,
+        _config: Config,
         thread_id: ThreadId,
+        caller_id: ThreadId,
         parent: Option<Arc<CodexThread>>,
     ) -> CodexResult<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
-        let membership = self.runtime.admit_start()?;
         let state = self.runtime.upgrade()?;
+        let caller = state.get_thread(caller_id).await?;
+        // A caller-supplied Config carries no authority. Project from the actual
+        // registered host Session, then restore only host-read target metadata.
+        let caller_turn = caller
+            .session
+            .new_turn_with_default_settings(Uuid::now_v7().to_string(), Default::default())
+            .await;
+        let mut config =
+            build_agent_resume_config(&caller_turn).map_err(CodexErr::InvalidRequest)?;
+        let caller_epoch =
+            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                &caller.session,
+                &caller.session_source,
+            )
+            .await;
+        if caller_epoch.config.config_layer_stack != config.config_layer_stack
+            || caller_epoch.settings.approval_policy != config.permissions.approval_policy.value()
+            || caller_epoch.settings.approvals_reviewer != config.approvals_reviewer
+            || caller_epoch.scope
+                != crate::agent::child_provider_authorization::ChildProviderScope::from_step(
+                    &config,
+                    &caller_turn.initial_environments,
+                )
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "actual caller changed while materializing its current execution environment",
+            ));
+        }
         let owner_thread_id = parent.as_ref().map(|parent| parent.session.thread_id);
         if let Some(parent) = &parent {
             let parent_thread_id = parent.session.thread_id;
@@ -352,7 +410,14 @@ impl LocalAgentControl {
         if owner_thread_id.is_none()
             && let Ok(thread) = state.get_thread(thread_id).await
         {
-            return self.runtime.pin_v2_residency(&state, &thread).await;
+            let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+            crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
+                Arc::clone(&thread),
+                Some(Arc::clone(&caller)),
+                None,
+            )
+            .await?;
+            return Ok(pin);
         }
         if self
             .runtime
@@ -375,6 +440,8 @@ impl LocalAgentControl {
                 include_history: false,
             })
             .await?;
+        let stored_permissions = stored_thread.permission_profile.clone();
+        let stored_approval = stored_thread.approval_mode;
         let stored_model = stored_thread.model.clone();
         let stored_model_provider = stored_thread.model_provider.clone();
         let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
@@ -409,7 +476,11 @@ impl LocalAgentControl {
             }
             if let Ok(thread) = state.get_thread(thread_id).await {
                 self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                return self.runtime.pin_v2_residency(&state, &thread).await;
+                let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+                crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
+                Arc::clone(&thread), Some(Arc::clone(&caller)), None,
+            ).await?;
+                return Ok(pin);
             }
         }
         let parent = if let Some(parent) = parent {
@@ -465,9 +536,11 @@ impl LocalAgentControl {
                 })?;
         }
         config.service_tier = self.root_service_tier();
-        if let Some(model) = stored_model {
-            config.model = Some(model);
-        }
+        // Absence is target metadata too: retaining the parent's model here
+        // would impersonate a saved selection before the private resume permit
+        // can fill it from the exact retained target registration. A cold
+        // target without that proof still fails the permit's missing-model gate.
+        config.model = stored_model;
         if config.model_provider_id != stored_model_provider {
             config.model_provider = config
                 .model_providers
@@ -647,12 +720,34 @@ impl LocalAgentControl {
             };
         // Reserving a slot can evict an idle nested parent. Capture its instructions and
         // analytics metadata alongside its authority before the live parent can disappear.
+        if environment_selections.is_none() {
+            environment_selections = inherited_environments
+                .as_ref()
+                .map(TurnEnvironmentSnapshot::inheritable_selections);
+        }
+        let authorization = crate::agent::child_provider_authorization::ChildResumePermit::prepare(
+            &self.runtime,
+            Arc::clone(&caller),
+            caller_epoch,
+            &mut config,
+            &initial_history,
+            &session_source,
+            parent_thread_id,
+            &stored_permissions,
+            stored_approval,
+            MultiAgentVersion::V2,
+            &mut environment_selections,
+            inherited_environments.as_ref(),
+        )
+        .await?;
+        let membership = self.runtime.admit_start()?;
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, &membership, Some(thread_id))
             .await?;
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                authorization: Some(authorization),
                 config,
                 prompt_cache_key,
                 initial_history,
@@ -678,8 +773,19 @@ impl LocalAgentControl {
                     let residency_pin = runtime
                         .pin_v2_residency(&state, &reloaded_thread.thread)
                         .await?;
+                    let threads = state.threads.write().await;
+                    if !threads
+                        .get(&thread_id)
+                        .is_some_and(|registered| Arc::ptr_eq(registered, &reloaded_thread.thread))
+                        || !reloaded_thread.thread.is_running()
+                    {
+                        return Err(crate::agent::child_provider_authorization::invalid(
+                            "resumed residency changed before commit",
+                        ));
+                    }
                     runtime.registry.clear_evicted_environments(thread_id);
                     residency_slot.commit(reloaded_thread.thread_id);
+                    drop(threads);
                     // Register before listeners can forward events from the resumed thread.
                     if let Some((client_metadata, source)) = subagent_analytics {
                         let thread_config = reloaded_thread.thread.config_snapshot().await;
@@ -710,7 +816,11 @@ impl LocalAgentControl {
                     }
                     self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    return self.runtime.pin_v2_residency(&state, &thread).await;
+                    let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+                    crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
+                Arc::clone(&thread), Some(Arc::clone(&caller)), None,
+            ).await?;
+                    return Ok(pin);
                 }
                 Err(err)
             }
@@ -724,6 +834,43 @@ impl LocalAgentControl {
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
+        let mut config = config;
+        let parent = session_source
+            .as_ref()
+            .and_then(SessionSource::parent_thread_id)
+            .or(options.parent_thread_id);
+        let launch_permit = if matches!(
+            session_source,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }))
+        ) {
+            let parent = parent.ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid("missing delegated parent")
+            })?;
+            let authorization = config.prepared_child_authorization.take().ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid(
+                    "native child requires host-prepared authorization",
+                )
+            })?;
+            Some(
+                authorization
+                    .consume(
+                        &self.runtime,
+                        parent,
+                        &config,
+                        options.fork_mode.is_some(),
+                        session_source.as_ref().ok_or_else(|| {
+                            crate::agent::child_provider_authorization::invalid(
+                                "missing native source",
+                            )
+                        })?,
+                    )
+                    .await?,
+            )
+        } else {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "delegated spawn requires a native child source",
+            ));
+        };
         let membership = self.runtime.admit_start()?;
         let spawn_started_at = Instant::now();
         let state = self.runtime.upgrade()?;
@@ -753,12 +900,13 @@ impl LocalAgentControl {
                 .is_some_and(is_v2_resident_session_source);
         let (residency_slot, residency_reservation) = if spawn_uses_v2_residency {
             let residency_reservation_started_at = Instant::now();
+            // A fresh grant cannot survive eviction of its authorizing caller.
             let residency_slot = self
                 .reserve_v2_residency_slot(
                     &state,
                     &config,
                     &membership,
-                    /*protected_thread_id*/ None,
+                    /*protected_thread_id*/ parent_thread_id,
                 )
                 .await?;
             (
@@ -883,13 +1031,21 @@ impl LocalAgentControl {
                 self.clone(),
                 parent_thread_id,
                 inherited_exec_policy,
+                launch_permit.ok_or_else(|| {
+                    crate::agent::child_provider_authorization::invalid(
+                        "native launch requires a host permit",
+                    )
+                })?,
             )
             .await
             .map_err(|err| err.with_agent_context(AgentErrorContext::ChildStartup))?;
         let child_create = child_create_started_at.elapsed();
         agent_metadata.agent_id = Some(new_thread.thread_id);
-        let mut pending_spawn =
-            PendingSpawn::new(Arc::clone(&state), new_thread.thread_id, membership);
+        let mut pending_spawn = PendingSpawn::new(
+            Arc::clone(&state),
+            Arc::clone(&new_thread.thread),
+            membership,
+        );
 
         if let Some(SessionSource::SubAgent(
             subagent_source @ SubAgentSource::ThreadSpawn {
@@ -940,13 +1096,19 @@ impl LocalAgentControl {
         }));
         let durability_wait_started_at = Instant::now();
         if options.fork_mode.is_some() {
-            tokio::join!(
+            let (checkpoint, ()) = tokio::join!(
                 new_thread
                     .thread
                     .session
-                    .ensure_rollout_materialized(PersistContext::Standard),
+                    .try_ensure_rollout_materialized(PersistContext::Standard),
                 pending_spawn.wait_for_edge(),
             );
+            // Keep PendingSpawn armed until copied history crosses its required
+            // checkpoint and the earlier Open task has finished. No initial input
+            // or acknowledgement may survive a failed Standard checkpoint.
+            checkpoint.map_err(|error| {
+                CodexErr::from(error).with_agent_context(AgentErrorContext::ForkHistory)
+            })?;
         } else {
             pending_spawn.wait_for_edge().await;
         }
@@ -981,17 +1143,18 @@ impl LocalAgentControl {
         let input_admission_started_at = Instant::now();
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input(new_thread.thread_id, input, start_options)
+                self.send_input_to_thread(&new_thread.thread, input, start_options)
                     .await
                     .map_err(|err| err.with_agent_context(AgentErrorContext::InputAdmission))?;
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
-                self.send_inter_agent_communication_after_capacity_check(
+                self.submit_inter_agent_communication(
                     new_thread.thread_id,
                     &state,
                     communication,
                     context,
                     start_options,
+                    Some(&new_thread.thread),
                 )
                 .await
                 .map_err(|err| err.with_agent_context(AgentErrorContext::InputAdmission))?;
@@ -1005,11 +1168,31 @@ impl LocalAgentControl {
             Some(config) => config,
             None => new_thread.thread.config_snapshot().await,
         };
-        reservation.commit(agent_metadata.clone());
+        let authority = self
+            .runtime
+            .retained_authority(new_thread.thread_id)
+            .filter(|authority| authority.matches_session(&new_thread.thread.session))
+            .ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid(
+                    "spawned runtime registration was replaced",
+                )
+            })?;
+        let threads = state.threads.write().await;
+        if !threads
+            .get(&new_thread.thread_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &new_thread.thread))
+            || !new_thread.thread.is_running()
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "spawned runtime stopped or changed before return",
+            ));
+        }
+        reservation.commit_if_current(agent_metadata.clone(), &authority)?;
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
         }
         let _membership = pending_spawn.disarm();
+        drop(threads);
 
         // Notify a new thread has been created. This notification will be processed by clients
         // to subscribe or drain this newly created thread.
@@ -1462,7 +1645,7 @@ impl LocalAgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1501,46 +1684,91 @@ impl LocalAgentControl {
                 &config,
             )
             .await;
-        let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
-        let mut reservation = self
-            .runtime
-            .registry
-            .reserve_spawn_slot(agent_max_threads)?;
-        let (session_source, agent_metadata) = match session_source {
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth,
-                agent_path,
-                agent_role: _,
-                agent_nickname: _,
-            }) => self.prepare_thread_spawn(
-                &mut reservation,
-                &config,
-                parent_thread_id,
-                depth,
-                agent_path.or(resumed_agent_path),
-                resumed_agent_role,
-                resumed_agent_nickname,
-            )?,
-            other => (other, AgentMetadata::default()),
-        };
-        let notification_source = session_source.clone();
+        let saved_source = initial_history
+            .get_resumed_session_sources()
+            .map(|(source, _)| source)
+            .unwrap_or_else(|| stored_thread.source.clone());
+        if saved_source.parent_thread_id() != session_source.parent_thread_id()
+            || saved_source.parent_thread_id() != parent_thread_id
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "saved runtime source cannot be relabeled by the resume request",
+            ));
+        }
+        let session_source = saved_source;
         let inherited_environments = self
             .inherited_environments_for_source(&state, Some(&session_source))
             .await;
+        let mut environment_selections = inherited_environments
+            .as_ref()
+            .map(TurnEnvironmentSnapshot::all_selections);
+        let authorization = if let Some(owner) = parent_thread_id {
+            let caller = state.get_thread(owner).await?;
+            let epoch =
+                crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+                    &caller.session,
+                    &caller.session_source,
+                )
+                .await;
+            let turn = caller
+                .session
+                .new_turn_with_default_settings(Uuid::now_v7().to_string(), Default::default())
+                .await;
+            config = build_agent_resume_config(&turn).map_err(CodexErr::InvalidRequest)?;
+            if let Some(role) = session_source.get_agent_role() {
+                apply_role_to_config(&mut config, Some(&role))
+                    .await
+                    .map_err(CodexErr::InvalidRequest)?;
+            }
+            config.model = stored_thread.model.clone();
+            config.model_provider_id = stored_thread.model_provider.clone();
+            config.model_reasoning_effort = stored_thread.reasoning_effort.clone();
+            Some(
+                crate::agent::child_provider_authorization::ChildResumePermit::prepare(
+                    &self.runtime,
+                    caller,
+                    epoch,
+                    &mut config,
+                    &initial_history,
+                    &session_source,
+                    parent_thread_id,
+                    &stored_thread.permission_profile,
+                    stored_thread.approval_mode,
+                    multi_agent_version,
+                    &mut environment_selections,
+                    inherited_environments.as_ref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
+        let reservation = self
+            .runtime
+            .registry
+            .reserve_spawn_slot(agent_max_threads)?;
+        let agent_metadata = AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: resumed_agent_path,
+            agent_nickname: resumed_agent_nickname,
+            agent_role: resumed_agent_role,
+        };
+        let notification_source = session_source.clone();
         let inherited_exec_policy = self
             .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
             .await;
 
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                authorization,
                 config: config.clone(),
                 prompt_cache_key: None,
                 initial_history,
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
-                environment_selections: None,
+                environment_selections,
                 inherited_environments,
                 inherited_instructions: None,
                 inherited_exec_policy,
@@ -1549,10 +1777,42 @@ impl LocalAgentControl {
             .await?;
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
-        reservation.commit(agent_metadata.clone());
+        let state_for_commit = Arc::clone(&state);
+        let thread_for_commit = Arc::clone(&resumed_thread.thread);
+        let metadata_for_commit = agent_metadata.clone();
+        // Once the resumed manager registration wins, cancellation must not
+        // abandon its metadata reservation. The exact epoch still fences close
+        // and replacement while this owned handoff waits for the map ordering.
+        tokio::spawn(async move {
+            let threads = state_for_commit.threads.write().await;
+            let id = thread_for_commit.session.thread_id;
+            if !threads
+                .get(&id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &thread_for_commit))
+                || !thread_for_commit.is_running()
+            {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "resumed runtime changed before metadata commit",
+                ));
+            }
+            let authority = thread_for_commit
+                .session
+                .services
+                .local_agent_runtime
+                .retained_authority(id)
+                .filter(|authority| authority.matches_session(&thread_for_commit.session))
+                .ok_or_else(|| {
+                    crate::agent::child_provider_authorization::invalid(
+                        "resumed registration authority changed",
+                    )
+                })?;
+            reservation.commit_if_current(metadata_for_commit, &authority)?;
+            state_for_commit.notify_thread_created(id);
+            Ok::<_, CodexErr>(())
+        })
+        .await??;
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
-        state.notify_thread_created(resumed_thread.thread_id);
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path

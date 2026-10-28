@@ -98,6 +98,13 @@ impl ThreadManager {
                     .get(&thread_id)
                     .is_some_and(|thread| Arc::ptr_eq(&thread.session, session))
                 {
+                    session.revoke_fresh_child_admission();
+                    let runtime = &session.services.local_agent_runtime;
+                    if let Some(authority) = runtime.retained_authority(thread_id)
+                        && authority.matches_session(session)
+                    {
+                        runtime.retire_authority(authority);
+                    }
                     threads.remove(&thread_id);
                 }
             }

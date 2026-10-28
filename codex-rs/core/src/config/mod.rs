@@ -1064,6 +1064,8 @@ pub struct Config {
     /// One-shot catalog binding produced by trusted child preparation. Consumed
     /// before session configuration is retained; never persisted in metadata.
     pub(crate) prepared_child_models: Option<crate::agent::child_config::PreparedChildModels>,
+    pub(crate) prepared_child_authorization:
+        Option<crate::agent::child_provider_authorization::PreparedChildAuthorization>,
     /// An applicable role explicitly selected this child's tier. Runtime-only;
     /// new descendants resolve their own role and do not inherit this marker.
     pub(crate) child_role_service_tier_override: bool,
@@ -4630,6 +4632,7 @@ impl Config {
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,
             prepared_child_models: None,
+            prepared_child_authorization: None,
             child_role_service_tier_override: false,
             model_verbosity: cfg.model_verbosity,
             chatgpt_base_url: cfg

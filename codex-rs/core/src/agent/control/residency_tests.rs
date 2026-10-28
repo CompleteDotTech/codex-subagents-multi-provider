@@ -37,7 +37,12 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start root thread");
-    let control = manager.agent_control();
+    let control = root
+        .thread
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.thread.session.services.agent_control.identity());
     let state = control
         .runtime
         .upgrade()
@@ -99,7 +104,12 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
         .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start root thread");
-    let control = manager.agent_control();
+    let control = root
+        .thread
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.thread.session.services.agent_control.identity());
     let state = control
         .runtime
         .upgrade()
@@ -142,7 +152,12 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
     mark_thread_completed(second.thread.as_ref()).await;
 
     let err = control
-        .ensure_v2_agent_loaded(config, first.thread_id, /*parent*/ None)
+        .ensure_v2_agent_loaded(
+            config,
+            first.thread_id,
+            root.thread_id,
+            /*parent*/ None,
+        )
         .await
         .expect_err("evicted interrupted agent should stay lost");
     match err.details() {
@@ -164,22 +179,63 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
 async fn spawn_v2_subagent(
     control: &LocalAgentControl,
     state: &Arc<ThreadManagerState>,
-    config: Config,
+    _config: Config,
     parent_thread_id: ThreadId,
     label: &str,
 ) -> crate::thread_manager::NewThread {
+    let parent = state
+        .get_thread(parent_thread_id)
+        .await
+        .expect("registered parent");
+    let turn = parent.session.new_default_turn().await;
+    let step = crate::session::step_context::StepContext::for_test(turn);
+    let mut config = crate::agent::child_config::prepare_agent_spawn_config(
+        &parent.session,
+        &step,
+        crate::agent::child_config::SpawnConfigOptions {
+            resolved_provider: None,
+            model_provider: None,
+            version: crate::agent::child_config::SpawnConfigVersion::V2,
+            full_history_fork: false,
+            role_name: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .expect("prepare native residency fixture")
+    .config;
+    let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: crate::agent::next_thread_spawn_depth(&parent.session_source),
+        agent_path: None,
+        agent_nickname: Some(label.to_owned()),
+        agent_role: None,
+    });
+    let permit = config
+        .prepared_child_authorization
+        .take()
+        .expect("prepared proof")
+        .consume(
+            &control.runtime,
+            parent_thread_id,
+            &config,
+            /*full_history*/ false,
+            &source,
+        )
+        .await
+        .expect("consume native proof");
     state
         .spawn_child_thread(
             crate::thread_manager::StartThreadOptions {
-                session_source: Some(SessionSource::SubAgent(SubAgentSource::Other(
-                    label.to_string(),
-                ))),
+                session_source: Some(source),
                 thread_source: Some(ThreadSource::Subagent),
                 ..crate::thread_manager::StartThreadOptions::new(config)
             },
             control.clone(),
             Some(parent_thread_id),
             /*inherited_exec_policy*/ None,
+            permit,
         )
         .await
         .expect("spawn v2 subagent")

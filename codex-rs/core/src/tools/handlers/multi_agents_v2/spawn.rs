@@ -131,6 +131,7 @@ async fn handle_spawn_agent(
             fork_mode: fork_mode.clone(),
             agent_type: args.agent_type.clone(),
             model: args.model,
+            model_provider: args.model_provider,
             reasoning_effort: args.reasoning_effort,
         },
     )
@@ -205,6 +206,7 @@ struct SpawnAgentArgs {
     task_name: String,
     agent_type: Option<String>,
     model: Option<String>,
+    model_provider: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
@@ -266,5 +268,32 @@ impl ToolOutput for SpawnAgentResult {
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         tool_output_code_mode_result(self, "spawn_agent")
+    }
+}
+
+#[cfg(test)]
+mod provider_selector_tests {
+    use super::*;
+    #[test]
+    fn provider_selection_does_not_change_history_defaults_or_legacy_aliases() {
+        for history in [None, Some("all"), Some("7")] {
+            let mut args =
+                serde_json::json!({"message":"task","task_name":"worker","model_provider":"a"});
+            if let Some(history) = history {
+                args["fork_turns"] = serde_json::json!(history);
+            }
+            let selected: SpawnAgentArgs = serde_json::from_value(args).unwrap();
+            assert_eq!(selected.model_provider.as_deref(), Some("a"));
+            assert!(matches!(
+                selected.fork_mode().unwrap(),
+                Some(SpawnAgentForkMode::FullHistory)
+            ));
+        }
+        let legacy: SpawnAgentArgs =
+            serde_json::from_value(serde_json::json!({"message":"task","task_name":"worker"}))
+                .unwrap();
+        assert!(legacy.model_provider.is_none());
+        assert!(serde_json::from_value::<SpawnAgentArgs>(serde_json::json!({"message":"task","task_name":"worker","model_provider":{"token":"forged"}})).is_err());
+        assert!(serde_json::from_value::<SpawnAgentArgs>(serde_json::json!({"message":"task","task_name":"worker","provider_definition":{"base_url":"https://forged.invalid"}})).is_err());
     }
 }

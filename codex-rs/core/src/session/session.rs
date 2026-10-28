@@ -59,6 +59,12 @@ type McpToolApprovalMetadataMap =
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
+    /// One actual allocation lifetime, independent of stable thread identity
+    /// and allocator address reuse. Never imported from config or history.
+    pub(crate) native_registration_id: uuid::Uuid,
+    /// Irrevocable, allocation-local fresh launch admission; never persisted.
+    pub(crate) fresh_child_admission_live: Arc<std::sync::Mutex<bool>>,
+    pub(crate) child_policy_revision: std::sync::Mutex<u64>,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
@@ -663,6 +669,16 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    /// Called synchronously before stopping or publishing removal of this allocation.
+    pub(crate) fn revoke_fresh_child_admission(&self) {
+        let mut live = self
+            .fresh_child_admission_live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *live = false;
+        self.services.local_agent_runtime.note_session_stopped(self);
+    }
+
     pub(super) async fn effective_thread_config_snapshot(
         &self,
         configuration: &SessionConfiguration,
@@ -1062,6 +1078,9 @@ impl Session {
         // - load history metadata (skipped for subagents)
         let persistence_auth = futures::FutureExt::shared(auth_manager.auth());
         let mcp_auth = persistence_auth.clone();
+        let require_owned_writer = startup
+            .as_ref()
+            .is_some_and(|startup| startup.requires_owned_writer());
         let thread_persistence_fut = async {
             if config.ephemeral {
                 Ok::<_, anyhow::Error>((None, LiveThreadInitGuard::new(/*live_thread*/ None), None))
@@ -1121,16 +1140,33 @@ impl Session {
                             )
                             && let InitialHistory::Forked(items) = &initial_history
                         {
-                            LiveThread::create_with_inherited_model_context(
-                                Arc::clone(&thread_store),
-                                params,
-                                items,
-                                guard,
-                            )
-                            .await?
+                            if require_owned_writer {
+                                LiveThread::create_owned_with_inherited_model_context(
+                                    Arc::clone(&thread_store),
+                                    params,
+                                    items,
+                                    guard,
+                                )
+                                .await?
+                            } else {
+                                LiveThread::create_with_inherited_model_context(
+                                    Arc::clone(&thread_store),
+                                    params,
+                                    items,
+                                    guard,
+                                )
+                                .await?
+                            }
                         } else {
+                            let store = Arc::clone(&thread_store);
                             guard
-                                .acquire(LiveThread::create(Arc::clone(&thread_store), params))
+                                .acquire(async move {
+                                    if require_owned_writer {
+                                        LiveThread::create_owned(store, params).await
+                                    } else {
+                                        LiveThread::create(store, params).await
+                                    }
+                                })
                                 .await?
                         }
                     }
@@ -1156,13 +1192,23 @@ impl Session {
                         let (context_tx, context_rx) = tokio::sync::oneshot::channel();
                         let live_thread = guard
                             .acquire(async move {
-                                let (live_thread, history) = LiveThread::resume(
-                                    store,
-                                    history_mode,
-                                    params,
-                                    resume_preparation,
-                                )
-                                .await?;
+                                let (live_thread, history) = if require_owned_writer {
+                                    LiveThread::resume_owned(
+                                        store,
+                                        history_mode,
+                                        params,
+                                        resume_preparation,
+                                    )
+                                    .await?
+                                } else {
+                                    LiveThread::resume(
+                                        store,
+                                        history_mode,
+                                        params,
+                                        resume_preparation,
+                                    )
+                                    .await?
+                                };
                                 // Cancellation still leaves the writer with the acquisition guard.
                                 let _ = context_tx.send(history);
                                 Ok(live_thread)
@@ -1172,6 +1218,9 @@ impl Session {
                         live_thread
                     }
                 };
+                if let Some(startup) = &startup {
+                    startup.check_native_current()?;
+                }
                 Ok((Some(live_thread), local_guard, resume_context))
             }
         }
@@ -1206,8 +1255,12 @@ impl Session {
         let mcp_originator = session_configuration.originator.clone();
         let mcp_session_source = session_configuration.session_source.clone();
         let mcp_disabled_plugin_ids = session_configuration.disabled_plugin_ids.clone();
+        let startup_for_mcp = startup.clone();
         let auth_and_mcp_fut = async move {
             let auth = mcp_auth.await;
+            if let Some(startup) = &startup_for_mcp {
+                startup.check_native_current()?;
+            }
             if config_for_mcp.features.plugin_recommendations_enabled() {
                 let plugins_config = config_for_mcp.plugins_config_input();
                 let auth_for_prewarm = auth.clone();
@@ -1239,7 +1292,7 @@ impl Session {
                     /*executor_capability_discovery_v2*/ None,
                 )
                 .await;
-            (auth, mcp_projection)
+            Ok::<_, anyhow::Error>((auth, mcp_projection))
         }
         .instrument(info_span!(
             "session_init.auth_mcp",
@@ -1247,7 +1300,7 @@ impl Session {
         ));
 
         // Join all independent futures.
-        let (thread_persistence_result, state_db_ctx, (auth, mcp_projection)) =
+        let (thread_persistence_result, state_db_ctx, auth_mcp_result) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
 
         let (live_thread, mut live_thread_init, resume_context) = thread_persistence_result
@@ -1255,6 +1308,7 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?;
+        let (auth, mcp_projection) = auth_mcp_result?;
         let session_result: anyhow::Result<Arc<Self>> = async {
             if let InitialHistory::Resumed(resumed) = &mut initial_history
                 && let Some(history) = resume_context
@@ -1854,6 +1908,9 @@ impl Session {
             };
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
+                native_registration_id: uuid::Uuid::now_v7(),
+                fresh_child_admission_live: Arc::new(std::sync::Mutex::new(true)),
+                child_policy_revision: std::sync::Mutex::new(0),
                 thread_id,
                 installation_id,
                 tx_event: tx_event.clone(),
@@ -1894,6 +1951,7 @@ impl Session {
             });
             if let Some(startup) = &startup {
                 startup.set_session(Arc::clone(&sess));
+                startup.check_native_current()?;
             }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

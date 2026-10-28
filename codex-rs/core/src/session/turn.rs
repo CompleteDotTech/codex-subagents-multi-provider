@@ -35,7 +35,6 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
-use crate::responses_retry::handle_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
@@ -1719,6 +1718,12 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+    // Current root policy is checked before constructing tool/code-mode workers.
+    let tool_operation = crate::agent::child_provider_authorization::current::prepare_inference(
+        &sess,
+        &step_context,
+    )
+    .await?;
     let turn_context = Arc::clone(&step_context.turn);
     let preempt = step_context.preempt.clone().unwrap_or_default();
     let _input_watch = if let Some(preempt) = &step_context.preempt {
@@ -1730,11 +1735,17 @@ async fn run_sampling_request(
     };
     let base_instructions = sess.get_prompt_base_instructions().await;
 
+    if let Some(operation) = tool_operation.as_ref() {
+        operation.check()?;
+    }
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     );
+    if let Some(operation) = tool_operation.as_ref() {
+        operation.check()?;
+    }
     let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
@@ -1797,6 +1808,7 @@ async fn run_sampling_request(
             &prompt,
             cancellation_token.child_token(),
             &mut draining_for_mailbox,
+            tool_operation.as_ref(),
         )
         .await
         {
@@ -1821,7 +1833,7 @@ async fn run_sampling_request(
 
         let original_input = original_input.get_or_insert(prompt.input);
 
-        let retry = handle_response_stream_error(
+        let retry = crate::responses_retry::handle_response_stream_error_guarded(
             &mut retry_state,
             max_retries,
             err,
@@ -1829,6 +1841,7 @@ async fn run_sampling_request(
             &sess,
             &step_context,
             ResponsesStreamRequest::Sampling,
+            tool_operation.as_ref(),
         )
         .or_cancel(&preempt)
         .or_cancel(&cancellation_token)
@@ -2645,6 +2658,9 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
+    current_operation: Option<
+        &crate::agent::child_provider_authorization::current::CurrentChildOperation,
+    >,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
@@ -2724,8 +2740,13 @@ async fn try_run_sampling_request(
     let mut request_token_usage = None;
     sess.set_server_reasoning_included(step_context.settings.model_info.use_responses_lite)
         .await;
+    // Hooks and other preparation awaits have completed. Recheck the ORIGINAL
+    // operation fence; publication cannot be hidden by recapturing new authority.
+    if let Some(operation) = current_operation {
+        operation.check()?;
+    }
     let mut stream = match client_session
-        .stream(
+        .stream_guarded(
             prompt,
             &step_context.settings.model_info,
             &step_context.session_telemetry,
@@ -2734,6 +2755,7 @@ async fn try_run_sampling_request(
             step_context.settings.service_tier.clone(),
             responses_metadata,
             &inference_trace,
+            current_operation,
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)

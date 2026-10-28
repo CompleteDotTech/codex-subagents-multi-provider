@@ -40,7 +40,7 @@ impl ThreadLifecycleContributor<Config> for ThreadStartRecorder {
 #[tokio::test]
 async fn forward_events_filters_private_events_before_blocked_send_is_cancelled() {
     let (tx_events, rx_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_sub, rx_sub) = crate::session::bounded_submission_channel(SUBMISSION_CHANNEL_CAPACITY);
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
     let io = Arc::new(SessionIo {
         tx_sub,
@@ -137,7 +137,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
 
 #[tokio::test]
 async fn forward_ops_preserves_submission_trace_context() {
-    let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_sub, rx_sub) = crate::session::bounded_submission_channel(SUBMISSION_CHANNEL_CAPACITY);
     let (_tx_events, rx_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
     let io = Arc::new(SessionIo {
@@ -146,7 +146,7 @@ async fn forward_ops_preserves_submission_trace_context() {
         agent_status,
         session_loop_termination: completed_session_loop_termination(),
     });
-    let (tx_ops, rx_ops) = bounded(1);
+    let (tx_ops, rx_ops) = crate::session::bounded_submission_channel(1);
     let cancel = CancellationToken::new();
     let forward = tokio::spawn(forward_ops(Arc::clone(&io), rx_ops, cancel));
 

@@ -162,6 +162,10 @@ type ThreadDataCleanup = dyn Fn(Vec<ThreadId>) -> ThreadStoreFuture<'static, ()>
 type WriterLockGuard = Arc<codex_rollout::WriterLockGuard>;
 
 struct LiveRecorderEntry {
+    owner: crate::ThreadWriterOwner,
+    stopped: bool,
+    fresh: bool,
+    authority_generation: Option<uuid::Uuid>,
     recorder: RolloutRecorder,
     // Rollout projection rows are keyed by immutable rollout ID, not the stable thread ID used
     // to find this live writer.
@@ -409,19 +413,25 @@ impl LocalThreadStore {
         rollout_id: ThreadId,
         history_mode: ThreadHistoryMode,
         writer_lock: WriterLockGuard,
-    ) -> ThreadStoreResult<()> {
+        fresh: bool,
+    ) -> ThreadStoreResult<crate::ThreadWriterOwner> {
         match self.live_recorders.lock().await.entry(thread_id) {
             Entry::Occupied(entry) => Err(ThreadStoreError::InvalidRequest {
                 message: format!("thread {} already has a live local writer", entry.key()),
             }),
             Entry::Vacant(entry) => {
+                let owner = crate::ThreadWriterOwner::new();
                 entry.insert(LiveRecorderEntry {
+                    owner: owner.clone(),
+                    stopped: false,
+                    fresh,
+                    authority_generation: None,
                     recorder,
                     rollout_id,
                     history_mode,
                     writer_lock,
                 });
-                Ok(())
+                Ok(owner)
             }
         }
     }
@@ -510,6 +520,193 @@ impl LocalThreadStore {
 }
 
 impl ThreadStore for LocalThreadStore {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: crate::NativeAuthorityEpoch,
+        owner: crate::ThreadWriterOwner,
+    ) -> ThreadStoreFuture<'_, ()> {
+        let store = self.clone();
+        Box::pin(async move {
+            let operation = owner.operation().await?;
+            crate::store::complete_writer_operation(operation, async move {
+                let _writer = store.live_writer_locks.lock(epoch.thread_id).await;
+                if !store
+                    .live_recorders
+                    .lock()
+                    .await
+                    .get(&epoch.thread_id)
+                    .is_some_and(|entry| entry.owner.matches(&owner))
+                {
+                    return Err(ThreadStoreError::Conflict {
+                        message: "native authority writer was replaced".into(),
+                    });
+                }
+                let thread = epoch.thread_id;
+                let generation = epoch.generation;
+                if let Some(entry) = store.live_recorders.lock().await.get_mut(&thread) {
+                    entry.authority_generation = Some(generation);
+                }
+                // Bind the expected generation before the storage await so a
+                // cancelled commit can still clean exactly its own provisional row.
+                store.begin_native_authority_epoch(epoch).await?;
+                Ok(())
+            })
+            .await
+        })
+    }
+    fn create_thread_owned(
+        &self,
+        params: CreateThreadParams,
+    ) -> ThreadStoreFuture<'_, crate::ThreadWriterOwner> {
+        Box::pin(async move { live_writer::create_thread(self, params, true).await })
+    }
+    fn resume_thread_owned(
+        &self,
+        params: ResumeThreadParams,
+        preparation: Option<crate::ThreadStoreResumePreparation>,
+    ) -> ThreadStoreFuture<'_, (Arc<Vec<RolloutItem>>, crate::ThreadWriterOwner)> {
+        Box::pin(async move {
+            if preparation.is_some() {
+                return Err(ThreadStoreError::Unsupported {
+                    operation: "resume_thread_with_preparation",
+                });
+            }
+            live_writer::resume_thread(self, params).await
+        })
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: crate::ThreadWriterOwner,
+        discard: bool,
+    ) -> ThreadStoreFuture<'_, ()> {
+        let store = self.clone();
+        Box::pin(async move {
+            let operation = owner.retirement(discard).await?;
+            crate::store::complete_writer_operation(operation, async move {
+                live_writer::finish_thread_owned(&store, thread, owner, discard).await
+            })
+            .await
+        })
+    }
+    fn native_authority_storage(&self) -> Option<crate::NativeAuthorityStorage> {
+        let actual = self.state_db.as_ref()?.sqlite();
+        if actual.state_db_path() != self.config.sqlite.state_db_path() {
+            return None;
+        }
+        Some(crate::NativeAuthorityStorage::Local {
+            directory: actual.home().to_path_buf(),
+            database: actual.state_db_path(),
+        })
+    }
+    fn begin_native_authority_epoch(
+        &self,
+        epoch: crate::NativeAuthorityEpoch,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .begin_native_authority_epoch(&epoch)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority epoch could not be committed".into(),
+                })
+        })
+    }
+    fn invalidate_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+        fence: uuid::Uuid,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            if self.state_db.is_none()
+                && tokio::fs::try_exists(self.config.sqlite.state_db_path())
+                    .await
+                    .map_err(|_| ThreadStoreError::Internal {
+                        message: "host authority store availability is unknown".into(),
+                    })?
+            {
+                return Err(ThreadStoreError::Internal {
+                    message: "existing host authority requires its actual state-store owner".into(),
+                });
+            }
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .invalidate_native_authority_receipt(thread, fence)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority receipt could not be invalidated".into(),
+                })
+        })
+    }
+    fn seal_native_authority_receipt(
+        &self,
+        receipt: crate::NativeAuthorityReceipt,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .seal_native_authority_receipt(&receipt)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority receipt could not be committed".into(),
+                })
+        })
+    }
+    fn read_native_authority_epoch(
+        &self,
+        thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityEpoch>> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .read_native_authority_epoch(thread)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority ownership could not be verified".into(),
+                })
+        })
+    }
+    fn read_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<crate::NativeAuthorityReceipt>> {
+        Box::pin(async move {
+            let state = self
+                .state_db
+                .as_ref()
+                .ok_or(ThreadStoreError::Unsupported {
+                    operation: "native_authority",
+                })?;
+            state
+                .read_native_authority_receipt(thread)
+                .await
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "native authority receipt could not be verified".into(),
+                })
+        })
+    }
+
     fn default_history_mode(&self) -> ThreadHistoryMode {
         ThreadHistoryMode::Paginated
     }
@@ -519,7 +716,11 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::create_thread(self, params).await })
+        Box::pin(async move {
+            live_writer::create_thread(self, params, false)
+                .await
+                .map(|_| ())
+        })
     }
 
     fn stage_pending_thread_metadata(
@@ -566,7 +767,11 @@ impl ThreadStore for LocalThreadStore {
         &self,
         params: ResumeThreadParams,
     ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
-        Box::pin(async move { live_writer::resume_thread(self, params).await })
+        Box::pin(async move {
+            live_writer::resume_thread(self, params)
+                .await
+                .map(|(history, _)| history)
+        })
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
@@ -847,6 +1052,8 @@ mod tests {
     mod acquisition_tests;
     #[path = "delegated_preview_tests.rs"]
     mod delegated_preview_tests;
+    #[path = "owned_write_tests.rs"]
+    mod owned_write_tests;
     use std::sync::Arc;
 
     use codex_protocol::ThreadId;
@@ -880,6 +1087,291 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with_history_mode;
+
+    #[tokio::test]
+    async fn owned_writer_cleanup_preserves_replacement_and_resumed_history() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            let thread = ThreadId::default();
+            // Paginated history persists canonical completed items, not legacy user events.
+            let message_item = |id: &str, message: &str| match mode {
+                ThreadHistoryMode::Legacy => user_message_item(message),
+                ThreadHistoryMode::Paginated => {
+                    RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                        thread_id: thread,
+                        turn_id: "owned-writer-fixture".to_string(),
+                        item: TurnItem::UserMessage(UserMessageItem {
+                            id: id.to_string(),
+                            client_id: None,
+                            content: vec![codex_protocol::user_input::UserInput::Text {
+                                text: message.to_string(),
+                                text_elements: Vec::new(),
+                            }],
+                        }),
+                        started_at_ms: Some(0),
+                        completed_at_ms: 1,
+                    }))
+                }
+            };
+            let mut params = create_thread_params(thread);
+            params.history_mode = mode;
+            let original = store.create_thread_owned(params).await.unwrap();
+            store
+                .append_items(AppendThreadItemsParams {
+                    thread_id: thread,
+                    items: vec![message_item("saved-message", "owned saved history")],
+                })
+                .await
+                .unwrap();
+            store
+                .persist_thread(thread, PersistContext::Standard)
+                .await
+                .unwrap();
+            store.flush_thread(thread).await.unwrap();
+            let path = store.live_rollout_path(thread).await.unwrap();
+            store
+                .finish_thread_owned(thread, original.clone(), false)
+                .await
+                .unwrap();
+            assert!(path.exists());
+            let (history, replacement) = store
+                .resume_thread_owned(
+                    ResumeThreadParams {
+                        thread_id: thread,
+                        rollout_path: Some(path.clone()),
+                        history: None,
+                        history_revision: None,
+                        include_archived: true,
+                        metadata: thread_metadata(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!history.is_empty());
+            store
+                .finish_thread_owned(thread, original, true)
+                .await
+                .unwrap();
+            assert!(
+                path.exists(),
+                "stale fresh cleanup must not delete resumed history"
+            );
+            store
+                .append_items(AppendThreadItemsParams {
+                    thread_id: thread,
+                    items: vec![message_item(
+                        "replacement-message",
+                        "replacement still owns writer",
+                    )],
+                })
+                .await
+                .unwrap();
+            store.flush_thread(thread).await.unwrap();
+            store
+                .finish_thread_owned(thread, replacement, true)
+                .await
+                .unwrap();
+            assert!(path.exists());
+            let (persisted_items, persisted_thread, parse_errors) =
+                RolloutRecorder::load_rollout_items(&path).await.unwrap();
+            assert_eq!(persisted_thread, Some(thread));
+            assert_eq!(parse_errors, 0);
+            let persisted_text = serde_json::to_string(&persisted_items).unwrap();
+            assert!(
+                persisted_text.contains("owned saved history"),
+                "{mode:?}: original message must remain in the durable rollout"
+            );
+            assert!(
+                persisted_text.contains("replacement still owns writer"),
+                "{mode:?}: replacement message must remain in the durable rollout"
+            );
+            let history_params = LoadThreadHistoryParams {
+                thread_id: thread,
+                include_archived: true,
+            };
+            let saved_items = match mode {
+                ThreadHistoryMode::Legacy => {
+                    store.load_history(history_params).await.unwrap().items
+                }
+                ThreadHistoryMode::Paginated => {
+                    store
+                        .load_latest_model_context(history_params)
+                        .await
+                        .unwrap()
+                        .items
+                }
+            };
+            let text = serde_json::to_string(&saved_items).unwrap();
+            assert!(
+                text.contains("owned saved history"),
+                "{mode:?}: saved history view"
+            );
+            assert!(
+                text.contains("replacement still owns writer"),
+                "{mode:?}: replacement history view"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_provisional_cleanup_discards_only_fresh_acquisition() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        let thread = ThreadId::default();
+        let mut guard = crate::LiveThreadInitGuard::default();
+        let owned_store: Arc<dyn ThreadStore> = store.clone();
+        let live = guard
+            .acquire(LiveThread::create_owned(
+                owned_store,
+                create_thread_params(thread),
+            ))
+            .await
+            .unwrap();
+        let path = store.live_rollout_path(thread).await.unwrap();
+        live.append_items(&[user_message_item("provisional materialized startup")])
+            .await
+            .unwrap();
+        live.persist(PersistContext::Standard).await.unwrap();
+        live.flush().await.unwrap();
+        assert!(path.exists());
+        assert!(runtime.get_thread(thread).await.unwrap().is_some());
+        live.begin_native_authority_epoch(crate::NativeAuthorityEpoch {
+            version: crate::NATIVE_AUTHORITY_VERSION,
+            thread_id: thread,
+            root_thread_id: thread,
+            parent_thread_id: None,
+            generation: uuid::Uuid::now_v7(),
+        })
+        .await
+        .unwrap();
+        live.shutdown().await.unwrap();
+        guard.discard().await.unwrap();
+        assert!(
+            !path.exists(),
+            "unregistered fresh shutdown cannot materialize an orphan"
+        );
+        assert!(runtime.get_thread(thread).await.unwrap().is_none());
+        assert!(
+            runtime
+                .read_native_authority_epoch(thread)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let replacement = store
+            .create_thread_owned(create_thread_params(thread))
+            .await
+            .unwrap();
+        guard.discard().await.unwrap();
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id: thread,
+                items: vec![user_message_item("new acquisition")],
+            })
+            .await
+            .unwrap();
+        store
+            .finish_thread_owned(thread, replacement, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_owned_acquisition_discards_materialized_fresh_writer() {
+        let home = TempDir::new().expect("temp dir");
+        let store = Arc::new(LocalThreadStore::new(test_config(home.path()), None));
+        let thread = ThreadId::default();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut guard = crate::LiveThreadInitGuard::default();
+        let acquiring_store = store.clone();
+        {
+            let acquisition = guard.acquire(async move {
+                let live =
+                    LiveThread::create_owned(acquiring_store, create_thread_params(thread)).await?;
+                live.append_items(&[user_message_item("cancelled acquisition")])
+                    .await?;
+                live.persist(PersistContext::Standard).await?;
+                live.flush().await?;
+                let _ = started.send(());
+                let _ = wait.await;
+                Ok(live)
+            });
+            tokio::pin!(acquisition);
+            tokio::select! {
+                _ = &mut acquisition => panic!("acquisition completed before release"),
+                result = ready => result.expect("fresh writer materialized before cancellation"),
+            }
+        }
+        // The guard retains the unfinished acquisition after its waiter leaves.
+        drop(guard);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !store.live_recorders.lock().await.contains_key(&thread)
+                    && store
+                        .load_history(LoadThreadHistoryParams {
+                            thread_id: thread,
+                            include_archived: true,
+                        })
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled acquisition owner removes its fresh writer and history");
+    }
+
+    #[tokio::test]
+    async fn cancelled_owned_cleanup_retains_writer_until_discard_completes() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let thread = ThreadId::default();
+        let owner = store
+            .create_thread_owned(create_thread_params(thread))
+            .await
+            .unwrap();
+        let lock = store.live_writer_locks.lock(thread).await;
+        let mut finish = store.finish_thread_owned(thread, owner, true);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(finish.as_mut(), cx).is_pending(),
+                "held writer lock must suspend exact cleanup"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(finish);
+        drop(lock);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.live_recorders.lock().await.contains_key(&thread) {
+                tokio::task::yield_now().await;
+            }
+            let replacement = store
+                .create_thread_owned(create_thread_params(thread))
+                .await
+                .unwrap();
+            store
+                .finish_thread_owned(thread, replacement, true)
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("owned cleanup survives cancellation and releases the real writer");
+    }
 
     #[tokio::test]
     async fn live_writer_lifecycle_writes_and_closes() {

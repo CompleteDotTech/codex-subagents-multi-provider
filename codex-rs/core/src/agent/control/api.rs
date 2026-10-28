@@ -67,6 +67,12 @@ impl AgentControl for LocalAgentControl {
                 source,
                 options,
             } = request;
+            if source.parent_thread_id() != Some(caller) || options.parent_thread_id != Some(caller)
+            {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "spawn caller and captured parent must agree",
+                ));
+            }
             let input = match input {
                 AgentInput::UserInput(input) => SpawnInitialInput::UserInput(input),
                 AgentInput::Message { message, mode } => {
@@ -111,12 +117,30 @@ impl AgentControl for LocalAgentControl {
                 AgentInput::UserInput(input) => {
                     let receiver = self.get_agent_metadata(target);
                     let _residency_pin = if receiver.is_some() {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?
+                        self.ensure_v2_agent_loaded(
+                            resume_config,
+                            target,
+                            caller,
+                            /*parent*/ None,
+                        )
+                        .await?
                     } else {
                         None
                     };
-                    let submission_id = self.send_input(target, input, start_options).await?;
+                    let guard = if receiver.is_some() {
+                        crate::agent::child_provider_authorization::current::prepare_loaded(
+                            &self.runtime,
+                            target,
+                            caller,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    let thread = self.runtime.upgrade()?.get_thread(target).await?;
+                    let submission_id = self
+                        .send_input_to_thread_guarded(&thread, input, start_options, guard.as_ref())
+                        .await?;
                     (receiver.unwrap_or_default(), submission_id)
                 }
                 AgentInput::Message { message, mode } => {
@@ -146,8 +170,13 @@ impl AgentControl for LocalAgentControl {
                         || (self.runtime.upgrade()?.get_thread(target).await.is_err()
                             && self.runtime.registry.evicted_environments(target).is_none())
                     {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?
+                        self.ensure_v2_agent_loaded(
+                            resume_config,
+                            target,
+                            caller,
+                            /*parent*/ None,
+                        )
+                        .await?
                     } else {
                         None
                     };
@@ -190,7 +219,7 @@ impl AgentControl for LocalAgentControl {
         Box::pin(async move {
             let parent = self.runtime.upgrade()?.get_thread(parent).await?;
             let config = parent.session.get_config().await.as_ref().clone();
-            self.ensure_v2_agent_loaded(config, child, Some(parent))
+            self.ensure_v2_agent_loaded(config, child, parent.session.thread_id, Some(parent))
                 .await
                 .map(drop)
         })

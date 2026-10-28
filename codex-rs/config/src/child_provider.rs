@@ -85,7 +85,7 @@ impl VerifiedChildProviderOrigin {
         binding: &ChildProviderOriginBinding,
     ) -> Result<Self, ChildProviderError> {
         if record.origin_id.is_nil()
-            || record.root_thread_id == ThreadId::from_u128(0)
+            || record.root_thread_id == ThreadId::from_u128(/*value*/ 0)
             || !valid_id(&record.provider_id)
             || record.origin_id != binding.origin_id
             || record.root_thread_id != binding.root_thread_id
@@ -143,6 +143,30 @@ pub struct ResolvedChildProvider {
 }
 
 impl ChildProviderPolicy {
+    /// Safe IDs for native tool guidance. No discovery or credential work occurs.
+    pub fn selectable_provider_ids(
+        &self,
+        origin: Option<&VerifiedChildProviderOrigin>,
+        parent_provider_id: &str,
+    ) -> Vec<String> {
+        let mut candidates = self.providers.keys().cloned().collect::<BTreeSet<_>>();
+        if let Some(origin) = origin
+            && origin.provider_id() == parent_provider_id
+        {
+            candidates.insert(parent_provider_id.to_owned());
+        }
+        candidates
+            .into_iter()
+            .filter(|id| {
+                self.authorize(id, origin).is_ok()
+                    && (!self.untrusted_provider_ids.contains(id)
+                        || origin.is_some_and(|origin| {
+                            origin.provider_id() == id && id == parent_provider_id
+                        }))
+            })
+            .collect()
+    }
+
     /// Capture only enabled host-owned layers. Project/session authority cannot leak in
     /// through a provider definition, a provider default, or a built-in endpoint override.
     /// `protected_catalog_roots` must be actual read-only carveouts from the finalized
@@ -156,7 +180,11 @@ impl ChildProviderPolicy {
         file_system_policy: &FileSystemSandboxPolicy,
     ) -> std::io::Result<Self> {
         let mut project_roots = vec![cwd.to_path_buf()];
-        project_roots.extend(workspace_roots.iter().map(|root| root.to_path_buf()));
+        project_roots.extend(
+            workspace_roots
+                .iter()
+                .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf),
+        );
         for layer in stack.layers_low_to_high() {
             if let ConfigLayerSource::Project { dot_codex_folder } = &layer.name
                 && let Some(root) = dot_codex_folder.as_path().parent()
@@ -168,11 +196,13 @@ impl ChildProviderPolicy {
             is_host_source(source)
                 && source_file(source).is_none_or(|file| {
                     canonical_source_path(file).is_some_and(|file| {
-                        !project_roots.iter().any(|root| {
-                            root.canonicalize().is_ok_and(|root| file.starts_with(root))
-                        }) || (!file_system_policy
-                            .can_write_local_path_with_cwd(&file, cwd.as_path())
-                            && protected_catalog_roots.iter().any(|root| {
+                        // Full-disk write access has no finite writable-root list.
+                        // The live policy's path decision is authoritative even
+                        // when this host file is outside every active workspace.
+                        !file_system_policy.can_write_local_path_with_cwd(&file, cwd.as_path())
+                            && (!project_roots.iter().any(|root| {
+                                root.canonicalize().is_ok_and(|root| file.starts_with(root))
+                            }) || protected_catalog_roots.iter().any(|root| {
                                 root.as_path()
                                     .canonicalize()
                                     .is_ok_and(|root| file.starts_with(root))
@@ -320,7 +350,7 @@ impl ChildProviderPolicy {
             cwd: cwd.clone(),
             protected_catalog_roots: protected_catalog_roots
                 .iter()
-                .map(|root| root.to_path_buf())
+                .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
                 .collect(),
         })
     }
@@ -511,6 +541,18 @@ impl ChildProviderPolicy {
                 "child_provider_model_unavailable",
                 provider_id,
                 "configured catalog is not a file",
+            ));
+        }
+        // In unrestricted profiles get_writable_roots_with_cwd is empty;
+        // writable local data still cannot supply privileged model metadata.
+        if self
+            .file_system_policy
+            .can_write_local_path_with_cwd(&canonical, self.cwd.as_path())
+        {
+            return Err(error(
+                "child_provider_untrusted_source",
+                provider_id,
+                "configured catalog is writable under the current filesystem policy",
             ));
         }
         let boundary = self

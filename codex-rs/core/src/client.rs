@@ -317,6 +317,7 @@ pub struct ModelClientSession {
 /// Executes HTTP Responses requests without owning a turn's WebSocket state.
 pub(crate) struct ResponsesHttpExecutor<'a> {
     client: &'a ModelClient,
+    guard: Option<&'a crate::agent::child_provider_authorization::current::CurrentChildOperation>,
 }
 
 #[derive(Debug, Clone)]
@@ -1239,6 +1240,14 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self, routing: ClientRouting) -> Result<CurrentClientSetup> {
+        self.current_client_setup_guarded(routing, None).await
+    }
+
+    async fn current_client_setup_guarded(
+        &self,
+        routing: ClientRouting,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> Result<CurrentClientSetup> {
         // Capture before resolving credentials so an account switch during setup cannot label
         // an old connection with the new owner's revision.
         let auth_owner_generation = self.auth_owner_generation();
@@ -1249,7 +1258,9 @@ impl ModelClient {
             .map(|manager| manager.auth_change_receiver());
         loop {
             let revision = auth_changes.as_ref().map(|changes| *changes.borrow());
+            admit_child_stage(guard)?;
             let auth = self.state.provider.auth().await;
+            admit_child_stage(guard)?;
             let (api_provider, redirect_policy) = match routing {
                 ClientRouting::Workspace => {
                     let resolved = self
@@ -1264,6 +1275,7 @@ impl ModelClient {
                     ClientRedirectPolicy::Default,
                 ),
             };
+            admit_child_stage(guard)?;
             let resolved_auth = self
                 .state
                 .provider
@@ -1558,7 +1570,20 @@ impl ModelClientSession {
 
 impl<'a> ResponsesHttpExecutor<'a> {
     pub(crate) fn new(client: &'a ModelClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            guard: None,
+        }
+    }
+
+    fn with_guard(
+        mut self,
+        guard: Option<
+            &'a crate::agent::child_provider_authorization::current::CurrentChildOperation,
+        >,
+    ) -> Self {
+        self.guard = guard;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1756,6 +1781,7 @@ impl ModelClientSession {
                             &provider,
                             self.client.event_sender.as_ref(),
                             responses_metadata.turn_id.as_deref(),
+                            None,
                         )
                         .await?,
                     );
@@ -1908,7 +1934,7 @@ impl ResponsesHttpExecutor<'_> {
         loop {
             let client_setup = self
                 .client
-                .current_client_setup(ClientRouting::Workspace)
+                .current_client_setup_guarded(ClientRouting::Workspace, self.guard)
                 .await?;
             if expected_auth_owner.is_some_and(|owner| {
                 Some(owner) != client_setup.auth_owner_generation
@@ -2007,13 +2033,36 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = input;
             }
             inference_trace_attempt.record_started(&request);
+            // Both adapters retain the original operation across EndpointSession's
+            // configured retries, including the await between auth and dispatch.
+            let operation = self.guard.cloned();
+            let denial = Arc::new(StdMutex::new(None));
             let client = ApiResponsesClient::new(
-                transport,
+                GuardedRequestTransport {
+                    inner: transport,
+                    operation: operation.clone(),
+                    denial: Arc::clone(&denial),
+                },
                 client_setup.api_provider,
-                client_setup.api_auth,
+                Arc::new(GuardedRequestAuth {
+                    inner: client_setup.api_auth,
+                    operation,
+                    denial: Arc::clone(&denial),
+                }),
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            admit_child_stage(self.guard)?;
             let stream_result = client.stream_request(request, options).await;
+            // The lower API preserves a nonretryable typed Policy sentinel. Restore
+            // the original child-policy error before generic mapping or recovery.
+            let denied = denial
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(error) = denied {
+                inference_trace_attempt.record_failed(&error, None, /*output_items*/ &[]);
+                return Err(error);
+            }
 
             match stream_result {
                 Ok(stream) => {
@@ -2040,6 +2089,7 @@ impl ResponsesHttpExecutor<'_> {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
+                    admit_child_stage(self.guard)?;
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -2049,6 +2099,7 @@ impl ResponsesHttpExecutor<'_> {
                             &self.client.state.provider,
                             event_sender,
                             responses_metadata.turn_id.as_deref(),
+                            self.guard,
                         )
                         .await?,
                     );
@@ -2098,6 +2149,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
     ) -> Result<WebsocketStreamOutcome> {
         self.client.validate_catalog_metadata(model_info)?;
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
@@ -2112,7 +2164,7 @@ impl ModelClientSession {
         loop {
             let client_setup = self
                 .client
-                .current_client_setup(ClientRouting::Workspace)
+                .current_client_setup_guarded(ClientRouting::Workspace, guard)
                 .await?;
             let include_internal = self
                 .client
@@ -2160,6 +2212,7 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
+            admit_child_stage(guard)?;
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
@@ -2183,6 +2236,7 @@ impl ModelClientSession {
                 Err(ApiError::Transport(unauthorized_transport))
                     if provider.is_recoverable_auth_error(&unauthorized_transport) =>
                 {
+                    admit_child_stage(guard)?;
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -2192,6 +2246,7 @@ impl ModelClientSession {
                             &provider,
                             self.client.event_sender.as_ref(),
                             responses_metadata.turn_id.as_deref(),
+                            guard,
                         )
                         .await?,
                     );
@@ -2335,6 +2390,7 @@ impl ModelClientSession {
                     ),
                 ],
             );
+            admit_child_stage(guard)?;
             let stream_result = websocket_connection
                 .stream_request(
                     ws_request,
@@ -2455,6 +2511,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                None,
             )
             .await
         {
@@ -2497,6 +2554,34 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.stream_guarded(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            inference_trace,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_guarded(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> Result<ResponseStream> {
+        admit_child_stage(guard)?;
         self.client.validate_catalog_metadata(model_info)?;
         self.client.validate_responses_compatibility(
             prompt,
@@ -2520,17 +2605,20 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            guard,
                         )
                         .await?
                     {
                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
                         WebsocketStreamOutcome::FallbackToHttp => {
+                            admit_child_stage(guard)?;
                             self.try_switch_fallback_transport(session_telemetry, model_info);
                         }
                     }
                 }
 
                 ResponsesHttpExecutor::new(&self.client)
+                    .with_guard(guard)
                     .stream_responses_http(
                         &self.turn_state,
                         /*expected_auth_owner*/ None,
@@ -2920,6 +3008,7 @@ fn emit_auth_recovery_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_unauthorized(
     transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
@@ -2928,6 +3017,7 @@ async fn handle_unauthorized(
     provider: &SharedModelProvider,
     event_sender: Option<&Sender<ProtocolEvent>>,
     turn_id: Option<&str>,
+    guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);
     if !*provider_auth_recovery_attempted {
@@ -2942,6 +3032,7 @@ async fn handle_unauthorized(
                 EventMsg::AuthRecoveryStarted,
             );
         }
+        admit_child_stage(guard)?;
         match provider.recover_from_unauthorized().await {
             Ok(ProviderUnauthorizedRecovery::Recovered) => {
                 if let Some(messages) = messages {
@@ -2980,6 +3071,7 @@ async fn handle_unauthorized(
     {
         let mode = recovery.mode_name();
         let phase = recovery.step_name();
+        admit_child_stage(guard)?;
         return match recovery.next().await {
             Ok(step_result) => {
                 session_telemetry.record_auth_recovery(
@@ -3242,3 +3334,269 @@ impl WebsocketTelemetry for ApiTelemetry {
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+/// A pure decision for exactly one following helper or transport stage. No user
+/// callback, future poll, or I/O runs while publication/registry locks are held.
+fn admit_child_stage(
+    guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+) -> Result<()> {
+    if let Some(guard) = guard {
+        guard.check()?;
+    }
+    Ok(())
+}
+
+// Each check admits one immediately following stage. Delegated futures are
+// constructed/polled only after all admission locks have been released.
+struct GuardedRequestAuth {
+    inner: SharedAuthProvider,
+    operation: Option<crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    denial: Arc<StdMutex<Option<CodexErr>>>,
+}
+
+fn admit_request_stage(
+    operation: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    denial: &StdMutex<Option<CodexErr>>,
+) -> std::result::Result<(), codex_http_client::NetworkPolicyDenied> {
+    admit_child_stage(operation).map_err(|error| {
+        let mut first = denial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first.is_none() {
+            *first = Some(error);
+        }
+        codex_http_client::NetworkPolicyDenied::Revoked
+    })
+}
+
+impl AuthProvider for GuardedRequestAuth {
+    fn add_auth_headers(
+        &self,
+        headers: &mut ApiHeaderMap,
+    ) -> std::result::Result<(), codex_api::AuthError> {
+        admit_request_stage(self.operation.as_ref(), &self.denial)?;
+        self.inner.add_auth_headers(headers)
+    }
+
+    fn resolve_auth_headers(&self) -> codex_api::AuthHeadersFuture<'_> {
+        Box::pin(async move {
+            admit_request_stage(self.operation.as_ref(), &self.denial)?;
+            self.inner.resolve_auth_headers().await
+        })
+    }
+
+    fn apply_auth(&self, request: codex_http_client::Request) -> codex_api::AuthProviderFuture<'_> {
+        Box::pin(async move {
+            admit_request_stage(self.operation.as_ref(), &self.denial)?;
+            self.inner.apply_auth(request).await
+        })
+    }
+
+    fn refresh_after_unauthorized(
+        &self,
+        rejected_headers: ApiHeaderMap,
+    ) -> codex_api::AuthRefreshFuture<'_> {
+        Box::pin(async move {
+            if admit_request_stage(self.operation.as_ref(), &self.denial).is_err() {
+                return false;
+            }
+            self.inner
+                .refresh_after_unauthorized(rejected_headers)
+                .await
+        })
+    }
+}
+
+struct GuardedRequestTransport<T> {
+    inner: T,
+    operation: Option<crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    denial: Arc<StdMutex<Option<CodexErr>>>,
+}
+
+impl<T: codex_http_client::HttpTransport> codex_http_client::HttpTransport
+    for GuardedRequestTransport<T>
+{
+    async fn execute(
+        &self,
+        request: codex_http_client::Request,
+    ) -> std::result::Result<codex_http_client::Response, TransportError> {
+        admit_request_stage(self.operation.as_ref(), &self.denial)?;
+        self.inner.execute(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: codex_http_client::Request,
+    ) -> std::result::Result<codex_http_client::StreamResponse, TransportError> {
+        admit_request_stage(self.operation.as_ref(), &self.denial)?;
+        self.inner.stream(request).await
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn exercise_current_http_boundary(
+    operation: crate::agent::child_provider_authorization::current::CurrentChildOperation,
+    hold_auth: bool,
+    publication: impl std::future::Future<Output = ()>,
+    revoke: bool,
+) {
+    use std::sync::atomic::AtomicUsize;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    struct HeldAuth {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+        hold: bool,
+    }
+    impl AuthProvider for HeldAuth {
+        fn add_auth_headers(
+            &self,
+            headers: &mut ApiHeaderMap,
+        ) -> std::result::Result<(), codex_api::AuthError> {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer boundary-test"),
+            );
+            Ok(())
+        }
+        fn apply_auth(
+            &self,
+            request: codex_http_client::Request,
+        ) -> codex_api::AuthProviderFuture<'_> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.hold {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                let mut request = request;
+                self.add_auth_headers(&mut request.headers)?;
+                Ok(request)
+            })
+        }
+    }
+    let response_started = Arc::new(StdMutex::new(None));
+    if !hold_auth {
+        let entered = Arc::clone(&entered);
+        let response_started = Arc::clone(&response_started);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |_: &wiremock::Request| {
+                *response_started.lock().unwrap() = Some(Instant::now());
+                entered.notify_one();
+                ResponseTemplate::new(500).set_delay(Duration::from_secs(10))
+            })
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST")).and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+            .set_body_string("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"boundary-complete\",\"output\":[]}}\n\n"))
+        .mount(&server).await;
+    let denial = Arc::new(StdMutex::new(None));
+    let transport = GuardedRequestTransport {
+        inner: ReqwestTransport::from_http_client(
+            codex_login::default_client::create_client_without_request_logging(),
+        ),
+        operation: Some(operation.clone()),
+        denial: Arc::clone(&denial),
+    };
+    let auth = GuardedRequestAuth {
+        inner: Arc::new(HeldAuth {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            calls: Arc::clone(&calls),
+            hold: hold_auth,
+        }),
+        operation: Some(operation),
+        denial: Arc::clone(&denial),
+    };
+    let provider = ApiProvider {
+        name: "actual-boundary-test".into(),
+        base_url: server.uri(),
+        query_params: None,
+        headers: ApiHeaderMap::new(),
+        stream_idle_timeout: Duration::from_secs(5),
+        retry: codex_client::RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            retry_429: true,
+            retry_5xx: true,
+            retry_transport: true,
+        },
+    };
+    let client = ApiResponsesClient::new(transport, provider, Arc::new(auth));
+    let request = client.stream(
+        serde_json::json!({"model":"shared-loaded","input":[]}),
+        ApiHeaderMap::new(),
+        Compression::default(),
+        None,
+    );
+    let change = async {
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("actual auth or first HTTP attempt must enter");
+        publication.await;
+        if hold_auth {
+            release.notify_one();
+        } else {
+            assert!(
+                response_started.lock().unwrap().unwrap().elapsed() < Duration::from_secs(10),
+                "publication must finish before the real retryable response is delivered; timeout is setup failure"
+            );
+        }
+    };
+    let (result, ()) = tokio::join!(request, change);
+    let original = denial.lock().unwrap().take();
+    if revoke {
+        assert!(matches!(
+            result,
+            Err(ApiError::Transport(TransportError::Policy(_)))
+        ));
+        let error = original
+            .expect("the original typed child denial must survive the lower-layer sentinel");
+        assert!(
+            matches!(
+                error.details(),
+                codex_protocol::error::CodexErrorDetails::InvalidRequest(_)
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("child_provider_policy_conflict"),
+            "{error}"
+        );
+    } else {
+        assert!(
+            result.is_ok(),
+            "unchanged actual lower HTTP request must succeed"
+        );
+        assert!(original.is_none());
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        if hold_auth {
+            usize::from(!revoke)
+        } else {
+            1 + usize::from(!revoke)
+        }
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        if hold_auth || revoke { 1 } else { 2 }
+    );
+    for request in requests {
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer boundary-test"
+        );
+    }
+}

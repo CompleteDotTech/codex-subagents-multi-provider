@@ -135,17 +135,51 @@ impl LocalAgentControl {
         self.session_id
     }
 
-    /// Send rich user input items to an existing agent thread.
+    /// Test convenience for the private initial-input delivery helper.
+    /// Public followups use caller-aware `AgentControl::send` instead.
+    #[cfg(test)]
     pub(crate) async fn send_input(
         &self,
         agent_id: ThreadId,
         input: Vec<UserInput>,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
+        let thread = self.runtime.upgrade()?.get_thread(agent_id).await?;
+        self.send_input_to_thread(&thread, input, start_options)
+            .await
+    }
+
+    // Initial input after successful private child startup. Public followups
+    // must retain the current caller/target fence via AgentControl::send.
+    async fn send_input_to_thread(
+        &self,
+        thread: &Arc<crate::CodexThread>,
+        input: Vec<UserInput>,
+        start_options: TurnStartOptions,
+    ) -> CodexResult<String> {
+        self.send_input_to_thread_guarded(thread, input, start_options, None)
+            .await
+    }
+
+    async fn send_input_to_thread_guarded(
+        &self,
+        thread: &Arc<crate::CodexThread>,
+        input: Vec<UserInput>,
+        start_options: TurnStartOptions,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<String> {
+        if guard.is_some_and(|guard| !guard.matches_target(thread)) {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "input target allocation changed",
+            ));
+        }
         let state = self.runtime.upgrade()?;
-        let thread = state.get_thread(agent_id).await?;
+        let agent_id = thread.session.thread_id;
         let result = match thread
-            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
+            .start_or_steer_turn_guarded(
+                TurnInputRequest::user_input(input).on_start(start_options),
+                guard,
+            )
             .await
         {
             Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok(turn_id),
@@ -161,8 +195,18 @@ impl LocalAgentControl {
             )),
             Err(err) => Err(err),
         };
-        self.handle_thread_request_result(agent_id, &state, result)
-            .await
+        if result
+            .as_ref()
+            .is_err_and(|error| matches!(error.details(), CodexErrorDetails::InternalAgentDied))
+        {
+            state
+                .remove_thread_if_matches(&agent_id, thread, || {
+                    self.forget_v2_residency(agent_id);
+                    self.runtime.registry.release_spawned_thread(agent_id);
+                })
+                .await;
+        }
+        result
     }
 
     pub(crate) async fn send_inter_agent_communication(
@@ -252,6 +296,7 @@ impl LocalAgentControl {
             communication,
             context,
             start_options,
+            None,
         )
         .await
     }
@@ -263,7 +308,18 @@ impl LocalAgentControl {
         mut communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
+        expected: Option<&Arc<crate::CodexThread>>,
     ) -> CodexResult<String> {
+        let guard = if communication.trigger_turn {
+            crate::agent::child_provider_authorization::current::prepare_loaded(
+                &self.runtime,
+                agent_id,
+                context.sender_thread_id,
+            )
+            .await?
+        } else {
+            None
+        };
         let observers = state.extensions.message_lifecycle_contributors();
         let delivery = (!observers.is_empty()).then(|| {
             let message_id = communication
@@ -308,24 +364,69 @@ impl LocalAgentControl {
         } else {
             (None, None)
         };
-        let result = self
-            .handle_thread_request_result(
-                agent_id,
-                state,
+        let submitted = if let Some(guard) = guard.as_ref() {
+            if expected.is_some_and(|expected| !guard.matches_target(expected)) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "communication target allocation changed",
+                ));
+            }
+            state
+                .send_op_to_thread_guarded(
+                    guard.target(),
+                    Op::InterAgentCommunication {
+                        communication,
+                        start_options,
+                    },
+                    parent_turn_id,
+                    root_turn_id,
+                    delivery,
+                    Some(guard),
+                )
+                .await
+        } else if let Some(expected) = expected {
+            state
+                .send_op_if_matches(
+                    expected,
+                    Op::InterAgentCommunication {
+                        communication,
+                        start_options,
+                    },
+                    parent_turn_id,
+                    root_turn_id,
+                    delivery,
+                )
+                .await
+        } else {
+            state
+                .send_op(
+                    agent_id,
+                    Op::InterAgentCommunication {
+                        communication,
+                        start_options,
+                    },
+                    parent_turn_id,
+                    root_turn_id,
+                    delivery,
+                )
+                .await
+        };
+        let result = if let Some(expected) = expected {
+            if submitted
+                .as_ref()
+                .is_err_and(|error| matches!(error.details(), CodexErrorDetails::InternalAgentDied))
+            {
                 state
-                    .send_op(
-                        agent_id,
-                        Op::InterAgentCommunication {
-                            communication,
-                            start_options,
-                        },
-                        parent_turn_id,
-                        root_turn_id,
-                        delivery,
-                    )
-                    .await,
-            )
-            .await;
+                    .remove_thread_if_matches(&agent_id, expected, || {
+                        self.forget_v2_residency(agent_id);
+                        self.runtime.registry.release_spawned_thread(agent_id);
+                    })
+                    .await;
+            }
+            submitted
+        } else {
+            self.handle_thread_request_result(agent_id, state, submitted)
+                .await
+        };
         if let (Some(communication), Ok(communication_id)) =
             (communication_for_log, result.as_ref())
         {
@@ -709,6 +810,19 @@ impl LocalAgentControl {
         let Some(agent_graph_store) = state.agent_graph_store() else {
             return;
         };
+        // A delayed old edge write cannot reopen or relabel a replacement.
+        // Graph storage never runs under a synchronous lifecycle mutex.
+        let threads = state.threads.read().await;
+        if !threads
+            .get(&child_thread_id)
+            .is_some_and(|registered| std::ptr::eq(registered.as_ref(), child_thread))
+            || !self
+                .runtime
+                .registry
+                .graph_open_is_current(&child_thread.session)
+        {
+            return;
+        }
         if let Err(err) = agent_graph_store
             .upsert_thread_spawn_edge(
                 parent_thread_id,

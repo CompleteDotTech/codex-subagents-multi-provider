@@ -105,6 +105,7 @@ const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 
 #[derive(Clone, Copy)]
 struct CoreToolPlanContext<'a> {
+    provider_origin: Option<&'a codex_config::child_provider::VerifiedChildProviderOrigin>,
     tool_policy: &'a codex_extension_api::ToolPolicy,
     turn_context: &'a TurnContext,
     model_info: &'a ModelInfo,
@@ -134,7 +135,13 @@ pub(crate) fn build_tool_router(
         .services
         .thread_extension_data
         .get::<crate::WaitForEnvironmentToolConfig>();
+    let provider_origin = session
+        .services
+        .local_agent_runtime
+        .child_provider_origins
+        .verified(session.thread_id);
     let context = CoreToolPlanContext {
+        provider_origin: provider_origin.as_ref(),
         tool_policy: &session.tool_policy,
         turn_context,
         model_info,
@@ -309,6 +316,7 @@ pub(crate) fn build_core_tool_registry(
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let context = CoreToolPlanContext {
+        provider_origin: None,
         tool_policy: &Default::default(),
         turn_context,
         model_info,
@@ -1454,6 +1462,22 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
 #[instrument(level = "trace", skip_all)]
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     let turn_context = context.turn_context;
+    let execution_scope = crate::agent::child_provider_authorization::ChildProviderScope::from_step(
+        &turn_context.config,
+        context.environments,
+    );
+    let allowed_model_providers =
+        crate::agent::child_provider_authorization::current_policy_in_scope(
+            &turn_context.config,
+            &execution_scope,
+        )
+        .map(|policy| {
+            policy.selectable_provider_ids(
+                context.provider_origin,
+                &turn_context.config.model_provider_id,
+            )
+        })
+        .unwrap_or_default();
     if collab_tools_enabled(turn_context, context.model_info) {
         if multi_agent_v2_enabled(turn_context) {
             let model_messages = ResolvedModelMessages::from_model(context.model_info);
@@ -1474,6 +1498,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     SpawnAgentHandlerV2::new(
                         SpawnAgentToolOptions {
                             available_models: turn_context.available_models.clone(),
+                            allowed_model_providers,
                             multi_agent_version: turn_context.multi_agent_version,
                             model_catalog_in_context: turn_context
                                 .config
@@ -1562,6 +1587,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             registry.add_with_exposure(
                 SpawnAgentHandler::new(SpawnAgentToolOptions {
                     available_models: turn_context.available_models.clone(),
+                    allowed_model_providers,
                     multi_agent_version: turn_context.multi_agent_version,
                     model_catalog_in_context: turn_context
                         .config

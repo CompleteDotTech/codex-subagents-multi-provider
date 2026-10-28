@@ -99,6 +99,7 @@ async fn handle_spawn_agent(
         &session,
         step_context.as_ref(),
         SpawnConfigOptions {
+            model_provider: args.model_provider.as_deref(),
             resolved_provider: None,
             version: SpawnConfigVersion::V1,
             full_history_fork: args.fork_context,
@@ -223,6 +224,7 @@ struct SpawnAgentArgs {
     items: Option<Vec<UserInput>>,
     agent_type: Option<String>,
     model: Option<String>,
+    model_provider: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     fork_context: bool,
@@ -249,5 +251,22 @@ impl ToolOutput for SpawnAgentResult {
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         tool_output_code_mode_result(self, "spawn_agent")
+    }
+}
+
+#[cfg(test)]
+mod provider_selector_tests {
+    use super::*;
+    #[test]
+    fn legacy_and_string_provider_arguments_remain_typed() {
+        let legacy: SpawnAgentArgs =
+            serde_json::from_value(serde_json::json!({"message":"task"})).unwrap();
+        assert!(legacy.model_provider.is_none());
+        assert!(!legacy.fork_context);
+        let selected: SpawnAgentArgs =
+            serde_json::from_value(serde_json::json!({"message":"task","model_provider":"a"}))
+                .unwrap();
+        assert_eq!(selected.model_provider.as_deref(), Some("a"));
+        assert!(serde_json::from_value::<SpawnAgentArgs>(serde_json::json!({"message":"task","model_provider":{"base_url":"https://forged.invalid"}})).is_err());
     }
 }

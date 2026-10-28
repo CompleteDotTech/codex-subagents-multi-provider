@@ -253,8 +253,14 @@ mod handlers;
 mod inject;
 mod reasoning_effort;
 mod submission;
+mod submission_channel;
 pub(crate) use reasoning_effort::RequestEffortUsage;
 pub(crate) use submission::Submission;
+pub(crate) use submission_channel::SubmissionReceiver;
+pub(crate) use submission_channel::SubmissionSender;
+pub(crate) use submission_channel::bounded_submission_channel;
+#[cfg(test)]
+pub(crate) use submission_channel::unbounded_submission_channel;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;
@@ -424,7 +430,7 @@ pub(crate) enum TokenUsageContext {
 /// completion future observes that shutdown.
 #[derive(Clone)]
 pub(crate) struct SessionIo {
-    pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) tx_sub: SubmissionSender,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
@@ -596,10 +602,58 @@ impl Session {
     }
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+        // Final native admission runs on this future's first poll, after all
+        // manager preparation awaits and before the first startup I/O/helper.
+        let native = matches!(
+            &args.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) || args
+            .conversation_history
+            .get_resumed_session_sources()
+            .is_some_and(|(source, _)| {
+                matches!(
+                    source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                )
+            });
+        if let Some(startup) = &args.startup {
+            startup.admit_native(native)?;
+        } else if native {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "native startup admission authority is missing",
+            ));
+        }
         args.config
             .config_layer_stack
             .ensure_config_server_applied()?;
         args.config.validate_windows_mxc_requirement()?;
+        let resumed_target = match &args.conversation_history {
+            InitialHistory::Resumed(saved) => Some(saved.conversation_id),
+            _ => None,
+        };
+        let resume_fence = args
+            .startup
+            .as_ref()
+            .map(|startup| startup.take_resume_fence(resumed_target))
+            .transpose()?
+            .flatten();
+        if let Some(target) = resume_fence {
+            // Final policy admission above is synchronous. Only an admitted
+            // manager-owned resume may invalidate the prior receipt, and that
+            // fence must commit before channels, Session creation or startup I/O.
+            match args
+                .thread_store
+                .invalidate_native_authority_receipt(target, uuid::Uuid::now_v7())
+                .await
+            {
+                Ok(()) | Err(codex_thread_store::ThreadStoreError::Unsupported { .. }) => {}
+                Err(_) => {
+                    return Err(crate::agent::child_provider_authorization::invalid(
+                        "saved authority could not be invalidated before runtime startup",
+                    ));
+                }
+            }
+        }
         let SessionSpawnArgs {
             startup,
             config,
@@ -649,7 +703,10 @@ impl Session {
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
         } = args;
-        let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        if let Some(startup) = &startup {
+            startup.check_native_current()?;
+        }
+        let (tx_sub, rx_sub) = bounded_submission_channel(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
         let isolation = thread_extension_init
@@ -752,6 +809,9 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
+        if let Some(startup) = &startup {
+            startup.check_native_current()?;
+        }
         if model.trim().is_empty() {
             return Err(CodexErr::InvalidRequest(
                 "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
@@ -1015,6 +1075,9 @@ impl Session {
                 Err(error) => map_session_init_error(&error, &config.codex_home),
             }
         })?;
+        if let Some(startup) = &startup {
+            startup.check_native_current()?;
+        }
         if let Some(message) = initial_service_tier_warning {
             session
                 .send_event_raw(Event {
@@ -1047,7 +1110,9 @@ impl Session {
 
         if let Some(startup) = startup {
             let _ = startup.io.set(io.clone());
-            startup.persistence.lock().await.commit();
+            if !startup.requires_owned_writer() {
+                startup.persistence.lock().await.commit();
+            }
         }
         Ok((session, io))
     }
@@ -1075,6 +1140,29 @@ impl SessionIo {
         residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
         message_delivery: Option<crate::agent_communication::MessageDelivery>,
     ) -> CodexResult<String> {
+        self.submit_with_trace_guarded(
+            op,
+            trace,
+            parent_turn_id,
+            root_turn_id,
+            residency_guard,
+            message_delivery,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit_with_trace_guarded(
+        &self,
+        op: impl Into<WithTurnExtensionData<Op>>,
+        trace: Option<W3cTraceContext>,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+        residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        message_delivery: Option<crate::agent_communication::MessageDelivery>,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<String> {
         let id = new_submission_id();
         let WithTurnExtensionData {
             request: op,
@@ -1090,20 +1178,24 @@ impl SessionIo {
             residency_guard,
             message_delivery,
         };
-        self.submit_with_id(sub).await?;
+        self.submit_with_id_guarded(sub, guard).await?;
         Ok(id)
     }
 
     /// Use sparingly: prefer `submit()` so submission IDs are generated consistently.
-    pub(crate) async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
+    pub(crate) async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
+        self.submit_with_id_guarded(sub, None).await
+    }
+
+    pub(crate) async fn submit_with_id_guarded(
+        &self,
+        mut sub: Submission,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<()> {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
         }
-        self.tx_sub
-            .send(sub)
-            .await
-            .map_err(|_| CodexErr::InternalAgentDied)?;
-        Ok(())
+        self.tx_sub.send_guarded(sub, guard).await
     }
 
     /// Submits an ordered turn-input call and waits only for Core's routing decision.
@@ -1115,6 +1207,15 @@ impl SessionIo {
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        self.submit_turn_input_guarded(request, mode, None).await
+    }
+
+    pub(crate) async fn submit_turn_input_guarded(
+        &self,
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        mode: TurnInputMode,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<TurnInputSubmission> {
         let id = new_submission_id();
         let (reply_tx, reply_rx) = oneshot::channel();
         let WithTurnExtensionData {
@@ -1122,20 +1223,23 @@ impl SessionIo {
             turn_extension_init,
         } = request.into();
         let trace = request.trace.take();
-        self.submit_with_id(Submission {
-            id,
-            op: Op::TurnInput {
-                request: Box::new(request),
-                mode,
-                reply: reply_tx,
+        self.submit_with_id_guarded(
+            Submission {
+                id,
+                op: Op::TurnInput {
+                    request: Box::new(request),
+                    mode,
+                    reply: reply_tx,
+                },
+                trace,
+                turn_extension_init,
+                parent_turn_id: None,
+                root_turn_id: None,
+                residency_guard: None,
+                message_delivery: None,
             },
-            trace,
-            turn_extension_init,
-            parent_turn_id: None,
-            root_turn_id: None,
-            residency_guard: None,
-            message_delivery: None,
-        })
+            guard,
+        )
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
     }
@@ -2091,6 +2195,20 @@ impl Session {
             // Save new environment defaults for future turns. The running turn keeps its own.
             windows_sandbox_changed =
                 state.session_configuration.windows_sandbox_level != updated.windows_sandbox_level;
+            let child_authority_changed = updated.thread_settings_snapshot(&updated.environments)
+                != state
+                    .session_configuration
+                    .thread_settings_snapshot(&state.session_configuration.environments)
+                || updated.environments != state.session_configuration.environments
+                || updated.inferred_environment_config()
+                    != state.session_configuration.inferred_environment_config();
+            // Settings and executor-scope publication must invalidate prepared
+            // child operations just like host config publication. Take the fence
+            // before publishing either the service view or the state snapshot.
+            let mut child_policy_revision = self
+                .child_policy_revision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.services
                 .turn_environments
                 .set_configured_thread_defaults(updated.inferred_environment_config());
@@ -2100,6 +2218,10 @@ impl Session {
                     .update_configured_selections(&updated.environments);
             }
             state.session_configuration = updated;
+            if child_authority_changed {
+                *child_policy_revision = child_policy_revision.wrapping_add(1);
+            }
+            drop(child_policy_revision);
             if root_service_tier_changed {
                 self.services.agent_control.propagate_config_update(
                     AgentConfigUpdate::ServiceTier(
@@ -2197,6 +2319,33 @@ impl Session {
     pub(crate) async fn configured_environment_selections(&self) -> Vec<TurnEnvironmentSelection> {
         let state = self.state.lock().await;
         state.session_configuration.environments.clone()
+    }
+
+    /// Captures one host authority epoch without executor, catalog or transport I/O.
+    pub(crate) async fn native_agent_authority_snapshot(
+        &self,
+    ) -> (Arc<Config>, ThreadSettingsSnapshot, TurnEnvironmentSnapshot) {
+        let state = self.state.lock().await;
+        let configuration = &state.session_configuration;
+        let mut config = configuration.original_config_do_not_use.as_ref().clone();
+        config.model = Some(
+            configuration
+                .step_settings
+                .collaboration_mode
+                .model()
+                .to_string(),
+        );
+        config.permissions.approval_policy = configuration.step_settings.approval_policy.clone();
+        config.approvals_reviewer = configuration.step_settings.approvals_reviewer;
+        config.permissions.allow_login_shell = configuration.allow_login_shell;
+        // Preserve the selected raw profile, whose ProjectRoots placeholders must
+        // be materialized against the captured executor rather than display roots.
+        configuration.apply_permission_profile_to_permissions(&mut config.permissions);
+        (
+            Arc::new(config),
+            configuration.thread_settings_snapshot(&configuration.environments),
+            self.services.turn_environments.snapshot_now(),
+        )
     }
 
     pub(crate) async fn thread_settings_snapshot(&self) -> ThreadSettingsSnapshot {

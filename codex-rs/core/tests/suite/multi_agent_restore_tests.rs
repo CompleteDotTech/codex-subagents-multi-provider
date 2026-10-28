@@ -4,7 +4,10 @@ use super::ROLE_MODEL;
 use super::ROLE_NAME;
 use super::body_contains;
 use super::configure_multi_agent_v2_with_role;
+use super::local_scope_descriptor;
+use super::managed_cold_provider_loader;
 use super::mount_root_collaboration_call;
+use super::mount_standard_http_fallback;
 use super::request_has_input_type;
 use super::request_has_model;
 use anyhow::Context;
@@ -13,7 +16,9 @@ use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_thread_store::AppendThreadItemsParams;
@@ -71,6 +76,82 @@ macro_rules! delegate_store_methods {
 }
 
 impl ThreadStore for GatedChildMetadataStore {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+        owner: codex_thread_store::ThreadWriterOwner,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.begin_native_authority_epoch_owned(epoch, owner)
+    }
+
+    fn create_thread_owned(
+        &self,
+        params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_thread_store::ThreadWriterOwner> {
+        self.inner.create_thread_owned(params)
+    }
+    fn resume_thread_owned(
+        &self,
+        params: ResumeThreadParams,
+        preparation: Option<codex_thread_store::ThreadStoreResumePreparation>,
+    ) -> ThreadStoreFuture<'_, (Arc<Vec<RolloutItem>>, codex_thread_store::ThreadWriterOwner)> {
+        Box::pin(async move {
+            assert!(
+                params.history_revision.is_some(),
+                "core must forward the revision"
+            );
+            let supplied = params.history.as_ref().expect("preloaded history");
+            let (unchanged, owner) = self
+                .inner
+                .resume_thread_owned(params.clone(), preparation)
+                .await?;
+            assert!(Arc::ptr_eq(supplied, &unchanged));
+            if params.thread_id != self.edited_child {
+                return Ok((unchanged, owner));
+            }
+
+            // Commit an edit after core preloads history, before its writer acquisition finishes.
+            let edit: ResponseItem = serde_json::from_value(json!({
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": LATE_EDIT}],
+            }))
+            .expect("late user message");
+            self.inner
+                .append_items(AppendThreadItemsParams {
+                    thread_id: params.thread_id,
+                    items: vec![RolloutItem::ResponseItem(edit.into())],
+                })
+                .await?;
+            self.inner
+                .finish_thread_owned(params.thread_id, owner, false)
+                .await?;
+            let (refreshed, owner) = self.inner.resume_thread_owned(params, None).await?;
+            assert!(!Arc::ptr_eq(&unchanged, &refreshed));
+            Ok((refreshed, owner))
+        })
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: codex_thread_store::ThreadWriterOwner,
+        discard: bool,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.finish_thread_owned(thread, owner, discard)
+    }
+
+    fn native_authority_storage(&self) -> Option<codex_thread_store::NativeAuthorityStorage> {
+        self.inner.native_authority_storage()
+    }
+
+    fn invalidate_native_authority_receipt(
+        &self,
+        thread: ThreadId,
+        fence: uuid::Uuid,
+    ) -> ThreadStoreFuture<'_, ()> {
+        self.inner
+            .invalidate_native_authority_receipt(thread, fence)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -80,6 +161,10 @@ impl ThreadStore for GatedChildMetadataStore {
     }
 
     delegate_store_methods! {
+        fn begin_native_authority_epoch(epoch: codex_thread_store::NativeAuthorityEpoch) -> ();
+        fn seal_native_authority_receipt(receipt: codex_thread_store::NativeAuthorityReceipt) -> bool;
+        fn read_native_authority_epoch(thread: ThreadId) -> Option<codex_thread_store::NativeAuthorityEpoch>;
+        fn read_native_authority_receipt(thread: ThreadId) -> Option<codex_thread_store::NativeAuthorityReceipt>;
         fn create_thread(params: CreateThreadParams) -> ();
         fn append_items(params: AppendThreadItemsParams) -> ();
         fn flush_thread(thread_id: ThreadId) -> ();
@@ -176,10 +261,21 @@ impl ThreadStore for GatedChildMetadataStore {
 async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_order() -> Result<()>
 {
     let server = start_mock_server().await;
+    mount_standard_http_fallback(&server).await;
     let initial_url = format!("{}/v1", server.uri());
     let initial = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &initial_url);
+            config
+                .permissions
+                .approval_policy
+                .set(AskForApproval::Never)
+                .expect("fixture approval mode");
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::read_only())
+                .expect("protect the real SQLite owner while preserving revision semantics");
             config
                 .features
                 .enable(Feature::Sqlite)
@@ -189,6 +285,10 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
         .build_with_auto_env(&server)
         .await?;
     let root = initial.session_configured.thread_id;
+    assert!(matches!(
+        initial.thread_store.native_authority_storage(),
+        Some(codex_thread_store::NativeAuthorityStorage::Local { .. })
+    ));
 
     for (name, prompt, call_id, task) in [
         ("alpha", "start alpha", "spawn-alpha", "alpha child task"),
@@ -214,7 +314,9 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
             sse(vec![ev_completed(&format!("{call_id}-child"))]),
         )
         .await;
-        initial.submit_turn(prompt).await?;
+        initial
+            .submit_turn_with_permission_profile(prompt, PermissionProfile::read_only())
+            .await?;
     }
 
     let subtree = initial
@@ -237,6 +339,27 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
         .await;
         child.flush_rollout().await?;
         child.shutdown_and_wait().await?;
+        let removed = initial
+            .thread_manager
+            .remove_thread(&child_id)
+            .await
+            .context("actual stopped SQLite child must be removed through its manager")?;
+        assert!(Arc::ptr_eq(&removed, &child));
+        assert_eq!(
+            child.config_snapshot().await.permission_profile,
+            PermissionProfile::read_only()
+        );
+        assert_eq!(
+            local_scope_descriptor(&child).await?,
+            local_scope_descriptor(&initial.codex).await?
+        );
+        let receipt = initial
+            .thread_store
+            .read_native_authority_receipt(child_id)
+            .await?
+            .context("actual protected SQLite child must seal before cold reconstruction")?;
+        assert_eq!(receipt.epoch.thread_id, child_id);
+        assert_eq!(receipt.epoch.parent_thread_id, Some(root));
     }
     initial.codex.flush_rollout().await?;
 
@@ -259,9 +382,19 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
     });
     let resume_url = format!("{}/v1", server.uri());
     let mut resume_builder = test_codex()
+        .with_cloud_config_bundle(managed_cold_provider_loader(&server)?)
         .with_thread_store(store)
         .with_config(move |config| {
             configure_multi_agent_v2_with_role(config, &resume_url);
+            config
+                .permissions
+                .approval_policy
+                .set(AskForApproval::Never)
+                .expect("fixture approval mode");
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::read_only())
+                .expect("the fresh caller must keep the SQLite owner protected");
             config
                 .features
                 .enable(Feature::Sqlite)
@@ -269,27 +402,35 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
             config.multi_agent_v2.max_concurrent_threads_per_session = 4;
         });
 
-    let (resumed, ()) = tokio::try_join!(resume_builder.restart(&server, &initial), async {
-        timeout(Duration::from_secs(10), async {
-            // Releasing nothing until all reads start makes a serial implementation fail.
-            let mut reads = Vec::new();
-            for _ in 0..3 {
-                reads.push(started.recv().await.context("child read started")?);
-            }
-            reads.sort_by_key(ToString::to_string);
-            assert_eq!(reads, ordered_children);
+    let initial_caller_scope = local_scope_descriptor(&initial.codex).await?;
+    let (resumed, ()) = tokio::try_join!(
+        resume_builder.restart_in_same_local_workspace(&server, &initial),
+        async {
+            timeout(Duration::from_secs(10), async {
+                // Releasing nothing until all reads start makes a serial implementation fail.
+                let mut reads = Vec::new();
+                for _ in 0..3 {
+                    reads.push(started.recv().await.context("child read started")?);
+                }
+                reads.sort_by_key(ToString::to_string);
+                assert_eq!(reads, ordered_children);
 
-            last_release.send(()).expect("release last child");
-            assert_eq!(completed.recv().await, Some(last));
-            failed_release.send(()).expect("release failed child");
-            assert_eq!(completed.recv().await, Some(failed));
-            first_release.send(()).expect("release first child");
-            assert_eq!(completed.recv().await, Some(first));
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .context("child metadata reads should overlap")?
-    })?;
+                last_release.send(()).expect("release last child");
+                assert_eq!(completed.recv().await, Some(last));
+                failed_release.send(()).expect("release failed child");
+                assert_eq!(completed.recv().await, Some(failed));
+                first_release.send(()).expect("release first child");
+                assert_eq!(completed.recv().await, Some(first));
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .context("child metadata reads should overlap")?
+        }
+    )?;
+    assert_eq!(
+        local_scope_descriptor(&resumed.codex).await?,
+        initial_caller_scope
+    );
 
     assert_eq!(resumed.thread_manager.list_thread_ids().await, vec![root]);
     for child_id in [last, failed] {
@@ -320,8 +461,18 @@ async fn cold_root_resume_overlaps_child_reads_and_applies_identities_in_graph_o
         sse(vec![ev_completed("restored-child-followup")]),
     )
     .await;
-    resumed.submit_turn("continue restored child").await?;
+    resumed
+        .submit_turn_with_permission_profile(
+            "continue restored child",
+            PermissionProfile::read_only(),
+        )
+        .await?;
     let child = resumed.thread_manager.get_thread(first).await?;
+    assert_eq!(
+        local_scope_descriptor(&resumed.codex).await?,
+        initial_caller_scope
+    );
+    assert_eq!(local_scope_descriptor(&child).await?, initial_caller_scope);
     wait_for_event(child.as_ref(), |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })

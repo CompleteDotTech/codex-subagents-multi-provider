@@ -2,7 +2,6 @@ use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
-use crate::session::Submission;
 use codex_guardian_reviewer::ReviewerRequest;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::CodexHarnessMetadata;
@@ -136,10 +135,10 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
 async fn test_review_session() -> (
     GuardianReviewSession,
     async_channel::Sender<Event>,
-    async_channel::Receiver<Submission>,
+    crate::session::SubmissionReceiver,
 ) {
     let (session, _turn, _rx) = crate::session::tests::make_session_and_context_with_rx().await;
-    let (tx_sub, rx_sub) = async_channel::bounded(4);
+    let (tx_sub, rx_sub) = crate::session::bounded_submission_channel(4);
     let (tx_event, rx_event) = async_channel::unbounded();
     let (_agent_status_tx, agent_status) = tokio::sync::watch::channel(AgentStatus::PendingInit);
     let reuse_key = GuardianReviewSessionReuseKey::from_spawn_config(

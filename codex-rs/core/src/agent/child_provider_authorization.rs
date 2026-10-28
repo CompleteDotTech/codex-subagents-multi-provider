@@ -1,0 +1,1402 @@
+//! Host-only, in-memory origin and single-use native launch authority.
+//!
+//! Issue15 adds durable records and reload verification. A model-visible config,
+//! source or UUID never creates an origin or a launch permit here.
+
+use crate::agent::control::LocalAgentRuntime;
+use crate::codex_thread::CodexThread;
+use crate::config::Config;
+use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::session::session::Session;
+use codex_config::child_provider::ChildProviderOriginBinding;
+use codex_config::child_provider::ChildProviderOriginRecord;
+use codex_config::child_provider::ChildProviderPolicy;
+use codex_config::child_provider::VerifiedChildProviderOrigin;
+use codex_history::InitialHistory;
+use codex_history::RolloutItem;
+use codex_protocol::ThreadId;
+use codex_protocol::error::AgentErrorContext;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use uuid::Uuid;
+
+#[derive(Default)]
+pub(crate) struct ChildProviderOrigins(Mutex<OriginState>);
+
+#[derive(Default)]
+struct OriginState {
+    records: HashMap<Uuid, ChildProviderOriginRecord>,
+    bindings: HashMap<ThreadId, ChildProviderOriginBinding>,
+    parents: HashMap<ThreadId, ThreadId>,
+}
+
+impl ChildProviderOrigins {
+    pub(crate) fn ownership_edges(&self) -> Vec<(ThreadId, ThreadId)> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .parents
+            .iter()
+            .map(|(child, parent)| (*child, *parent))
+            .collect()
+    }
+    pub(crate) fn parent(&self, thread: ThreadId) -> Option<ThreadId> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .parents
+            .get(&thread)
+            .copied()
+    }
+
+    pub(crate) fn verified(&self, thread: ThreadId) -> Option<VerifiedChildProviderOrigin> {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let binding = state.bindings.get(&thread)?;
+        VerifiedChildProviderOrigin::verify(state.records.get(&binding.origin_id)?, binding).ok()
+    }
+
+    /// Called only inside successful host thread registration, never from spawn input.
+    pub(crate) fn publish_root(&self, thread: ThreadId, provider: &str) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.parents.contains_key(&thread) {
+            return;
+        }
+        if state
+            .bindings
+            .get(&thread)
+            .is_some_and(|old| old.provider_id == provider)
+        {
+            return;
+        }
+        let record = ChildProviderOriginRecord {
+            origin_id: Uuid::now_v7(),
+            root_thread_id: thread,
+            provider_id: provider.to_owned(),
+        };
+        let binding = ChildProviderOriginBinding {
+            origin_id: record.origin_id,
+            root_thread_id: thread,
+            provider_id: provider.to_owned(),
+        };
+        state.records.insert(record.origin_id, record);
+        state.bindings.insert(thread, binding);
+    }
+
+    pub(crate) fn publish_child(
+        &self,
+        child: ThreadId,
+        parent: ThreadId,
+        origin: Option<VerifiedChildProviderOrigin>,
+    ) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.parents.insert(child, parent);
+        if let Some(origin) = origin {
+            // The permit captured this immutable record at authorized dispatch.
+            // A subsequent root update must not rewrite that accepted subtree.
+            state.bindings.insert(
+                child,
+                ChildProviderOriginBinding {
+                    origin_id: origin.origin_id(),
+                    root_thread_id: origin.root_thread_id(),
+                    provider_id: origin.provider_id().to_owned(),
+                },
+            );
+        }
+    }
+}
+
+/// Host-captured execution authority, distinct from top-level display/default roots.
+/// No Session/Thread is retained and no caller can deserialize or supply this scope.
+#[derive(Clone, PartialEq)]
+pub(crate) struct ChildProviderScope {
+    cwd: AbsolutePathBuf,
+    roots: Vec<AbsolutePathBuf>,
+    profile: PermissionProfile,
+    environments: Vec<(TurnEnvironmentSelection, Option<EnvironmentConfig>)>,
+}
+
+impl ChildProviderScope {
+    pub(crate) fn from_step(config: &Config, environments: &TurnEnvironmentSnapshot) -> Self {
+        Self::capture(config, /*settings*/ None, environments)
+    }
+
+    pub(crate) fn from_current(
+        config: &Config,
+        settings: &ThreadSettingsSnapshot,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> Self {
+        Self::capture(config, Some(settings), environments)
+    }
+
+    fn capture(
+        config: &Config,
+        settings: Option<&ThreadSettingsSnapshot>,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> Self {
+        let mut cwd = settings
+            .map(|settings| settings.cwd.clone())
+            .unwrap_or_else(|| config.cwd.clone());
+        let mut roots = settings
+            .and_then(|settings| settings.runtime_workspace_roots.clone())
+            .unwrap_or_else(|| config.workspace_roots.clone());
+        let mut profile = config.permissions.permission_profile().clone();
+        if let Some(local) = environments.local_selection() {
+            if let Ok(local_cwd) = local.cwd.to_abs_path() {
+                cwd = local_cwd;
+            }
+            roots = local
+                .workspace_roots
+                .iter()
+                .filter_map(|root| root.to_abs_path().ok())
+                .collect();
+            profile = if let Some(ready) = environments
+                .turn_environments()
+                .find(|environment| environment.selection.environment_id == local.environment_id)
+            {
+                ready.permission_profile_with_workspace_roots()
+            } else if let EnvironmentConfigState::Ready(owner) = &local.config {
+                owner
+                    .permission_profile
+                    .permission_profile()
+                    .clone()
+                    .materialize_project_roots_with_workspace_roots(&roots)
+            } else {
+                profile.materialize_project_roots_with_workspace_roots(&roots)
+            };
+        } else {
+            profile = profile.materialize_project_roots_with_workspace_roots(&roots);
+        }
+        let bindings = environments
+            .all_selections()
+            .into_iter()
+            .map(|selection| {
+                let ready = environments
+                    .turn_environments()
+                    .find(|environment| {
+                        environment.selection.environment_id == selection.environment_id
+                    })
+                    .map(|environment| environment.config().clone());
+                (selection, ready)
+            })
+            .collect();
+        Self {
+            cwd,
+            roots,
+            profile,
+            environments: bindings,
+        }
+    }
+}
+
+/// Config-only policy probe for managed-binding tests; executing paths use captured scopes.
+#[cfg(test)]
+pub(crate) fn current_policy(config: &Config) -> std::io::Result<ChildProviderPolicy> {
+    current_policy_in_scope(
+        config,
+        &ChildProviderScope {
+            cwd: config.cwd.clone(),
+            roots: config.workspace_roots.clone(),
+            profile: config.permissions.effective_permission_profile(),
+            environments: Vec::new(),
+        },
+    )
+}
+
+/// Re-establish trust using the actual captured executor's filesystem authority.
+pub(crate) fn current_policy_in_scope(
+    config: &Config,
+    scope: &ChildProviderScope,
+) -> std::io::Result<ChildProviderPolicy> {
+    // Retained layer snapshots cannot authorize new launches after the host
+    // observes a changed or suspended managed bundle.
+    let managed = config
+        .config_layer_stack
+        .cloud_config_binding()
+        .map(|binding| binding.read());
+    if managed
+        .as_ref()
+        .is_some_and(|guard| guard.status != codex_config::CloudConfigBundleBindingStatus::Current)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed child-provider policy is no longer current",
+        ));
+    }
+    let filesystem = scope.profile.file_system_sandbox_policy();
+    let writable = filesystem.get_writable_roots_with_cwd(scope.cwd.as_path());
+    let mut roots = scope.roots.clone();
+    roots.extend(writable.iter().map(|root| root.root.clone()));
+    roots.sort();
+    roots.dedup();
+    let protected = writable
+        .into_iter()
+        .flat_map(|root| root.read_only_subpaths)
+        .collect::<Vec<_>>();
+    ChildProviderPolicy::from_config_layers(
+        &config.config_layer_stack,
+        &scope.cwd,
+        &roots,
+        &protected,
+        &filesystem,
+    )
+}
+
+/// A host-captured in-memory ceiling, never a launch credential or durable record.
+/// Deliberately has no Debug/Serialize and holds no Session/Thread reference.
+#[derive(Clone)]
+pub(crate) struct RetainedAgentAuthority {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) config: Arc<Config>,
+    pub(crate) settings: ThreadSettingsSnapshot,
+    pub(crate) scope: ChildProviderScope,
+    pub(crate) source: SessionSource,
+    root_session_id: codex_protocol::SessionId,
+    model_authority: Option<String>,
+    registration_id: Uuid,
+    session_allocation: usize,
+}
+
+impl RetainedAgentAuthority {
+    pub(crate) fn registration_id(&self) -> Uuid {
+        self.registration_id
+    }
+
+    pub(crate) fn same_registration(&self, other: &Self) -> bool {
+        self.thread_id == other.thread_id
+            && self.registration_id == other.registration_id
+            && self.session_allocation == other.session_allocation
+    }
+
+    pub(crate) fn matches_session(&self, session: &Session) -> bool {
+        self.thread_id == session.thread_id
+            && self.registration_id == session.native_registration_id
+            && self.session_allocation == session as *const Session as usize
+    }
+
+    pub(crate) async fn capture(session: &Session, source: &SessionSource) -> Arc<Self> {
+        let (config, settings, environments) = session.native_agent_authority_snapshot().await;
+        let scope = ChildProviderScope::from_current(&config, &settings, &environments);
+        let session_allocation = session as *const Session as usize;
+        let registration_id = session.native_registration_id;
+        let model_authority = session
+            .services
+            .models_manager
+            .try_pinned_authority_model(&settings.model, &config.to_models_manager_config())
+            .as_ref()
+            .and_then(|model| durable::model_fingerprint(&config, model));
+        Arc::new(Self {
+            root_session_id: session.session_id(),
+            model_authority,
+            registration_id,
+            session_allocation,
+            thread_id: session.thread_id,
+            config,
+            settings,
+            scope,
+            source: source.clone(),
+        })
+    }
+}
+
+/// Fresh launch authority follows one actual caller allocation until final admission.
+/// Weak ownership avoids Config -> proof -> Session -> Config cycles.
+#[derive(Clone)]
+pub(crate) struct FreshChildCaller {
+    caller: Weak<CodexThread>,
+    registration_id: Uuid,
+    live: Arc<Mutex<bool>>,
+}
+
+impl FreshChildCaller {
+    pub(crate) async fn capture(session: &Session) -> Result<Self> {
+        let runtime = &session.services.local_agent_runtime;
+        let manager = runtime.upgrade()?;
+        let caller = manager.get_thread(session.thread_id).await?;
+        if !std::ptr::eq(caller.session.as_ref(), session) {
+            return Err(invalid(
+                "fresh child caller is no longer the registered runtime",
+            ));
+        }
+        let authority = runtime
+            .retained_authority(session.thread_id)
+            .filter(|authority| authority.matches_session(session))
+            .ok_or_else(|| invalid("fresh child caller registration is unavailable"))?;
+        let fence = Self {
+            caller: Arc::downgrade(&caller),
+            registration_id: authority.registration_id,
+            live: Arc::clone(&session.fresh_child_admission_live),
+        };
+        fence.check_current()?;
+        Ok(fence)
+    }
+
+    pub(crate) fn check_prepared(&self) -> std::result::Result<(), String> {
+        self.check_current().map_err(|error| error.to_string())
+    }
+
+    fn matches_registered(&self, registered: &Arc<CodexThread>) -> bool {
+        self.caller
+            .upgrade()
+            .is_some_and(|caller| Arc::ptr_eq(&caller, registered))
+    }
+
+    fn check_current(&self) -> Result<()> {
+        self.with_current(|| Ok(()))
+    }
+
+    fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let caller = self
+            .caller
+            .upgrade()
+            .ok_or_else(|| invalid("fresh child caller runtime is unavailable"))?;
+        // Revocation takes this same lock before stopping or removing this exact
+        // allocation. Keep it through the synchronous grant decision, never an await.
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| invalid("fresh child caller admission state is unavailable"))?;
+        let runtime = &caller.session.services.local_agent_runtime;
+        if runtime.shutdown.is_cancelled() {
+            return Err(
+                CodexErr::InvalidRequest("agent runtime is shutting down".to_owned())
+                    .with_agent_context(AgentErrorContext::RuntimeShutdown),
+            );
+        }
+        if !*live
+            || !caller.is_running()
+            || !Arc::ptr_eq(&self.live, &caller.session.fresh_child_admission_live)
+        {
+            return Err(invalid(
+                "fresh child caller stopped or changed before startup admission",
+            ));
+        }
+        // Explicit close can revoke the registry while this signal is still
+        // live. Hold Current/epoch validation through the same synchronous
+        // decision, ordered signal -> registry -> managed binding.
+        let result = runtime.with_fresh_caller(&caller.session, self.registration_id, admit);
+        drop(live);
+        result
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedChildAuthorization {
+    caller: ThreadId,
+    caller_fence: FreshChildCaller,
+    origins: Arc<ChildProviderOrigins>,
+    origin: Option<VerifiedChildProviderOrigin>,
+    full_history: bool,
+    role_name: Option<String>,
+    parent_settings: ThreadSettingsSnapshot,
+    parent_base: Arc<Config>,
+    execution_scope: ChildProviderScope,
+    approved: Arc<Config>,
+    consumed: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for PreparedChildAuthorization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedChildAuthorization")
+            .field("caller", &self.caller)
+            .field("full_history", &self.full_history)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PreparedChildAuthorization {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.consumed, &other.consumed)
+    }
+}
+
+impl PreparedChildAuthorization {
+    pub(crate) fn capture(
+        session: &Session,
+        config: &Config,
+        full_history: bool,
+        parent_authority: (Arc<Config>, ThreadSettingsSnapshot),
+        role_name: Option<String>,
+        execution_scope: ChildProviderScope,
+        caller_fence: FreshChildCaller,
+    ) -> Self {
+        debug_assert!(config.prepared_child_authorization.is_none());
+        let (parent_base, parent_settings) = parent_authority;
+        Self {
+            caller: session.thread_id,
+            caller_fence,
+            origins: Arc::clone(&session.services.local_agent_runtime.child_provider_origins),
+            origin: session
+                .services
+                .local_agent_runtime
+                .child_provider_origins
+                .verified(session.thread_id),
+            full_history,
+            role_name,
+            parent_settings,
+            parent_base,
+            execution_scope,
+            approved: Arc::new(config.clone()),
+            consumed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn role_name(&self) -> Option<String> {
+        self.role_name.clone()
+    }
+
+    pub(crate) async fn consume(
+        self,
+        runtime: &LocalAgentRuntime,
+        caller: ThreadId,
+        config: &Config,
+        full_history: bool,
+        source: &SessionSource,
+    ) -> Result<ChildLaunchPermit> {
+        if self.caller != caller
+            || self.full_history != full_history
+            || !Arc::ptr_eq(&self.origins, &runtime.child_provider_origins)
+            || self.approved.as_ref() != config
+        {
+            return Err(invalid("prepared child configuration or caller changed"));
+        }
+        let manager = runtime.upgrade()?;
+        let parent = manager.get_thread(caller).await?;
+        if !self.caller_fence.matches_registered(&parent) {
+            return Err(invalid(
+                "fresh child caller is no longer the prepared runtime",
+            ));
+        }
+        self.caller_fence.check_current()?;
+        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth,
+            agent_role,
+            agent_path,
+            ..
+        }) = source
+        else {
+            return Err(invalid("delegated source is not a native child"));
+        };
+        if *parent_thread_id != caller
+            || *depth != crate::agent::next_thread_spawn_depth(&parent.session_source)
+            || (parent.multi_agent_version() != Some(MultiAgentVersion::V2)
+                && crate::agent::exceeds_thread_spawn_depth_limit(*depth, config.agent_max_depth))
+            || agent_role != &self.role_name
+        {
+            return Err(invalid(
+                "child source changed its prepared parent, role, or depth",
+            ));
+        }
+        if let Some(path) = agent_path {
+            let expected_parent = parent
+                .session_source
+                .get_agent_path()
+                .unwrap_or_else(codex_protocol::AgentPath::root);
+            if path.as_str().rsplit_once('/').map(|(prefix, _)| prefix)
+                != Some(expected_parent.as_str())
+            {
+                return Err(invalid("child task path is outside its actual parent"));
+            }
+        }
+        let (current, settings, environments) =
+            parent.session.native_agent_authority_snapshot().await;
+        self.caller_fence.check_current()?;
+        if !Arc::ptr_eq(
+            &self.origins,
+            &parent
+                .session
+                .services
+                .local_agent_runtime
+                .child_provider_origins,
+        ) || settings != self.parent_settings
+            || current.as_ref() != self.parent_base.as_ref()
+            || self.origins.verified(caller) != self.origin
+        {
+            return Err(invalid("parent authority changed after child preparation"));
+        }
+        let scope = ChildProviderScope::from_current(&current, &settings, &environments);
+        if scope != self.execution_scope {
+            return Err(invalid(
+                "execution environment authority changed after child preparation",
+            ));
+        }
+        let policy = current_policy_in_scope(config, &scope)
+            .map_err(|_| invalid("current child policy cannot be established"))?;
+        policy
+            .authorize(&config.model_provider_id, self.origin.as_ref())
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        if self
+            .consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(invalid("prepared child authorization was already consumed"));
+        }
+        Ok(ChildLaunchPermit {
+            session_id: parent.session.session_id(),
+            caller,
+            origins: self.origins,
+            origin: self.origin,
+            approved: self.approved,
+            admission: NativeChildAdmission::for_fresh(&current, self.caller_fence),
+        })
+    }
+}
+
+/// Non-cloneable proof consumed by the lower native thread creation boundary.
+pub(crate) struct ChildLaunchPermit {
+    session_id: codex_protocol::SessionId,
+    caller: ThreadId,
+    origins: Arc<ChildProviderOrigins>,
+    origin: Option<VerifiedChildProviderOrigin>,
+    approved: Arc<Config>,
+    admission: NativeChildAdmission,
+}
+
+impl ChildLaunchPermit {
+    pub(crate) fn consume(
+        self,
+        runtime: &LocalAgentRuntime,
+        parent: Option<ThreadId>,
+        config: &Config,
+    ) -> Result<(
+        Option<VerifiedChildProviderOrigin>,
+        codex_protocol::SessionId,
+        NativeChildAdmission,
+    )> {
+        if parent != Some(self.caller)
+            || !Arc::ptr_eq(&self.origins, &runtime.child_provider_origins)
+            || self.approved.as_ref() != config
+        {
+            return Err(invalid(
+                "native child launch authority does not match its configuration",
+            ));
+        }
+        self.admission.check_current()?;
+        Ok((self.origin, self.session_id, self.admission))
+    }
+}
+
+/// Held only by an in-flight private operation, never Config or the registry.
+/// Completed host residency eviction preserves this exact registration; shutdown
+/// and explicit close do not. Registry phase and epoch remain live until admit.
+struct ResumeChildCaller {
+    caller: Arc<CodexThread>,
+    epoch: Arc<RetainedAgentAuthority>,
+}
+
+impl ResumeChildCaller {
+    fn check_current(&self) -> Result<()> {
+        self.with_current(|| Ok(()))
+    }
+
+    fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let live = self
+            .caller
+            .session
+            .fresh_child_admission_live
+            .lock()
+            .map_err(|_| invalid("private resume caller admission state is unavailable"))?;
+        let runtime = &self.caller.session.services.local_agent_runtime;
+        if runtime.shutdown.is_cancelled() {
+            return Err(
+                CodexErr::InvalidRequest("agent runtime is shutting down".to_owned())
+                    .with_agent_context(AgentErrorContext::RuntimeShutdown),
+            );
+        }
+        // Signal -> registry -> binding. The registry holds its epoch/phase lock
+        // through admit; no map lock, async guard, or registry reentry is allowed.
+        let result =
+            runtime.with_resume_caller(&self.epoch, *live && self.caller.is_running(), admit);
+        drop(live);
+        result
+    }
+}
+
+/// Opaque, non-cloneable continuation of a real native launch authorization.
+/// Config equality cannot freeze this live managed-policy binding.
+pub(crate) struct NativeChildAdmission {
+    caller_fence: Option<FreshChildCaller>,
+    resume_caller: Option<ResumeChildCaller>,
+    binding: Option<codex_config::CloudConfigBundleBinding>,
+    teardown_revisions: Vec<(ThreadId, u64)>,
+}
+
+impl NativeChildAdmission {
+    fn new(config: &Config) -> Self {
+        Self {
+            caller_fence: None,
+            resume_caller: None,
+            binding: config.config_layer_stack.cloud_config_binding().cloned(),
+            teardown_revisions: Vec::new(),
+        }
+    }
+
+    fn for_fresh(config: &Config, caller_fence: FreshChildCaller) -> Self {
+        Self {
+            caller_fence: Some(caller_fence),
+            ..Self::new(config)
+        }
+    }
+
+    fn for_resume(
+        config: &Config,
+        resume_caller: ResumeChildCaller,
+        teardown_revisions: Vec<(ThreadId, u64)>,
+    ) -> Self {
+        Self {
+            resume_caller: Some(resume_caller),
+            teardown_revisions,
+            ..Self::new(config)
+        }
+    }
+
+    pub(crate) fn check_current(&self) -> Result<()> {
+        let runtime = self
+            .caller_fence
+            .as_ref()
+            .and_then(|fence| fence.caller.upgrade())
+            .or_else(|| {
+                self.resume_caller
+                    .as_ref()
+                    .map(|fence| Arc::clone(&fence.caller))
+            });
+        if let Some(caller) = runtime {
+            let registry = &caller.session.services.local_agent_runtime;
+            if self
+                .teardown_revisions
+                .iter()
+                .any(|(id, revision)| registry.teardown_revision(*id) != *revision)
+            {
+                return Err(invalid("native target was closed during startup"));
+            }
+        }
+        match &self.caller_fence {
+            Some(caller) => caller.with_current(|| self.check_binding()),
+            None => match &self.resume_caller {
+                Some(caller) => caller.with_current(|| self.check_binding()),
+                None => self.check_binding(),
+            },
+        }
+    }
+
+    fn check_binding(&self) -> Result<()> {
+        let binding = self.binding.as_ref().map(|binding| binding.read());
+        if binding.as_ref().is_some_and(|guard| {
+            guard.status != codex_config::CloudConfigBundleBindingStatus::Current
+        }) {
+            return Err(invalid(
+                "managed native child policy was revoked before startup admission",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit(&self) -> Result<()> {
+        // For fresh launches the caller signal lock spans the epoch/liveness
+        // checks and managed binding read. Admission and exact-caller revocation
+        // therefore have a shared synchronous ordering after all startup awaits.
+        // Private resume carries its original caller epoch and allows only a
+        // registry-authenticated completed residency eviction of that same epoch.
+        self.check_current()
+    }
+
+    pub(crate) fn commit_registration<T>(
+        &self,
+        authority: Arc<RetainedAgentAuthority>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let (caller, epoch, allow_evicted) = if let Some(fence) = &self.caller_fence {
+            let caller = fence
+                .caller
+                .upgrade()
+                .ok_or_else(|| invalid("native startup caller is unavailable"))?;
+            let epoch = caller
+                .session
+                .services
+                .local_agent_runtime
+                .retained_authority(caller.session.thread_id)
+                .filter(|epoch| {
+                    epoch.registration_id() == fence.registration_id
+                        && epoch.matches_session(&caller.session)
+                })
+                .ok_or_else(|| invalid("native startup caller registration changed"))?;
+            (caller, epoch, false)
+        } else if let Some(fence) = &self.resume_caller {
+            (Arc::clone(&fence.caller), Arc::clone(&fence.epoch), true)
+        } else {
+            return Err(invalid("native startup has no caller continuation"));
+        };
+        let live = caller
+            .session
+            .fresh_child_admission_live
+            .lock()
+            .map_err(|_| invalid("native startup caller signal is unavailable"))?;
+        let runtime = &caller.session.services.local_agent_runtime;
+        if runtime.shutdown.is_cancelled() {
+            return Err(invalid("native runtime shut down during startup"));
+        }
+        runtime.commit_native_registration(
+            &epoch,
+            *live && caller.is_running(),
+            allow_evicted,
+            &self.teardown_revisions,
+            authority,
+            || {
+                let binding = self.binding.as_ref().map(|binding| binding.read());
+                if binding.as_ref().is_some_and(|guard| {
+                    guard.status != codex_config::CloudConfigBundleBindingStatus::Current
+                }) {
+                    return Err(invalid(
+                        "managed native child policy was revoked before registration",
+                    ));
+                }
+                let result = commit()?;
+                // The registry retains this guard through installation of the
+                // new epoch, not merely through the earlier status check.
+                Ok((result, binding))
+            },
+        )
+    }
+}
+
+/// Non-cloneable one-operation authorization for a host-read saved runtime.
+/// The caller Arc exists only while this operation is in flight, never in the registry.
+pub(crate) struct ChildResumePermit {
+    caller: Arc<CodexThread>,
+    caller_epoch: Arc<RetainedAgentAuthority>,
+    origins: Arc<ChildProviderOrigins>,
+    target: ThreadId,
+    teardown_revisions: Vec<(ThreadId, u64)>,
+    parent: Option<ThreadId>,
+    source: SessionSource,
+    history: Arc<Vec<RolloutItem>>,
+    history_revision: Option<String>,
+    rollout_path: Option<std::path::PathBuf>,
+    target_ceiling: Option<Arc<RetainedAgentAuthority>>,
+    origin: Option<VerifiedChildProviderOrigin>,
+    authorization_origin: Option<VerifiedChildProviderOrigin>,
+    cold_receipt: Option<(
+        codex_thread_store::NativeAuthorityStorage,
+        codex_thread_store::NativeAuthorityReceipt,
+    )>,
+    environment_selections: Option<Vec<TurnEnvironmentSelection>>,
+    inherited_scope: Option<ChildProviderScope>,
+    approved: Arc<Config>,
+}
+
+/// The existing lower-admission inputs, borrowed together for one permit consumption.
+/// This context carries no authorization and cannot mint or clone a permit.
+pub(crate) struct ChildResumeAdmissionContext<'a> {
+    pub(crate) runtime: &'a LocalAgentRuntime,
+    pub(crate) config: &'a Config,
+    pub(crate) history: &'a InitialHistory,
+    pub(crate) source: &'a SessionSource,
+    pub(crate) parent: Option<ThreadId>,
+    pub(crate) selections: &'a Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) inherited: Option<&'a TurnEnvironmentSnapshot>,
+}
+
+impl ChildResumePermit {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare(
+        runtime: &LocalAgentRuntime,
+        caller: Arc<CodexThread>,
+        caller_epoch: Arc<RetainedAgentAuthority>,
+        config: &mut Config,
+        history: &InitialHistory,
+        source: &SessionSource,
+        parent: Option<ThreadId>,
+        stored_permissions: &PermissionProfile,
+        stored_approval: AskForApproval,
+        version: MultiAgentVersion,
+        selections: &mut Option<Vec<TurnEnvironmentSelection>>,
+        inherited: Option<&TurnEnvironmentSnapshot>,
+    ) -> Result<Self> {
+        let InitialHistory::Resumed(prepared_history) = history else {
+            return Err(invalid("private reload requires host-read resumed history"));
+        };
+        let mut teardown_revisions = vec![(
+            prepared_history.conversation_id,
+            runtime.teardown_revision(prepared_history.conversation_id),
+        )];
+        if let Some(parent) = parent {
+            teardown_revisions.push((parent, runtime.teardown_revision(parent)));
+        }
+        let manager = runtime.upgrade()?;
+        let registered = manager.get_thread(caller.session.thread_id).await?;
+        if !Arc::ptr_eq(&registered, &caller)
+            || !caller.is_running()
+            || !Arc::ptr_eq(
+                &runtime.child_provider_origins,
+                &caller
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .child_provider_origins,
+            )
+        {
+            return Err(invalid(
+                "resume caller is not the actual loaded host runtime",
+            ));
+        }
+        let current =
+            RetainedAgentAuthority::capture(&caller.session, &caller.session_source).await;
+        if !current.same_registration(&caller_epoch)
+            || current.config.as_ref() != caller_epoch.config.as_ref()
+            || current.settings != caller_epoch.settings
+            || current.scope != caller_epoch.scope
+            || current.model_authority != caller_epoch.model_authority
+            || current.root_session_id != caller_epoch.root_session_id
+        {
+            return Err(invalid(
+                "resume caller authority changed during preparation",
+            ));
+        }
+        let InitialHistory::Resumed(saved) = history else {
+            return Err(invalid("private reload requires host-read resumed history"));
+        };
+        let meta = saved
+            .history
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::SessionMeta(meta) => Some(&meta.meta),
+                _ => None,
+            })
+            .ok_or_else(|| invalid("saved runtime has no host identity metadata"))?;
+        if meta.id != saved.conversation_id
+            || meta.session_id != caller.session.session_id()
+            || meta.parent_thread_id != parent
+            || source.parent_thread_id() != parent
+            || meta.model_provider.as_deref() != Some(config.model_provider_id.as_str())
+        {
+            return Err(invalid(&format!(
+                "saved runtime identity, provider or ownership is inconsistent (target={}, session={}, parent={}, source_parent={}, provider={})",
+                meta.id == saved.conversation_id,
+                meta.session_id == caller.session.session_id(),
+                meta.parent_thread_id == parent,
+                source.parent_thread_id() == parent,
+                meta.model_provider.as_deref() == Some(config.model_provider_id.as_str())
+            )));
+        }
+        let target = saved.conversation_id;
+        let ceiling = runtime.retained_authority(target);
+        if let Some(ceiling) = &ceiling {
+            if ceiling.root_session_id != caller.session.session_id()
+                || ceiling.root_session_id != meta.session_id
+            {
+                return Err(invalid("saved runtime belongs to another actual host root"));
+            }
+            if ceiling.thread_id != target
+                || ceiling.source != *source
+                || ceiling.config.model_provider_id != config.model_provider_id
+                || runtime.child_provider_origins.parent(target) != parent
+            {
+                return Err(invalid(
+                    "saved runtime differs from retained host ownership",
+                ));
+            }
+            // SQLite-less legacy metadata omits selected-model fields. Only the
+            // authenticated same-runtime target snapshot may fill that absence.
+            match config.model.as_deref() {
+                Some(model) if model != ceiling.settings.model => {
+                    return Err(invalid(
+                        "saved model differs from its retained actual selection",
+                    ));
+                }
+                None => config.model = Some(ceiling.settings.model.clone()),
+                Some(_) => {}
+            }
+            if ceiling.settings.approval_policy != current.settings.approval_policy
+                || ceiling.settings.approvals_reviewer != current.settings.approvals_reviewer
+            {
+                return Err(invalid(
+                    "saved approval authority requires explicit host reconfiguration",
+                ));
+            }
+            crate::agent::role::preserve_retained_role_restrictions(config, &ceiling.config)
+                .map_err(CodexErr::InvalidRequest)?;
+            config.permissions.allow_login_shell &= ceiling.config.permissions.allow_login_shell;
+            for feature in [
+                codex_features::Feature::ShellTool,
+                codex_features::Feature::Apps,
+                codex_features::Feature::Plugins,
+                codex_features::Feature::MemoryTool,
+                codex_features::Feature::RequestPermissionsTool,
+            ] {
+                if !ceiling.config.features.enabled(feature) {
+                    config.features.disable(feature).map_err(|_| {
+                        invalid("retained tool restriction conflicts with current policy")
+                    })?;
+                }
+            }
+        }
+
+        if stored_approval != current.settings.approval_policy {
+            return Err(invalid(
+                "stored approval mode differs from the current caller",
+            ));
+        }
+        let mut bounded = codex_protocol::intersect_effective_permission_profiles(
+            &current.scope.profile,
+            stored_permissions,
+            &config.cwd,
+        )
+        .map_err(|_| invalid("stored runtime permissions cannot be bounded safely"))?;
+        if let Some(ceiling) = &ceiling {
+            bounded = codex_protocol::intersect_effective_permission_profiles(
+                &ceiling.scope.profile,
+                &bounded,
+                &config.cwd,
+            )
+            .map_err(|error| {
+                invalid(&format!(
+                    "retained runtime permissions cannot be bounded safely: {error}"
+                ))
+            })?;
+        }
+        config
+            .permissions
+            .set_permission_profile(bounded)
+            .map_err(|_| invalid("bounded runtime permissions conflict with host policy"))?;
+        config
+            .permissions
+            .approval_policy
+            .set(current.settings.approval_policy)
+            .map_err(|_| invalid("bounded approval mode conflicts with host policy"))?;
+        config.approvals_reviewer = current.settings.approvals_reviewer;
+        if let Some(selections) = selections.as_mut() {
+            for selection in selections {
+                let EnvironmentConfigState::Ready(environment) = &mut selection.config else {
+                    // Pending and failed selections preserve their startup failure;
+                    // FromThread is bounded by the Config permission profile above.
+                    continue;
+                };
+                let cwd = selection.cwd.to_abs_path().map_err(|_| {
+                    invalid("saved executor permissions cannot be bounded on a non-local workspace")
+                })?;
+                let roots = selection
+                    .workspace_roots
+                    .iter()
+                    .map(codex_utils_path_uri::PathUri::to_abs_path)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|_| invalid("saved executor roots are not local absolute paths"))?;
+                let requested = environment
+                    .permission_profile
+                    .permission_profile()
+                    .clone()
+                    .materialize_project_roots_with_workspace_roots(&roots);
+                let bounded = codex_protocol::intersect_effective_permission_profiles(
+                    config.permissions.permission_profile(),
+                    &requested,
+                    &cwd,
+                )
+                .map_err(|_| invalid("saved executor permissions cannot be bounded safely"))?;
+                if inherited.is_some_and(|snapshot| {
+                    snapshot.turn_environments().any(|ready| {
+                        ready.selection.environment_id == selection.environment_id
+                            && ready.environment.is_remote()
+                    })
+                }) && bounded != requested
+                {
+                    return Err(invalid("saved remote executor authority changed"));
+                }
+                environment.permission_profile =
+                    crate::config::PermissionProfileSnapshot::legacy(bounded);
+                environment.allow_login_shell &= config.permissions.allow_login_shell;
+            }
+        }
+        // Current trusted host inputs authorize this operation. A retained Config
+        // is only a ceiling and never bypasses current managed/file/allowlist checks.
+        let policy = current_policy_in_scope(&current.config, &current.scope)
+            .map_err(|_| invalid("current resume policy cannot be established"))?;
+        let cold_receipt = if ceiling.is_none() {
+            let storage = manager
+                .native_authority_storage()
+                .ok_or_else(|| invalid("cold effective authority has no trusted host store"))?;
+            if !durable::protected_storage(&storage, &current.scope) {
+                return Err(invalid(
+                    "cold authority metadata is writable by the current executor",
+                ));
+            }
+            let receipt = manager
+                .read_native_authority_receipt(target)
+                .await?
+                .ok_or_else(|| invalid("cold effective authority is unsealed or unavailable"))?;
+            if receipt.epoch.thread_id != target {
+                return Err(invalid("cold authority receipt names another target"));
+            }
+            durable::verify_cold_lineage(
+                &manager,
+                &receipt,
+                caller.session.session_id().into(),
+                parent,
+            )
+            .await?;
+            if history
+                .get_dynamic_tools()
+                .is_some_and(|tools| !tools.is_empty())
+                || caller
+                    .session
+                    .services
+                    .client_mcp_extensions
+                    .iter()
+                    .next()
+                    .is_some()
+            {
+                return Err(invalid(
+                    "cold dynamic tool or extension authority is not supported",
+                ));
+            }
+            let exec = caller.session.services.exec_policy.current();
+            if !exec.rules().is_empty()
+                || !exec.network_rules().is_empty()
+                || !exec.host_executables().is_empty()
+            {
+                return Err(invalid(
+                    "cold custom execution-policy authority is not supported",
+                ));
+            }
+            Some((storage, receipt))
+        } else {
+            None
+        };
+        let origin = runtime.child_provider_origins.verified(target);
+        let caller_origin = runtime
+            .child_provider_origins
+            .verified(caller.session.thread_id);
+        let authorization_origin = origin
+            .as_ref()
+            .filter(|target_origin| {
+                caller_origin.as_ref().is_some_and(|caller_origin| {
+                    caller_origin.origin_id() == target_origin.origin_id()
+                        && caller_origin.root_thread_id() == target_origin.root_thread_id()
+                })
+            })
+            .cloned();
+        // Only a real same-host retained target may preserve its original-root
+        // legacy definition. A cold snapshot never manufactures this exemption.
+        let previous = ceiling.as_ref().filter(|ceiling| {
+            authorization_origin
+                .as_ref()
+                .is_some_and(|origin| origin.provider_id() == ceiling.config.model_provider_id)
+        });
+        let previous_id = previous
+            .map(|ceiling| ceiling.config.model_provider_id.as_str())
+            .unwrap_or(current.config.model_provider_id.as_str());
+        let previous_definition = previous
+            .map(|ceiling| &ceiling.config.model_provider)
+            .unwrap_or(&current.config.model_provider);
+        let model = config
+            .model
+            .as_deref()
+            .ok_or_else(|| invalid("saved runtime has no model"))?;
+        let resolved = policy
+            .resolve(codex_config::child_provider::ChildProviderRequest {
+                explicit_provider: Some(&config.model_provider_id),
+                role_provider: None,
+                parent_provider_id: previous_id,
+                parent_provider: previous_definition,
+                parent_model: model,
+                authorization_origin: authorization_origin.clone(),
+                explicit_model: Some(model),
+                role_model: None,
+                default_subagent_model: None,
+                full_history: false,
+                host_owned: false,
+            })
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        if ceiling
+            .as_ref()
+            .is_some_and(|ceiling| ceiling.config.model_provider != resolved.provider)
+        {
+            return Err(invalid("retained provider definition changed"));
+        }
+        config.model_provider = resolved.provider.clone();
+        config.model_provider_id = resolved.provider_id.clone();
+        config.model_catalog = if resolved.model_catalog_json.is_none() {
+            ceiling
+                .as_ref()
+                .and_then(|ceiling| ceiling.config.model_catalog.clone())
+        } else {
+            None
+        };
+        config.child_provider_policy = policy;
+        let effort = config.model_reasoning_effort.clone();
+        let manager = crate::agent::child_config::prepare_resolved_child_models(
+            &caller.session,
+            config,
+            &resolved,
+            /*requested_model*/ None,
+            effort.clone(),
+        )
+        .await
+        .map_err(CodexErr::InvalidRequest)?;
+        // A saved runtime restores its selected effort, including None meaning
+        // model default. Fresh-child provider defaults must not materialize it.
+        config.model_reasoning_effort = effort;
+        crate::agent::child_config::validate_resolved_child_model(
+            &manager, config, &resolved, version,
+        )
+        .await
+        .map_err(CodexErr::InvalidRequest)?;
+        if let Some(ceiling) = &ceiling {
+            let selected = manager
+                .try_pinned_authority_model(&resolved.model, &config.to_models_manager_config())
+                .as_ref()
+                .and_then(|model| durable::model_fingerprint(config, model));
+            if selected.is_none() || selected != ceiling.model_authority {
+                return Err(invalid(
+                    "saved selected model tool authority changed or is unavailable",
+                ));
+            }
+        }
+        if let Some(ceiling) = &ceiling {
+            let candidate_scope = durable::candidate_scope(config, selections.as_deref());
+            let access = durable::shell_environment_authority(config, &candidate_scope);
+            if access.is_none()
+                || access != durable::shell_environment_authority(&ceiling.config, &ceiling.scope)
+            {
+                return Err(invalid(
+                    "saved executor environment access changed or is unavailable",
+                ));
+            }
+        }
+        if let Some((storage, receipt)) = &cold_receipt {
+            let model = manager
+                .try_pinned_authority_model(&resolved.model, &config.to_models_manager_config())
+                .ok_or_else(|| invalid("cold selected model authority is not pinned"))?;
+            let candidate_scope = durable::candidate_scope(config, selections.as_deref());
+            if !durable::protected_storage(storage, &candidate_scope) {
+                return Err(invalid(
+                    "cold restored executor can write its authority metadata",
+                ));
+            }
+            let disabled = saved
+                .history
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    RolloutItem::TurnContext(context) => context.disabled_plugin_ids.clone(),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let fingerprint = durable::fingerprint(
+                config,
+                &candidate_scope,
+                &model,
+                &meta.selected_capability_roots,
+                &disabled,
+            )
+            .ok_or_else(|| invalid("cold effective authority cannot be reconstructed"))?;
+            if fingerprint != receipt.fingerprint {
+                return Err(invalid(
+                    "cold effective authority differs from its sealed host ceiling",
+                ));
+            }
+        }
+        ResumeChildCaller {
+            caller: Arc::clone(&caller),
+            epoch: Arc::clone(&caller_epoch),
+        }
+        .check_current()?;
+        Ok(Self {
+            caller,
+            caller_epoch,
+            origins: Arc::clone(&runtime.child_provider_origins),
+            target,
+            teardown_revisions,
+            parent,
+            source: source.clone(),
+            history: Arc::clone(&saved.history),
+            history_revision: saved.history_revision.clone(),
+            rollout_path: saved.rollout_path.clone(),
+            target_ceiling: ceiling,
+            cold_receipt,
+            origin,
+            authorization_origin,
+            environment_selections: selections.clone(),
+            inherited_scope: inherited
+                .map(|snapshot| ChildProviderScope::from_step(config, snapshot)),
+            approved: Arc::new(config.clone()),
+        })
+    }
+
+    pub(crate) async fn consume(
+        self,
+        context: ChildResumeAdmissionContext<'_>,
+    ) -> Result<(Option<VerifiedChildProviderOrigin>, NativeChildAdmission)> {
+        let ChildResumeAdmissionContext {
+            runtime,
+            config,
+            history,
+            source,
+            parent,
+            selections,
+            inherited,
+        } = context;
+        let InitialHistory::Resumed(saved) = history else {
+            return Err(invalid("reload history changed"));
+        };
+        if !Arc::ptr_eq(&self.origins, &runtime.child_provider_origins)
+            || self.target != saved.conversation_id
+            || self.parent != parent
+            || self.source != *source
+            || !Arc::ptr_eq(&self.history, &saved.history)
+            || self.history_revision != saved.history_revision
+            || self.rollout_path != saved.rollout_path
+            || self.approved.as_ref() != config
+            || self.origins.verified(self.target) != self.origin
+            || self.environment_selections != *selections
+            || self.inherited_scope
+                != inherited.map(|snapshot| ChildProviderScope::from_step(config, snapshot))
+        {
+            return Err(invalid(
+                "private resume permit does not match this runtime/history/config",
+            ));
+        }
+        let caller_fence = ResumeChildCaller {
+            caller: Arc::clone(&self.caller),
+            epoch: Arc::clone(&self.caller_epoch),
+        };
+        caller_fence.check_current()?;
+        let retained = runtime.retained_authority(self.target);
+        if match (&retained, &self.target_ceiling) {
+            (Some(current), Some(captured)) => !Arc::ptr_eq(current, captured),
+            (None, None) => false,
+            _ => true,
+        } {
+            return Err(invalid("target authority changed after resume preparation"));
+        }
+        if runtime
+            .retained_authority(self.caller.session.thread_id)
+            .is_none_or(|registered| {
+                registered.registration_id != self.caller_epoch.registration_id
+            })
+        {
+            return Err(invalid(
+                "actual caller runtime was replaced before admission",
+            ));
+        }
+        if let Some((storage, receipt)) = &self.cold_receipt {
+            let manager = runtime.upgrade()?;
+            if manager.native_authority_storage().as_ref() != Some(storage)
+                || !durable::protected_storage(storage, &self.caller_epoch.scope)
+                || manager
+                    .read_native_authority_receipt(self.target)
+                    .await?
+                    .as_ref()
+                    != Some(receipt)
+            {
+                return Err(invalid("sealed cold authority changed before admission"));
+            }
+            durable::verify_cold_lineage(
+                &manager,
+                receipt,
+                self.caller.session.session_id().into(),
+                self.parent,
+            )
+            .await?;
+        }
+        // This actual caller may have been evicted by our own residency reservation.
+        // Validate the held host Session epoch, never re-fetch an absent ancestor.
+        let current =
+            RetainedAgentAuthority::capture(&self.caller.session, &self.caller.session_source)
+                .await;
+        caller_fence.check_current()?;
+        if current.config.as_ref() != self.caller_epoch.config.as_ref()
+            || current.settings != self.caller_epoch.settings
+            || current.scope != self.caller_epoch.scope
+            || current.model_authority != self.caller_epoch.model_authority
+            || current.root_session_id != self.caller_epoch.root_session_id
+        {
+            return Err(invalid("resume caller authority changed before admission"));
+        }
+        current_policy_in_scope(&current.config, &current.scope)
+            .map_err(|_| invalid("current resume policy was revoked before admission"))?
+            .authorize(
+                &config.model_provider_id,
+                self.authorization_origin.as_ref(),
+            )
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        Ok((
+            self.origin,
+            NativeChildAdmission::for_resume(
+                &current.config,
+                caller_fence,
+                self.teardown_revisions,
+            ),
+        ))
+    }
+}
+
+pub(crate) fn invalid(message: &str) -> CodexErr {
+    CodexErr::InvalidRequest(format!("child_provider_policy_conflict: {message}"))
+}
+
+pub(crate) mod current;
+pub(crate) mod durable;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_reconfiguration_retains_old_descendant_origins() {
+        let store = ChildProviderOrigins::default();
+        let root = ThreadId::new();
+        let child = ThreadId::new();
+        let grandchild = ThreadId::new();
+        assert!(store.verified(root).is_none());
+        store.publish_root(root, "openai");
+        let original = store.verified(root).unwrap();
+        store.publish_root(root, "openai");
+        assert_eq!(store.verified(root), Some(original.clone()));
+        store.publish_child(child, root, Some(original.clone()));
+        store.publish_root(root, "zai");
+        assert_ne!(
+            store.verified(root).unwrap().origin_id(),
+            original.origin_id()
+        );
+        assert_eq!(store.verified(child), Some(original.clone()));
+        store.publish_child(grandchild, child, store.verified(child));
+        assert_eq!(store.verified(grandchild), Some(original));
+        // A child can never be promoted to a newly exempt root.
+        store.publish_root(child, "ollama");
+        assert_eq!(store.verified(child).unwrap().provider_id(), "openai");
+    }
+
+    #[test]
+    fn missing_or_mismatched_host_record_never_verifies_a_binding() {
+        let store = ChildProviderOrigins::default();
+        let root = ThreadId::new();
+        store.publish_root(root, "openai");
+        {
+            let mut state = store.0.lock().unwrap();
+            state.bindings.get_mut(&root).unwrap().provider_id = "zai".into();
+        }
+        assert!(store.verified(root).is_none());
+        let unbound = ThreadId::new();
+        store.publish_child(unbound, root, /*origin*/ None);
+        assert!(store.verified(unbound).is_none());
+    }
+}
