@@ -1719,6 +1719,12 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+    // Current root policy is checked before constructing tool/code-mode workers.
+    let tool_operation = crate::agent::child_provider_authorization::current::prepare_inference(
+        &sess,
+        &step_context,
+    )
+    .await?;
     let turn_context = Arc::clone(&step_context.turn);
     let preempt = step_context.preempt.clone().unwrap_or_default();
     let _input_watch = if let Some(preempt) = &step_context.preempt {
@@ -1730,11 +1736,17 @@ async fn run_sampling_request(
     };
     let base_instructions = sess.get_prompt_base_instructions().await;
 
+    if let Some(operation) = tool_operation.as_ref() {
+        operation.check()?;
+    }
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     );
+    if let Some(operation) = tool_operation.as_ref() {
+        operation.check()?;
+    }
     let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
@@ -2724,8 +2736,15 @@ async fn try_run_sampling_request(
     let mut request_token_usage = None;
     sess.set_server_reasoning_included(step_context.settings.model_info.use_responses_lite)
         .await;
+    // Hooks and other preparation awaits have completed. Capture one immutable
+    // operation fence; every lower retry/helper/fallback stage consults it.
+    let current_operation = crate::agent::child_provider_authorization::current::prepare_inference(
+        &sess,
+        &step_context,
+    )
+    .await?;
     let mut stream = match client_session
-        .stream(
+        .stream_guarded(
             prompt,
             &step_context.settings.model_info,
             &step_context.session_telemetry,
@@ -2734,6 +2753,7 @@ async fn try_run_sampling_request(
             step_context.settings.service_tier.clone(),
             responses_metadata,
             &inference_trace,
+            current_operation.as_ref(),
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)

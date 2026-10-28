@@ -1188,6 +1188,7 @@ async fn widen_native_fixture_executor(fixture: &Fixture) -> Result<()> {
     let host_file = fixture.home.path().join("config.toml");
     let catalog = fixture.home.path().join("catalog.json");
     let current = fixture.test.codex.environment_selections().await;
+    let current_config = fixture.test.codex.config().await;
     assert!(
         !current.is_empty(),
         "actual invoking environment is required"
@@ -1195,6 +1196,19 @@ async fn widen_native_fixture_executor(fixture: &Fixture) -> Result<()> {
     let requests = current
         .into_iter()
         .map(|mut selection| {
+            // Configured local selections normally inherit FromThread; they
+            // are not the active turn's resolved Ready environment snapshot.
+            if matches!(
+                selection.config,
+                codex_protocol::protocol::EnvironmentConfigState::FromThread
+            ) {
+                selection.config = codex_protocol::protocol::EnvironmentConfigState::Ready(
+                    core_test_support::test_codex::environment_config_for_selection(
+                        &current_config,
+                        &selection,
+                    ),
+                );
+            }
             let codex_protocol::protocol::EnvironmentConfigState::Ready(owner) =
                 &mut selection.config
             else {
@@ -1248,6 +1262,18 @@ async fn native_post_count(server: &MockServer) -> usize {
             request.method.as_str() == "POST" && request.url.path() == "/v1/responses"
         })
         .count()
+}
+
+fn native_advertises_exec_command(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            (object.get("type").and_then(Value::as_str) == Some("function")
+                && object.get("name").and_then(Value::as_str) == Some("exec_command"))
+                || object.values().any(native_advertises_exec_command)
+        }
+        Value::Array(values) => values.iter().any(native_advertises_exec_command),
+        _ => false,
+    }
 }
 
 async fn script_native_followup(server: &MockServer, target: codex_protocol::ThreadId) {
@@ -1380,6 +1406,12 @@ async fn native_loaded_followup_rechecks_policy_before_target_network(change: u8
 }
 
 fn native_continuation_exec_setup(config: &mut codex_core::config::Config) {
+    // TestCodex changes cwd after loading Config; bind both root projections to
+    // that owned workspace rather than retaining the loader's earlier cwd.
+    config.workspace_roots = vec![config.cwd.clone()];
+    config
+        .permissions
+        .set_workspace_roots(config.workspace_roots.clone());
     config
         .permissions
         .approval_policy
@@ -1387,7 +1419,14 @@ fn native_continuation_exec_setup(config: &mut codex_core::config::Config) {
         .unwrap();
     config
         .permissions
-        .set_permission_profile(codex_protocol::models::PermissionProfile::workspace_write())
+        .set_permission_profile(
+            codex_protocol::models::PermissionProfile::workspace_write_with(
+                &[],
+                codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                /*exclude_tmpdir_env_var*/ true,
+                /*exclude_slash_tmp*/ true,
+            ),
+        )
         .unwrap();
     config.features.enable(Feature::ShellTool).unwrap();
     for feature in [
@@ -1397,6 +1436,60 @@ fn native_continuation_exec_setup(config: &mut codex_core::config::Config) {
         Feature::CodeModeToolSearch,
     ] {
         config.features.disable(feature).unwrap();
+    }
+}
+
+fn assert_native_continuation_workspace(
+    fixture: &Fixture,
+    config: &codex_core::config::Config,
+    selections: &[codex_protocol::protocol::TurnEnvironmentSelection],
+) {
+    assert_eq!(config.cwd.as_path(), fixture.test.cwd.path());
+    assert_eq!(config.workspace_roots, vec![config.cwd.clone()]);
+    let expected = fixture.test.executor_environment().selection();
+    assert_eq!(selections.len(), 1, "one actual owned executor is required");
+    let selection = &selections[0];
+    assert_eq!(selection.environment_id, expected.environment_id);
+    assert_eq!(selection.cwd, expected.cwd);
+    assert_eq!(selection.workspace_roots, vec![expected.cwd.clone()]);
+    let owner = match &selection.config {
+        codex_protocol::protocol::EnvironmentConfigState::Ready(owner) => owner.clone(),
+        // Active selection readback preserves ownership as FromThread. This is an
+        // effective filesystem permission projection from the actual child defaults
+        // and selected roots, not readback of its full internal resolved config.
+        codex_protocol::protocol::EnvironmentConfigState::FromThread => {
+            core_test_support::test_codex::environment_config_for_selection(config, selection)
+        }
+        _ => panic!("selected executor configuration must be available"),
+    };
+    assert_eq!(owner.workspace_roots, selection.workspace_roots);
+    let filesystem = owner
+        .permission_profile
+        .permission_profile()
+        .clone()
+        .materialize_project_roots_with_path_uris(&owner.workspace_roots)
+        .file_system_sandbox_policy();
+    for name in [
+        "native-continuation-started",
+        "native-continuation-release",
+        "native-continuation-done",
+    ] {
+        assert!(
+            filesystem.can_write_local_path_with_cwd(
+                &fixture.test.cwd.path().join(name),
+                config.cwd.as_path()
+            ),
+            "actual selected executor roots must permit the owned continuation markers"
+        );
+    }
+    for path in [
+        fixture.home.path().join("config.toml"),
+        fixture.home.path().join("catalog.json"),
+    ] {
+        assert!(
+            !filesystem.can_write_local_path_with_cwd(&path, config.cwd.as_path()),
+            "the selected executor must not write host provider inputs"
+        );
     }
 }
 
@@ -1448,6 +1541,12 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     for path in [&started, &release, &done] {
         assert!(!path.exists());
     }
+    let config = fixture.test.codex.config().await;
+    assert_native_continuation_workspace(
+        &fixture,
+        &config,
+        &fixture.test.codex.environment_selections().await,
+    );
     let (cmd, shell) = native_owned_barrier_command(&started, &release, &done);
     let arguments = json!({"cmd":cmd,"shell":shell,"login":false,"tty":false,"yield_time_ms":10000,"timeout_ms":5000,"max_output_tokens":1000});
     Mock::given(method("POST"))
@@ -1481,11 +1580,72 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     let change_policy = async {
         tokio::time::timeout(Duration::from_secs(30), async {
             while !started.exists() {
+                let root_requests = fixture.root.received_requests().await.expect("root recording enabled");
+                for request in root_requests.iter().filter(|request| request.method.as_str() == "POST") {
+                    if let Some(output) = body(request)["input"].as_array().and_then(|items| items.iter().find(|item| {
+                        item["type"].as_str() == Some("function_call_output")
+                            && item["call_id"].as_str() == Some("continuation_worker")
+                    })) {
+                        let ids = fixture.test.thread_manager.list_thread_ids().await;
+                        if ids.iter().all(|id| *id == fixture.test.session_configured.thread_id) {
+                            anyhow::bail!("actual root spawn returned without a registered child; setup failure, not policy RED: {output}");
+                        }
+                    }
+                }
+                for id in fixture.test.thread_manager.list_thread_ids().await {
+                    if id == fixture.test.session_configured.thread_id {
+                        continue;
+                    }
+                    if let Ok(child) = fixture.test.thread_manager.get_thread(id).await {
+                        let status = child.agent_status().await;
+                        if matches!(
+                            status,
+                            codex_protocol::protocol::AgentStatus::Completed(_)
+                                | codex_protocol::protocol::AgentStatus::Errored(_)
+                        ) && !started.exists() {
+                            anyhow::bail!("registered child became terminal before the owned tool barrier; setup failure, not policy RED: {status:?}");
+                        }
+                    }
+                }
+                let requests = fixture.a.received_requests().await.expect("recording enabled");
+                if let Some(first) = requests.iter().find(|request| request.method.as_str() == "POST") {
+                    let tools = body(first)["tools"].clone();
+                    assert!(
+                        native_advertises_exec_command(&tools),
+                        "actual selected-provider request must advertise exec_command before the owned tool barrier: {tools}"
+                    );
+                }
+                for request in requests.iter().filter(|request| request.method.as_str() == "POST") {
+                    if let Some(output) = body(request)["input"].as_array().and_then(|items| items.iter().find(|item| {
+                        item["type"].as_str() == Some("function_call_output")
+                            && item["call_id"].as_str() == Some("native-owned-tool-call")
+                    })) {
+                        anyhow::bail!("owned exec_command returned before creating the barrier; setup failure, not policy RED: {output}");
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            Ok::<_, anyhow::Error>(())
         })
         .await
-        .expect("actual exec_command reaches owned barrier");
+        .expect("actual exec_command reaches owned barrier")?;
+        let children = fixture.children(1).await?;
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        let child_config = child.config().await;
+        assert_native_continuation_workspace(
+            &fixture,
+            &child_config,
+            &child.environment_selections().await,
+        );
+        assert_native_continuation_workspace(
+            &fixture,
+            &child_config,
+            &child
+                .active_turn_environment_selections()
+                .await
+                .expect("actual owned tool keeps the child turn active"),
+        );
         if change != 0 {
             revoke_native_fixture_a(fixture.home.path())?;
             let children = fixture.children(1).await?;
@@ -1518,15 +1678,29 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
         "done",
         "actual owned tool must succeed, never convert a missing executable or barrier timeout into policy RED"
     );
+    child.ensure_rollout_materialized().await;
+    child.flush_rollout().await?;
     let stored = child
         .read_thread(
-            /*include_archived*/ true, /*include_history*/ true,
+            /*include_archived*/ true, /*include_history*/ false,
         )
         .await?;
     let id = stored.thread_id;
-    let history = stored
-        .history
-        .expect("actual child history including tool result");
+    let history = fixture
+        .test
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
+            thread_id: id,
+            include_archived: true,
+        })
+        .await?;
+    assert_eq!(history.thread_id, id);
+    assert!(
+        matches!(history.items.first(), Some(codex_history::RolloutItem::SessionMeta(meta))
+            if meta.meta.id == id
+                && meta.meta.parent_thread_id == Some(fixture.test.session_configured.thread_id)),
+        "actual durable model context must identify this child and its owned parent"
+    );
     let successful_tool = history.items.iter().any(|item| {
         let codex_history::RolloutItem::ResponseItem(envelope) = item else { return false; };
         matches!(&envelope.item, codex_protocol::models::ResponseItem::FunctionCallOutput {

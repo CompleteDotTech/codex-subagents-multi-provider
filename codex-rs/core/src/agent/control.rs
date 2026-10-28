@@ -153,10 +153,29 @@ impl LocalAgentControl {
         input: Vec<UserInput>,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
+        self.send_input_to_thread_guarded(thread, input, start_options, None)
+            .await
+    }
+
+    async fn send_input_to_thread_guarded(
+        &self,
+        thread: &Arc<crate::CodexThread>,
+        input: Vec<UserInput>,
+        start_options: TurnStartOptions,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<String> {
+        if guard.is_some_and(|guard| !guard.matches_target(thread)) {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "input target allocation changed",
+            ));
+        }
         let state = self.runtime.upgrade()?;
         let agent_id = thread.session.thread_id;
         let result = match thread
-            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
+            .start_or_steer_turn_guarded(
+                TurnInputRequest::user_input(input).on_start(start_options),
+                guard,
+            )
             .await
         {
             Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok(turn_id),
@@ -287,6 +306,16 @@ impl LocalAgentControl {
         start_options: TurnStartOptions,
         expected: Option<&Arc<crate::CodexThread>>,
     ) -> CodexResult<String> {
+        let guard = if communication.trigger_turn {
+            crate::agent::child_provider_authorization::current::prepare_loaded(
+                &self.runtime,
+                agent_id,
+                context.sender_thread_id,
+            )
+            .await?
+        } else {
+            None
+        };
         let observers = state.extensions.message_lifecycle_contributors();
         let delivery = (!observers.is_empty()).then(|| {
             let message_id = communication
@@ -331,7 +360,26 @@ impl LocalAgentControl {
         } else {
             (None, None)
         };
-        let submitted = if let Some(expected) = expected {
+        let submitted = if let Some(guard) = guard.as_ref() {
+            if expected.is_some_and(|expected| !guard.matches_target(expected)) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "communication target allocation changed",
+                ));
+            }
+            state
+                .send_op_to_thread_guarded(
+                    guard.target(),
+                    Op::InterAgentCommunication {
+                        communication,
+                        start_options,
+                    },
+                    parent_turn_id,
+                    root_turn_id,
+                    delivery,
+                    Some(guard),
+                )
+                .await
+        } else if let Some(expected) = expected {
             state
                 .send_op_if_matches(
                     expected,

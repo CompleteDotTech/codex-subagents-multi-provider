@@ -119,6 +119,13 @@ impl Session {
             ) {
                 return ConfigRefreshOutcome::Stale;
             }
+            // Lock order: Session state -> publication revision -> managed
+            // binding. Admission takes revision -> registry -> managed binding.
+            // Neither path takes Session state while holding a revision fence.
+            let mut revision = self
+                .child_policy_revision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // User-only refreshes retain the current managed inputs and their
             // admission binding. Only MCP refreshes can publish a new policy.
             let policy_guard = matches!(scope, RuntimeConfigRefresh::Mcp)
@@ -177,7 +184,11 @@ impl Session {
                     .clone()
                     .with_mcp_ema_cancellation(cancellation);
             }
+            // Publication and request admission share this short synchronous fence.
+            // A stage already admitted may finish; subsequent stages must recheck.
             state.session_configuration.original_config_do_not_use = Arc::clone(&config);
+            *revision = revision.wrapping_add(1);
+            drop(revision);
             drop(policy_guard);
             if matches!(scope, RuntimeConfigRefresh::Mcp) {
                 self.services.mcp_runtime.invalidate_resource_caches();

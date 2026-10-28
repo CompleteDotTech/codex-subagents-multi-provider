@@ -279,6 +279,17 @@ impl LocalAgentRuntime {
         self.registry.with_resume_caller(authority, live, admit)
     }
 
+    pub(crate) fn with_current_native_operation<T>(
+        &self,
+        root: &crate::session::session::Session,
+        target: &crate::session::session::Session,
+        callers: &[&crate::session::session::Session],
+        admit: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        self.registry
+            .with_current_native_operation(root, target, callers, admit)
+    }
+
     pub(crate) fn retained_authority(
         &self,
         target: ThreadId,

@@ -317,6 +317,7 @@ pub struct ModelClientSession {
 /// Executes HTTP Responses requests without owning a turn's WebSocket state.
 pub(crate) struct ResponsesHttpExecutor<'a> {
     client: &'a ModelClient,
+    guard: Option<&'a crate::agent::child_provider_authorization::current::CurrentChildOperation>,
 }
 
 #[derive(Debug, Clone)]
@@ -1239,6 +1240,14 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self, routing: ClientRouting) -> Result<CurrentClientSetup> {
+        self.current_client_setup_guarded(routing, None).await
+    }
+
+    async fn current_client_setup_guarded(
+        &self,
+        routing: ClientRouting,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> Result<CurrentClientSetup> {
         // Capture before resolving credentials so an account switch during setup cannot label
         // an old connection with the new owner's revision.
         let auth_owner_generation = self.auth_owner_generation();
@@ -1249,7 +1258,9 @@ impl ModelClient {
             .map(|manager| manager.auth_change_receiver());
         loop {
             let revision = auth_changes.as_ref().map(|changes| *changes.borrow());
+            admit_child_stage(guard)?;
             let auth = self.state.provider.auth().await;
+            admit_child_stage(guard)?;
             let (api_provider, redirect_policy) = match routing {
                 ClientRouting::Workspace => {
                     let resolved = self
@@ -1264,6 +1275,7 @@ impl ModelClient {
                     ClientRedirectPolicy::Default,
                 ),
             };
+            admit_child_stage(guard)?;
             let resolved_auth = self
                 .state
                 .provider
@@ -1558,7 +1570,20 @@ impl ModelClientSession {
 
 impl<'a> ResponsesHttpExecutor<'a> {
     pub(crate) fn new(client: &'a ModelClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            guard: None,
+        }
+    }
+
+    fn with_guard(
+        mut self,
+        guard: Option<
+            &'a crate::agent::child_provider_authorization::current::CurrentChildOperation,
+        >,
+    ) -> Self {
+        self.guard = guard;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1756,6 +1781,7 @@ impl ModelClientSession {
                             &provider,
                             self.client.event_sender.as_ref(),
                             responses_metadata.turn_id.as_deref(),
+                            None,
                         )
                         .await?,
                     );
@@ -1908,7 +1934,7 @@ impl ResponsesHttpExecutor<'_> {
         loop {
             let client_setup = self
                 .client
-                .current_client_setup(ClientRouting::Workspace)
+                .current_client_setup_guarded(ClientRouting::Workspace, self.guard)
                 .await?;
             if expected_auth_owner.is_some_and(|owner| {
                 Some(owner) != client_setup.auth_owner_generation
@@ -2013,6 +2039,7 @@ impl ResponsesHttpExecutor<'_> {
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            admit_child_stage(self.guard)?;
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
@@ -2040,6 +2067,7 @@ impl ResponsesHttpExecutor<'_> {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
+                    admit_child_stage(self.guard)?;
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -2049,6 +2077,7 @@ impl ResponsesHttpExecutor<'_> {
                             &self.client.state.provider,
                             event_sender,
                             responses_metadata.turn_id.as_deref(),
+                            self.guard,
                         )
                         .await?,
                     );
@@ -2098,6 +2127,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
     ) -> Result<WebsocketStreamOutcome> {
         self.client.validate_catalog_metadata(model_info)?;
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
@@ -2112,7 +2142,7 @@ impl ModelClientSession {
         loop {
             let client_setup = self
                 .client
-                .current_client_setup(ClientRouting::Workspace)
+                .current_client_setup_guarded(ClientRouting::Workspace, guard)
                 .await?;
             let include_internal = self
                 .client
@@ -2160,6 +2190,7 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
+            admit_child_stage(guard)?;
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
@@ -2183,6 +2214,7 @@ impl ModelClientSession {
                 Err(ApiError::Transport(unauthorized_transport))
                     if provider.is_recoverable_auth_error(&unauthorized_transport) =>
                 {
+                    admit_child_stage(guard)?;
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -2192,6 +2224,7 @@ impl ModelClientSession {
                             &provider,
                             self.client.event_sender.as_ref(),
                             responses_metadata.turn_id.as_deref(),
+                            guard,
                         )
                         .await?,
                     );
@@ -2335,6 +2368,7 @@ impl ModelClientSession {
                     ),
                 ],
             );
+            admit_child_stage(guard)?;
             let stream_result = websocket_connection
                 .stream_request(
                     ws_request,
@@ -2455,6 +2489,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                None,
             )
             .await
         {
@@ -2497,6 +2532,34 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.stream_guarded(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            inference_trace,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_guarded(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> Result<ResponseStream> {
+        admit_child_stage(guard)?;
         self.client.validate_catalog_metadata(model_info)?;
         self.client.validate_responses_compatibility(
             prompt,
@@ -2520,17 +2583,20 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            guard,
                         )
                         .await?
                     {
                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
                         WebsocketStreamOutcome::FallbackToHttp => {
+                            admit_child_stage(guard)?;
                             self.try_switch_fallback_transport(session_telemetry, model_info);
                         }
                     }
                 }
 
                 ResponsesHttpExecutor::new(&self.client)
+                    .with_guard(guard)
                     .stream_responses_http(
                         &self.turn_state,
                         /*expected_auth_owner*/ None,
@@ -2920,6 +2986,7 @@ fn emit_auth_recovery_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_unauthorized(
     transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
@@ -2928,6 +2995,7 @@ async fn handle_unauthorized(
     provider: &SharedModelProvider,
     event_sender: Option<&Sender<ProtocolEvent>>,
     turn_id: Option<&str>,
+    guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);
     if !*provider_auth_recovery_attempted {
@@ -2942,6 +3010,7 @@ async fn handle_unauthorized(
                 EventMsg::AuthRecoveryStarted,
             );
         }
+        admit_child_stage(guard)?;
         match provider.recover_from_unauthorized().await {
             Ok(ProviderUnauthorizedRecovery::Recovered) => {
                 if let Some(messages) = messages {
@@ -2980,6 +3049,7 @@ async fn handle_unauthorized(
     {
         let mode = recovery.mode_name();
         let phase = recovery.step_name();
+        admit_child_stage(guard)?;
         return match recovery.next().await {
             Ok(step_result) => {
                 session_telemetry.record_auth_recovery(
@@ -3242,3 +3312,14 @@ impl WebsocketTelemetry for ApiTelemetry {
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+/// A pure decision for exactly one following helper or transport stage. No user
+/// callback, future poll, or I/O runs while publication/registry locks are held.
+fn admit_child_stage(
+    guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+) -> Result<()> {
+    if let Some(guard) = guard {
+        guard.check()?;
+    }
+    Ok(())
+}

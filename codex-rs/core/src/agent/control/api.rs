@@ -127,7 +127,20 @@ impl AgentControl for LocalAgentControl {
                     } else {
                         None
                     };
-                    let submission_id = self.send_input(target, input, start_options).await?;
+                    let guard = if receiver.is_some() {
+                        crate::agent::child_provider_authorization::current::prepare_loaded(
+                            &self.runtime,
+                            target,
+                            caller,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    let thread = self.runtime.upgrade()?.get_thread(target).await?;
+                    let submission_id = self
+                        .send_input_to_thread_guarded(&thread, input, start_options, guard.as_ref())
+                        .await?;
                     (receiver.unwrap_or_default(), submission_id)
                 }
                 AgentInput::Message { message, mode } => {

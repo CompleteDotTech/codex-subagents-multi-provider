@@ -1353,6 +1353,7 @@ pub(crate) fn invalid(message: &str) -> CodexErr {
     CodexErr::InvalidRequest(format!("child_provider_policy_conflict: {message}"))
 }
 
+pub(crate) mod current;
 pub(crate) mod durable;
 
 #[cfg(test)]

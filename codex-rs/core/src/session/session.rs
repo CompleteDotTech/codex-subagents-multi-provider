@@ -64,6 +64,7 @@ pub(crate) struct Session {
     pub(crate) native_registration_id: uuid::Uuid,
     /// Irrevocable, allocation-local fresh launch admission; never persisted.
     pub(crate) fresh_child_admission_live: Arc<std::sync::Mutex<bool>>,
+    pub(crate) child_policy_revision: std::sync::Mutex<u64>,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
@@ -1909,6 +1910,7 @@ impl Session {
             let sess = Arc::new(Session {
                 native_registration_id: uuid::Uuid::now_v7(),
                 fresh_child_admission_live: Arc::new(std::sync::Mutex::new(true)),
+                child_policy_revision: std::sync::Mutex::new(0),
                 thread_id,
                 installation_id,
                 tx_event: tx_event.clone(),

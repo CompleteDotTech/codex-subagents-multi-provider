@@ -410,7 +410,14 @@ impl LocalAgentControl {
         if owner_thread_id.is_none()
             && let Ok(thread) = state.get_thread(thread_id).await
         {
-            return self.runtime.pin_v2_residency(&state, &thread).await;
+            let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+            crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
+                Arc::clone(&thread),
+                Some(Arc::clone(&caller)),
+                None,
+            )
+            .await?;
+            return Ok(pin);
         }
         if self
             .runtime
@@ -469,7 +476,11 @@ impl LocalAgentControl {
             }
             if let Ok(thread) = state.get_thread(thread_id).await {
                 self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                return self.runtime.pin_v2_residency(&state, &thread).await;
+                let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+                crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
+                Arc::clone(&thread), Some(Arc::clone(&caller)), None,
+            ).await?;
+                return Ok(pin);
             }
         }
         let parent = if let Some(parent) = parent {
@@ -803,7 +814,11 @@ impl LocalAgentControl {
                     }
                     self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    return self.runtime.pin_v2_residency(&state, &thread).await;
+                    let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
+                    crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
+                Arc::clone(&thread), Some(Arc::clone(&caller)), None,
+            ).await?;
+                    return Ok(pin);
                 }
                 Err(err)
             }

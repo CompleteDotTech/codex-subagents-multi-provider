@@ -1134,6 +1134,29 @@ impl SessionIo {
         residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
         message_delivery: Option<crate::agent_communication::MessageDelivery>,
     ) -> CodexResult<String> {
+        self.submit_with_trace_guarded(
+            op,
+            trace,
+            parent_turn_id,
+            root_turn_id,
+            residency_guard,
+            message_delivery,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit_with_trace_guarded(
+        &self,
+        op: impl Into<WithTurnExtensionData<Op>>,
+        trace: Option<W3cTraceContext>,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+        residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        message_delivery: Option<crate::agent_communication::MessageDelivery>,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<String> {
         let id = new_submission_id();
         let WithTurnExtensionData {
             request: op,
@@ -1149,19 +1172,38 @@ impl SessionIo {
             residency_guard,
             message_delivery,
         };
-        self.submit_with_id(sub).await?;
+        self.submit_with_id_guarded(sub, guard).await?;
         Ok(id)
     }
 
     /// Use sparingly: prefer `submit()` so submission IDs are generated consistently.
-    pub(crate) async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
+    pub(crate) async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
+        self.submit_with_id_guarded(sub, None).await
+    }
+
+    pub(crate) async fn submit_with_id_guarded(
+        &self,
+        mut sub: Submission,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<()> {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
         }
-        self.tx_sub
-            .send(sub)
+        let permit = self
+            .tx_sub
+            .reserve()
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
+        if let Some(guard) = guard {
+            // Capacity has already been reserved. This callback only enqueues;
+            // it cannot wait, invoke hooks, or execute the submitted operation.
+            guard.with_current(|| {
+                permit.send(sub);
+                Ok(())
+            })?;
+        } else {
+            permit.send(sub);
+        }
         Ok(())
     }
 
@@ -1174,6 +1216,15 @@ impl SessionIo {
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        self.submit_turn_input_guarded(request, mode, None).await
+    }
+
+    pub(crate) async fn submit_turn_input_guarded(
+        &self,
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        mode: TurnInputMode,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<TurnInputSubmission> {
         let id = new_submission_id();
         let (reply_tx, reply_rx) = oneshot::channel();
         let WithTurnExtensionData {
@@ -1181,20 +1232,23 @@ impl SessionIo {
             turn_extension_init,
         } = request.into();
         let trace = request.trace.take();
-        self.submit_with_id(Submission {
-            id,
-            op: Op::TurnInput {
-                request: Box::new(request),
-                mode,
-                reply: reply_tx,
+        self.submit_with_id_guarded(
+            Submission {
+                id,
+                op: Op::TurnInput {
+                    request: Box::new(request),
+                    mode,
+                    reply: reply_tx,
+                },
+                trace,
+                turn_extension_init,
+                parent_turn_id: None,
+                root_turn_id: None,
+                residency_guard: None,
+                message_delivery: None,
             },
-            trace,
-            turn_extension_init,
-            parent_turn_id: None,
-            root_turn_id: None,
-            residency_guard: None,
-            message_delivery: None,
-        })
+            guard,
+        )
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
     }

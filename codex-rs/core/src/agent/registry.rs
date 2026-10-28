@@ -53,6 +53,9 @@ enum CallerPhase {
 
 struct RetainedAuthorityEntry {
     authority: Arc<RetainedAgentAuthority>,
+    // Captured only on NEW registration; same-registration refresh/eviction
+    // cannot attach a descendant to a replacement owner with the same ID.
+    parent_registration: Option<uuid::Uuid>,
     phase: CallerPhase,
 }
 
@@ -207,10 +210,17 @@ impl AgentRegistry {
             .teardown_revisions
             .entry(authority.thread_id)
             .or_default() += 1;
+        let parent_registration = authority.source.parent_thread_id().and_then(|parent| {
+            state
+                .retained_authority
+                .get(&parent)
+                .map(|entry| entry.authority.registration_id())
+        });
         state.retained_authority.insert(
             authority.thread_id,
             RetainedAuthorityEntry {
                 authority,
+                parent_registration,
                 phase: CallerPhase::Current,
             },
         );
@@ -232,10 +242,17 @@ impl AgentRegistry {
             return;
         }
         *state.teardown_revisions.entry(thread_id).or_default() += 1;
+        let parent_registration = authority.source.parent_thread_id().and_then(|parent| {
+            state
+                .retained_authority
+                .get(&parent)
+                .map(|entry| entry.authority.registration_id())
+        });
         state.retained_authority.insert(
             thread_id,
             RetainedAuthorityEntry {
                 authority,
+                parent_registration,
                 phase: CallerPhase::Current,
             },
         );
@@ -404,6 +421,75 @@ impl AgentRegistry {
         let result = admit();
         drop(state);
         result
+    }
+
+    /// One atomic decision over the canonical retained lineage. The callback is
+    /// synchronous and must not poll a future, do I/O, or reenter the registry.
+    pub(crate) fn with_current_native_operation<T>(
+        &self,
+        root: &crate::session::session::Session,
+        target: &crate::session::session::Session,
+        callers: &[&crate::session::session::Session],
+        admit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let state = self.active_agents.lock().map_err(|_| {
+            crate::agent::child_provider_authorization::invalid("operation registry is unavailable")
+        })?;
+        for session in std::iter::once(root)
+            .chain(std::iter::once(target))
+            .chain(callers.iter().copied())
+        {
+            if !state
+                .retained_authority
+                .get(&session.thread_id)
+                .is_some_and(|entry| {
+                    entry.phase == CallerPhase::Current && entry.authority.matches_session(session)
+                })
+            {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "operation registration was revoked or replaced",
+                ));
+            }
+        }
+        let mut cursor = target.thread_id;
+        let mut visited = HashSet::new();
+        while cursor != root.thread_id {
+            if !visited.insert(cursor) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "operation lineage contains a cycle",
+                ));
+            }
+            let entry = state.retained_authority.get(&cursor).ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid(
+                    "operation lineage is unavailable",
+                )
+            })?;
+            if !matches!(
+                entry.phase,
+                CallerPhase::Current | CallerPhase::CompletedResidencyEviction
+            ) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "operation lineage was revoked",
+                ));
+            }
+            let parent = entry.authority.source.parent_thread_id().ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid(
+                    "operation lineage has another root",
+                )
+            })?;
+            if !entry.parent_registration.is_some_and(|expected| {
+                state
+                    .retained_authority
+                    .get(&parent)
+                    .is_some_and(|parent| parent.authority.registration_id() == expected)
+            }) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "operation lineage owner registration changed",
+                ));
+            }
+            cursor = parent;
+        }
+        admit()
     }
 
     pub(crate) fn retained_authority(

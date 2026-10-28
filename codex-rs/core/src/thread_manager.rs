@@ -2068,6 +2068,34 @@ impl ThreadManagerState {
         root_turn_id: Option<String>,
         message_delivery: Option<crate::agent_communication::MessageDelivery>,
     ) -> CodexResult<String> {
+        self.send_op_to_thread_guarded(
+            thread,
+            op,
+            parent_turn_id,
+            root_turn_id,
+            message_delivery,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_op_to_thread_guarded(
+        &self,
+        thread: &Arc<CodexThread>,
+        op: Op,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+        message_delivery: Option<crate::agent_communication::MessageDelivery>,
+        guard: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    ) -> CodexResult<String> {
+        if let Some(guard) = guard {
+            if !guard.matches_target(thread) {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "submission target allocation changed",
+                ));
+            }
+        }
         let thread_id = thread.session.thread_id;
         let residency_guard = if matches!(op, Op::InterAgentCommunication { .. }) {
             thread
@@ -2087,13 +2115,14 @@ impl ThreadManagerState {
         }
         thread
             .io
-            .submit_with_trace(
+            .submit_with_trace_guarded(
                 op,
                 /*trace*/ None,
                 parent_turn_id,
                 root_turn_id,
                 residency_guard,
                 message_delivery,
+                guard,
             )
             .await
     }

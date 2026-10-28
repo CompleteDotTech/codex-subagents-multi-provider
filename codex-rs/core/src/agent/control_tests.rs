@@ -9396,6 +9396,9 @@ async fn loaded_custom_provider_resident(
     metadata.agent_id = Some(child.thread_id);
     reservation.commit(metadata);
     slot.commit(child.thread_id);
+    // An idle lower-start has not activated its speculative rollout yet.
+    // Materialize through the actual Session before the owner route reads it.
+    child.thread.ensure_rollout_materialized().await;
     child.thread.flush_rollout().await.unwrap();
     assert_eq!(
         child.thread.multi_agent_version(),
@@ -10373,4 +10376,428 @@ async fn legacy_custom_store_root_remains_supported_without_native_owned_writer_
     );
     assert!(store.inner.calls().await.shutdown_thread >= 1);
     assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+// Exercise the actual reserved-queue implementation with actual registered
+// sessions. A cloned SessionIo replaces only the queue with a bounded observed
+// queue, so no Core task can consume capacity before the publication barrier.
+#[test_case::test_case(false; "prepared operation queue unchanged positive")]
+#[test_case::test_case(true; "publication while queue capacity pending")]
+#[tokio::test]
+async fn loaded_operation_publication_between_check_and_enqueue(revoke: bool) {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    let catalog_file = home.path().join("loaded-a.json");
+    std::fs::write(
+        &host_file,
+        r#"
+model = "gpt-5.5"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "loaded-a.json"
+[model_providers.a]
+name = "Loaded custom fixture"
+base_url = "http://127.0.0.1:9/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+    )
+    .unwrap();
+    let mut info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .expect("real bundled model metadata");
+    info.slug = "shared-loaded".into();
+    info.multi_agent_version = Some(MultiAgentVersion::V2);
+    info.supports_search_tool = false;
+    info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    info.used_fallback_model_metadata = false;
+    std::fs::write(
+        &catalog_file,
+        serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+    )
+    .unwrap();
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(snapshot.binding);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "openai");
+    let target = loaded_custom_provider_resident(&harness, &parent).await;
+    let target_id = target.session.thread_id;
+    assert!(target.is_running());
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+
+    let guard = crate::agent::child_provider_authorization::current::prepare_loaded(
+        &harness.control.runtime,
+        target_id,
+        parent_id,
+    )
+    .await
+    .unwrap()
+    .expect("ordinary delegated target is guarded");
+    guard
+        .check()
+        .expect("prepared current helper stage is admitted");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut io = target.io.clone();
+    io.tx_sub = tx;
+    io.submit(Op::Interrupt).await.unwrap();
+    let submit =
+        io.submit_with_trace_guarded(Op::Interrupt, None, None, None, None, None, Some(&guard));
+    let mut submit = std::pin::pin!(submit);
+    assert!(
+        matches!(futures::poll!(submit.as_mut()), std::task::Poll::Pending),
+        "the actual guarded queue must wait for capacity after the initial policy check"
+    );
+    if revoke {
+        let mut value: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
+        value["agents"]["allowed_model_providers"] =
+            TomlValue::Array(vec![TomlValue::String("openai".into())]);
+        std::fs::write(&host_file, toml::to_string(&value).unwrap()).unwrap();
+        let next = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(harness.config.codex_home.to_path_buf())
+            .harness_overrides(crate::config::ConfigOverrides {
+                cwd: Some(project.path().to_path_buf()),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            parent
+                .refresh_runtime_config(parent.config().await, next)
+                .await,
+            crate::ConfigRefreshOutcome::Published
+        );
+    }
+    assert!(matches!(rx.recv().await.unwrap().op, Op::Interrupt));
+    let outcome = submit.await;
+    if revoke {
+        let error =
+            outcome.expect_err("a prepared operation cannot cross a completed policy publication");
+        assert!(loaded_fixture_policy_denial(&error.to_string()), "{error}");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the final admission must not enqueue the denied operation"
+        );
+        let mut later_stage_ran = false;
+        assert!(
+            guard
+                .with_current(|| {
+                    later_stage_ran = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(
+            !later_stage_ran,
+            "a later helper/retry/fallback stage cannot reuse the admitted earlier stage"
+        );
+    } else {
+        outcome.expect("an unchanged prepared operation can enqueue after the capacity wait");
+        assert!(matches!(rx.recv().await.unwrap().op, Op::Interrupt));
+        guard
+            .check()
+            .expect("later stages remain usable under unchanged policy");
+    }
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+    target.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&target_id).await;
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
+}
+
+async fn loaded_custom_provider_resident_nested(
+    harness: &AgentControlHarness,
+    parent: &Arc<CodexThread>,
+) -> Arc<CodexThread> {
+    let runtime = &harness.control.runtime;
+    let state = runtime.upgrade().unwrap();
+    let membership = runtime.admit_start().unwrap();
+    let slot = harness
+        .control
+        .reserve_v2_residency_slot(
+            &state,
+            &harness.config,
+            &membership,
+            /*protected_thread_id*/ None,
+        )
+        .await
+        .unwrap();
+    let turn = parent.session.new_default_turn().await;
+    let step = StepContext::for_test(turn);
+    let mut prepared = crate::agent::child_config::prepare_agent_spawn_config(
+        &parent.session,
+        &step,
+        crate::agent::child_config::SpawnConfigOptions {
+            resolved_provider: None,
+            model_provider: Some("a"),
+            version: crate::agent::child_config::SpawnConfigVersion::V2,
+            full_history_fork: false,
+            role_name: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .expect("real trusted custom-provider preparation")
+    .config;
+    assert_eq!(prepared.model_provider_id, "a");
+    let mut reservation = runtime.registry.reserve_spawn_slot(None).unwrap();
+    let (source, mut metadata) = harness
+        .control
+        .prepare_thread_spawn(
+            &mut reservation,
+            &prepared,
+            parent.session.thread_id,
+            next_thread_spawn_depth(&parent.session_source),
+            Some(
+                AgentPath::from_string(format!(
+                    "{}/nested_authority_target",
+                    parent.session_source.get_agent_path().unwrap().as_str()
+                ))
+                .unwrap(),
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+    let permit = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            runtime,
+            parent.session.thread_id,
+            &prepared,
+            /*full_history*/ false,
+            &source,
+        )
+        .await
+        .expect("consume actual prepared custom-provider proof");
+    let child = fresh_lifetime_lower_start(harness, parent, prepared, source, permit)
+        .await
+        .unwrap();
+    metadata.agent_id = Some(child.thread_id);
+    reservation.commit(metadata);
+    slot.commit(child.thread_id);
+    // An idle lower-start has not activated its speculative rollout yet.
+    // Materialize through the actual Session before the owner route reads it.
+    child.thread.ensure_rollout_materialized().await;
+    child.thread.flush_rollout().await.unwrap();
+    assert_eq!(
+        child.thread.multi_agent_version(),
+        Some(MultiAgentVersion::V2)
+    );
+    let stored = child.thread.read_thread(true, true).await.unwrap();
+    let history = stored
+        .history
+        .expect("actual lower-start persisted startup history");
+    assert!(history.items.iter().any(|item| matches!(item,
+        RolloutItem::SessionMeta(line) if line.meta.id == child.thread_id && line.meta.multi_agent_version == Some(MultiAgentVersion::V2)
+    )), "actual persisted V2 metadata required by owner-loaded path");
+    assert!(
+        runtime
+            .registry
+            .agent_metadata_for_thread(child.thread_id)
+            .is_some()
+    );
+    assert!(child.thread.session.active_turn.lock().await.is_none());
+    assert_eq!(child.thread.config_snapshot().await.model_provider_id, "a");
+    child.thread
+}
+
+#[tokio::test]
+async fn inference_lineage_keeps_eviction_but_rejects_replaced_intermediate_registration() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    let catalog_file = home.path().join("loaded-a.json");
+    std::fs::write(
+        &host_file,
+        r#"
+model = "gpt-5.5"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "loaded-a.json"
+[model_providers.a]
+name = "Loaded custom fixture"
+base_url = "http://127.0.0.1:9/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+    )
+    .unwrap();
+    let mut info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .expect("real bundled model metadata");
+    info.slug = "shared-loaded".into();
+    info.multi_agent_version = Some(MultiAgentVersion::V2);
+    info.supports_search_tool = false;
+    info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    info.used_fallback_model_metadata = false;
+    std::fs::write(
+        &catalog_file,
+        serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+    )
+    .unwrap();
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(snapshot.binding);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "openai");
+    let target = loaded_custom_provider_resident(&harness, &parent).await;
+    let target_id = target.session.thread_id;
+    assert!(target.is_running());
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+
+    let owner = target;
+    let owner_id = target_id;
+    let descendant = loaded_custom_provider_resident_nested(&harness, &owner).await;
+    let descendant_id = descendant.session.thread_id;
+    let runtime = &harness.control.runtime;
+    let check = || {
+        runtime.with_current_native_operation(&parent.session, &descendant.session, &[], || Ok(()))
+    };
+    check().expect("current canonical lineage is admitted");
+    let original = runtime.retained_authority(owner_id).unwrap();
+    runtime.register_authority(
+        crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
+            &owner.session,
+            &owner.session_source,
+        )
+        .await,
+    );
+    assert!(original.same_registration(&runtime.retained_authority(owner_id).unwrap()));
+    check().expect("same-registration snapshot refresh preserves the ownership binding");
+    let turn = owner.session.new_default_turn().await;
+    owner
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
+                turn_id: turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("owned intermediate completion".into()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(Arc::clone(&owner))
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Evicted
+    );
+    assert!(harness.manager.get_thread(owner_id).await.is_err());
+    assert!(descendant.is_running());
+    check().expect("completed own residency eviction preserves an active descendant");
+    harness
+        .control
+        .ensure_child_loaded(parent_id, owner_id)
+        .await
+        .expect("private owned resume creates the actual replacement registration");
+    let replacement = harness.manager.get_thread(owner_id).await.unwrap();
+    assert!(!Arc::ptr_eq(&owner, &replacement));
+    assert!(!original.same_registration(&runtime.retained_authority(owner_id).unwrap()));
+    assert!(Arc::ptr_eq(
+        &descendant,
+        &harness.manager.get_thread(descendant_id).await.unwrap()
+    ));
+    assert!(
+        descendant.is_running(),
+        "the old descendant remains the exact Current allocation for this denial"
+    );
+    let before = harness.manager.captured_ops().len();
+    let error = check()
+        .expect_err("a Current descendant cannot acquire a replacement owner by stable thread ID");
+    assert!(loaded_fixture_policy_denial(&error.to_string()), "{error}");
+    assert_eq!(
+        harness.manager.captured_ops().len(),
+        before,
+        "pure lineage denial performs no target submission/helper/network call"
+    );
+    descendant.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&descendant_id).await;
+    replacement.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&owner_id).await;
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
 }
