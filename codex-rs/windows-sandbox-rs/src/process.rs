@@ -111,6 +111,48 @@ pub unsafe fn create_process_as_user(
     console_mode: ConsoleMode,
     desktop: LaunchDesktop,
 ) -> Result<CreatedProcess> {
+    create_process_as_user_inner(
+        CreateRequest {
+            h_token,
+            argv,
+            cwd,
+            env_map,
+            logs_base_dir,
+            stdio,
+            console_mode,
+            desktop,
+        },
+        #[cfg(test)]
+        None,
+    )
+}
+
+struct CreateRequest<'a> {
+    h_token: HANDLE,
+    argv: &'a [String],
+    cwd: &'a Path,
+    env_map: &'a HashMap<String, String>,
+    logs_base_dir: Option<&'a Path>,
+    stdio: Option<(HANDLE, HANDLE, HANDLE)>,
+    console_mode: ConsoleMode,
+    desktop: LaunchDesktop,
+}
+
+// One native body; release callers cannot select any experiment mode.
+unsafe fn create_process_as_user_inner(
+    request: CreateRequest<'_>,
+    #[cfg(test)] experiment: Option<&crate::token::flag_experiment::Observation>,
+) -> Result<CreatedProcess> {
+    let CreateRequest {
+        h_token,
+        argv,
+        cwd,
+        env_map,
+        logs_base_dir,
+        stdio,
+        console_mode,
+        desktop,
+    } = request;
     let cmdline_str = argv_to_command_line(argv);
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
     let env_block = make_env_block(env_map);
@@ -165,6 +207,16 @@ pub unsafe fn create_process_as_user(
     si.lpAttributeList = attrs.as_mut_ptr();
 
     let creation_flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | console_flags;
+    #[cfg(test)]
+    let creation_flags = if experiment.is_some() {
+        anyhow::ensure!(
+            stdio.is_some(),
+            "flag observation requires the non-TTY pipe path"
+        );
+        creation_flags | windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+    } else {
+        creation_flags
+    };
     let ok = CreateProcessAsUserW(
         h_token,
         std::ptr::null(),
@@ -178,6 +230,15 @@ pub unsafe fn create_process_as_user(
         &si.StartupInfo,
         &mut pi,
     );
+    #[cfg(test)]
+    let mut experiment_child = if ok != 0 && experiment.is_some() {
+        Some(crate::token::flag_experiment::SuspendedChild::new(
+            pi,
+            Arc::clone(&job),
+        ))
+    } else {
+        None
+    };
     if ok == 0 {
         let err = GetLastError() as i32;
         let msg = format!(
@@ -192,6 +253,24 @@ pub unsafe fn create_process_as_user(
         );
         logging::debug_log(&msg, logs_base_dir);
         return Err(std::io::Error::from_raw_os_error(err)).context(msg);
+    }
+
+    #[cfg(test)]
+    if let Some(observer) = experiment {
+        let guard = experiment_child
+            .as_mut()
+            .expect("successful observed create has an owner");
+        // Convert a test observer unwind to Err so the existing pipe error path
+        // closes every pipe as well as the immediately installed child guard.
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.observe(h_token, pi.hProcess)?;
+            guard.resume_once()
+        }));
+        match observed {
+            Ok(result) => result?,
+            Err(_) => return Err(anyhow!("read-only test token observation unwound")),
+        }
+        guard.disarm();
     }
 
     Ok(CreatedProcess {
@@ -247,6 +326,50 @@ pub fn spawn_process_with_pipes(
     desktop: LaunchDesktop,
     logs_base_dir: Option<&Path>,
 ) -> Result<PipeSpawnHandles> {
+    spawn_process_with_pipes_inner(
+        PipeRequest {
+            h_token,
+            argv,
+            cwd,
+            env_map,
+            stdin_mode,
+            stderr_mode,
+            console_mode,
+            desktop,
+            logs_base_dir,
+        },
+        #[cfg(test)]
+        None,
+    )
+}
+
+pub(crate) struct PipeRequest<'a> {
+    pub(crate) h_token: BorrowedHandle<'a>,
+    pub(crate) argv: &'a [String],
+    pub(crate) cwd: &'a Path,
+    pub(crate) env_map: &'a HashMap<String, String>,
+    pub(crate) stdin_mode: StdinMode,
+    pub(crate) stderr_mode: StderrMode,
+    pub(crate) console_mode: ConsoleMode,
+    pub(crate) desktop: LaunchDesktop,
+    pub(crate) logs_base_dir: Option<&'a Path>,
+}
+
+pub(crate) fn spawn_process_with_pipes_inner(
+    request: PipeRequest<'_>,
+    #[cfg(test)] experiment: Option<&crate::token::flag_experiment::Observation>,
+) -> Result<PipeSpawnHandles> {
+    let PipeRequest {
+        h_token,
+        argv,
+        cwd,
+        env_map,
+        stdin_mode,
+        stderr_mode,
+        console_mode,
+        desktop,
+        logs_base_dir,
+    } = request;
     let mut in_r: HANDLE = std::ptr::null_mut();
     let mut in_w: HANDLE = std::ptr::null_mut();
     let mut out_r: HANDLE = std::ptr::null_mut();
@@ -280,15 +403,19 @@ pub fn spawn_process_with_pipes(
 
     let stdio = Some((in_r, out_w, stderr_handle));
     let spawn_result = unsafe {
-        create_process_as_user(
-            h_token.as_raw_handle(),
-            argv,
-            cwd,
-            env_map,
-            logs_base_dir,
-            stdio,
-            console_mode,
-            desktop,
+        create_process_as_user_inner(
+            CreateRequest {
+                h_token: h_token.as_raw_handle(),
+                argv,
+                cwd,
+                env_map,
+                logs_base_dir,
+                stdio,
+                console_mode,
+                desktop,
+            },
+            #[cfg(test)]
+            experiment,
         )
     };
     let created = match spawn_result {

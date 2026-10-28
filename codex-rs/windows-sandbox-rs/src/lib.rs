@@ -758,6 +758,8 @@ mod windows_impl {
             codex_home,
             cwd,
             capability_roots,
+            #[cfg(test)]
+            None,
         )?;
         allow_null_device_for_workspace_write(uses_write_capabilities);
         apply_legacy_session_acl_rules(

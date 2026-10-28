@@ -386,7 +386,13 @@ pub unsafe fn create_readonly_token_with_cap_from(
     base_token: HANDLE,
     psid_capability: *mut c_void,
 ) -> Result<(HANDLE, *mut c_void)> {
-    let new_token = create_token_with_caps_from(base_token, &[psid_capability], &[])?;
+    let new_token = create_token_with_caps_from(
+        base_token,
+        &[psid_capability],
+        &[],
+        #[cfg(test)]
+        None,
+    )?;
     Ok((new_token, psid_capability))
 }
 
@@ -398,7 +404,13 @@ pub unsafe fn create_workspace_write_token_with_caps_from(
     base_token: HANDLE,
     psid_capabilities: &[*mut c_void],
 ) -> Result<HANDLE> {
-    create_token_with_caps_from(base_token, psid_capabilities, &[])
+    create_token_with_caps_from(
+        base_token,
+        psid_capabilities,
+        &[],
+        #[cfg(test)]
+        None,
+    )
 }
 
 /// Create a restricted token that includes all provided capability SIDs, the token user SID, and
@@ -429,7 +441,13 @@ pub unsafe fn create_readonly_token_with_caps_from(
     base_token: HANDLE,
     psid_capabilities: &[*mut c_void],
 ) -> Result<HANDLE> {
-    create_token_with_caps_from(base_token, psid_capabilities, &[])
+    create_token_with_caps_from(
+        base_token,
+        psid_capabilities,
+        &[],
+        #[cfg(test)]
+        None,
+    )
 }
 
 /// Create a restricted token that includes all provided capability SIDs, the token user SID, and
@@ -462,13 +480,20 @@ unsafe fn create_token_with_caps_user_and_additional_restrictions_from(
     let mut extra_restricting_sids = Vec::with_capacity(additional_restricting_sids.len() + 1);
     extra_restricting_sids.push(psid_user);
     extra_restricting_sids.extend_from_slice(additional_restricting_sids);
-    create_token_with_caps_from(base_token, psid_capabilities, &extra_restricting_sids)
+    create_token_with_caps_from(
+        base_token,
+        psid_capabilities,
+        &extra_restricting_sids,
+        #[cfg(test)]
+        None,
+    )
 }
 
 unsafe fn create_token_with_caps_from(
     base_token: HANDLE,
     psid_capabilities: &[*mut c_void],
     extra_restricting_sids: &[*mut c_void],
+    #[cfg(test)] experiment: Option<flag_experiment::FlagMode>,
 ) -> Result<HANDLE> {
     if psid_capabilities.is_empty() {
         return Err(anyhow!("no capability SIDs provided"));
@@ -498,6 +523,11 @@ unsafe fn create_token_with_caps_from(
 
     let mut new_token: HANDLE = std::ptr::null_mut();
     let flags = DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED;
+    #[cfg(test)]
+    let flags = match experiment {
+        Some(flag_experiment::FlagMode::WithoutWriteRestricted) => flags & !WRITE_RESTRICTED,
+        Some(flag_experiment::FlagMode::Default) | None => flags,
+    };
     let ok = CreateRestrictedToken(
         base_token,
         flags,
@@ -522,6 +552,19 @@ unsafe fn create_token_with_caps_from(
         return Err(error);
     }
     Ok(new_token)
+}
+
+#[cfg(test)]
+#[path = "token_flag_experiment.rs"]
+pub(crate) mod flag_experiment;
+
+#[cfg(test)]
+pub(crate) unsafe fn create_workspace_write_token_for_flag_experiment(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+    mode: flag_experiment::FlagMode,
+) -> Result<HANDLE> {
+    create_token_with_caps_from(base_token, psid_capabilities, &[], Some(mode))
 }
 
 #[cfg(test)]

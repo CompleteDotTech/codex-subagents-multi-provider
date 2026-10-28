@@ -149,6 +149,7 @@ pub(crate) fn prepare_legacy_session_security(
     codex_home: &Path,
     cwd: &Path,
     capability_roots: impl IntoIterator<Item = PathBuf>,
+    #[cfg(test)] experiment: Option<crate::token::flag_experiment::FlagMode>,
 ) -> Result<LegacySessionSecurity> {
     let caps = load_or_create_cap_sids(codex_home)?;
     let (h_token, readonly_sid, readonly_sid_str, write_root_sids) = unsafe {
@@ -162,7 +163,17 @@ pub(crate) fn prepare_legacy_session_security(
                 .iter()
                 .map(|root| root.sid.as_ptr())
                 .collect();
+            #[cfg(not(test))]
             let h_token = create_workspace_write_token_with_caps_from(base, cap_ptrs.as_slice());
+            #[cfg(test)]
+            let h_token = match experiment {
+                Some(mode) => crate::token::create_workspace_write_token_for_flag_experiment(
+                    base,
+                    cap_ptrs.as_slice(),
+                    mode,
+                ),
+                None => create_workspace_write_token_with_caps_from(base, cap_ptrs.as_slice()),
+            };
             CloseHandle(base);
             let h_token = h_token?;
             (h_token, None, None, write_root_sids)

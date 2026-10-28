@@ -98,6 +98,8 @@ pub(crate) async fn spawn_windows_sandbox_session_with_desktop(
             request.tty,
             request.stdin_open,
             private_desktop_name,
+            #[cfg(test)]
+            None,
         )
         .await
     }
@@ -130,6 +132,8 @@ pub async fn spawn_windows_sandbox_session_legacy(
         tty,
         stdin_open,
         /*private_desktop_name*/ None,
+        #[cfg(test)]
+        None,
     )
     .await
 }

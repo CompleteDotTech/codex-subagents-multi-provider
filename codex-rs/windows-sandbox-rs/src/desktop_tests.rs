@@ -194,6 +194,8 @@ fn legacy_desktop_reuses_only_equivalent_permissions() -> Result<()> {
         &codex_home,
         &workspace,
         legacy_session_capability_roots(&permissions, &workspace, &env, &codex_home),
+        #[cfg(test)]
+        None,
     )?;
     let _token = unsafe { OwnedHandle::from_raw_handle(security.h_token as *mut _) };
     let desktop = |deny_write_paths| {

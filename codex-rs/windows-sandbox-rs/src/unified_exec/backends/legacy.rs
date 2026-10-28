@@ -9,7 +9,6 @@ use crate::process::ConsoleMode;
 use crate::process::StderrMode;
 use crate::process::StdinMode;
 use crate::process::read_handle_loop;
-use crate::process::spawn_process_with_pipes;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::spawn_prep::LegacyAclSids;
 use crate::spawn_prep::LegacySessionSecurity;
@@ -92,6 +91,7 @@ fn spawn_legacy_process(
     stderr_tx: Option<broadcast::Sender<Vec<u8>>>,
     writer_rx: mpsc::Receiver<Vec<u8>>,
     logs_base_dir: Option<&Path>,
+    #[cfg(test)] experiment: Option<&crate::token::flag_experiment::Observation>,
 ) -> Result<LegacyProcessHandles> {
     let h_token = security.h_token;
     // SAFETY: The caller keeps security.h_token open throughout this synchronous spawn.
@@ -122,20 +122,24 @@ fn spawn_legacy_process(
         );
         (pi, job, output_join, writer_handle, hpc, Some(conpty), None)
     } else {
-        let pipe_handles = spawn_process_with_pipes(
-            token,
-            command,
-            cwd,
-            env_map,
-            if stdin_open {
-                StdinMode::Open
-            } else {
-                StdinMode::Closed
+        let pipe_handles = crate::process::spawn_process_with_pipes_inner(
+            crate::process::PipeRequest {
+                h_token: token,
+                argv: command,
+                cwd,
+                env_map,
+                stdin_mode: if stdin_open {
+                    StdinMode::Open
+                } else {
+                    StdinMode::Closed
+                },
+                stderr_mode: StderrMode::Separate,
+                console_mode: ConsoleMode::NoWindow,
+                desktop: launch_desktop,
+                logs_base_dir,
             },
-            StderrMode::Separate,
-            ConsoleMode::NoWindow,
-            launch_desktop,
-            logs_base_dir,
+            #[cfg(test)]
+            experiment,
         )?;
         let stdout_join = spawn_output_reader(pipe_handles.stdout_read, stdout_tx);
         let Some(stderr_read) = pipe_handles.stderr_read else {
@@ -342,7 +346,12 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     tty: bool,
     stdin_open: bool,
     private_desktop_name: Option<String>,
+    #[cfg(test)] experiment: Option<Arc<crate::token::flag_experiment::Observation>>,
 ) -> Result<SpawnedProcess> {
+    #[cfg(test)]
+    if experiment.is_some() && (tty || stdin_open || private_desktop_name.is_some()) {
+        anyhow::bail!("flag experiment requires the original non-TTY closed-stdin desktop path");
+    }
     let common = prepare_legacy_spawn_context(
         permission_profile,
         workspace_roots,
@@ -378,6 +387,8 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         codex_home,
         cwd,
         capability_roots,
+        #[cfg(test)]
+        experiment.as_ref().map(|value| value.mode),
     )?;
     allow_null_device_for_workspace_write(common.uses_write_capabilities);
 
@@ -427,6 +438,8 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         stderr_rx.as_ref().map(|(tx, _rx)| tx.clone()),
         writer_rx,
         common.logs_base_dir.as_deref(),
+        #[cfg(test)]
+        experiment.as_deref(),
     ) {
         Ok(handles) => handles,
         Err(err) => {

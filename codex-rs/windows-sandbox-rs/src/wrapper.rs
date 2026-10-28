@@ -191,6 +191,8 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
                 codex_home,
                 command_cwd.as_path(),
                 capability_roots,
+                #[cfg(test)]
+                None,
             )?;
             let desktop_name = LaunchDesktop::shared_legacy_name(
                 &common.permissions,

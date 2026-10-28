@@ -912,3 +912,6 @@ fn run_inheriting_file_control(control: InheritingFileControl) {
         }
     });
 }
+
+#[path = "legacy_token_flag_diagnostics.rs"]
+mod token_flag_diagnostics;
