@@ -3441,8 +3441,11 @@ pub(crate) async fn exercise_current_http_boundary(
     revoke: bool,
 ) {
     use std::sync::atomic::AtomicUsize;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
     let server = MockServer::start().await;
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());

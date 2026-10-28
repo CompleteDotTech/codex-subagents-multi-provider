@@ -1,15 +1,19 @@
 //! A genuinely independent store using ONLY the public persistence protocol.
 //! No Local/InMemory forwarding, private module access or product test hooks.
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::{
-    EventMsg, SessionSource, ThreadHistoryMode, ThreadMemoryMode, UserMessageEvent,
-};
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_rollout::RolloutItem;
 use codex_thread_store::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, Notify};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 #[derive(Default)]
 struct Entry {
