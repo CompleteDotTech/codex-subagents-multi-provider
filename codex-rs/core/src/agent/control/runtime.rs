@@ -257,6 +257,7 @@ impl LocalAgentRuntime {
 
     pub(crate) fn commit_native_registration<T, G>(
         &self,
+        root: &crate::session::session::Session,
         caller: &crate::agent::child_provider_authorization::RetainedAgentAuthority,
         live: bool,
         allow_completed_eviction: bool,
@@ -265,6 +266,7 @@ impl LocalAgentRuntime {
         commit: impl FnOnce() -> CodexResult<(T, G)>,
     ) -> CodexResult<T> {
         self.registry.commit_native_registration(
+            root,
             caller,
             live,
             allow_completed_eviction,
@@ -283,14 +285,16 @@ impl LocalAgentRuntime {
 
     pub(crate) fn with_fresh_caller<T>(
         &self,
+        root: &crate::session::session::Session,
         caller: &crate::session::session::Session,
         registration_id: uuid::Uuid,
         admit: impl FnOnce() -> CodexResult<T>,
     ) -> CodexResult<T> {
         self.registry
-            .with_fresh_caller(caller, registration_id, admit)
+            .with_fresh_caller(root, caller, registration_id, admit)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_resume_caller<T>(
         &self,
         authority: &crate::agent::child_provider_authorization::RetainedAgentAuthority,
@@ -298,6 +302,17 @@ impl LocalAgentRuntime {
         admit: impl FnOnce() -> CodexResult<T>,
     ) -> CodexResult<T> {
         self.registry.with_resume_caller(authority, live, admit)
+    }
+
+    pub(crate) fn with_native_resume_caller<T>(
+        &self,
+        root: &crate::session::session::Session,
+        authority: &crate::agent::child_provider_authorization::RetainedAgentAuthority,
+        live: bool,
+        admit: impl FnOnce() -> CodexResult<T>,
+    ) -> CodexResult<T> {
+        self.registry
+            .with_native_resume_caller(root, authority, live, admit)
     }
 
     pub(crate) fn with_current_native_operation<T>(
