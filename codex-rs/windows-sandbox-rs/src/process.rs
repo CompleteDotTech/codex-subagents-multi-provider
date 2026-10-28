@@ -276,7 +276,11 @@ unsafe fn create_process_as_user_inner(
             guard
                 .abort_checked()
                 .map_err(anyhow::Error::new)
-                .context("test observation failed and owned cleanup was not confirmed")?;
+                .with_context(|| {
+                    format!(
+                        "owned cleanup was not confirmed; original observation error: {error:#}"
+                    )
+                })?;
             return Err(error);
         }
         guard.disarm();
