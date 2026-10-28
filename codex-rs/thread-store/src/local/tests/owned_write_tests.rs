@@ -202,19 +202,30 @@ async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMo
         .await
         .expect("distinguishable actual replacement metadata");
     replacement.flush().await.unwrap();
-    let before = replacement.read_thread(true, true).await.unwrap();
+    let before = replacement.read_thread(true, false).await.unwrap();
     assert_eq!(before.preview, "current replacement preview");
-    let history_before = serde_json::to_value(&before.history).unwrap();
+    // Read the entire actual owned rollout, including Paginated records; the
+    // metadata API deliberately rejects legacy full-history reads in that mode.
+    let (history_before, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+        .await
+        .unwrap();
+    let history_before = serde_json::to_value(&history_before).unwrap();
 
     // Retrying an old handle may reject its stale identity or safely no-op, but
     // must not write its retained patch before the exact owner check.
     let retry = old.shutdown().await;
-    let after = replacement.read_thread(true, true).await.unwrap();
-    let history_after = serde_json::to_value(&after.history).unwrap();
+    replacement.flush().await.unwrap();
+    let after = replacement.read_thread(true, false).await.unwrap();
+    let (history_after, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+        .await
+        .unwrap();
+    let history_after = serde_json::to_value(&history_after).unwrap();
     let usable = replacement.append_items(&[replacement_message]).await;
     let flushed = replacement.flush().await;
-    let saved = replacement.load_history(true).await.unwrap();
-    let usable_message_saved = serde_json::to_string(&saved.items)
+    let (saved, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+        .await
+        .unwrap();
+    let usable_message_saved = serde_json::to_string(&saved)
         .unwrap()
         .contains("replacement writer remains usable");
     // Close the actual replacement before asserting the captured regression,
