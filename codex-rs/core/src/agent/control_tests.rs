@@ -9194,11 +9194,12 @@ async fn post_admission_startup_cannot_escape_completed_subtree_shutdown(stage: 
     }
     assert!(
         outcome.is_err(),
-        "completed subtree teardown must reject independently awaited in-flight native startup"
+        "completed subtree teardown must reject independently awaited in-flight native startup: returned_success={} survivor_present={survivor_present} survivor_running={survivor_running}",
+        outcome.is_ok()
     );
     assert!(
         !survivor_present && !survivor_running,
-        "no admitted child may register or run after completed subtree teardown"
+        "no admitted child may register or run after completed subtree teardown: survivor_present={survivor_present} survivor_running={survivor_running}"
     );
     assert!(harness.manager.list_thread_ids().await.is_empty());
 }
