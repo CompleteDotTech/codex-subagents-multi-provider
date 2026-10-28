@@ -29,6 +29,8 @@ use std::sync::atomic::Ordering;
 pub(crate) struct AgentRegistry {
     active_agents: Mutex<ActiveAgents>,
     total_count: AtomicUsize,
+    #[cfg(test)]
+    graph_test_pauses: Mutex<[Option<Arc<GraphLifecyclePause>>; 3]>,
 }
 
 #[derive(Default)]
@@ -38,9 +40,17 @@ struct ActiveAgents {
     // Actual finalized/unloaded Session ceilings only; never serialized, printed,
     // or sufficient by themselves to authorize provider use.
     retained_authority: HashMap<ThreadId, RetainedAuthorityEntry>,
-    teardown_revisions: HashMap<ThreadId, u64>,
+    // Same canonical tombstone map: revocations advance revision; only a NEW
+    // actual registration changes generation. Neither disappears with residency.
+    lifecycles: HashMap<ThreadId, CanonicalRegistrationLifecycle>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
+}
+
+#[derive(Default)]
+struct CanonicalRegistrationLifecycle {
+    teardown_revision: u64,
+    registration_generation: Option<uuid::Uuid>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,22 +122,57 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
     depth > max_depth
 }
 
-/// Opaque observation produced by the SAME canonical revoke operation. It is
-/// graph ordering state, never provider authority or a persisted receipt.
+/// Explicit graph intent tied to the SAME canonical registration observed at
+/// revoke, not to the revocation revision. Same-registration teardown transfers
+/// this idempotent Closed obligation; only a new actual registration invalidates
+/// it. This is graph ordering state, never provider authority or a receipt.
 pub(crate) struct NativeGraphCloseStamp {
     root: ThreadId,
-    revision: u64,
+    registration_generation: Option<uuid::Uuid>,
+    retained_registration: Option<uuid::Uuid>,
+    explicit_intent: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum GraphLifecycleTestPoint {
+    BeforeExplicitCapture = 0,
+    AfterExplicitCapture = 1,
+    AfterOrdinaryCapture = 2,
+}
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct GraphLifecyclePause {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
 impl AgentRegistry {
+    #[cfg(test)]
+    pub(crate) fn pause_graph_at(
+        &self,
+        point: GraphLifecycleTestPoint,
+    ) -> Arc<GraphLifecyclePause> {
+        let pause = Arc::new(GraphLifecyclePause::default());
+        self.graph_test_pauses.lock().unwrap()[point as usize] = Some(pause.clone());
+        pause
+    }
+    #[cfg(test)]
+    pub(crate) async fn graph_test_pause(&self, point: GraphLifecycleTestPoint) {
+        let pause = self.graph_test_pauses.lock().unwrap()[point as usize].take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
     pub(crate) fn teardown_revision(&self, thread: ThreadId) -> u64 {
-        *self
-            .active_agents
+        self.active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .teardown_revisions
+            .lifecycles
             .get(&thread)
-            .unwrap_or(&0)
+            .map(|lifecycle| lifecycle.teardown_revision)
+            .unwrap_or(0)
     }
 
     /// Called with the manager map write guard held. Ownership edges remain
@@ -136,6 +181,7 @@ impl AgentRegistry {
         &self,
         root: ThreadId,
         edges: impl IntoIterator<Item = (ThreadId, ThreadId)>,
+        explicit_intent: bool,
     ) -> (HashSet<ThreadId>, NativeGraphCloseStamp) {
         let mut state = self
             .active_agents
@@ -162,7 +208,7 @@ impl AgentRegistry {
             }
         }
         for id in &closed {
-            *state.teardown_revisions.entry(*id).or_default() += 1;
+            state.lifecycles.entry(*id).or_default().teardown_revision += 1;
             if let Some(entry) = state.retained_authority.get_mut(id) {
                 entry.phase = CallerPhase::Revoked;
             }
@@ -172,7 +218,15 @@ impl AgentRegistry {
         }
         let stamp = NativeGraphCloseStamp {
             root,
-            revision: state.teardown_revisions.get(&root).copied().unwrap_or(0),
+            registration_generation: state
+                .lifecycles
+                .get(&root)
+                .and_then(|lifecycle| lifecycle.registration_generation),
+            retained_registration: state
+                .retained_authority
+                .get(&root)
+                .map(|entry| entry.authority.registration_id()),
+            explicit_intent,
         };
         (closed, stamp)
     }
@@ -206,7 +260,12 @@ impl AgentRegistry {
             });
         if !valid
             || revisions.iter().any(|(id, revision)| {
-                state.teardown_revisions.get(id).copied().unwrap_or(0) != *revision
+                state
+                    .lifecycles
+                    .get(id)
+                    .map(|lifecycle| lifecycle.teardown_revision)
+                    .unwrap_or(0)
+                    != *revision
             })
         {
             return Err(crate::agent::child_provider_authorization::invalid(
@@ -214,10 +273,16 @@ impl AgentRegistry {
             ));
         }
         let (result, policy_guard) = commit()?;
-        *state
-            .teardown_revisions
+        state
+            .lifecycles
             .entry(authority.thread_id)
-            .or_default() += 1;
+            .or_default()
+            .teardown_revision += 1;
+        state
+            .lifecycles
+            .entry(authority.thread_id)
+            .or_default()
+            .registration_generation = Some(authority.registration_id());
         state.retained_authority.insert(
             authority.thread_id,
             RetainedAuthorityEntry {
@@ -242,7 +307,16 @@ impl AgentRegistry {
             entry.authority = authority;
             return;
         }
-        *state.teardown_revisions.entry(thread_id).or_default() += 1;
+        state
+            .lifecycles
+            .entry(thread_id)
+            .or_default()
+            .teardown_revision += 1;
+        state
+            .lifecycles
+            .entry(thread_id)
+            .or_default()
+            .registration_generation = Some(authority.registration_id());
         state.retained_authority.insert(
             thread_id,
             RetainedAuthorityEntry {
@@ -302,24 +376,33 @@ impl AgentRegistry {
         };
         if entry.phase == CallerPhase::Current {
             entry.phase = CallerPhase::Revoked;
-            *state
-                .teardown_revisions
+            state
+                .lifecycles
                 .entry(session.thread_id)
-                .or_default() += 1;
+                .or_default()
+                .teardown_revision += 1;
         }
     }
 
     /// Explicit loaded or unloaded close sets a tombstone before its first await.
     pub(crate) fn revoke_caller(&self, thread_id: ThreadId) {
-        let _ = self.revoke_caller_stamped(thread_id);
+        let _ = self.revoke_caller_stamped(thread_id, false);
     }
 
-    pub(crate) fn revoke_caller_stamped(&self, thread_id: ThreadId) -> NativeGraphCloseStamp {
+    pub(crate) fn revoke_caller_stamped(
+        &self,
+        thread_id: ThreadId,
+        explicit_intent: bool,
+    ) -> NativeGraphCloseStamp {
         let mut state = self
             .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state.teardown_revisions.entry(thread_id).or_default() += 1;
+        state
+            .lifecycles
+            .entry(thread_id)
+            .or_default()
+            .teardown_revision += 1;
         if let Some(entry) = state.retained_authority.get_mut(&thread_id) {
             entry.phase = CallerPhase::Revoked;
         }
@@ -328,11 +411,15 @@ impl AgentRegistry {
         }
         NativeGraphCloseStamp {
             root: thread_id,
-            revision: state
-                .teardown_revisions
+            registration_generation: state
+                .lifecycles
                 .get(&thread_id)
-                .copied()
-                .unwrap_or(0),
+                .and_then(|lifecycle| lifecycle.registration_generation),
+            retained_registration: state
+                .retained_authority
+                .get(&thread_id)
+                .map(|entry| entry.authority.registration_id()),
+            explicit_intent,
         }
     }
 
@@ -349,17 +436,25 @@ impl AgentRegistry {
             })
     }
 
+    /// Even absent->absent must match the canonical registration tombstone. A
+    /// new registration followed by eviction cannot revive an old Closed write.
     pub(crate) fn graph_close_is_current(&self, stamp: &NativeGraphCloseStamp) -> bool {
-        self.active_agents
+        let state = self
+            .active_agents
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .teardown_revisions
-            .get(&stamp.root)
-            .copied()
-            .unwrap_or(0)
-            == stamp.revision
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stamp.explicit_intent
+            && state
+                .lifecycles
+                .get(&stamp.root)
+                .and_then(|lifecycle| lifecycle.registration_generation)
+                == stamp.registration_generation
+            && state
+                .retained_authority
+                .get(&stamp.root)
+                .map(|entry| entry.authority.registration_id())
+                == stamp.retained_registration
     }
-
     /// Called only after exact successful map removal. CAS cannot undo a close
     /// tombstone or attach a stale completion to a replacement registration.
     pub(crate) fn complete_residency_eviction(

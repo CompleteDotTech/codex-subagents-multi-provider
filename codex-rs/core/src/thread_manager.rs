@@ -2121,7 +2121,7 @@ impl ThreadManagerState {
         descendants: bool,
         unloaded: impl FnMut(ThreadId),
     ) -> Vec<(ThreadId, Arc<CodexThread>)> {
-        self.fence_native_subtree_with_graph_stamp(runtime, root, descendants, unloaded)
+        self.capture_native_shutdown(runtime, root, descendants, unloaded, false)
             .await
             .threads
     }
@@ -2131,7 +2131,19 @@ impl ThreadManagerState {
         runtime: &LocalAgentRuntime,
         root: ThreadId,
         descendants: bool,
+        unloaded: impl FnMut(ThreadId),
+    ) -> NativeShutdownCapture {
+        self.capture_native_shutdown(runtime, root, descendants, unloaded, true)
+            .await
+    }
+
+    async fn capture_native_shutdown(
+        &self,
+        runtime: &LocalAgentRuntime,
+        root: ThreadId,
+        descendants: bool,
         mut unloaded: impl FnMut(ThreadId),
+        explicit_graph_close: bool,
     ) -> NativeShutdownCapture {
         let threads = self.threads.write().await;
         let mut edges = runtime.child_provider_origins.ownership_edges();
@@ -2143,11 +2155,11 @@ impl ThreadManagerState {
         }));
         let root_allocation = threads.get(&root).cloned();
         let (closed, graph_stamp) = if descendants {
-            runtime.revoke_subtree_with_edges(root, edges)
+            runtime.revoke_subtree_with_edges(root, edges, explicit_graph_close)
         } else {
             (
                 std::collections::HashSet::from([root]),
-                runtime.revoke_single_caller(root),
+                runtime.revoke_single_caller(root, explicit_graph_close),
             )
         };
         for id in closed.iter().filter(|id| !threads.contains_key(id)) {
@@ -2167,19 +2179,22 @@ impl ThreadManagerState {
     }
 
     /// Manager map -> short canonical stamp check -> graph await with only map
-    /// write held. A new registration/close invalidates an obsolete close stamp.
+    /// write held. New registration invalidates old close intent; same-registration
+    /// teardown transfers that intent even after exact removal to absence.
     pub(crate) async fn persist_native_graph_closed(
         &self,
         runtime: &LocalAgentRuntime,
         capture: &NativeShutdownCapture,
     ) -> codex_agent_graph_store::AgentGraphStoreResult<()> {
         let threads = self.threads.write().await;
-        let same_root = match (&capture.root_allocation, threads.get(&capture.root)) {
+        // Absence after exact same-registration removal may inherit Closed;
+        // it is NEVER sufficient without the canonical generation check below.
+        let compatible_residency = match (&capture.root_allocation, threads.get(&capture.root)) {
             (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
-            (None, None) => true,
+            (None, None) | (Some(_), None) => true,
             _ => false,
         };
-        if !same_root
+        if !compatible_residency
             || !runtime
                 .registry
                 .graph_close_is_current(&capture.graph_stamp)

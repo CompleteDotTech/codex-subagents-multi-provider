@@ -46,11 +46,23 @@ impl LocalAgentControl {
     /// agent and any live descendants reached from the in-memory tree.
     pub(crate) async fn close_agent(&self, agent_id: ThreadId) -> CodexResult<AgentInfo> {
         self.runtime.registry.revoke_caller(agent_id);
+        #[cfg(test)]
+        self.runtime
+            .registry
+            .graph_test_pause(
+                crate::agent::registry::GraphLifecycleTestPoint::BeforeExplicitCapture,
+            )
+            .await;
         let state = self.runtime.upgrade()?;
         let metadata = self.get_agent_metadata(agent_id);
         let known_agent = metadata.is_some();
         let captured = self
             .capture_shutdown_with_graph_stamp(&state, agent_id, true)
+            .await;
+        #[cfg(test)]
+        self.runtime
+            .registry
+            .graph_test_pause(crate::agent::registry::GraphLifecycleTestPoint::AfterExplicitCapture)
             .await;
         let snapshot = match captured
             .threads
@@ -121,13 +133,19 @@ impl LocalAgentControl {
         agent_id: ThreadId,
         descendants: bool,
     ) -> Vec<(ThreadId, Arc<CodexThread>)> {
-        state
+        let captured = state
             .fence_native_subtree(&self.runtime, agent_id, descendants, |id| {
                 self.forget_v2_residency(id);
                 self.runtime.registry.release_spawned_thread(id);
                 self.runtime.mailboxes.remove(id);
             })
-            .await
+            .await;
+        #[cfg(test)]
+        self.runtime
+            .registry
+            .graph_test_pause(crate::agent::registry::GraphLifecycleTestPoint::AfterOrdinaryCapture)
+            .await;
+        captured
     }
 
     async fn capture_shutdown_with_graph_stamp(
