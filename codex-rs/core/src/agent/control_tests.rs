@@ -13107,3 +13107,306 @@ stream_idle_timeout_ms = 1000
         assert!(loaded_fixture_policy_denial(&error.to_string()), "{error}");
     }
 }
+
+async fn public_v1_cold_compat_resident(
+    harness: &AgentControlHarness,
+    parent: &Arc<CodexThread>,
+    selected: bool,
+) -> Arc<CodexThread> {
+    let runtime = &harness.control.runtime;
+    let state = runtime.upgrade().unwrap();
+    let membership = runtime.admit_start().unwrap();
+    let slot = harness
+        .control
+        .reserve_v2_residency_slot(
+            &state,
+            &harness.config,
+            &membership,
+            /*protected_thread_id*/ None,
+        )
+        .await
+        .unwrap();
+    let turn = parent.session.new_default_turn().await;
+    let step = StepContext::for_test(turn);
+    let mut prepared = crate::agent::child_config::prepare_agent_spawn_config(
+        &parent.session,
+        &step,
+        crate::agent::child_config::SpawnConfigOptions {
+            resolved_provider: None,
+            model_provider: selected.then_some("a"),
+            version: crate::agent::child_config::SpawnConfigVersion::V2,
+            full_history_fork: false,
+            role_name: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .expect("real trusted custom-provider preparation")
+    .config;
+    assert_eq!(
+        prepared.model_provider_id,
+        if selected { "a" } else { "openai" }
+    );
+    let mut reservation = runtime.registry.reserve_spawn_slot(None).unwrap();
+    let (source, mut metadata) = harness
+        .control
+        .prepare_thread_spawn(
+            &mut reservation,
+            &prepared,
+            parent.session.thread_id,
+            next_thread_spawn_depth(&parent.session_source),
+            Some(AgentPath::from_string("/root/public_v1_cold_compat_target".into()).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+    let permit = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            runtime,
+            parent.session.thread_id,
+            &prepared,
+            /*full_history*/ false,
+            &source,
+        )
+        .await
+        .expect("consume actual prepared custom-provider proof");
+    let child = fresh_lifetime_lower_start(harness, parent, prepared, source, permit)
+        .await
+        .unwrap();
+    metadata.agent_id = Some(child.thread_id);
+    reservation.commit(metadata);
+    slot.commit(child.thread_id);
+    // An idle lower-start has not activated its speculative rollout yet.
+    // Materialize through the actual Session before the owner route reads it.
+    child.thread.ensure_rollout_materialized().await;
+    child.thread.flush_rollout().await.unwrap();
+    assert_eq!(
+        child.thread.multi_agent_version(),
+        Some(MultiAgentVersion::V2)
+    );
+    let stored = child.thread.read_thread(true, true).await.unwrap();
+    let history = stored
+        .history
+        .expect("actual lower-start persisted startup history");
+    assert!(history.items.iter().any(|item| matches!(item,
+        RolloutItem::SessionMeta(line) if line.meta.id == child.thread_id && line.meta.multi_agent_version == Some(MultiAgentVersion::V2)
+    )), "actual persisted V2 metadata required by owner-loaded path");
+    assert!(
+        runtime
+            .registry
+            .agent_metadata_for_thread(child.thread_id)
+            .is_some()
+    );
+    assert!(child.thread.session.active_turn.lock().await.is_none());
+    assert_eq!(
+        child.thread.config_snapshot().await.model_provider_id,
+        if selected { "a" } else { "openai" }
+    );
+    child.thread
+}
+
+#[test_case::test_case(false; "ordinary V1 cold interrupt positive")]
+#[test_case::test_case(true; "selected V1 cold interrupt positive")]
+#[tokio::test]
+async fn public_v1_send_input_reloads_before_interrupt(selected: bool) {
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::handlers::multi_agents::SendInputHandler;
+    use crate::tools::registry::ToolExecutor;
+
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"cold-compat\",\"output\":[]}}\n\n"))
+        .mount(&server).await;
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    std::fs::write(
+        &host_file,
+        format!(
+            r#"
+openai_base_url = "{}/v1"
+model = "gpt-5.5"
+model_catalog_json = "root-v1.json"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "selected-v1.json"
+[model_providers.a]
+name = "V1 queue fixture"
+base_url = "{}/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+            server.uri(),
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let mut root_info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .unwrap();
+    root_info.multi_agent_version = Some(MultiAgentVersion::V2);
+    root_info.supports_search_tool = false;
+    root_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    root_info.used_fallback_model_metadata = false;
+    let mut selected_info = root_info.clone();
+    selected_info.slug = "shared-loaded".into();
+    for (file, info) in [
+        ("root-v1.json", root_info),
+        ("selected-v1.json", selected_info),
+    ] {
+        std::fs::write(
+            home.path().join(file),
+            serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+        )
+        .unwrap();
+    }
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut binding = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut binding);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(binding.binding);
+    // Use the config-aware production manager so the root's actual model is V1.
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    let state_db = init_state_db(&config).await;
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        Arc::new(LocalThreadStore::new(
+            LocalThreadStoreConfig {
+                codex_home: config.codex_home.to_path_buf(),
+                sqlite: codex_state::SqliteConfig::new_for_testing(config.codex_home.clone()),
+                default_model_provider_id: "openai".into(),
+            },
+            state_db.clone(),
+        )),
+        crate::thread_manager::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    )
+    .with_code_mode_session_provider(Arc::new(codex_code_mode::DisabledCodeModeSessionProvider));
+    let control = manager.agent_control();
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db,
+        manager,
+        control,
+    };
+    let (parent_id, parent) = harness.start_thread().await;
+    let original = public_v1_cold_compat_resident(&harness, &parent, selected).await;
+    let target_id = original.session.thread_id;
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(Arc::clone(&original))
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Evicted
+    );
+    assert!(harness.manager.get_thread(target_id).await.is_err());
+    assert!(
+        harness
+            .control
+            .runtime
+            .registry
+            .evicted_environments(target_id)
+            .is_some()
+    );
+    let before_ops = harness.manager.captured_ops().len();
+    let turn = parent.session.new_default_turn().await;
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let invocation = ToolInvocation {
+        session: Arc::clone(&parent.session), turn, step_context: step,
+        cancellation_token: CancellationToken::new(),
+        tracker: Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::default())),
+        call_id: "public-v1-cold-interrupt".into(),
+        tool_name: codex_tools::ToolName::namespaced(crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE, "send_input"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function { arguments: serde_json::json!({"target": target_id.to_string(), "message": "cold V1 interrupt compatibility", "interrupt": true}).to_string() },
+    };
+    let result = timeout(Duration::from_secs(10), SendInputHandler.handle(invocation))
+        .await
+        .expect("bounded actual cold V1 handler");
+    let loaded = harness.manager.get_thread(target_id).await.ok();
+    let interrupted = harness
+        .manager
+        .captured_ops()
+        .into_iter()
+        .skip(before_ops)
+        .filter(|entry| captured_op_matches(entry, &(target_id, Op::Interrupt)))
+        .count();
+    let mut reloaded = false;
+    if let Some(thread) = &loaded {
+        reloaded = !Arc::ptr_eq(thread, &original);
+        assert_eq!(
+            thread.config_snapshot().await.model_provider_id,
+            if selected { "a" } else { "openai" }
+        );
+        if result.is_ok() {
+            wait_for_recorded_user_message(thread.as_ref(), "cold V1 interrupt compatibility")
+                .await;
+        }
+        thread.shutdown_and_wait().await.unwrap();
+        harness.manager.remove_thread(&target_id).await;
+    }
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
+    eprintln!(
+        "V1_PUBLIC_COLD_INTERRUPT_OBSERVED selected={selected} reloaded={reloaded} interrupted={interrupted} accepted={} cleanup=complete",
+        result.is_ok()
+    );
+    assert!(
+        result.is_ok(),
+        "actual cold V1 interrupt must reload before interrupt"
+    );
+    assert!(reloaded, "actual evicted allocation must be replaced");
+    assert_eq!(
+        interrupted, 1,
+        "actual V1 interrupt dispatched once after reload"
+    );
+}

@@ -62,6 +62,21 @@ impl Handler {
         } else {
             turn.config.as_ref().clone()
         };
+        // V1 interrupt must still see a loaded target before shared delivery.
+        // Keep this pin through input acceptance, as on the original route.
+        let residency_pin = if receiver_agent.is_some() {
+            local_agent_control
+                .ensure_v2_agent_loaded(
+                    resume_config.clone(),
+                    receiver_thread_id,
+                    session.thread_id,
+                    /*parent*/ None,
+                )
+                .await
+                .map_err(|err| collab_agent_error(receiver_thread_id, err))?
+        } else {
+            None
+        };
         let receiver_agent = receiver_agent.unwrap_or_default();
         if args.interrupt {
             session
@@ -111,6 +126,7 @@ impl Handler {
             .await
             .map(|receipt| receipt.submission_id)
             .map_err(|err| collab_agent_error(receiver_thread_id, err));
+        drop(residency_pin);
         let status = local_agent_control.get_status(receiver_thread_id).await;
         session
             .emit_turn_item_completed(
