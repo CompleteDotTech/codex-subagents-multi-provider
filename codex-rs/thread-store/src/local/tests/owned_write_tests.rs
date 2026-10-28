@@ -353,13 +353,18 @@ impl ThreadStore for GatedWriterStore {
     }
 }
 
-async fn poll_writer_blocked<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+async fn poll_writer_blocked<F: std::future::Future>(
+    future: std::pin::Pin<&mut F>,
+    owner: &ThreadWriterOwner,
+) {
+    let observed = owner.watch_lease_wait();
     let mut future = future;
     std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
         std::task::Poll::Pending => std::task::Poll::Ready(()),
         std::task::Poll::Ready(_) => panic!("operation passed the held writer lease"),
     })
     .await;
+    observed.notified().await; // actual lock acquisition polled Pending, not an outer task/IO yield
 }
 
 #[tokio::test]
@@ -399,15 +404,6 @@ async fn owned_mutation_cancellation_drains_admitted_work_before_retirement() {
                 .await
         });
         gate.entered.notified().await; // actual adapter await, inside admitted lease
-        let mut never_admitted = Box::pin(live.update_metadata(
-            ThreadMetadataPatch {
-                preview: Some("cancelled before admission".into()),
-                ..Default::default()
-            },
-            true,
-        ));
-        poll_writer_blocked(never_admitted.as_mut()).await;
-        drop(never_admitted);
         let owner = store
             .inner
             .live_recorders
@@ -417,12 +413,25 @@ async fn owned_mutation_cancellation_drains_admitted_work_before_retirement() {
             .unwrap()
             .owner
             .clone();
-        let mut finish = Box::pin(store.inner.finish_thread_owned(thread, owner, false));
-        poll_writer_blocked(finish.as_mut()).await;
+        let mut never_admitted = Box::pin(live.update_metadata(
+            ThreadMetadataPatch {
+                preview: Some("cancelled before admission".into()),
+                ..Default::default()
+            },
+            true,
+        ));
+        poll_writer_blocked(never_admitted.as_mut(), &owner).await;
+        drop(never_admitted);
+        let mut finish = Box::pin(
+            store
+                .inner
+                .finish_thread_owned(thread, owner.clone(), false),
+        );
+        poll_writer_blocked(finish.as_mut(), &owner).await;
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
         // The outer waiter is gone; the actual admitted I/O still owns the lease.
-        poll_writer_blocked(finish.as_mut()).await;
+        poll_writer_blocked(finish.as_mut(), &owner).await;
         gate.release.notify_one();
         finish.await.unwrap();
         assert_eq!(
@@ -667,6 +676,15 @@ async fn owned_mutation_orders_active_single_and_batch_delete() {
                 .await
                 .unwrap();
             survivor.persist(PersistContext::Standard).await.unwrap();
+            let owner = store
+                .inner
+                .live_recorders
+                .lock()
+                .await
+                .get(&thread)
+                .unwrap()
+                .owner
+                .clone();
             gate.armed.store(true, Ordering::SeqCst);
             let writer = live.clone();
             let write = tokio::spawn(async move {
@@ -696,7 +714,7 @@ async fn owned_mutation_orders_active_single_and_batch_delete() {
                         .await
                 }
             });
-            poll_writer_blocked(delete.as_mut()).await;
+            poll_writer_blocked(delete.as_mut(), &owner).await;
             gate.release.notify_one();
             write.await.unwrap().unwrap();
             delete.await.unwrap();
@@ -750,6 +768,7 @@ async fn owned_mutation_orders_active_single_and_batch_delete() {
 }
 
 struct GatedMemoryWriterStore {
+    owner: tokio::sync::Mutex<Option<ThreadWriterOwner>>,
     inner: InMemoryThreadStore,
     gate: Arc<WriterMetadataGate>,
 }
@@ -765,7 +784,13 @@ impl ThreadStore for GatedMemoryWriterStore {
         &self,
         params: CreateThreadParams,
     ) -> ThreadStoreFuture<'_, ThreadWriterOwner> {
-        <InMemoryThreadStore as ThreadStore>::create_thread_owned(&self.inner, params)
+        Box::pin(async move {
+            let owner =
+                <InMemoryThreadStore as ThreadStore>::create_thread_owned(&self.inner, params)
+                    .await?;
+            *self.owner.lock().await = Some(owner.clone());
+            Ok(owner)
+        })
     }
     fn resume_thread(
         &self,
@@ -864,6 +889,7 @@ async fn owned_memory_mutation_orders_legacy_overwrite_and_delete() {
         for action in 0..5 {
             let gate = Arc::new(WriterMetadataGate::default());
             let store = Arc::new(GatedMemoryWriterStore {
+                owner: tokio::sync::Mutex::new(None),
                 inner: InMemoryThreadStore::default(),
                 gate: gate.clone(),
             });
@@ -874,6 +900,7 @@ async fn owned_memory_mutation_orders_legacy_overwrite_and_delete() {
             live.append_items(&[user_message_item("saved original")])
                 .await
                 .unwrap();
+            let owner = store.owner.lock().await.clone().unwrap();
             store.inner.omit_metadata_update_result_for_testing();
             gate.armed.store(true, Ordering::SeqCst);
             let writer = live.clone();
@@ -928,7 +955,7 @@ async fn owned_memory_mutation_orders_legacy_overwrite_and_delete() {
                     }
                 }
             });
-            poll_writer_blocked(lifecycle.as_mut()).await;
+            poll_writer_blocked(lifecycle.as_mut(), &owner).await;
             gate.release.notify_one();
             assert_eq!(write.await.unwrap().unwrap().preview, "admitted memory");
             lifecycle.await.unwrap();
@@ -1034,7 +1061,7 @@ async fn owned_finish_failure_keeps_closing_writer_until_exact_retry() {
     conflicting.generation = uuid::Uuid::now_v7();
     // Actual authority generation CAS mismatch makes provisional teardown fail.
     store
-        .begin_native_authority_epoch(conflicting)
+        .begin_native_authority_epoch(conflicting.clone())
         .await
         .unwrap();
     assert!(guard.discard().await.is_err());
@@ -1056,6 +1083,63 @@ async fn owned_finish_failure_keeps_closing_writer_until_exact_retry() {
         .await
         .is_err()
     );
+    let retained = serde_json::to_value(
+        <InMemoryThreadStore as ThreadStore>::load_history(
+            store.as_ref(),
+            LoadThreadHistoryParams {
+                thread_id: thread,
+                include_archived: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items,
+    )
+    .unwrap();
+    assert!(store.shutdown_thread(thread).await.is_err());
+    assert!(store.discard_thread(thread).await.is_err());
+    assert!(
+        LiveThread::resume_owned(
+            store.clone(),
+            ThreadHistoryMode::Legacy,
+            ResumeThreadParams {
+                thread_id: thread,
+                rollout_path: None,
+                history: None,
+                history_revision: None,
+                include_archived: true,
+                metadata: thread_metadata(),
+            },
+            None
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        store
+            .read_native_authority_epoch(thread)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        conflicting.generation
+    );
+    assert_eq!(
+        serde_json::to_value(
+            <InMemoryThreadStore as ThreadStore>::load_history(
+                store.as_ref(),
+                LoadThreadHistoryParams {
+                    thread_id: thread,
+                    include_archived: true
+                }
+            )
+            .await
+            .unwrap()
+            .items
+        )
+        .unwrap(),
+        retained
+    );
     store.begin_native_authority_epoch(first).await.unwrap();
     guard.discard().await.unwrap();
     let replacement = LiveThread::create_owned(store.clone(), create_thread_params(thread))
@@ -1072,6 +1156,7 @@ async fn owned_finish_failure_keeps_closing_writer_until_exact_retry() {
 async fn owned_operation_panic_after_real_commit_fails_closed() {
     let gate = Arc::new(WriterMetadataGate::default());
     let store = Arc::new(GatedMemoryWriterStore {
+        owner: tokio::sync::Mutex::new(None),
         inner: InMemoryThreadStore::default(),
         gate: gate.clone(),
     });
@@ -1161,6 +1246,15 @@ async fn owned_local_mutation_orders_legacy_shutdown_and_discard() {
             .unwrap();
             live.persist(PersistContext::Standard).await.unwrap();
             let path = store.inner.live_rollout_path(thread).await.unwrap();
+            let owner = store
+                .inner
+                .live_recorders
+                .lock()
+                .await
+                .get(&thread)
+                .unwrap()
+                .owner
+                .clone();
             gate.armed.store(true, Ordering::SeqCst);
             let writer = live.clone();
             let write = tokio::spawn(async move {
@@ -1182,7 +1276,7 @@ async fn owned_local_mutation_orders_legacy_shutdown_and_discard() {
                     store.inner.shutdown_thread(thread).await
                 }
             });
-            poll_writer_blocked(finish.as_mut()).await;
+            poll_writer_blocked(finish.as_mut(), &owner).await;
             gate.release.notify_one();
             write.await.unwrap().unwrap();
             finish.await.unwrap();
@@ -1222,4 +1316,186 @@ async fn owned_local_mutation_orders_legacy_shutdown_and_discard() {
     })
     .await
     .expect("bounded actual legacy finish after admitted write");
+}
+
+#[tokio::test]
+async fn owned_delete_barrier_detects_intentional_lease_bypass() {
+    use futures::FutureExt;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let state = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
+        let gate = Arc::new(WriterMetadataGate::default());
+        let store = Arc::new(GatedWriterStore {
+            inner: LocalThreadStore::new(config, Some(state.clone())),
+            gate: gate.clone(),
+        });
+        let thread = ThreadId::default();
+        let mut params = create_thread_params(thread);
+        params.history_mode = ThreadHistoryMode::Paginated;
+        let live = LiveThread::create_owned(store.clone(), params)
+            .await
+            .unwrap();
+        live.persist(PersistContext::Standard).await.unwrap();
+        let path = store.inner.live_rollout_path(thread).await.unwrap();
+        let owner = store
+            .inner
+            .live_recorders
+            .lock()
+            .await
+            .get(&thread)
+            .unwrap()
+            .owner
+            .clone();
+        let observed = owner.watch_lease_wait();
+        gate.armed.store(true, Ordering::SeqCst);
+        let writer = live.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .update_metadata(
+                    ThreadMetadataPatch {
+                        preview: Some("held admitted metadata".into()),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await
+        });
+        gate.entered.notified().await;
+        owner.bypass_lifecycle_for_test();
+        // Same real delete path and spawned I/O; ONLY owner admission is broken.
+        // It actually deletes the row/file BEFORE releasing the admitted write.
+        store
+            .inner
+            .delete_thread(DeleteThreadParams { thread_id: thread })
+            .await
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "negative must reach actual destructive effect while gate held"
+        );
+        assert!(state.get_thread(thread).await.unwrap().is_none());
+        assert!(
+            observed.notified().now_or_never().is_none(),
+            "bypass must not impersonate contested lease admission"
+        );
+        gate.release.notify_one();
+        let _actual_stale_result = write.await.unwrap();
+    })
+    .await
+    .expect("bounded real lease-bypass negative sensitivity");
+}
+
+#[tokio::test]
+async fn owned_local_failed_discard_rejects_legacy_release_and_changed_intent() {
+    let home = TempDir::new().unwrap();
+    let config = test_config(home.path());
+    let state = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .unwrap();
+    let outsider = Arc::new(LocalThreadStore::new(config.clone(), Some(state.clone())));
+    let store = Arc::new(LocalThreadStore::new(config, Some(state.clone())));
+    let thread = ThreadId::default();
+    let live = LiveThread::create_owned(store.clone(), create_thread_params(thread))
+        .await
+        .unwrap();
+    let mut guard = LiveThreadInitGuard::new(Some(live.clone()));
+    live.append_items(&[user_message_item("provisional retained on conflict")])
+        .await
+        .unwrap();
+    live.persist(PersistContext::Standard).await.unwrap();
+    let path = store.live_rollout_path(thread).await.unwrap();
+    let (owner, os_lock) = {
+        let entries = store.live_recorders.lock().await;
+        let entry = entries.get(&thread).unwrap();
+        (entry.owner.clone(), Arc::downgrade(&entry.writer_lock))
+    };
+    let first = crate::NativeAuthorityEpoch {
+        version: crate::NATIVE_AUTHORITY_VERSION,
+        thread_id: thread,
+        root_thread_id: thread,
+        parent_thread_id: None,
+        generation: uuid::Uuid::now_v7(),
+    };
+    live.begin_native_authority_epoch(first.clone())
+        .await
+        .unwrap();
+    let mut conflicting = first.clone();
+    conflicting.generation = uuid::Uuid::now_v7();
+    state
+        .begin_native_authority_epoch(&conflicting)
+        .await
+        .unwrap();
+    assert!(guard.discard().await.is_err());
+    assert!(store.shutdown_thread(thread).await.is_err());
+    assert!(store.discard_thread(thread).await.is_err());
+    assert!(
+        store
+            .finish_thread_owned(thread, owner.clone(), false)
+            .await
+            .is_err()
+    );
+    {
+        let entries = store.live_recorders.lock().await;
+        let entry = entries.get(&thread).unwrap();
+        assert!(entry.owner.matches(&owner));
+        assert!(std::sync::Weak::ptr_eq(
+            &Arc::downgrade(&entry.writer_lock),
+            &os_lock
+        ));
+        assert_eq!(entry.authority_generation, Some(first.generation));
+        assert!(entry.stopped);
+    }
+    assert_eq!(
+        state
+            .read_native_authority_epoch(thread)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        conflicting.generation
+    );
+    assert!(path.exists());
+    assert!(
+        LiveThread::resume_owned(
+            outsider,
+            ThreadHistoryMode::Legacy,
+            ResumeThreadParams {
+                thread_id: thread,
+                rollout_path: Some(path.clone()),
+                history: None,
+                history_revision: None,
+                include_archived: true,
+                metadata: thread_metadata(),
+            },
+            None
+        )
+        .await
+        .is_err(),
+        "independent Local store must still encounter the OS writer lock"
+    );
+    state.begin_native_authority_epoch(&first).await.unwrap();
+    guard.discard().await.unwrap();
+    assert!(!path.exists());
+    assert!(state.get_thread(thread).await.unwrap().is_none());
+    assert!(
+        os_lock.upgrade().is_none(),
+        "exact cleanup releases retained OS ownership"
+    );
+    let replacement = LiveThread::create_owned(store.clone(), create_thread_params(thread))
+        .await
+        .unwrap();
+    replacement
+        .append_items(&[user_message_item("usable after exact retry")])
+        .await
+        .unwrap();
+    replacement.shutdown().await.unwrap();
 }

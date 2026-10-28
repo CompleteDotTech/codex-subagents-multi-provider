@@ -559,7 +559,7 @@ async fn finish_current_writer(
             .ok_or(ThreadStoreError::ThreadNotFound { thread_id: thread })?
             .owner
             .clone();
-        let operation = owner.retirement().await?;
+        let mut operation = owner.lifecycle().await?;
         if !store
             .live_recorders
             .lock()
@@ -570,6 +570,7 @@ async fn finish_current_writer(
             operation.complete();
             continue;
         }
+        operation.legacy_intent(discard)?;
         operation.closing();
         let store = store.clone();
         return crate::store::complete_writer_operation(operation, async move {

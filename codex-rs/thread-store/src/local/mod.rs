@@ -582,7 +582,7 @@ impl ThreadStore for LocalThreadStore {
     ) -> ThreadStoreFuture<'_, ()> {
         let store = self.clone();
         Box::pin(async move {
-            let operation = owner.retirement().await?;
+            let operation = owner.retirement(discard).await?;
             crate::store::complete_writer_operation(operation, async move {
                 live_writer::finish_thread_owned(&store, thread, owner, discard).await
             })

@@ -942,7 +942,7 @@ async fn lock_delete_writers(
         let mut operations = Vec::new();
         for (_, owner) in &selected {
             if let Some(owner) = owner {
-                operations.push(owner.retirement().await?);
+                operations.push(owner.lifecycle().await?);
             }
         }
         let mut writers = Vec::new();

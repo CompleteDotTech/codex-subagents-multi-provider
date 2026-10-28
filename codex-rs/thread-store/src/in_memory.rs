@@ -617,7 +617,7 @@ impl InMemoryThreadStore {
                 return Ok((None, state));
             };
             drop(state);
-            let operation = owner.retirement().await?;
+            let operation = owner.lifecycle().await?;
             let state = self.state.clone().lock_owned().await;
             if state
                 .writer_owners
@@ -1135,7 +1135,7 @@ impl ThreadStore for InMemoryThreadStore {
     ) -> ThreadStoreFuture<'_, ()> {
         let store = self.with_state_db(self.state_db.clone());
         Box::pin(async move {
-            let operation = owner.retirement().await?;
+            let operation = owner.retirement(discard).await?;
             crate::store::complete_writer_operation(operation, async move {
                 let mut state = store.state.lock().await;
                 if !state
@@ -1326,6 +1326,7 @@ impl ThreadStore for InMemoryThreadStore {
             let (operation, mut state) = self.lock_writer_lifecycle(thread_id).await?;
             let mut operation = operation;
             if let Some(operation) = operation.as_mut() {
+                operation.legacy_intent(false)?;
                 operation.start_retirement();
             }
             state.calls.shutdown_thread += 1;
@@ -1347,6 +1348,7 @@ impl ThreadStore for InMemoryThreadStore {
             let (operation, mut state) = self.lock_writer_lifecycle(thread_id).await?;
             let mut operation = operation;
             if let Some(operation) = operation.as_mut() {
+                operation.legacy_intent(true)?;
                 operation.start_retirement();
             }
             state.calls.discard_thread += 1;
