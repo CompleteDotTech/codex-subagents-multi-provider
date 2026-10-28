@@ -9282,6 +9282,9 @@ async fn loaded_custom_provider_resident(
     metadata.agent_id = Some(child.thread_id);
     reservation.commit(metadata);
     slot.commit(child.thread_id);
+    // An idle lower-start has not activated its speculative rollout yet.
+    // Materialize through the actual Session before the owner route reads it.
+    child.thread.ensure_rollout_materialized().await;
     child.thread.flush_rollout().await.unwrap();
     assert_eq!(
         child.thread.multi_agent_version(),
