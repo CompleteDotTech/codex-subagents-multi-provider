@@ -1218,6 +1218,9 @@ async fn widen_native_fixture_executor(fixture: &Fixture) -> Result<()> {
             ..Default::default()
         })
         .await?;
+    fixture
+        .turn("materialize accepted invoking executor settings")
+        .await?;
     let published = fixture.test.codex.environment_selections().await;
     assert!(!published.is_empty());
     for selection in published {
@@ -1524,10 +1527,12 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     let history = stored
         .history
         .expect("actual child history including tool result");
-    let successful_tool = history.items.iter().any(|item| matches!(item,
-        codex_history::RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::FunctionCallOutput {
+    let successful_tool = history.items.iter().any(|item| {
+        let codex_history::RolloutItem::ResponseItem(envelope) = item else { return false; };
+        matches!(&envelope.item, codex_protocol::models::ResponseItem::FunctionCallOutput {
             call_id: Some(call_id), output, ..
-        }) if call_id == "native-owned-tool-call" && output.text_content().is_some_and(|text| text.contains("Process exited with code 0") && text.contains("owned continuation tool completed"))));
+        } if call_id == "native-owned-tool-call" && output.text_content().is_some_and(|text| text.contains("Process exited with code 0") && text.contains("owned continuation tool completed")))
+    });
     assert!(
         successful_tool,
         "actual successful function result must precede the guarded next inference"

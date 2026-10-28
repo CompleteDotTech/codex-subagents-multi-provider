@@ -9250,14 +9250,19 @@ async fn loaded_custom_provider_resident(
     .expect("real trusted custom-provider preparation")
     .config;
     assert_eq!(prepared.model_provider_id, "a");
-    let source = thread_spawn_source(
-        parent.session.thread_id,
-        &parent.session_source,
-        next_thread_spawn_depth(&parent.session_source),
-        /*agent_role*/ None,
-        Some("loaded_custom_authority_target".into()),
-    )
-    .unwrap();
+    let mut reservation = runtime.registry.reserve_spawn_slot(None).unwrap();
+    let (source, mut metadata) = harness
+        .control
+        .prepare_thread_spawn(
+            &mut reservation,
+            &prepared,
+            parent.session.thread_id,
+            next_thread_spawn_depth(&parent.session_source),
+            Some(AgentPath::from_string("/root/loaded_custom_authority_target".into()).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
     let permit = prepared
         .prepared_child_authorization
         .take()
@@ -9274,7 +9279,27 @@ async fn loaded_custom_provider_resident(
     let child = fresh_lifetime_lower_start(harness, parent, prepared, source, permit)
         .await
         .unwrap();
+    metadata.agent_id = Some(child.thread_id);
+    reservation.commit(metadata);
     slot.commit(child.thread_id);
+    child.thread.flush_rollout().await.unwrap();
+    assert_eq!(
+        child.thread.multi_agent_version(),
+        Some(MultiAgentVersion::V2)
+    );
+    let stored = child.thread.read_thread(true, true).await.unwrap();
+    let history = stored
+        .history
+        .expect("actual lower-start persisted startup history");
+    assert!(history.items.iter().any(|item| matches!(item,
+        RolloutItem::SessionMeta(line) if line.meta.id == child.thread_id && line.meta.multi_agent_version == Some(MultiAgentVersion::V2)
+    )), "actual persisted V2 metadata required by owner-loaded path");
+    assert!(
+        runtime
+            .registry
+            .agent_metadata_for_thread(child.thread_id)
+            .is_some()
+    );
     assert!(child.thread.session.active_turn.lock().await.is_none());
     assert_eq!(child.thread.config_snapshot().await.model_provider_id, "a");
     child.thread
@@ -9452,7 +9477,10 @@ stream_idle_timeout_ms = 1000
         }
         _ => unreachable!(),
     }
-    let caller_turn = parent.session.new_default_turn().await;
+    let caller_turn = parent
+        .session
+        .new_turn_with_default_settings("loaded-authority-followup".into(), Default::default())
+        .await;
     let resume_config =
         crate::agent::child_config::build_agent_resume_config(&caller_turn).unwrap();
     let captured = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
