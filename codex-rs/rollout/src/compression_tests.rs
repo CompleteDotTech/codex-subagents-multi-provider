@@ -907,27 +907,38 @@ fn mapped_alternate_group(
 #[test]
 fn alternate_group_selection_requires_a_namespace_mapping() -> anyhow::Result<()> {
     assert_eq!(
-        mapped_alternate_group(&[65534, 1000, 65534], 1000, "1000 1000 1\n")?,
+        mapped_alternate_group(
+            &[65534, 1000, 65534],
+            /*original_group*/ 1000,
+            "1000 1000 1\n"
+        )?,
         None,
         "unmapped supplementary groups must not masquerade as overflowgid membership"
     );
     assert_eq!(
-        mapped_alternate_group(&[4, 1000], 1000, "0 0 4294967295\n")?,
+        mapped_alternate_group(&[4, 1000], /*original_group*/ 1000, "0 0 4294967295\n")?,
         Some(4)
     );
     assert_eq!(
-        mapped_alternate_group(&[65534, 1000], 1000, "1000 1000 1\n65534 65534 1\n")?,
+        mapped_alternate_group(
+            &[65534, 1000],
+            /*original_group*/ 1000,
+            "1000 1000 1\n65534 65534 1\n"
+        )?,
         Some(65534),
         "a genuinely mapped 65534 is valid; do not blacklist the numeric overflow default"
     );
-    assert_eq!(mapped_alternate_group(&[4, 1000], 1000, "")?, None);
+    assert_eq!(
+        mapped_alternate_group(&[4, 1000], /*original_group*/ 1000, "")?,
+        None
+    );
     for invalid in [
         "1000 1000",
         "1 1 0",
         "4294967295 1 1",
         "1 18446744073709551615 1",
     ] {
-        assert!(mapped_alternate_group(&[4, 1000], 1000, invalid).is_err());
+        assert!(mapped_alternate_group(&[4, 1000], /*original_group*/ 1000, invalid).is_err());
     }
     Ok(())
 }
