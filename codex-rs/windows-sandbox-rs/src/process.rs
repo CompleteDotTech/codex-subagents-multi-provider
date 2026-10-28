@@ -263,7 +263,7 @@ unsafe fn create_process_as_user_inner(
         // Convert a test observer unwind to Err so the existing pipe error path
         // closes every pipe as well as the immediately installed child guard.
         let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            observer.observe(h_token, pi.hProcess)?;
+            observer.observe(h_token, pi.hProcess, &job)?;
             guard.resume_once()
         }));
         let observed = match observed {

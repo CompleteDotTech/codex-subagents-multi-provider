@@ -81,6 +81,7 @@ pub(crate) struct Observation {
     roots: Vec<PathBuf>,
     objects: Vec<PathBuf>,
     pub(crate) result: Mutex<Option<ObservationResult>>,
+    pub(crate) capdeny: Option<capdeny::BObservation>,
 }
 
 impl Observation {
@@ -100,11 +101,17 @@ impl Observation {
             roots,
             objects,
             result: Mutex::new(None),
+            capdeny: None,
         }
     }
 
     // This fixed observer may only query retained handles and owned fixture state.
-    pub(crate) unsafe fn observe(&self, launch: HANDLE, child_process: HANDLE) -> Result<()> {
+    pub(crate) unsafe fn observe(
+        &self,
+        launch: HANDLE,
+        child_process: HANDLE,
+        job: &Arc<JobObject>,
+    ) -> Result<()> {
         let mut raw = std::ptr::null_mut();
         ensure!(
             OpenProcessToken(child_process, TOKEN_QUERY, &mut raw) != 0,
@@ -196,6 +203,9 @@ impl Observation {
                     }
                 }
             }
+        }
+        if let Some(capdeny) = &self.capdeny {
+            capdeny.check_and_retain(&child, &roots, &record, &acls, child_process, job)?;
         }
         let owner_groups = child
             .groups
@@ -564,3 +574,6 @@ impl Drop for SuspendedChild {
         }
     }
 }
+
+#[path = "token_flag_capdeny_experiment.rs"]
+pub(crate) mod capdeny;

@@ -393,3 +393,6 @@ fn legacy_delete_diagnostic_actual_child_token_flag_pair() {
         }
     });
 }
+
+#[path = "legacy_capdeny_diagnostics.rs"]
+mod capdeny_diagnostics;
