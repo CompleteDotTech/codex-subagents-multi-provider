@@ -1094,13 +1094,33 @@ mod tests {
         let store = LocalThreadStore::new(test_config(home.path()), None);
         for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
             let thread = ThreadId::default();
+            // Paginated history persists canonical completed items, not legacy user events.
+            let message_item = |id: &str, message: &str| match mode {
+                ThreadHistoryMode::Legacy => user_message_item(message),
+                ThreadHistoryMode::Paginated => {
+                    RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                        thread_id: thread,
+                        turn_id: "owned-writer-fixture".to_string(),
+                        item: TurnItem::UserMessage(UserMessageItem {
+                            id: id.to_string(),
+                            client_id: None,
+                            content: vec![codex_protocol::user_input::UserInput::Text {
+                                text: message.to_string(),
+                                text_elements: Vec::new(),
+                            }],
+                        }),
+                        started_at_ms: Some(0),
+                        completed_at_ms: 1,
+                    }))
+                }
+            };
             let mut params = create_thread_params(thread);
             params.history_mode = mode;
             let original = store.create_thread_owned(params).await.unwrap();
             store
                 .append_items(AppendThreadItemsParams {
                     thread_id: thread,
-                    items: vec![user_message_item("owned saved history")],
+                    items: vec![message_item("saved-message", "owned saved history")],
                 })
                 .await
                 .unwrap();
@@ -1141,7 +1161,10 @@ mod tests {
             store
                 .append_items(AppendThreadItemsParams {
                     thread_id: thread,
-                    items: vec![user_message_item("replacement still owns writer")],
+                    items: vec![message_item(
+                        "replacement-message",
+                        "replacement still owns writer",
+                    )],
                 })
                 .await
                 .unwrap();
@@ -1151,6 +1174,19 @@ mod tests {
                 .await
                 .unwrap();
             assert!(path.exists());
+            let (persisted_items, persisted_thread, parse_errors) =
+                RolloutRecorder::load_rollout_items(&path).await.unwrap();
+            assert_eq!(persisted_thread, Some(thread));
+            assert_eq!(parse_errors, 0);
+            let persisted_text = serde_json::to_string(&persisted_items).unwrap();
+            assert!(
+                persisted_text.contains("owned saved history"),
+                "{mode:?}: original message must remain in the durable rollout"
+            );
+            assert!(
+                persisted_text.contains("replacement still owns writer"),
+                "{mode:?}: replacement message must remain in the durable rollout"
+            );
             let history_params = LoadThreadHistoryParams {
                 thread_id: thread,
                 include_archived: true,
@@ -1168,8 +1204,14 @@ mod tests {
                 }
             };
             let text = serde_json::to_string(&saved_items).unwrap();
-            assert!(text.contains("owned saved history"));
-            assert!(text.contains("replacement still owns writer"));
+            assert!(
+                text.contains("owned saved history"),
+                "{mode:?}: saved history view"
+            );
+            assert!(
+                text.contains("replacement still owns writer"),
+                "{mode:?}: replacement history view"
+            );
         }
     }
 
