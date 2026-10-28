@@ -47,6 +47,26 @@ struct ActiveAgents {
     nickname_reset_count: usize,
 }
 
+impl ActiveAgents {
+    fn native_caller_valid(
+        &self,
+        authority: &RetainedAgentAuthority,
+        live: bool,
+        allow_completed_eviction: bool,
+    ) -> bool {
+        self.retained_authority
+            .get(&authority.thread_id)
+            .is_some_and(|entry| {
+                entry.authority.same_registration(authority)
+                    && match entry.phase {
+                        CallerPhase::Current => live,
+                        CallerPhase::CompletedResidencyEviction => allow_completed_eviction,
+                        CallerPhase::Revoked | CallerPhase::ResidencyEvictionInProgress => false,
+                    }
+            })
+    }
+}
+
 #[derive(Default)]
 struct CanonicalRegistrationLifecycle {
     teardown_revision: u64,
@@ -266,6 +286,7 @@ impl AgentRegistry {
     /// No callback may reenter this registry or await.
     pub(crate) fn commit_native_registration<T, G>(
         &self,
+        root: &crate::session::session::Session,
         caller: &RetainedAgentAuthority,
         live: bool,
         allow_completed_eviction: bool,
@@ -278,18 +299,19 @@ impl AgentRegistry {
                 "native registration registry is unavailable",
             )
         })?;
-        let valid = state
+        let valid = state.native_caller_valid(caller, live, allow_completed_eviction);
+        let root_valid = state
             .retained_authority
-            .get(&caller.thread_id)
+            .get(&root.thread_id)
             .is_some_and(|entry| {
-                entry.authority.same_registration(caller)
-                    && match entry.phase {
-                        CallerPhase::Current => live,
-                        CallerPhase::CompletedResidencyEviction => allow_completed_eviction,
-                        CallerPhase::Revoked | CallerPhase::ResidencyEvictionInProgress => false,
-                    }
+                entry.authority.matches_session(root)
+                    && (entry.phase == CallerPhase::Current
+                        || (allow_completed_eviction
+                            && root.thread_id == caller.thread_id
+                            && entry.phase == CallerPhase::CompletedResidencyEviction))
             });
         if !valid
+            || !root_valid
             || revisions.iter().any(|(id, revision)| {
                 state
                     .lifecycles
@@ -531,6 +553,7 @@ impl AgentRegistry {
     /// a private-resume exception. Keep revocation ordered through the callback.
     pub(crate) fn with_fresh_caller<T>(
         &self,
+        root: &crate::session::session::Session,
         caller: &crate::session::session::Session,
         registration_id: uuid::Uuid,
         admit: impl FnOnce() -> Result<T>,
@@ -548,7 +571,13 @@ impl AgentRegistry {
                     && entry.authority.registration_id() == registration_id
                     && entry.authority.matches_session(caller)
             });
-        if !valid {
+        let root_valid = state
+            .retained_authority
+            .get(&root.thread_id)
+            .is_some_and(|entry| {
+                entry.authority.matches_session(root) && (entry.phase == CallerPhase::Current)
+            });
+        if !valid || !root_valid {
             return Err(crate::agent::child_provider_authorization::invalid(
                 "fresh child caller was revoked or changed before startup admission",
             ));
@@ -561,6 +590,7 @@ impl AgentRegistry {
 
     /// The callback must not reenter this registry. Hold this lock through the
     /// final synchronous decision so replacement and revocation cannot race it.
+    #[cfg(test)]
     pub(crate) fn with_resume_caller<T>(
         &self,
         authority: &RetainedAgentAuthority,
@@ -572,18 +602,42 @@ impl AgentRegistry {
                 "private resume caller registry is unavailable",
             )
         })?;
-        let valid = state
-            .retained_authority
-            .get(&authority.thread_id)
-            .is_some_and(|entry| {
-                entry.authority.same_registration(authority)
-                    && match entry.phase {
-                        CallerPhase::Current => live,
-                        CallerPhase::CompletedResidencyEviction => true,
-                        CallerPhase::Revoked | CallerPhase::ResidencyEvictionInProgress => false,
-                    }
-            });
+        let valid =
+            state.native_caller_valid(authority, live, /*allow_completed_eviction*/ true);
         if !valid {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "private resume caller stopped or changed before startup admission",
+            ));
+        }
+        let result = admit();
+        drop(state);
+        result
+    }
+
+    pub(crate) fn with_native_resume_caller<T>(
+        &self,
+        root: &crate::session::session::Session,
+        authority: &RetainedAgentAuthority,
+        live: bool,
+        admit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let state = self.active_agents.lock().map_err(|_| {
+            crate::agent::child_provider_authorization::invalid(
+                "private resume caller registry is unavailable",
+            )
+        })?;
+        let valid =
+            state.native_caller_valid(authority, live, /*allow_completed_eviction*/ true);
+        let root_valid = state
+            .retained_authority
+            .get(&root.thread_id)
+            .is_some_and(|entry| {
+                entry.authority.matches_session(root)
+                    && (entry.phase == CallerPhase::Current
+                        || (root.thread_id == authority.thread_id
+                            && entry.phase == CallerPhase::CompletedResidencyEviction))
+            });
+        if !valid || !root_valid {
             return Err(crate::agent::child_provider_authorization::invalid(
                 "private resume caller stopped or changed before startup admission",
             ));
