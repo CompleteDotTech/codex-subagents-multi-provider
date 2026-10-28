@@ -11364,8 +11364,12 @@ stream_idle_timeout_ms = 1000
     let server = wiremock::MockServer::start().await;
     let mut host: TomlValue =
         toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
-    host["model_providers"]["a"]["base_url"] = TomlValue::String(format!("{}/v1", server.uri()));
-    host["model_providers"]["a"]["supports_websockets"] = TomlValue::Boolean(websockets);
+    let provider = host["model_providers"]["a"].as_table_mut().unwrap();
+    provider.insert(
+        "base_url".into(),
+        TomlValue::String(format!("{}/v1", server.uri())),
+    );
+    provider.insert("supports_websockets".into(), TomlValue::Boolean(websockets));
     let marker = home.path().join("idle-native-helper-marker");
     let command = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
     let args = if cfg!(windows) {
@@ -11383,7 +11387,7 @@ stream_idle_timeout_ms = 1000
             ),
         ]
     };
-    host["model_providers"]["a"].as_table_mut().unwrap().insert(
+    provider.insert(
         "auth".into(),
         TomlValue::Table(toml::Table::from_iter([
             ("command".into(), TomlValue::String(command.into())),
@@ -11557,8 +11561,12 @@ stream_idle_timeout_ms = 1000
     let server = wiremock::MockServer::start().await;
     let mut host: TomlValue =
         toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
-    host["model_providers"]["a"]["base_url"] = TomlValue::String(format!("{}/v1", server.uri()));
-    host["model_providers"]["a"]["supports_websockets"] = TomlValue::Boolean(websockets);
+    let provider = host["model_providers"]["a"].as_table_mut().unwrap();
+    provider.insert(
+        "base_url".into(),
+        TomlValue::String(format!("{}/v1", server.uri())),
+    );
+    provider.insert("supports_websockets".into(), TomlValue::Boolean(websockets));
     let marker = home.path().join("idle-native-helper-marker");
     let command = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
     let args = if cfg!(windows) {
@@ -11576,7 +11584,7 @@ stream_idle_timeout_ms = 1000
             ),
         ]
     };
-    host["model_providers"]["a"].as_table_mut().unwrap().insert(
+    provider.insert(
         "auth".into(),
         TomlValue::Table(toml::Table::from_iter([
             ("command".into(), TomlValue::String(command.into())),
