@@ -406,19 +406,24 @@ function global:Get-CimInstance {
 }
 function global:Test-Path {
     param($LiteralPath, $PathType)
-    if ($LiteralPath -ne 'C:\fixture\codex-dev-drive.vhdx') { throw 'unexpected VHD path' }
+    if ($LiteralPath -ne $global:fixtureVhd) { throw 'unexpected VHD path' }
     return $true
 }
 function global:Get-Item {
     param($LiteralPath)
-    if ($LiteralPath -ne 'C:\fixture\codex-dev-drive.vhdx') { throw 'unexpected VHD path' }
+    if ($LiteralPath -ne $global:fixtureVhd) { throw 'unexpected VHD path' }
     [pscustomobject]@{ Length=4096 }
 }
-$env:RUNNER_TEMP = 'C:\fixture'
+$env:RUNNER_TEMP = 'FIXTURE_ROOT'
+$global:fixtureVhd = Join-Path $env:RUNNER_TEMP 'codex-dev-drive.vhdx'
 $epoch = [datetime]::new(1601, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).Ticks
 $micro = [long](($global:fixtureCreated.Ticks - $epoch) / 10D) + OFFSET
 & $args[0] -OwnedPid 101 -CreationMicroseconds $micro
 """
+        # Keep Windows C: semantics there; Linux PowerShell needs a native
+        # filesystem root for Join-Path and System.IO.Path root interpretation.
+        fixture_root = "C:\\fixture" if os.name == "nt" else tempfile.gettempdir()
+        fixture = fixture.replace("FIXTURE_ROOT", fixture_root.replace("'", "''"))
         fixture = fixture.replace("CHILDREN", str(children)).replace(
             "OFFSET", str(offset)
         )
@@ -452,7 +457,10 @@ $micro = [long](($global:fixtureCreated.Ticks - $epoch) / 10D) + OFFSET
         )
         self.assertEqual(data["vhd"]["file_length_bytes"], 4096)
         self.assertEqual(data["vhd"]["logical_size_bytes"], 68719476736)
-        self.assertEqual(data["vhd"]["backing_volume"], "C:\\".replace("\\\\", "\\"))
+        self.assertEqual(
+            data["vhd"]["backing_volume"],
+            "C:\\" if os.name == "nt" else Path(tempfile.gettempdir()).anchor,
+        )
         self.assertIsNone(data["vhd"]["allocated_physical_bytes"])
         self.assertLessEqual(len(data["volumes"]), 16)
 

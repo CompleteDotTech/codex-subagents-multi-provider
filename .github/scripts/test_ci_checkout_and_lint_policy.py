@@ -16,6 +16,7 @@ class CheckoutAndLintPolicyTest(unittest.TestCase):
                 "test": ("30", 90),
                 "test-windows-shard": ("30", 90),
                 "test-windows-native-main": ("40", None),
+                "voice-runtime-diagnostic": ("60", None),
                 "clippy": ("30", 90),
                 "verify-release-build": ("30", 90),
             },
