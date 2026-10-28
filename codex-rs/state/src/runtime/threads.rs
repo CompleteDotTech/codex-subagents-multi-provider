@@ -1191,13 +1191,12 @@ ON CONFLICT(id) DO UPDATE SET
         if edges != 0 {
             return Ok(false);
         }
-        for table in [
-            "thread_dynamic_tools",
-            "native_authority_receipts",
-            "thread_read_receipts",
+        for query in [
+            "DELETE FROM thread_dynamic_tools WHERE thread_id = ?",
+            "DELETE FROM native_authority_receipts WHERE thread_id = ?",
+            "DELETE FROM thread_read_receipts WHERE thread_id = ?",
         ] {
-            let query = format!("DELETE FROM {table} WHERE thread_id = ?");
-            sqlx::query(&query).bind(&id).execute(&mut *tx).await?;
+            sqlx::query(query).bind(&id).execute(&mut *tx).await?;
         }
         sqlx::query("DELETE FROM threads WHERE id = ? AND rollout_path = ?")
             .bind(&id)
