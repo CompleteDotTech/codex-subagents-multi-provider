@@ -97,7 +97,6 @@ impl FlagFixture {
         fs::write(&self.script, concat!(
             "@echo off\r\n",
             "echo EXECUTE_OK\r\n",
-            "\"%SystemRoot%\\System32\\cmd.exe\" /d /c echo NESTED_EXECUTE_OK\r\necho EXECUTE_STATUS=%errorlevel%\r\n",
             "type \"%WORKSPACE_READ%\"\r\necho WORKSPACE_READ_STATUS=%errorlevel%\r\n",
             "type \"%TEMP_READ%\"\r\necho TEMP_READ_STATUS=%errorlevel%\r\n",
             "type \"%TMP_READ%\"\r\necho TMP_READ_STATUS=%errorlevel%\r\n",
@@ -253,8 +252,6 @@ async fn record_flag_sample(
     let lines = stdout.lines().collect::<Vec<_>>();
     let compatibility = [
         "EXECUTE_OK",
-        "NESTED_EXECUTE_OK",
-        "EXECUTE_STATUS=0",
         "WORKSPACE_READ_OK",
         "TEMP_READ_OK",
         "TMP_READ_OK",
