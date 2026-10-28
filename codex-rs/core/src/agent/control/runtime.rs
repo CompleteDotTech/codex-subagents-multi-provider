@@ -218,12 +218,18 @@ impl LocalAgentRuntime {
         &self,
         root: ThreadId,
         edges: Vec<(ThreadId, ThreadId)>,
-    ) -> std::collections::HashSet<ThreadId> {
+    ) -> (
+        std::collections::HashSet<ThreadId>,
+        crate::agent::registry::NativeGraphCloseStamp,
+    ) {
         self.registry.revoke_subtree(root, edges)
     }
 
-    pub(crate) fn revoke_single_caller(&self, thread: ThreadId) {
-        self.registry.revoke_caller(thread);
+    pub(crate) fn revoke_single_caller(
+        &self,
+        thread: ThreadId,
+    ) -> crate::agent::registry::NativeGraphCloseStamp {
+        self.registry.revoke_caller_stamped(thread)
     }
 
     pub(crate) fn teardown_revision(&self, thread: ThreadId) -> u64 {

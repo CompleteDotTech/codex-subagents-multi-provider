@@ -112,6 +112,13 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
     depth > max_depth
 }
 
+/// Opaque observation produced by the SAME canonical revoke operation. It is
+/// graph ordering state, never provider authority or a persisted receipt.
+pub(crate) struct NativeGraphCloseStamp {
+    root: ThreadId,
+    revision: u64,
+}
+
 impl AgentRegistry {
     pub(crate) fn teardown_revision(&self, thread: ThreadId) -> u64 {
         *self
@@ -129,7 +136,7 @@ impl AgentRegistry {
         &self,
         root: ThreadId,
         edges: impl IntoIterator<Item = (ThreadId, ThreadId)>,
-    ) -> HashSet<ThreadId> {
+    ) -> (HashSet<ThreadId>, NativeGraphCloseStamp) {
         let mut state = self
             .active_agents
             .lock()
@@ -163,7 +170,11 @@ impl AgentRegistry {
                 agent.evicted_environments = None;
             }
         }
-        closed
+        let stamp = NativeGraphCloseStamp {
+            root,
+            revision: state.teardown_revisions.get(&root).copied().unwrap_or(0),
+        };
+        (closed, stamp)
     }
 
     /// The caller signal and manager map are held by the private startup owner.
@@ -300,6 +311,10 @@ impl AgentRegistry {
 
     /// Explicit loaded or unloaded close sets a tombstone before its first await.
     pub(crate) fn revoke_caller(&self, thread_id: ThreadId) {
+        let _ = self.revoke_caller_stamped(thread_id);
+    }
+
+    pub(crate) fn revoke_caller_stamped(&self, thread_id: ThreadId) -> NativeGraphCloseStamp {
         let mut state = self
             .active_agents
             .lock()
@@ -311,6 +326,38 @@ impl AgentRegistry {
         if let Some(agent) = state.thread_paths.get_mut(&thread_id) {
             agent.evicted_environments = None;
         }
+        NativeGraphCloseStamp {
+            root: thread_id,
+            revision: state
+                .teardown_revisions
+                .get(&thread_id)
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    /// Map membership is held by the caller; release this short registry read
+    /// before any graph await. A revoked SAME allocation cannot publish Open.
+    pub(crate) fn graph_open_is_current(&self, session: &crate::session::session::Session) -> bool {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_authority
+            .get(&session.thread_id)
+            .is_some_and(|entry| {
+                entry.phase == CallerPhase::Current && entry.authority.matches_session(session)
+            })
+    }
+
+    pub(crate) fn graph_close_is_current(&self, stamp: &NativeGraphCloseStamp) -> bool {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .teardown_revisions
+            .get(&stamp.root)
+            .copied()
+            .unwrap_or(0)
+            == stamp.revision
     }
 
     /// Called only after exact successful map removal. CAS cannot undo a close

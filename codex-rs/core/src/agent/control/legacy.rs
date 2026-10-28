@@ -49,8 +49,11 @@ impl LocalAgentControl {
         let state = self.runtime.upgrade()?;
         let metadata = self.get_agent_metadata(agent_id);
         let known_agent = metadata.is_some();
-        let captured = self.capture_shutdown(&state, agent_id, true).await;
+        let captured = self
+            .capture_shutdown_with_graph_stamp(&state, agent_id, true)
+            .await;
         let snapshot = match captured
+            .threads
             .iter()
             .find(|(id, _)| *id == agent_id)
             .map(|(_, thread)| Arc::clone(thread))
@@ -64,12 +67,8 @@ impl LocalAgentControl {
                 };
                 let config = Box::new(thread.config_snapshot().await);
                 if !config.ephemeral
-                    && let Some(agent_graph_store) = state.agent_graph_store()
-                    && let Err(err) = agent_graph_store
-                        .set_thread_spawn_edge_status(
-                            agent_id,
-                            codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
-                        )
+                    && let Err(err) = state
+                        .persist_native_graph_closed(&self.runtime, &captured)
                         .await
                 {
                     warn!("failed to persist thread-spawn edge status for {agent_id}: {err}");
@@ -79,13 +78,9 @@ impl LocalAgentControl {
             Err(err)
                 if known_agent && matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) =>
             {
-                if let Some(agent_graph_store) = state.agent_graph_store()
-                    && let Err(err) = agent_graph_store
-                        .set_thread_spawn_edge_status(
-                            agent_id,
-                            codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
-                        )
-                        .await
+                if let Err(err) = state
+                    .persist_native_graph_closed(&self.runtime, &captured)
+                    .await
                 {
                     return Err(CodexErr::Fatal(format!(
                         "failed to persist stale thread-spawn edge status for {agent_id}: {err}"
@@ -96,7 +91,7 @@ impl LocalAgentControl {
             Err(err) => return Err(err),
         };
         match self
-            .shutdown_captured_tree(&state, agent_id, captured)
+            .shutdown_captured_tree(&state, agent_id, captured.threads)
             .await
         {
             Err(err)
@@ -128,6 +123,21 @@ impl LocalAgentControl {
     ) -> Vec<(ThreadId, Arc<CodexThread>)> {
         state
             .fence_native_subtree(&self.runtime, agent_id, descendants, |id| {
+                self.forget_v2_residency(id);
+                self.runtime.registry.release_spawned_thread(id);
+                self.runtime.mailboxes.remove(id);
+            })
+            .await
+    }
+
+    async fn capture_shutdown_with_graph_stamp(
+        &self,
+        state: &ThreadManagerState,
+        agent_id: ThreadId,
+        descendants: bool,
+    ) -> crate::thread_manager::NativeShutdownCapture {
+        state
+            .fence_native_subtree_with_graph_stamp(&self.runtime, agent_id, descendants, |id| {
                 self.forget_v2_residency(id);
                 self.runtime.registry.release_spawned_thread(id);
                 self.runtime.mailboxes.remove(id);
