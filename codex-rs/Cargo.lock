@@ -86,7 +86,6 @@ dependencies = [
 [[package]]
 name = "age"
 version = "0.12.1"
-source = "git+https://github.com/str4d/rage?rev=b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f#b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f"
 dependencies = [
  "age-core",
  "base64 0.22.1",

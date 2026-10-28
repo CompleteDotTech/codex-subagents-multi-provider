@@ -31,20 +31,28 @@ MANIFEST_FEATURE_EXCEPTIONS = {
 }
 OPTIONAL_DEPENDENCY_EXCEPTIONS = set()
 INTERNAL_DEPENDENCY_FEATURE_EXCEPTIONS = {}
-VERIFIED_VENDOR_MANIFEST = "codex-rs/third-party/aws-config/Cargo.toml"
+VERIFIED_VENDORS = {
+    "aws-config": "verify_aws_config.py",
+    "age": "verify_age.py",
+}
 
 
 def verified_vendor_manifests() -> set[Path]:
     """Allow only the exact external snapshot after its integrity guard succeeds."""
-    verifier = ROOT / "codex-rs/third-party/verify_aws_config.py"
-    result = subprocess.run(
-        [sys.executable, str(verifier)], text=True, capture_output=True, check=False
-    )
-    if result.returncode != 0:
-        raise ValueError(
-            "AWS vendor integrity check failed: " + result.stdout + result.stderr
+    manifests = set()
+    for name, filename in VERIFIED_VENDORS.items():
+        verifier = ROOT / "codex-rs/third-party" / filename
+        result = subprocess.run(
+            [sys.executable, str(verifier)], text=True, capture_output=True, check=False
         )
-    return {(ROOT / VERIFIED_VENDOR_MANIFEST).resolve()}
+        if result.returncode != 0:
+            raise ValueError(
+                f"{name} vendor integrity check failed: "
+                + result.stdout
+                + result.stderr
+            )
+        manifests.add((ROOT / "codex-rs/third-party" / name / "Cargo.toml").resolve())
+    return manifests
 
 
 def main() -> int:

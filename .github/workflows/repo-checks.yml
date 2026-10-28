@@ -20,6 +20,15 @@ jobs:
       - name: Verify codex-rs Cargo manifests inherit workspace settings
         run: python3 .github/scripts/verify_cargo_workspace_manifests.py
 
+      - name: Test verified vendor formatting policy
+        run: python3 -m unittest discover -s .github/scripts -p 'test_check_rust_format.py'
+
+      - name: Test verified vendor manifest policy
+        run: python3 -m unittest discover -s .github/scripts -p 'test_verify_cargo_workspace_manifests.py'
+
+      - name: Test licensed age source integrity and patch reconstruction
+        run: python3 -m unittest discover -s codex-rs/third-party -p 'test_verify_age.py'
+
       - name: Verify codex-tui does not import codex-core directly
         run: python3 .github/scripts/verify_tui_core_boundary.py
 

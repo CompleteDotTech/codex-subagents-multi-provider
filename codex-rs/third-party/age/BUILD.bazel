@@ -1,0 +1,256 @@
+load("@age_async_test_crates//:defs.bzl", async_deps = "all_crate_deps")
+load("@age_ssh_test_crates//:defs.bzl", ssh_deps = "all_crate_deps")
+load("@age_unit_test_crates//:defs.bzl", unit_deps = "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//:defs.bzl", "WINDOWS_RUSTC_LINK_FLAGS", "workspace_root_test")
+
+# Production is the generated path dependency, whose non-workspace fact excludes
+# dev dependencies. Do not substitute any of the test-graph libraries here.
+alias(
+    name = "age",
+    actual = "@crates//:age-0.12.1",
+    visibility = ["//visibility:public"],
+)
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+_SOURCE = glob(["src/**/*.rs"])
+
+_COMPILE_DATA = glob([
+    "assets/**",
+    "i18n/**",
+]) + ["i18n.toml"]
+
+_TEST_DATA = glob(["tests/**"]) + ["Cargo.toml"]
+
+_ENV = {
+    "BAZEL_PACKAGE": "codex-rs/third-party/age",
+    "CARGO_MANIFEST_PATH": "$(execpath :Cargo.toml)",
+    "CARGO_PKG_NAME": "age",
+}
+
+# This is the existing production lock's complete 24-dependency default graph,
+# checked against the generated upstream age crate. No dev/optional graph enters
+# this strict validation target, and it does not replace the production alias.
+_NORMAL_DEPS = [
+    "@crates//:age-core-0.12.0",
+    "@crates//:base64-0.22.1",
+    "@crates//:bech32-0.11.1",
+    "@crates//:chacha20poly1305-0.11.0",
+    "@crates//:cipher-0.5.2",
+    "@crates//:cookie-factory-0.3.3",
+    "@crates//:hkdf-0.13.0",
+    "@crates//:hmac-0.13.0",
+    "@crates//:hpke-0.14.1",
+    "@crates//:i18n-embed-0.16.0",
+    "@crates//:i18n-embed-fl-0.10.1",
+    "@crates//:lazy_static-1.5.0",
+    "@crates//:ml-kem-0.3.3",
+    "@crates//:nom-8.0.0",
+    "@crates//:p256-0.14.0",
+    "@crates//:pin-project-1.1.10",
+    "@crates//:rand-0.10.1",
+    "@crates//:rust-embed-8.11.0",
+    "@crates//:scrypt-0.12.0",
+    "@crates//:sha2-0.11.0",
+    "@crates//:sha3-0.12.0",
+    "@crates//:subtle-2.6.1",
+    "@crates//:x25519-dalek-3.0.0",
+    "@crates//:zeroize-1.8.2",
+]
+
+rust_library(
+    name = "age-strict-lib",
+    srcs = _SOURCE,
+    compile_data = _COMPILE_DATA + ["Cargo.toml"],
+    crate_features = ["default"],
+    crate_name = "age",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_env = _ENV,
+    version = "0.12.1",
+    deps = _NORMAL_DEPS,
+)
+
+filegroup(
+    name = "package-files",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "BUILD.bazel",
+            "target/**",
+        ],
+    ),
+    visibility = ["//visibility:public"],
+)
+
+# Each library and its test use ONE metadata repository, including age-core, so
+# Rust trait types never cross independently compiled dependency graph islands.
+rust_library(
+    name = "age-unit-test-lib",
+    srcs = _SOURCE,
+    compile_data = _COMPILE_DATA + ["Cargo.toml"],
+    crate_features = ["default"],
+    crate_name = "age",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_env = _ENV,
+    version = "0.12.1",
+    deps = unit_deps(normal = True),
+)
+
+rust_test(
+    name = "age-unit-tests-bin",
+    crate = ":age-unit-test-lib",
+    crate_features = ["default"],
+    data = _TEST_DATA,
+    rustc_env = _ENV,
+    rustc_flags = WINDOWS_RUSTC_LINK_FLAGS,
+    tags = ["manual"],
+    version = "0.12.1",
+    deps = unit_deps(normal = True) + [
+        "@age_unit_test_crates//:proptest-1.11.0",
+    ],
+)
+
+workspace_root_test(
+    name = "age-unit-tests",
+    test_bin = ":age-unit-tests-bin",
+    working_directory_marker = ":Cargo.toml",
+    workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+)
+
+# Armor has no additional Cargo dependencies. Recompile the existing unit crate
+# with cfg(test) + armor so its encrypted-identity and armor unit tests execute.
+# Keep the default-feature unit target unchanged and use the SAME metadata hub.
+rust_test(
+    name = "age-armor-unit-tests-bin",
+    crate = ":age-unit-test-lib",
+    crate_features = [
+        "default",
+        "armor",
+    ],
+    data = _TEST_DATA,
+    rustc_env = _ENV,
+    rustc_flags = WINDOWS_RUSTC_LINK_FLAGS,
+    tags = ["manual"],
+    version = "0.12.1",
+    deps = unit_deps(normal = True) + [
+        "@age_unit_test_crates//:proptest-1.11.0",
+    ],
+)
+
+workspace_root_test(
+    name = "age-armor-unit-tests",
+    test_bin = ":age-armor-unit-tests-bin",
+    working_directory_marker = ":Cargo.toml",
+    workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+)
+
+# Preserve the original Cargo required-feature closures, including implicit
+# dependency features. The annotations select only these TEST metadata repos.
+_SSH_FEATURES = [
+    "cli-common",
+    "console",
+    "default",
+    "ssh",
+    "aes",
+    "aes-gcm",
+    "bcrypt-pbkdf",
+    "cbc",
+    "ctr",
+    "curve25519-dalek",
+    "num-traits",
+    "is-terminal",
+    "pinentry",
+    "rpassword",
+    "rsa",
+]
+
+_ASYNC_FEATURES = [
+    "default",
+    "armor",
+    "async",
+    "futures",
+    "memchr",
+]
+
+rust_library(
+    name = "age-ssh-test-lib",
+    srcs = _SOURCE,
+    compile_data = _COMPILE_DATA + ["Cargo.toml"],
+    crate_features = _SSH_FEATURES,
+    crate_name = "age",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_env = _ENV,
+    version = "0.12.1",
+    deps = ssh_deps(normal = True),
+)
+
+rust_test(
+    name = "age-test-vectors-ssh-bin",
+    srcs = ["tests/test_vectors.rs"],
+    compile_data = _TEST_DATA,
+    crate_features = _SSH_FEATURES,
+    crate_name = "test_vectors",
+    crate_root = "tests/test_vectors.rs",
+    data = _TEST_DATA,
+    edition = "2024",
+    rustc_env = _ENV,
+    rustc_flags = WINDOWS_RUSTC_LINK_FLAGS,
+    tags = ["manual"],
+    version = "0.12.1",
+    deps = ssh_deps(normal = True) + [":age-ssh-test-lib"],
+)
+
+workspace_root_test(
+    name = "age-test-vectors-ssh",
+    test_bin = ":age-test-vectors-ssh-bin",
+    working_directory_marker = ":Cargo.toml",
+    workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+)
+
+rust_library(
+    name = "age-armor-async-test-lib",
+    srcs = _SOURCE,
+    compile_data = _COMPILE_DATA + ["Cargo.toml"],
+    crate_features = _ASYNC_FEATURES,
+    crate_name = "age",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_env = _ENV,
+    version = "0.12.1",
+    deps = async_deps(normal = True),
+)
+
+rust_test(
+    name = "age-testkit-armor-async-bin",
+    srcs = ["tests/testkit.rs"],
+    compile_data = _TEST_DATA,
+    crate_features = _ASYNC_FEATURES,
+    crate_name = "testkit",
+    crate_root = "tests/testkit.rs",
+    data = _TEST_DATA,
+    edition = "2024",
+    rustc_env = _ENV,
+    rustc_flags = WINDOWS_RUSTC_LINK_FLAGS,
+    tags = ["manual"],
+    version = "0.12.1",
+    deps = async_deps(normal = True) + [
+        "@age_async_test_crates//:flate2-1.1.9",
+        "@age_async_test_crates//:hex-0.4.3",
+        "@age_async_test_crates//:test-case-3.3.1",
+        "@age_async_test_crates//:tokio-1.52.3",
+    ] + [":age-armor-async-test-lib"],
+)
+
+workspace_root_test(
+    name = "age-testkit-armor-async",
+    test_bin = ":age-testkit-armor-async-bin",
+    working_directory_marker = ":Cargo.toml",
+    workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+)

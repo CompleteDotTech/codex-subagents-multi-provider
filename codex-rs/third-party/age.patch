@@ -1,0 +1,1816 @@
+--- a/age/Cargo.toml
++++ b/age/Cargo.toml
+@@ -2,28 +2,28 @@
+ name = "age"
+ description = "[BETA] A simple, secure, and modern encryption library."
+ version = "0.12.1"
+-authors.workspace = true
+-repository.workspace = true
++authors = ["Jack Grigg <thestr4d@gmail.com>"]
++repository = "https://github.com/str4d/rage"
+ readme = "README.md"
+ keywords = ["rage", "encryption"]
+ categories = ["cryptography"]
+-license.workspace = true
+-edition.workspace = true
+-rust-version.workspace = true
++license = "MIT OR Apache-2.0"
++edition = "2024"
++rust-version = "1.85"
+ 
+ [badges]
+ maintenance = { status = "experimental" }
+ 
+ [dependencies]
+-age-core.workspace = true
++age-core = { "version" = "0.12.0", "git" = "https://github.com/str4d/rage", "rev" = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f" }
+ 
+ # Dependencies exposed in a public API:
+ # (Breaking upgrades to these require a breaking upgrade to this crate.)
+-base64.workspace = true
+-chacha20poly1305.workspace = true
+-hmac.workspace = true
+-i18n-embed.workspace = true
+-rand.workspace = true
++base64 = { "version" = "0.22" }
++chacha20poly1305 = { "version" = "0.11", "default-features" = false, "features" = ["alloc"] }
++hmac = { "version" = "0.13" }
++i18n-embed = { "version" = "0.16", "features" = ["fluent-system"] }
++rand = { "version" = "0.10" }
+ 
+ # OpenSSH-specific dependencies:
+ # - RSAES-OAEP from RFC 8017 with SHA-256 and MGF1
+@@ -39,27 +39,27 @@
+ pin-project = "1"
+ 
+ # Common CLI dependencies
+-pinentry = { workspace = true, optional = true }
++pinentry = { "version" = "0.8", "optional" = true }
+ 
+ # Dependencies used internally:
+ # (Breaking upgrades to these are usually backwards-compatible, but check MSRVs.)
+-bech32.workspace = true
++bech32 = { "version" = "0.11" }
+ cipher = { version = "0.5", features = ["alloc"] }
+-cookie-factory.workspace = true
+-hkdf.workspace = true
+-hpke = { workspace = true, features = ["mlkem", "nistp"] }
+-i18n-embed-fl.workspace = true
+-lazy_static.workspace = true
+-ml-kem.workspace = true
+-nom.workspace = true
+-p256.workspace = true
+-rust-embed.workspace = true
+-scrypt.workspace = true
+-sha2.workspace = true
+-sha3.workspace = true
+-subtle.workspace = true
+-x25519-dalek.workspace = true
+-zeroize.workspace = true
++cookie-factory = { "version" = "0.3.1" }
++hkdf = { "version" = "0.13" }
++hpke = { "version" = "0.14", "default-features" = false, "features" = ["alloc", "chacha", "mlkem", "nistp"] }
++i18n-embed-fl = { "version" = "0.10" }
++lazy_static = { "version" = "1" }
++ml-kem = { "version" = "0.3" }
++nom = { "version" = "8", "default-features" = false, "features" = ["alloc"] }
++p256 = { "version" = "0.14", "default-features" = false, "features" = ["arithmetic"] }
++rust-embed = { "version" = "8" }
++scrypt = { "version" = "0.12", "default-features" = false }
++sha2 = { "version" = "0.11" }
++sha3 = { "version" = "0.12" }
++subtle = { "version" = "2.6" }
++x25519-dalek = { "version" = "3", "features" = ["static_secrets"] }
++zeroize = { "version" = "1" }
+ 
+ # OpenSSH-specific dependencies:
+ # - RSAES-OAEP from RFC 8017 with SHA-256 and MGF1
+@@ -82,7 +82,7 @@
+ memchr = { version = "2.5", optional = true }
+ 
+ # Common CLI dependencies
+-console = { workspace = true, optional = true, features = ["std"] }
++console = { "version" = "0.16", "default-features" = false, "optional" = true, "features" = ["std"] }
+ is-terminal = { version = "0.4", optional = true }
+ rpassword = { version = "7", optional = true }
+ 
+@@ -93,10 +93,10 @@
+ 
+ [dev-dependencies]
+ criterion = "0.5"
+-flate2.workspace = true
++flate2 = { "version" = "1" }
+ futures-test = "0.3"
+ hex = "0.4"
+-i18n-embed = { workspace = true, features = ["desktop-requester"] }
++i18n-embed = { "version" = "0.16", "features" = ["fluent-system", "desktop-requester"] }
+ proptest = "1"
+ test-case = "3"
+ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+@@ -149,4 +149,7 @@
+ rustdoc-args = ["--cfg", "docsrs"]
+ 
+ [lints]
+-workspace = true
++rust = { "unexpected_cfgs" = { "level" = "warn", "check-cfg" = ["cfg(fuzzing)"] } }
++
++# Keep upstream dev/test feature resolution outside the application workspace.
++[workspace]
+--- a/age/src/cli_common.rs
++++ b/age/src/cli_common.rs
+@@ -170,7 +170,12 @@
+     }
+ 
+     fn request_passphrase(&self, description: &str) -> Option<SecretString> {
+-        read_secret(description, &fl!("cli-passphrase-prompt"), None).ok()
++        read_secret(
++            description,
++            &fl!("cli-passphrase-prompt"),
++            /*confirm*/ None,
++        )
++        .ok()
+     }
+ }
+ 
+@@ -185,14 +190,17 @@
+ impl Passphrase {
+     /// Generates a secure passphrase.
+     pub fn random<R: CryptoRng>(mut rng: R) -> Self {
+-        let between = Uniform::try_from(0..2048).expect("valid");
++        let between = match Uniform::try_from(0..2048) {
++            Ok(between) => between,
++            Err(_) => unreachable!("the nonempty BIP39 index range is valid"),
++        };
+         let new_passphrase = (0..10)
+-            .map(|_| {
+-                BIP39_WORDLIST
+-                    .lines()
+-                    .nth(between.sample(&mut rng))
+-                    .expect("index is in range")
+-            })
++            .map(
++                |_| match BIP39_WORDLIST.lines().nth(between.sample(&mut rng)) {
++                    Some(word) => word,
++                    None => unreachable!("the BIP39 wordlist contains every sampled index"),
++                },
++            )
+             .fold(String::new(), |acc, s| {
+                 if acc.is_empty() {
+                     acc + s
+--- a/age/src/cli_common/file_io.rs
++++ b/age/src/cli_common/file_io.rs
+@@ -304,11 +304,12 @@
+             self.file = Some(options.open(filename));
+         }
+ 
+-        self.file
+-            .as_mut()
+-            .unwrap()
+-            .as_mut()
+-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open file '{filename}'")))
++        match self.file.as_mut() {
++            Some(file) => file,
++            None => panic!("lazy file must be initialized before access"),
++        }
++        .as_mut()
++        .map_err(|e| io::Error::new(e.kind(), format!("Failed to open file '{filename}'")))
+     }
+ }
+ 
+@@ -392,11 +393,9 @@
+                 // don't try to parse it as UTF-8 in StdoutWriter and perhaps reject it.
+                 format = OutputFormat::Binary;
+             }
+-        } else if is_tty {
+-            if let OutputFormat::Binary = format {
+-                // If output == Some("-") then this error is skipped.
+-                return Err(io::Error::other(FileError::DenyBinaryOutput));
+-            }
++        } else if is_tty && matches!(format, OutputFormat::Binary) {
++            // If output == Some("-") then this error is skipped.
++            return Err(io::Error::other(FileError::DenyBinaryOutput));
+         }
+ 
+         Ok(OutputWriter::Stdout(StdoutWriter::new(
+--- a/age/src/cli_common/identities.rs
++++ b/age/src/cli_common/identities.rs
+@@ -56,7 +56,12 @@
+             // IdentityFileEntry::into_identity will never return a PluginResolve error
+             // when plugin feature is not enabled.
+             #[cfg(not(feature = "plugin"))]
+-            let new_identities = new_identities.unwrap();
++            let new_identities = match new_identities {
++                Ok(identities) => identities,
++                Err(_) => unreachable!(
++                    "identity conversion cannot resolve plugins without the plugin feature"
++                ),
++            };
+ 
+             identities.extend(new_identities.into_iter().map(|i| i as _));
+ 
+--- a/age/src/cli_common/recipients.rs
++++ b/age/src/cli_common/recipients.rs
+@@ -185,12 +185,14 @@
+         },
+         #[cfg(feature = "ssh")]
+         |recipients, filename, identity| {
+-            let recipient = parse_ssh_recipient(
++            let recipient = match parse_ssh_recipient(
+                 || ssh::Recipient::try_from(identity),
+                 || Err(ReadError::InvalidRecipient(filename.to_owned())),
+                 filename,
+-            )?
+-            .expect("unsupported identities were already handled");
++            )? {
++                Some(recipient) => recipient,
++                None => unreachable!("unsupported identities were already handled"),
++            };
+             recipients.push(recipient);
+             Ok(())
+         },
+--- a/age/src/encrypted.rs
++++ b/age/src/encrypted.rs
+@@ -103,7 +103,10 @@
+             Self::Encrypted(encrypted) => encrypted.decrypt(filename).map(|file| (file, true)),
+             Self::Decrypted(identity_file) => Ok((identity_file, false)),
+             // `IdentityState::decrypt` is only ever called with `Some`.
+-            Self::Poisoned(e) => Err(e.unwrap()),
++            Self::Poisoned(Some(error)) => Err(error),
++            Self::Poisoned(None) => {
++                panic!("encrypted identity state was taken without being restored")
++            }
+         }
+     }
+ }
+@@ -222,7 +225,7 @@
+     }
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "armor"))]
+ mod tests {
+     use std::sync::{Arc, Mutex};
+ 
+@@ -274,13 +277,17 @@
+ 
+         /// This intentionally panics if called twice.
+         fn request_passphrase(&self, _: &str) -> Option<SecretString> {
+-            self.0
+-                .lock()
+-                .unwrap()
+-                .take()
+-                .expect("passphrase is only input once")
+-                .to_owned()
+-                .map(SecretString::from)
++            let mut guard = match self.0.lock() {
++                Ok(guard) => guard,
++                Err(error) => {
++                    panic!("encrypted identity test passphrase mutex is poisoned: {error}")
++                }
++            };
++            let passphrase = match guard.take() {
++                Some(passphrase) => passphrase,
++                None => panic!("passphrase is only input once"),
++            };
++            passphrase.to_owned().map(SecretString::from)
+         }
+     }
+ 
+@@ -299,9 +306,9 @@
+             let buf = ArmoredReader::new(TEST_ENCRYPTED_IDENTITY.as_bytes());
+             let identity = Identity::from_buffer(
+                 buf,
+-                None,
++                /*filename*/ None,
+                 MockCallbacks::new(Some("wrong passphrase")),
+-                None,
++                /*max_work_factor*/ None,
+             )
+             .unwrap()
+             .unwrap();
+@@ -319,9 +326,14 @@
+         // Unwrapping fails if we cannot obtain a passphrase.
+         {
+             let buf = ArmoredReader::new(TEST_ENCRYPTED_IDENTITY.as_bytes());
+-            let identity = Identity::from_buffer(buf, None, MockCallbacks::new(None), None)
+-                .unwrap()
+-                .unwrap();
++            let identity = Identity::from_buffer(
++                buf,
++                /*filename*/ None,
++                MockCallbacks::new(/*passphrase*/ None),
++                /*max_work_factor*/ None,
++            )
++            .unwrap()
++            .unwrap();
+ 
+             match identity.unwrap_stanzas(&wrapped).unwrap() {
+                 Err(e) => {
+@@ -336,9 +348,9 @@
+         let buf = ArmoredReader::new(TEST_ENCRYPTED_IDENTITY.as_bytes());
+         let identity = Identity::from_buffer(
+             buf,
+-            None,
++            /*filename*/ None,
+             MockCallbacks::new(Some(TEST_ENCRYPTED_IDENTITY_PASSPHRASE)),
+-            None,
++            /*max_work_factor*/ None,
+         )
+         .unwrap()
+         .unwrap();
+--- a/age/src/format.rs
++++ b/age/src/format.rs
+@@ -52,8 +52,9 @@
+         }
+ 
+         let mut mac = HmacWriter::new(mac_key);
+-        cookie_factory::r#gen(write::header_v1_minus_mac(&header), &mut mac)
+-            .expect("can serialize Header into HmacWriter");
++        if let Err(error) = cookie_factory::r#gen(write::header_v1_minus_mac(&header), &mut mac) {
++            panic!("cannot serialize age header into infallible HMAC writer: {error}");
++        }
+         header
+             .mac
+             .copy_from_slice(mac.finalize().into_bytes().as_slice());
+@@ -65,11 +66,13 @@
+         let mut mac = HmacWriter::new(mac_key);
+         if let Some(bytes) = &self.encoded_bytes {
+             // The MAC covers all bytes up to the end of the --- prefix.
+-            mac.write_all(&bytes[..bytes.len() - ENCODED_MAC_LENGTH - 2])
+-                .expect("can serialize Header into HmacWriter");
++            if let Err(error) = mac.write_all(&bytes[..bytes.len() - ENCODED_MAC_LENGTH - 2]) {
++                panic!("cannot serialize age header into infallible HMAC writer: {error}");
++            }
+         } else {
+-            cookie_factory::r#gen(write::header_v1_minus_mac(self), &mut mac)
+-                .expect("can serialize Header into HmacWriter");
++            if let Err(error) = cookie_factory::r#gen(write::header_v1_minus_mac(self), &mut mac) {
++                panic!("cannot serialize age header into infallible HMAC writer: {error}");
++            }
+         }
+         mac.verify(&self.mac)
+     }
+@@ -319,7 +322,7 @@
+ 
+     fn recipient_stanza<'a, W: 'a + Write>(r: &'a Stanza) -> impl SerializeFn<W> + 'a {
+         move |w: WriteContext<W>| {
+-            let args: Vec<_> = r.args.iter().map(|s| s.as_str()).collect();
++            let args: Vec<_> = r.args.iter().map(String::as_str).collect();
+             let writer = age_stanza(&r.tag, &args, &r.body);
+             writer(w)
+         }
+--- a/age/src/i18n.rs
++++ b/age/src/i18n.rs
+@@ -15,8 +15,13 @@
+         let language_loader = fluent_language_loader!();
+         // Ensure that the fallback language is always loaded, even if the library user
+         // doesn't call `localizer().select(languages)`.
+-        let fallback: LanguageIdentifier = "en-US".parse().unwrap();
+-        language_loader.load_languages(&Localizations, &[fallback]).unwrap();
++        let fallback: LanguageIdentifier = match "en-US".parse() {
++            Ok(fallback) => fallback,
++            Err(error) => panic!("invalid built-in fallback language en-US: {error}"),
++        };
++        if let Err(error) = language_loader.load_languages(&Localizations, &[fallback]) {
++            panic!("missing or invalid embedded fallback language: {error}");
++        }
+         language_loader
+     };
+ }
+@@ -101,3 +106,55 @@
+         Ok(supported_languages)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{FluentLanguageLoader, LanguageIdentifier, LanguageLoader, Localizations};
++    use i18n_embed::fluent::fluent_language_loader;
++
++    #[test]
++    fn localization_resources_and_fallback_are_available() {
++        let mut resources: Vec<_> = Localizations::iter()
++            .map(std::borrow::Cow::into_owned)
++            .collect();
++        resources.sort();
++        assert_eq!(
++            resources,
++            [
++                "en-US/age.ftl",
++                "es-AR/age.ftl",
++                "fr/age.ftl",
++                "it/age.ftl",
++                "ru/age.ftl",
++                "zh-CN/age.ftl",
++                "zh-TW/age.ftl",
++            ]
++        );
++        for path in resources {
++            let resource = Localizations::get(&path).expect("localization resource is available");
++            let text = std::str::from_utf8(resource.data.as_ref()).expect("valid Fluent UTF-8");
++            assert!(text.contains("cli-secret-input-required ="), "{path}");
++        }
++
++        // Use a fresh loader so this test cannot change the process-wide locale.
++        let loader: FluentLanguageLoader = fluent_language_loader!();
++        let fallback: LanguageIdentifier = "en-US".parse().unwrap();
++        loader.load_languages(&Localizations, &[fallback]).unwrap();
++        assert_eq!(loader.get("cli-secret-input-required"), "Input is required");
++
++        // An unavailable requested locale must still resolve through the real fallback.
++        let unavailable: LanguageIdentifier = "de-DE".parse().unwrap();
++        i18n_embed::select(&loader, &Localizations, &[unavailable]).unwrap();
++        assert_eq!(loader.get("cli-secret-input-required"), "Input is required");
++    }
++
++    #[test]
++    fn french_localization_loads_from_resources() {
++        let loader: FluentLanguageLoader = fluent_language_loader!();
++        let french: LanguageIdentifier = "fr".parse().unwrap();
++        let selected =
++            i18n_embed::select(&loader, &Localizations, std::slice::from_ref(&french)).unwrap();
++        assert!(selected.contains(&french));
++        assert_eq!(loader.get("cli-secret-input-required"), "Entrée requise");
++    }
++}
+--- a/age/src/identity.rs
++++ b/age/src/identity.rs
+@@ -68,7 +68,7 @@
+ 
+     /// Parses one or more identities from a buffered input containing valid UTF-8.
+     pub fn from_buffer<R: io::BufRead>(data: R) -> io::Result<Self> {
+-        Self::parse_identities(None, data)
++        Self::parse_identities(/*filename*/ None, data)
+     }
+ 
+     /// Parses one or more identities from an [`InputReader`];
+@@ -253,7 +253,7 @@
+         self.plugin_recipients.push(recipient);
+     }
+ 
+-    #[cfg(feature = "armor")]
++    #[cfg(all(feature = "armor", feature = "cli-common"))]
+     pub(crate) fn extend(
+         &mut self,
+         iter: impl IntoIterator<Item = Box<dyn crate::Recipient + Send>>,
+@@ -342,49 +342,49 @@
+ 
+     #[test]
+     fn secret_key_encoding() {
+-        valid_secret_key_encoding(TEST_SK, 1);
++        valid_secret_key_encoding(TEST_SK, /*num_keys*/ 1);
+     }
+ 
+     #[test]
+     fn secret_key_lf() {
+-        valid_secret_key_encoding(&format!("{TEST_SK}\n"), 1);
++        valid_secret_key_encoding(&format!("{TEST_SK}\n"), /*num_keys*/ 1);
+     }
+ 
+     #[test]
+     fn two_secret_keys_lf() {
+-        valid_secret_key_encoding(&format!("{TEST_SK}\n{TEST_SK}"), 2);
++        valid_secret_key_encoding(&format!("{TEST_SK}\n{TEST_SK}"), /*num_keys*/ 2);
+     }
+ 
+     #[test]
+     fn secret_key_with_comment_lf() {
+-        valid_secret_key_encoding(&format!("# Foo bar baz\n{TEST_SK}"), 1);
+-        valid_secret_key_encoding(&format!("{TEST_SK}\n# Foo bar baz"), 1);
++        valid_secret_key_encoding(&format!("# Foo bar baz\n{TEST_SK}"), /*num_keys*/ 1);
++        valid_secret_key_encoding(&format!("{TEST_SK}\n# Foo bar baz"), /*num_keys*/ 1);
+     }
+ 
+     #[test]
+     fn secret_key_with_empty_line_lf() {
+-        valid_secret_key_encoding(&format!("\n\n{TEST_SK}"), 1);
++        valid_secret_key_encoding(&format!("\n\n{TEST_SK}"), /*num_keys*/ 1);
+     }
+ 
+     #[test]
+     fn secret_key_crlf() {
+-        valid_secret_key_encoding(&format!("{TEST_SK}\r\n"), 1);
++        valid_secret_key_encoding(&format!("{TEST_SK}\r\n"), /*num_keys*/ 1);
+     }
+ 
+     #[test]
+     fn two_secret_keys_crlf() {
+-        valid_secret_key_encoding(&format!("{TEST_SK}\r\n{TEST_SK}"), 2);
++        valid_secret_key_encoding(&format!("{TEST_SK}\r\n{TEST_SK}"), /*num_keys*/ 2);
+     }
+ 
+     #[test]
+     fn secret_key_with_comment_crlf() {
+-        valid_secret_key_encoding(&format!("# Foo bar baz\r\n{TEST_SK}"), 1);
+-        valid_secret_key_encoding(&format!("{TEST_SK}\r\n# Foo bar baz"), 1);
++        valid_secret_key_encoding(&format!("# Foo bar baz\r\n{TEST_SK}"), /*num_keys*/ 1);
++        valid_secret_key_encoding(&format!("{TEST_SK}\r\n# Foo bar baz"), /*num_keys*/ 1);
+     }
+ 
+     #[test]
+     fn secret_key_with_empty_line_crlf() {
+-        valid_secret_key_encoding(&format!("\r\n\r\n{TEST_SK}"), 1);
++        valid_secret_key_encoding(&format!("\r\n\r\n{TEST_SK}"), /*num_keys*/ 1);
+     }
+ 
+     #[test]
+--- a/age/src/native.rs
++++ b/age/src/native.rs
+@@ -9,15 +9,18 @@
+ pub mod x25519;
+ 
+ fn static_tag(pk: &[u8]) -> [u8; 4] {
+-    Sha256::digest(pk)[..4]
+-        .try_into()
+-        .expect("length is correct")
++    let digest = Sha256::digest(pk);
++    let mut output = [0; 4];
++    output.copy_from_slice(&digest[..4]);
++    output
+ }
+ 
+ /// Derives a tag for the tagged age recipient formats.
+ fn stanza_tag(ikm: &[u8], salt: &str) -> [u8; 4] {
+     let (tag, _) = Hkdf::<Sha256>::extract(Some(salt.as_bytes()), ikm);
+-    tag[..4].try_into().expect("correct length")
++    let mut output = [0; 4];
++    output.copy_from_slice(&tag[..4]);
++    output
+ }
+ 
+ fn label_pq_only() -> HashSet<String> {
+--- a/age/src/native/scrypt.rs
++++ b/age/src/native/scrypt.rs
+@@ -34,6 +34,63 @@
+ /// Pick an scrypt work factor that will take around 1 second on this device.
+ ///
+ /// Guaranteed to return a valid work factor (less than 64).
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn target_scrypt_work_factor() -> u8 {
++    use std::time::Instant;
++
++    calibrate_native_work_factor(|log_n| {
++        #[cfg(test)]
++        if let Some(elapsed) = calibration_test_hooks::measurement(log_n) {
++            return require_native_elapsed(elapsed);
++        }
++        let start = Instant::now();
++        if let Err(error) = scrypt(&[], log_n, "") {
++            panic!("internally selected scrypt calibration factor {log_n} must be valid: {error}");
++        }
++        require_native_elapsed(Instant::now().checked_duration_since(start))
++    })
++}
++
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn require_native_elapsed(elapsed: Option<Duration>) -> Duration {
++    match elapsed {
++        Some(duration) => duration,
++        None => panic!("cannot calibrate scrypt: monotonic clock moved backwards"),
++    }
++}
++
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn calibrate_native_work_factor(mut measure: impl FnMut(u8) -> Duration) -> u8 {
++    // At most 21 measurements, with a maximum 64 MiB primary scrypt workspace.
++    // Each new recipient and identity still measures current capacity independently.
++    for log_n in 10..=16 {
++        let mut samples = [Duration::ZERO; 3];
++        for sample in &mut samples {
++            *sample = measure(log_n);
++        }
++        samples.sort_unstable();
++        let duration = samples[1];
++        if !duration.is_zero() {
++            return work_factor_from_duration(log_n, duration);
++        }
++    }
++    panic!("cannot calibrate scrypt: timer resolution insufficient through log_n=16");
++}
++
++#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
++fn work_factor_from_duration(mut log_n: u8, mut duration: Duration) -> u8 {
++    assert!(log_n < 64 && !duration.is_zero());
++    // Preserve round-up extrapolation. Multiplication only happens below one
++    // second, so neither Duration overflow nor invalid work factors are introduced.
++    while duration < ONE_SECOND && log_n < 63 {
++        log_n += 1;
++        duration *= 2;
++    }
++    log_n
++}
++
++// Preserve the complete upstream browser/WASM calibration body and fallback.
++#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+ fn target_scrypt_work_factor() -> u8 {
+     let measure_duration = |log_n| {
+         // Platforms that have a functional SystemTime::now():
+@@ -113,6 +170,11 @@
+     ///
+     /// The scrypt work factor is picked to target about 1 second for encryption or
+     /// decryption on this device. Override it with [`Self::set_work_factor`].
++    ///
++    /// # Panics
++    /// On native platforms (including WASI), panics if the monotonic timer is
++    /// invalid or three-sample medians remain zero through work factor 16.
++    /// A weaker factor is not substituted. Browser/WASM behavior is unchanged.
+     pub fn new(passphrase: SecretString) -> Self {
+         Self {
+             passphrase,
+@@ -149,8 +211,10 @@
+         inner_salt[..SCRYPT_SALT_LABEL.len()].copy_from_slice(SCRYPT_SALT_LABEL);
+         inner_salt[SCRYPT_SALT_LABEL.len()..].copy_from_slice(&salt);
+ 
+-        let enc_key =
+-            scrypt(&inner_salt, self.log_n, self.passphrase.expose_secret()).expect("log_n < 64");
++        let enc_key = match scrypt(&inner_salt, self.log_n, self.passphrase.expose_secret()) {
++            Ok(key) => key,
++            Err(error) => panic!("configured scrypt recipient work factor must be valid: {error}"),
++        };
+         let encrypted_file_key = aead_encrypt(&enc_key, file_key.expose_secret());
+ 
+         let encoded_salt = BASE64_STANDARD_NO_PAD.encode(salt);
+@@ -184,6 +248,11 @@
+ 
+ impl Identity {
+     /// Constructs a new `Identity` with the given passphrase.
++    ///
++    /// # Panics
++    /// On native platforms (including WASI), panics if the monotonic timer is
++    /// invalid or three-sample medians remain zero through work factor 16.
++    /// A more permissive cap is not substituted. Browser/WASM behavior is unchanged.
+     pub fn new(passphrase: SecretString) -> Self {
+         let target_work_factor = target_scrypt_work_factor();
+ 
+@@ -247,6 +316,8 @@
+         inner_salt[..SCRYPT_SALT_LABEL.len()].copy_from_slice(SCRYPT_SALT_LABEL);
+         inner_salt[SCRYPT_SALT_LABEL.len()..].copy_from_slice(&salt);
+ 
++        #[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
++        calibration_test_hooks::record_stanza_derivation();
+         let enc_key = match scrypt(&inner_salt, log_n, self.passphrase.expose_secret()) {
+             Ok(k) => k,
+             Err(_) => {
+@@ -277,3 +348,337 @@
+         )
+     }
+ }
++
++// Test-only hooks are thread-local, scoped, and absent from production builds.
++// Installing timings changes calibration measurement only; stanza derivation
++// instrumentation counts the real KDF boundary and never substitutes a key.
++#[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
++mod calibration_test_hooks {
++    use std::cell::RefCell;
++    use std::collections::VecDeque;
++    use std::rc::Rc;
++    use std::time::Duration;
++
++    #[derive(Default)]
++    struct State {
++        timings: VecDeque<(u8, Option<Duration>)>,
++        measured: Vec<u8>,
++        stanza_derivations: usize,
++    }
++
++    thread_local! {
++        static CURRENT: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
++    }
++
++    pub(super) struct Guard {
++        state: Rc<RefCell<State>>,
++        previous: Option<Rc<RefCell<State>>>,
++    }
++
++    impl Guard {
++        pub(super) fn install(timings: Vec<(u8, Option<Duration>)>) -> Self {
++            let state = Rc::new(RefCell::new(State {
++                timings: timings.into(),
++                ..State::default()
++            }));
++            let previous = CURRENT.with(|slot| slot.replace(Some(Rc::clone(&state))));
++            Self { state, previous }
++        }
++
++        pub(super) fn measured(&self) -> Vec<u8> {
++            self.state.borrow().measured.clone()
++        }
++
++        pub(super) fn remaining(&self) -> usize {
++            self.state.borrow().timings.len()
++        }
++
++        pub(super) fn derivations(&self) -> usize {
++            self.state.borrow().stanza_derivations
++        }
++    }
++
++    impl Drop for Guard {
++        fn drop(&mut self) {
++            CURRENT.with(|slot| slot.replace(self.previous.take()));
++        }
++    }
++
++    pub(super) fn measurement(log_n: u8) -> Option<Option<Duration>> {
++        CURRENT.with(|slot| {
++            slot.borrow().as_ref().map(|state| {
++                let mut state = state.borrow_mut();
++                state.measured.push(log_n);
++                let (expected_factor, elapsed) = match state.timings.pop_front() {
++                    Some(measurement) => measurement,
++                    None => panic!("unexpected extra calibration measurement"),
++                };
++                assert_eq!(log_n, expected_factor);
++                elapsed
++            })
++        })
++    }
++
++    pub(super) fn record_stanza_derivation() {
++        CURRENT.with(|slot| {
++            if let Some(state) = slot.borrow().as_ref() {
++                state.borrow_mut().stanza_derivations += 1;
++            }
++        });
++    }
++}
++
++#[cfg(all(test, not(all(target_arch = "wasm32", not(target_os = "wasi")))))]
++mod calibration_tests {
++    use super::*;
++    use calibration_test_hooks::Guard;
++    use std::panic::{AssertUnwindSafe, catch_unwind};
++
++    fn samples(log_n: u8, duration: Duration) -> Vec<(u8, Option<Duration>)> {
++        vec![(log_n, Some(duration)); 3]
++    }
++
++    fn public_passphrase() -> SecretString {
++        "public calibration regression".to_owned().into()
++    }
++
++    fn public_stanza(factor: u8) -> Stanza {
++        Stanza {
++            tag: SCRYPT_RECIPIENT_TAG.to_owned(),
++            args: vec![
++                BASE64_STANDARD_NO_PAD.encode([0_u8; SALT_LEN]),
++                factor.to_string(),
++            ],
++            body: vec![0; ENCRYPTED_FILE_KEY_BYTES],
++        }
++    }
++
++    #[test]
++    fn public_constructors_recalibrate_readers_and_writers_in_both_directions() {
++        let fast = Duration::from_millis(1);
++        let slow = Duration::from_millis(32);
++        let timings = [fast, fast, slow, slow, fast, fast]
++            .into_iter()
++            .flat_map(|duration| samples(/*log_n*/ 10, duration))
++            .collect();
++        let guard = Guard::install(timings);
++        let early_writer = Recipient::new(public_passphrase());
++        let early_reader = Identity::new(public_passphrase());
++        let slower_reader = Identity::new(public_passphrase());
++        let slower_writer = Recipient::new(public_passphrase());
++        let faster_reader = Identity::new(public_passphrase());
++        let faster_writer = Recipient::new(public_passphrase());
++        assert_eq!(
++            (early_writer.log_n, early_reader.target_work_factor),
++            (20, 20)
++        );
++        assert_eq!(
++            (slower_writer.log_n, slower_reader.target_work_factor),
++            (15, 15)
++        );
++        assert_eq!(
++            (faster_writer.log_n, faster_reader.target_work_factor),
++            (20, 20)
++        );
++        assert_eq!(
++            (
++                early_reader.max_work_factor,
++                slower_reader.max_work_factor,
++                faster_reader.max_work_factor
++            ),
++            (24, 19, 24)
++        );
++        assert_eq!(guard.measured(), vec![10; 18]);
++        assert_eq!(guard.remaining(), 0);
++        assert!(matches!(
++            crate::Identity::unwrap_stanza(&slower_reader, &public_stanza(/*factor*/ 20)),
++            Some(Err(DecryptError::ExcessiveWork {
++                required: 20,
++                target: 15
++            }))
++        ));
++        assert_eq!(guard.derivations(), 0);
++    }
++
++    #[test]
++    fn every_isolated_high_low_or_zero_sample_preserves_two_representative_samples() {
++        let stable = Duration::from_millis(40);
++        for outlier in [
++            Duration::from_secs(2),
++            Duration::from_nanos(1),
++            Duration::ZERO,
++        ] {
++            for position in 0..3 {
++                let mut timings = samples(/*log_n*/ 10, stable);
++                timings[position].1 = Some(outlier);
++                let guard = Guard::install(timings);
++                assert_eq!(Recipient::new(public_passphrase()).log_n, 15);
++                assert_eq!(guard.measured(), vec![10; 3]);
++                assert_eq!(guard.remaining(), 0);
++            }
++        }
++    }
++
++    #[test]
++    fn two_zero_samples_advance_one_factor_with_exact_call_counts() {
++        for positive_position in 0..3 {
++            let mut timings = samples(/*log_n*/ 10, Duration::ZERO);
++            timings[positive_position].1 = Some(Duration::from_millis(40));
++            timings.extend(samples(/*log_n*/ 11, Duration::from_millis(40)));
++            let guard = Guard::install(timings);
++            assert_eq!(Identity::new(public_passphrase()).target_work_factor, 16);
++            assert_eq!(guard.measured(), vec![10, 10, 10, 11, 11, 11]);
++            assert_eq!(guard.remaining(), 0);
++        }
++    }
++
++    #[test]
++    fn zero_resolution_is_bounded_and_fails_closed_after_twenty_one_calls() {
++        let timings = (10..=16)
++            .flat_map(|factor| samples(factor, Duration::ZERO))
++            .collect();
++        let guard = Guard::install(timings);
++        assert!(catch_unwind(AssertUnwindSafe(|| Recipient::new(public_passphrase()))).is_err());
++        assert_eq!(guard.measured().len(), 21);
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn last_permitted_factor_can_measure_without_exceeding_the_bound() {
++        let mut timings: Vec<_> = (10..16)
++            .flat_map(|factor| samples(factor, Duration::ZERO))
++            .collect();
++        timings.extend(samples(/*log_n*/ 16, Duration::from_millis(40)));
++        let guard = Guard::install(timings);
++        assert_eq!(Recipient::new(public_passphrase()).log_n, 21);
++        assert_eq!(guard.measured().len(), 21);
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn invalid_or_missing_native_elapsed_never_reuses_partial_samples_or_falls_back() {
++        for invalid_position in 0..3 {
++            let mut timings = samples(/*log_n*/ 10, Duration::from_millis(40));
++            timings[invalid_position].1 = None;
++            let guard = Guard::install(timings);
++            assert!(catch_unwind(AssertUnwindSafe(|| Identity::new(public_passphrase()))).is_err());
++            assert_eq!(guard.measured().len(), invalid_position + 1);
++        }
++    }
++
++    #[test]
++    fn scoped_hooks_restore_prior_state_on_drop_and_unwind() {
++        let outer = Guard::install(samples(/*log_n*/ 10, Duration::from_millis(40)));
++        assert!(
++            catch_unwind(|| {
++                let _inner = Guard::install(samples(/*log_n*/ 10, Duration::ZERO));
++                panic!("simulate unrelated test panic");
++            })
++            .is_err()
++        );
++        assert_eq!(Recipient::new(public_passphrase()).log_n, 15);
++        assert_eq!(outer.remaining(), 0);
++    }
++
++    #[test]
++    fn hooks_do_not_leak_to_another_test_thread() {
++        let guard = Guard::install(samples(/*log_n*/ 10, Duration::from_millis(40)));
++        std::thread::spawn(|| {
++            assert!(calibration_test_hooks::measurement(/*log_n*/ 10).is_none());
++            let guard = Guard::install(samples(/*log_n*/ 10, Duration::from_millis(1)));
++            assert_eq!(Identity::new(public_passphrase()).target_work_factor, 20);
++            assert_eq!(guard.remaining(), 0);
++        })
++        .join()
++        .expect("isolated test thread");
++        assert_eq!(Recipient::new(public_passphrase()).log_n, 15);
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn actual_stanza_plus_five_rejects_without_derivation_plus_four_authenticates() {
++        // target10, cap14 keeps the single REAL boundary KDF to N=2^14.
++        let guard = Guard::install(samples(/*log_n*/ 10, ONE_SECOND));
++        let identity = Identity::new(public_passphrase());
++        assert!(matches!(
++            crate::Identity::unwrap_stanza(&identity, &public_stanza(/*factor*/ 15)),
++            Some(Err(DecryptError::ExcessiveWork {
++                required: 15,
++                target: 10
++            }))
++        ));
++        assert_eq!(guard.derivations(), 0);
++        assert!(matches!(
++            crate::Identity::unwrap_stanza(&identity, &public_stanza(/*factor*/ 14)),
++            Some(Err(DecryptError::DecryptionFailed))
++        ));
++        assert_eq!(guard.derivations(), 1);
++    }
++
++    #[test]
++    fn actual_malformed_stanzas_reject_before_the_kdf_boundary() {
++        let guard = Guard::install(samples(/*log_n*/ 10, ONE_SECOND));
++        let identity = Identity::new(public_passphrase());
++        for variation in 0..4 {
++            let mut stanza = public_stanza(/*factor*/ 14);
++            match variation {
++                0 => stanza.args[0] = "invalid salt=".to_owned(),
++                1 => stanza.args[1] = "14x".to_owned(),
++                2 => {
++                    stanza.args.pop();
++                }
++                _ => {
++                    stanza.body.pop();
++                }
++            }
++            assert!(
++                matches!(
++                    crate::Identity::unwrap_stanza(&identity, &stanza),
++                    Some(Err(DecryptError::InvalidHeader))
++                ),
++                "malformed stanza variation {variation}"
++            );
++        }
++        assert_eq!(guard.derivations(), 0);
++    }
++
++    #[test]
++    fn existing_setters_remain_explicit_and_do_not_change_the_calibrated_target() {
++        let mut timings = samples(/*log_n*/ 10, Duration::from_millis(40));
++        timings.extend(samples(/*log_n*/ 10, Duration::from_millis(40)));
++        let guard = Guard::install(timings);
++        let mut recipient = Recipient::new(public_passphrase());
++        recipient.set_work_factor(/*log_n*/ 17);
++        assert_eq!(recipient.log_n, 17);
++        let mut identity = Identity::new(public_passphrase());
++        identity.set_max_work_factor(/*max_log_n*/ 18);
++        assert_eq!(
++            (identity.target_work_factor, identity.max_work_factor),
++            (15, 18)
++        );
++        assert_eq!(guard.remaining(), 0);
++    }
++
++    #[test]
++    fn estimator_retains_threshold_rounding_overflow_and_saturation_behavior() {
++        assert_eq!(work_factor_from_duration(/*log_n*/ 10, ONE_SECOND), 10);
++        assert_eq!(
++            work_factor_from_duration(/*log_n*/ 10, ONE_SECOND - Duration::from_nanos(1)),
++            11
++        );
++        assert_eq!(
++            work_factor_from_duration(/*log_n*/ 10, Duration::from_millis(500)),
++            11
++        );
++        assert_eq!(
++            work_factor_from_duration(/*log_n*/ 10, Duration::from_millis(499)),
++            12
++        );
++        assert_eq!(work_factor_from_duration(/*log_n*/ 10, Duration::MAX), 10);
++        assert_eq!(
++            work_factor_from_duration(/*log_n*/ 63, Duration::from_nanos(1)),
++            63
++        );
++        assert!(catch_unwind(|| work_factor_from_duration(/*log_n*/ 10, Duration::ZERO)).is_err());
++    }
++}
+--- a/age/src/native/tag.rs
++++ b/age/src/native/tag.rs
+@@ -64,9 +64,14 @@
+             .into_option()
+             .ok_or("invalid P-256 point")?;
+ 
+-        let pk_recip =
+-            <Kem as hpke::Kem>::PublicKey::from_bytes(point.to_sec1_point(false).as_bytes())
+-                .expect("valid");
++        let pk_recip = match <Kem as hpke::Kem>::PublicKey::from_bytes(
++            point.to_sec1_point(false).as_bytes(),
++        ) {
++            Ok(key) => key,
++            Err(error) => {
++                panic!("validated P-256 point must convert to HPKE uncompressed SEC1: {error}")
++            }
++        };
+ 
+         Ok(Self {
+             compressed: encoded,
+--- a/age/src/native/x25519.rs
++++ b/age/src/native/x25519.rs
+@@ -110,9 +110,8 @@
+         }
+ 
+         let epk: PublicKey = ephemeral_share.into();
+-        let encrypted_file_key: [u8; ENCRYPTED_FILE_KEY_BYTES] = stanza.body[..]
+-            .try_into()
+-            .expect("Length should have been checked above");
++        let mut encrypted_file_key = [0; ENCRYPTED_FILE_KEY_BYTES];
++        encrypted_file_key.copy_from_slice(&stanza.body);
+ 
+         let pk: PublicKey = (&self.0).into();
+         let shared_secret = self.0.diffie_hellman(&epk);
+--- a/age/src/primitives.rs
++++ b/age/src/primitives.rs
+@@ -30,7 +30,10 @@
+     /// Constructs a new writer to process input data.
+     pub(crate) fn new(key: HmacKey) -> Self {
+         HmacWriter {
+-            inner: Hmac::new_from_slice(key.0.expose_secret()).expect("key is the correct length"),
++            inner: match Hmac::new_from_slice(key.0.expose_secret()) {
++                Ok(inner) => inner,
++                Err(error) => panic!("HMAC-SHA256 must accept the fixed 32-byte key: {error}"),
++            },
+         }
+     }
+ 
+@@ -65,7 +68,8 @@
+     let params = ScryptParams::new(log_n, 8, 1)?;
+ 
+     let mut output = [0; 32];
+-    scrypt_inner(password.as_bytes(), salt, &params, &mut output)
+-        .expect("output is the correct length");
++    if scrypt_inner(password.as_bytes(), salt, &params, &mut output).is_err() {
++        panic!("scrypt must accept the fixed 32-byte output");
++    }
+     Ok(output)
+ }
+--- a/age/src/primitives/armor.rs
++++ b/age/src/primitives/armor.rs
+@@ -371,10 +371,16 @@
+                 mut encoded_buf,
+                 ..
+             } => {
+-                let byte_buf = byte_buf.unwrap();
+-                let encoded = BASE64_STANDARD
+-                    .encode_slice(byte_buf, &mut encoded_buf[..])
+-                    .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES");
++                let byte_buf = match byte_buf {
++                    Some(byte_buf) => byte_buf,
++                    None => panic!("cannot finish age armor after its byte buffer was taken"),
++                };
++                let encoded = match BASE64_STANDARD.encode_slice(byte_buf, &mut encoded_buf[..]) {
++                    Ok(encoded) => encoded,
++                    Err(error) => panic!(
++                        "age armor base64 output buffer must fit the bounded byte chunk: {error}"
++                    ),
++                };
+                 inner.write_all(&encoded_buf[..encoded])?;
+                 inner.finish()
+             }
+@@ -394,7 +400,12 @@
+             } => {
+                 // Guaranteed to be Some (as long as async and sync writing isn't mixed),
+                 // because ArmoredWriter::finish consumes self.
+-                let byte_buf = byte_buf.as_mut().unwrap();
++                let byte_buf = match byte_buf.as_mut() {
++                    Some(byte_buf) => byte_buf,
++                    None => panic!(
++                        "cannot synchronously write age armor after its byte buffer was taken"
++                    ),
++                };
+ 
+                 let mut written = 0;
+                 loop {
+@@ -415,12 +426,15 @@
+                     if buf.is_empty() {
+                         break;
+                     } else {
+-                        assert_eq!(
+-                            BASE64_STANDARD
+-                                .encode_slice(&byte_buf, &mut encoded_buf[..])
+-                                .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES"),
+-                            BASE64_CHUNK_SIZE_COLUMNS
+-                        );
++                        let encoded = match BASE64_STANDARD
++                            .encode_slice(&byte_buf, &mut encoded_buf[..])
++                        {
++                            Ok(encoded) => encoded,
++                            Err(error) => panic!(
++                                "age armor base64 output buffer must fit the bounded byte chunk: {error}"
++                            ),
++                        };
++                        assert_eq!(encoded, BASE64_CHUNK_SIZE_COLUMNS);
+                         inner.write_all(&encoded_buf[..])?;
+                         byte_buf.clear();
+                     };
+@@ -515,12 +529,15 @@
+                     // Only encode the line if we have more data to write, as the last
+                     // line must be written in poll_close().
+                     if !buf.is_empty() {
+-                        assert_eq!(
+-                            BASE64_STANDARD
+-                                .encode_slice(&byte_buf, &mut encoded_buf[..],)
+-                                .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES"),
+-                            BASE64_CHUNK_SIZE_COLUMNS
+-                        );
++                        let encoded = match BASE64_STANDARD
++                            .encode_slice(&byte_buf, &mut encoded_buf[..])
++                        {
++                            Ok(encoded) => encoded,
++                            Err(error) => panic!(
++                                "age armor base64 output buffer must fit the bounded byte chunk: {error}"
++                            ),
++                        };
++                        assert_eq!(encoded, BASE64_CHUNK_SIZE_COLUMNS);
+                         *encoded_line = Some(EncodedBytes {
+                             offset: 0,
+                             end: BASE64_CHUNK_SIZE_COLUMNS,
+@@ -562,9 +579,12 @@
+             if let Some(byte_buf) = byte_buf {
+                 // Finish the armored format with a partial line (if necessary) and the end
+                 // marker.
+-                let encoded = BASE64_STANDARD
+-                    .encode_slice(byte_buf, &mut encoded_buf[..])
+-                    .expect("byte_buf.len() <= BASE64_CHUNK_SIZE_BYTES");
++                let encoded = match BASE64_STANDARD.encode_slice(byte_buf, &mut encoded_buf[..]) {
++                    Ok(encoded) => encoded,
++                    Err(error) => panic!(
++                        "age armor base64 output buffer must fit the bounded byte chunk: {error}"
++                    ),
++                };
+                 *encoded_line = Some(EncodedBytes {
+                     offset: 0,
+                     end: encoded,
+@@ -817,7 +837,7 @@
+                                 )
+                             })?,
+                     );
+-                    self.count_reader_bytes(1);
++                    self.count_reader_bytes(/*read*/ 1);
+                 }
+                 (_, b"\r\n") => (),
+                 (_, _) => {
+@@ -1057,7 +1077,9 @@
+     bytes: &mut Vec<u8>,
+     read: &mut usize,
+ ) -> Poll<io::Result<usize>> {
+-    let ret = ready!(read_until_internal(reader, cx, b'\n', bytes, read));
++    let ret = ready!(read_until_internal(
++        reader, cx, /*byte*/ b'\n', bytes, read
++    ));
+     match String::from_utf8(mem::take(bytes)) {
+         Err(_) => Poll::Ready(ret.and_then(|_| {
+             Err(io::Error::new(
+--- a/age/src/primitives/stream.rs
++++ b/age/src/primitives/stream.rs
+@@ -66,9 +66,10 @@
+     }
+ 
+     fn to_bytes(self) -> [u8; 12] {
+-        self.0.to_be_bytes()[4..]
+-            .try_into()
+-            .expect("slice is correct length")
++        let bytes = self.0.to_be_bytes();
++        let mut nonce = [0; 12];
++        nonce.copy_from_slice(&bytes[4..]);
++        nonce
+     }
+ }
+ 
+@@ -183,10 +184,10 @@
+             io::Error::new(io::ErrorKind::WriteZero, "last chunk has been processed")
+         })?;
+ 
+-        let encrypted = self
+-            .aead
+-            .encrypt(&self.nonce.to_bytes().into(), chunk)
+-            .expect("we will never hit chacha20::MAX_BLOCKS because of the chunk size");
++        let encrypted = match self.aead.encrypt(&self.nonce.to_bytes().into(), chunk) {
++            Ok(encrypted) => encrypted,
++            Err(error) => panic!("age chunk size must remain below chacha20::MAX_BLOCKS: {error}"),
++        };
+         self.nonce.increment_counter();
+ 
+         Ok(encrypted)
+@@ -233,7 +234,7 @@
+     /// encryption process. Failing to call `finish` will result in a truncated file that
+     /// that will fail to decrypt.
+     pub fn finish(mut self) -> io::Result<W> {
+-        let encrypted = self.stream.encrypt_chunk(&self.chunk, true)?;
++        let encrypted = self.stream.encrypt_chunk(&self.chunk, /*last*/ true)?;
+         self.inner.write_all(&encrypted)?;
+         Ok(self.inner)
+     }
+@@ -255,7 +256,7 @@
+             // Only encrypt the chunk if we have more data to write, as the last
+             // chunk must be written in finish().
+             if !buf.is_empty() {
+-                let encrypted = self.stream.encrypt_chunk(&self.chunk, false)?;
++                let encrypted = self.stream.encrypt_chunk(&self.chunk, /*last*/ false)?;
+                 self.inner.write_all(&encrypted)?;
+                 self.chunk.clear();
+             }
+@@ -334,7 +335,7 @@
+             if !buf.is_empty() {
+                 let this = self.as_mut().project();
+                 *this.encrypted_chunk = Some(EncryptedChunk {
+-                    bytes: this.stream.encrypt_chunk(this.chunk, false)?,
++                    bytes: this.stream.encrypt_chunk(this.chunk, /*last*/ false)?,
+                     offset: 0,
+                 });
+                 this.chunk.clear();
+@@ -368,7 +369,7 @@
+             // Finish the stream.
+             let this = self.as_mut().project();
+             *this.encrypted_chunk = Some(EncryptedChunk {
+-                bytes: this.stream.encrypt_chunk(this.chunk, true)?,
++                bytes: this.stream.encrypt_chunk(this.chunk, /*last*/ true)?,
+                 offset: 0,
+             });
+         }
+@@ -445,7 +446,7 @@
+                     ));
+                 }
+                 (Ok(chunk), _) => Some(chunk),
+-                (Err(_), false) => Some(self.stream.decrypt_chunk(chunk, true)?),
++                (Err(_), false) => Some(self.stream.decrypt_chunk(chunk, /*last*/ true)?),
+                 (Err(e), true) => return Err(e),
+             };
+         }
+@@ -457,11 +458,9 @@
+     }
+ 
+     fn read_from_chunk(&mut self, buf: &mut [u8]) -> usize {
+-        if self.chunk.is_none() {
++        let Some(chunk) = self.chunk.as_ref() else {
+             return 0;
+-        }
+-
+-        let chunk = self.chunk.as_ref().unwrap();
++        };
+         let cur_chunk_offset = self.cur_plaintext_pos as usize % CHUNK_SIZE;
+ 
+         let to_read = cmp::min(chunk.expose_secret().len() - cur_chunk_offset, buf.len());
+@@ -469,7 +468,8 @@
+         buf[..to_read]
+             .copy_from_slice(&chunk.expose_secret()[cur_chunk_offset..cur_chunk_offset + to_read]);
+         self.cur_plaintext_pos += to_read as u64;
+-        if self.cur_plaintext_pos % CHUNK_SIZE as u64 == 0 {
++        // CHUNK_SIZE is fixed at 64 * 1024 (2^16), so its low-bit mask detects boundaries.
++        if self.cur_plaintext_pos & (CHUNK_SIZE as u64 - 1) == 0 {
+             // We've finished with the current chunk.
+             self.chunk = None;
+         }
+@@ -578,12 +578,14 @@
+                 self.inner.seek(SeekFrom::Start(last_chunk_start))?;
+                 self.inner.read_to_end(&mut last_chunk)?;
+                 self.stream.nonce.set_counter(non_last_chunks);
+-                self.stream.decrypt_chunk(&last_chunk, true).map_err(|_| {
+-                    io::Error::new(
+-                        io::ErrorKind::InvalidData,
+-                        "Last chunk is invalid, stream might be truncated",
+-                    )
+-                })?;
++                self.stream
++                    .decrypt_chunk(&last_chunk, /*last*/ true)
++                    .map_err(|_| {
++                        io::Error::new(
++                            io::ErrorKind::InvalidData,
++                            "Last chunk is invalid, stream might be truncated",
++                        )
++                    })?;
+ 
+                 // Now that we have authenticated the ciphertext length, we can use it to
+                 // calculate the plaintext length.
+@@ -667,11 +669,10 @@
+             // To handle this edge case, when `target_pos` is a multiple of the chunk
+             // size (i.e. this conditional branch), we compute the length of the
+             // plaintext. This is cached, so the overhead should be minimal.
+-            else if target_pos == self.len()? {
+-                self.stream
+-                    .nonce
+-                    .set_last(true)
+-                    .expect("We unset the last chunk flag earlier");
++            else if target_pos == self.len()?
++                && self.stream.nonce.set_last(/*last*/ true).is_err()
++            {
++                panic!("seek reset must clear the age stream final-chunk flag");
+             }
+         }
+ 
+@@ -702,12 +703,12 @@
+ 
+         let encrypted = {
+             let mut s = Stream::new(PayloadKey([7; 32].into()));
+-            s.encrypt_chunk(&data, false).unwrap()
++            s.encrypt_chunk(&data, /*last*/ false).unwrap()
+         };
+ 
+         let decrypted = {
+             let mut s = Stream::new(PayloadKey([7; 32].into()));
+-            s.decrypt_chunk(&encrypted, false).unwrap()
++            s.decrypt_chunk(&encrypted, /*last*/ false).unwrap()
+         };
+ 
+         assert_eq!(decrypted.expose_secret(), &data);
+@@ -719,15 +720,15 @@
+ 
+         let encrypted = {
+             let mut s = Stream::new(PayloadKey([7; 32].into()));
+-            let res = s.encrypt_chunk(&data, true).unwrap();
++            let res = s.encrypt_chunk(&data, /*last*/ true).unwrap();
+ 
+             // Further calls return an error
+             assert_eq!(
+-                s.encrypt_chunk(&data, false).unwrap_err().kind(),
++                s.encrypt_chunk(&data, /*last*/ false).unwrap_err().kind(),
+                 io::ErrorKind::WriteZero
+             );
+             assert_eq!(
+-                s.encrypt_chunk(&data, true).unwrap_err().kind(),
++                s.encrypt_chunk(&data, /*last*/ true).unwrap_err().kind(),
+                 io::ErrorKind::WriteZero
+             );
+ 
+@@ -736,14 +737,14 @@
+ 
+         let decrypted = {
+             let mut s = Stream::new(PayloadKey([7; 32].into()));
+-            let res = s.decrypt_chunk(&encrypted, true).unwrap();
++            let res = s.decrypt_chunk(&encrypted, /*last*/ true).unwrap();
+ 
+             // Further calls return an error
+-            match s.decrypt_chunk(&encrypted, false) {
++            match s.decrypt_chunk(&encrypted, /*last*/ false) {
+                 Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+                 _ => panic!("Expected error"),
+             }
+-            match s.decrypt_chunk(&encrypted, true) {
++            match s.decrypt_chunk(&encrypted, /*last*/ true) {
+                 Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+                 _ => panic!("Expected error"),
+             }
+--- a/age/src/protocol.rs
++++ b/age/src/protocol.rs
+@@ -65,8 +65,10 @@
+     ///
+     /// [`x25519::Identity`]: crate::x25519::Identity
+     pub fn with_user_passphrase(passphrase: SecretString) -> Self {
+-        Self::with_recipients(iter::once(&scrypt::Recipient::new(passphrase) as _))
+-            .expect("no errors can occur with this recipient set")
++        match Self::with_recipients(iter::once(&scrypt::Recipient::new(passphrase) as _)) {
++            Ok(encryptor) => encryptor,
++            Err(error) => panic!("single built-in scrypt recipient must be valid: {error}"),
++        }
+     }
+ 
+     /// Constructs an `Encryptor` that will create an age file encrypted to a list of
+@@ -121,7 +123,10 @@
+ 
+         let header = HeaderV1::new(recipients, mac_key(&file_key))?;
+         let nonce = Nonce::random();
+-        let payload_key = v1_payload_key(&file_key, &header, &nonce).expect("MAC is correct");
++        let payload_key = match v1_payload_key(&file_key, &header, &nonce) {
++            Ok(key) => key,
++            Err(error) => panic!("freshly generated age header MAC must verify: {error}"),
++        };
+ 
+         Ok(Self {
+             header: Header::V1(header),
+@@ -477,7 +482,7 @@
+ 
+         let mut recipient = scrypt::Recipient::new(SecretString::from("passphrase".to_string()));
+         // Override to something very fast for testing.
+-        recipient.set_work_factor(2);
++        recipient.set_work_factor(/*log_n*/ 2);
+ 
+         let mut encrypted = vec![];
+         let e = Encryptor::with_recipients(iter::once(&recipient as _)).unwrap();
+--- a/age/src/simple.rs
++++ b/age/src/simple.rs
+@@ -15,9 +15,10 @@
+ ///
+ /// This function returns binary ciphertext. To obtain an ASCII-armored text string, use
+ /// [`encrypt_and_armor`].
++///
++/// Errors from the recipient, including invalid recipient labels, are returned to the caller.
+ pub fn encrypt(recipient: &impl Recipient, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
+-    let encryptor =
+-        Encryptor::with_recipients(iter::once(recipient as _)).expect("we provided a recipient");
++    let encryptor = Encryptor::with_recipients(iter::once(recipient as _))?;
+ 
+     let mut ciphertext = Vec::with_capacity(plaintext.len());
+     let mut writer = encryptor.wrap_output(&mut ciphertext)?;
+@@ -32,14 +33,15 @@
+ ///
+ /// To encrypt to more than one recipient, use [`Encryptor::with_recipients`] along with
+ /// [`ArmoredWriter`].
++///
++/// Errors from the recipient, including invalid recipient labels, are returned to the caller.
+ #[cfg(feature = "armor")]
+ #[cfg_attr(docsrs, doc(cfg(feature = "armor")))]
+ pub fn encrypt_and_armor(
+     recipient: &impl Recipient,
+     plaintext: &[u8],
+ ) -> Result<String, EncryptError> {
+-    let encryptor =
+-        Encryptor::with_recipients(iter::once(recipient as _)).expect("we provided a recipient");
++    let encryptor = Encryptor::with_recipients(iter::once(recipient as _))?;
+ 
+     let mut ciphertext = Vec::with_capacity(plaintext.len());
+     let mut writer = encryptor.wrap_output(ArmoredWriter::wrap_output(
+@@ -49,7 +51,10 @@
+     writer.write_all(plaintext)?;
+     writer.finish()?.finish()?;
+ 
+-    Ok(String::from_utf8(ciphertext).expect("is armored"))
++    match String::from_utf8(ciphertext) {
++        Ok(text) => Ok(text),
++        Err(error) => panic!("age ASCII armor must contain valid UTF-8: {error}"),
++    }
+ }
+ 
+ /// Decrypts the given ciphertext with the given identity.
+@@ -75,10 +80,85 @@
+ #[cfg(test)]
+ mod tests {
+     use super::{decrypt, encrypt};
+-    use crate::x25519;
++    use crate::{EncryptError, Recipient, x25519};
++    use age_core::format::{FileKey, Stanza};
++    use std::{collections::HashSet, io};
++
++    struct FailingRecipient;
++
++    impl Recipient for FailingRecipient {
++        fn wrap_file_key(
++            &self,
++            _file_key: &FileKey,
++        ) -> Result<(Vec<Stanza>, HashSet<String>), EncryptError> {
++            Err(EncryptError::Io(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "recipient refused the file key",
++            )))
++        }
++    }
++
++    #[test]
++    fn encrypt_propagates_recipient_error() {
++        match encrypt(&FailingRecipient, b"plaintext") {
++            Err(EncryptError::Io(error)) => {
++                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
++                assert_eq!(error.to_string(), "recipient refused the file key");
++            }
++            other => panic!("expected original recipient error, got {other:?}"),
++        }
++    }
++
++    struct InvalidLabelRecipient(x25519::Recipient);
++
++    impl Recipient for InvalidLabelRecipient {
++        fn wrap_file_key(
++            &self,
++            file_key: &FileKey,
++        ) -> Result<(Vec<Stanza>, HashSet<String>), EncryptError> {
++            let (stanzas, mut labels) = self.0.wrap_file_key(file_key)?;
++            labels.insert("invalid label".into());
++            Ok((stanzas, labels))
++        }
++    }
++
++    #[test]
++    fn encrypt_propagates_invalid_recipient_labels() {
++        let recipient = InvalidLabelRecipient(crate::x25519::tests::TEST_PK.parse().unwrap());
++        match encrypt(&recipient, b"plaintext") {
++            Err(EncryptError::InvalidRecipientLabels(labels)) => {
++                assert_eq!(labels, HashSet::from(["invalid label".to_owned()]));
++            }
++            other => panic!("expected original invalid-label error, got {other:?}"),
++        }
++    }
+ 
+     #[cfg(feature = "armor")]
+     use super::encrypt_and_armor;
++
++    #[cfg(feature = "armor")]
++    #[test]
++    fn encrypt_and_armor_propagates_recipient_error() {
++        match encrypt_and_armor(&FailingRecipient, b"plaintext") {
++            Err(EncryptError::Io(error)) => {
++                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
++                assert_eq!(error.to_string(), "recipient refused the file key");
++            }
++            other => panic!("expected original recipient error, got {other:?}"),
++        }
++    }
++
++    #[cfg(feature = "armor")]
++    #[test]
++    fn encrypt_and_armor_propagates_invalid_recipient_labels() {
++        let recipient = InvalidLabelRecipient(crate::x25519::tests::TEST_PK.parse().unwrap());
++        match encrypt_and_armor(&recipient, b"plaintext") {
++            Err(EncryptError::InvalidRecipientLabels(labels)) => {
++                assert_eq!(labels, HashSet::from(["invalid label".to_owned()]));
++            }
++            other => panic!("expected original invalid-label error, got {other:?}"),
++        }
++    }
+ 
+     #[test]
+     fn x25519_round_trip() {
+--- a/age/src/ssh.rs
++++ b/age/src/ssh.rs
+@@ -156,8 +156,14 @@
+             .map(|kdf_output| {
+                 let (key, iv) = kdf_output.split_at(KeySize::USIZE);
+                 (
+-                    Array::try_from(key).expect("key is correct length"),
+-                    Array::try_from(iv).expect("iv is correct length"),
++                    match Array::try_from(key) {
++                        Ok(key) => key,
++                        Err(_) => unreachable!("derived key has the requested length"),
++                    },
++                    match Array::try_from(iv) {
++                        Ok(iv) => iv,
++                        Err(_) => unreachable!("derived IV has the requested length"),
++                    },
+                 )
+             })
+     }
+--- a/age/src/ssh/identity.rs
++++ b/age/src/ssh/identity.rs
+@@ -345,11 +345,12 @@
+                             .ok()
+                             .map(|privkey| {
+                                 let mut ssh_key = vec![];
+-                                cookie_factory::r#gen(
++                                if let Err(error) = cookie_factory::r#gen(
+                                     write_ssh::rsa_pubkey(&privkey.to_public_key()),
+                                     &mut ssh_key,
+-                                )
+-                                .expect("can write into a Vec");
++                                ) {
++                                    panic!("RSA public key serialization into a Vec must succeed: {error}");
++                                }
+                                 UnencryptedKey::SshRsa(ssh_key, Box::new(privkey)).into()
+                             })
+                     }
+--- a/age/src/ssh/recipient.rs
++++ b/age/src/ssh/recipient.rs
+@@ -161,13 +161,14 @@
+ 
+         let stanzas = match self {
+             Recipient::SshRsa(ssh_key, pk) => {
+-                let encrypted_file_key = pk
+-                    .encrypt(
+-                        &mut rng,
+-                        Oaep::<Sha256>::new_with_label(SSH_RSA_OAEP_LABEL),
+-                        file_key.expose_secret(),
+-                    )
+-                    .expect("pubkey is valid and file key is not too long");
++                let encrypted_file_key = match pk.encrypt(
++                    &mut rng,
++                    Oaep::<Sha256>::new_with_label(SSH_RSA_OAEP_LABEL),
++                    file_key.expose_secret(),
++                ) {
++                    Ok(encrypted) => encrypted,
++                    Err(error) => panic!("RSA public key is valid and the file key fits: {error}"),
++                };
+ 
+                 let encoded_tag = BASE64_STANDARD_NO_PAD.encode(ssh_tag(ssh_key));
+ 
+@@ -239,7 +240,7 @@
+     preceded(
+         pair(tag(SSH_ED25519_KEY_PREFIX), tag(" ")),
+         map_opt(
+-            encoded_str(51, BASE64_STANDARD_NO_PAD),
++            encoded_str(/*count*/ 51, BASE64_STANDARD_NO_PAD),
+             |ssh_key| match read_ssh::ed25519_pubkey(&ssh_key) {
+                 Ok((_, pk)) => Some(ParsedRecipient::Supported(Recipient::SshEd25519(
+                     ssh_key, pk,
+--- a/age/src/util.rs
++++ b/age/src/util.rs
+@@ -94,7 +94,7 @@
+         }
+ 
+         let mut output = vec![];
+-        let mut reader = LimitedReader::new(&b"abcd"[..], 3);
++        let mut reader = LimitedReader::new(&b"abcd"[..], /*n*/ 3);
+         let err = reader.read_to_end(&mut output).unwrap_err();
+         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+         assert_eq!(output, b"abc");
+@@ -115,7 +115,7 @@
+         }
+ 
+         let mut output = vec![];
+-        let mut reader = LimitedReader::new(Cursor::new(&b"abcd"[..]), 3);
++        let mut reader = LimitedReader::new(Cursor::new(&b"abcd"[..]), /*n*/ 3);
+         let err = reader.read_until(b'\n', &mut output).unwrap_err();
+         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+         assert_eq!(output, b"abc");
+@@ -217,7 +217,11 @@
+ 
+         let mut buf = [0; B];
+         match BASE64_STANDARD_NO_PAD.decode_slice(arg, buf.as_mut()) {
+-            Ok(n) if n == N => Some(buf[..N].try_into().unwrap()),
++            Ok(n) if n == N => {
++                let mut output = [0; N];
++                output.copy_from_slice(&buf[..N]);
++                Some(output)
++            }
+             _ => None,
+         }
+     }
+@@ -227,7 +231,23 @@
+         verify::<_, _, (), _, _>(digit1, |n: &str| !n.starts_with('0'))
+             .parse_complete(arg)
+             .ok()
++            .filter(|(remaining, _)| remaining.is_empty())
+             .and_then(|(_, n)| n.parse_to())
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::decimal_digit_arg;
++
++        #[test]
++        fn decimal_digit_arg_requires_a_complete_canonical_number() {
++            for (arg, expected) in [("1", 1u8), ("14", 14), ("63", 63), ("255", 255)] {
++                assert_eq!(decimal_digit_arg::<u8>(arg), Some(expected), "{arg:?}");
++            }
++            for arg in ["", "0", "01", "+14", "-14", "14x", "14 ", "256"] {
++                assert_eq!(decimal_digit_arg::<u8>(arg), None, "{arg:?}");
++            }
++        }
+     }
+ }
+ 
+--- a/age/tests/testkit.rs
++++ b/age/tests/testkit.rs
+@@ -620,6 +620,13 @@
+         .unwrap_or_default()
+ }
+ 
++fn fixture_value<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
++    match result {
++        Ok(value) => value,
++        Err(error) => panic!("{context}: {error:?}"),
++    }
++}
++
+ fn get_testkit_identities(filename: &str, testfile: &TestFile) -> Vec<x25519::Identity> {
+     assert_eq!(
+         testfile.passphrases.len(),
+@@ -628,21 +635,26 @@
+         // different recipient stanza kind.
+         usize::from(filename == "scrypt_uppercase")
+     );
+-    testfile
+-        .identities
+-        .iter()
+-        .map(|s| s.as_str())
+-        .map(x25519::Identity::from_str)
+-        .collect::<Result<_, _>>()
+-        .unwrap()
++    fixture_value(
++        testfile
++            .identities
++            .iter()
++            .map(String::as_str)
++            .map(x25519::Identity::from_str)
++            .collect::<Result<_, _>>(),
++        "testkit identities must be valid x25519 identities",
++    )
+ }
+ 
+ fn get_testkit_passphrase(testfile: &TestFile, comment: &str) -> SecretString {
+     assert_eq!(testfile.identities.len(), 0);
+-    match testfile.passphrases.len() {
+-        0 => panic!("Test file is missing passphrase{comment}"),
+-        1 => testfile.passphrases.first().cloned().unwrap().into(),
+-        n => panic!("Too many passphrases ({n}){comment}"),
++    match testfile.passphrases.as_slice() {
++        [] => panic!("Test file is missing passphrase{comment}"),
++        [passphrase] => passphrase.clone().into(),
++        passphrases => {
++            let n = passphrases.len();
++            panic!("Too many passphrases ({n}){comment}")
++        }
+     }
+ }
+ 
+@@ -769,33 +781,53 @@
+ 
+ impl TestFile {
+     fn parse(filename: &str) -> Self {
+-        let file = File::open(format!("./tests/testdata/testkit/{filename}")).unwrap();
++        let file = fixture_value(
++            File::open(format!("./tests/testdata/testkit/{filename}")),
++            "testkit fixture must be readable",
++        );
+         let mut r = BufReader::new(file);
+         let mut line = String::new();
+ 
+         fn data<'l>(line: &'l str, prefix: &str) -> &'l str {
+-            line.strip_prefix(prefix).unwrap().trim()
++            match line.strip_prefix(prefix) {
++                Some(data) => data.trim(),
++                None => panic!("testkit field must start with {prefix:?}"),
++            }
+         }
+ 
+         let expect = {
+-            r.read_line(&mut line).unwrap();
++            fixture_value(r.read_line(&mut line), "testkit line must be readable");
+             match data(&line, "expect:") {
+                 "success" => {
+                     line.clear();
+-                    r.read_line(&mut line).unwrap();
++                    fixture_value(r.read_line(&mut line), "testkit line must be readable");
+                     let payload = data(&line, "payload:");
+                     Expect::Success {
+-                        payload_sha256: hex::decode(payload).unwrap().try_into().unwrap(),
++                        payload_sha256: fixture_value(
++                            fixture_value(
++                                hex::decode(payload),
++                                "testkit payload digest must be hex",
++                            )
++                            .try_into(),
++                            "testkit payload digest must contain exactly 32 bytes",
++                        ),
+                     }
+                 }
+                 "armor failure" => Expect::ArmorFailure,
+                 "header failure" => Expect::HeaderFailure,
+                 "payload failure" => {
+                     line.clear();
+-                    r.read_line(&mut line).unwrap();
++                    fixture_value(r.read_line(&mut line), "testkit line must be readable");
+                     let payload = data(&line, "payload:");
+                     Expect::PayloadFailure {
+-                        payload_sha256: hex::decode(payload).unwrap().try_into().unwrap(),
++                        payload_sha256: fixture_value(
++                            fixture_value(
++                                hex::decode(payload),
++                                "testkit payload digest must be hex",
++                            )
++                            .try_into(),
++                            "testkit payload digest must contain exactly 32 bytes",
++                        ),
+                     }
+                 }
+                 "HMAC failure" => Expect::HmacFailure,
+@@ -806,8 +838,11 @@
+ 
+         let _file_key = {
+             line.clear();
+-            r.read_line(&mut line).unwrap();
+-            hex::decode(data(&line, "file key: ")).unwrap()
++            fixture_value(r.read_line(&mut line), "testkit line must be readable");
++            fixture_value(
++                hex::decode(data(&line, "file key: ")),
++                "testkit file key must be hex",
++            )
+         };
+ 
+         let mut identities = vec![];
+@@ -817,12 +852,15 @@
+         let mut comment = None;
+         loop {
+             line.clear();
+-            r.read_line(&mut line).unwrap();
++            fixture_value(r.read_line(&mut line), "testkit line must be readable");
+             if line.trim().is_empty() {
+                 break;
+             }
+ 
+-            let (prefix, data) = line.trim().split_once(": ").unwrap();
++            let (prefix, data) = match line.trim().split_once(": ") {
++                Some(field) => field,
++                None => panic!("testkit metadata must contain a colon and space"),
++            };
+             match prefix {
+                 "compressed" => match data {
+                     "zlib" => compressed = true,
+@@ -839,9 +877,15 @@
+         let mut age_file = vec![];
+         if compressed {
+             let mut z = flate2::read::ZlibDecoder::new(r);
+-            z.read_to_end(&mut age_file).unwrap();
++            fixture_value(
++                z.read_to_end(&mut age_file),
++                "compressed testkit payload must be readable",
++            );
+         } else {
+-            r.read_to_end(&mut age_file).unwrap();
++            fixture_value(
++                r.read_to_end(&mut age_file),
++                "testkit payload must be readable",
++            );
+         };
+ 
+         Self {

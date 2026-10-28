@@ -95,11 +95,12 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
         ],
         cwd=REPO_ROOT,
     ).split(b"\0")
-    vendor = Path("codex-rs/third-party/aws-config")
-    protected_tree = (REPO_ROOT / vendor).resolve()
+    vendors = [Path("codex-rs/third-party") / name for name in ("aws-config", "age")]
+    protected_trees = [(REPO_ROOT / vendor).resolve() for vendor in vendors]
     protected_identities = {
         (status.st_dev, status.st_ino)
-        for path in protected_tree.rglob("*")
+        for tree in protected_trees
+        for path in tree.rglob("*")
         if path.is_file()
         for status in [path.stat()]
     }
@@ -109,14 +110,17 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
             continue
         path = Path(os.fsdecode(encoded))
         source = REPO_ROOT / path
-        if path.is_relative_to(vendor) or not source.is_file():
+        if (
+            any(path.is_relative_to(vendor) for vendor in vendors)
+            or not source.is_file()
+        ):
             continue
         resolved = source.resolve()
         if not resolved.is_relative_to(REPO_ROOT.resolve()):
             raise ValueError(f"Rust source resolves outside repository: {path}")
         status = source.stat()
         if (
-            resolved.is_relative_to(protected_tree)
+            any(resolved.is_relative_to(tree) for tree in protected_trees)
             or (status.st_dev, status.st_ino) in protected_identities
         ):
             raise ValueError(

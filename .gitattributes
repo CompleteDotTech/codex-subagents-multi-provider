@@ -6,4 +6,8 @@ patches/v8_array_sort_elements_kind.patch text eol=lf
 codex-rs/third-party/aws-config/** -text
 codex-rs/third-party/aws-config.*.json -text
 codex-rs/third-party/aws-config.patch -text
+# Preserve the exact licensed age snapshot and reviewed patch on Windows.
+codex-rs/third-party/age/** -text
+codex-rs/third-party/age.*.json -text
+codex-rs/third-party/age.patch -text
 workspace_root_test_launcher.bat.tpl text eol=crlf
