@@ -251,24 +251,24 @@ fn managed_proxy_path_facts(role: &str, path: &Path, declared_root: &Path) -> St
     let metadata = std::fs::metadata(path).ok();
     let canonical = path.canonicalize().ok();
     let canonical_root = declared_root.canonicalize().ok();
+    // Optional facts distinguish unavailable observations from observed false values.
     format!(
-        "MANAGED_PROXY_PATH_DIAG role={role} observation=host-after-failure absolute={} regular={} symlink={} exec_mode={} identity={:?} canonical_equals_logical={} declared_root_contains_canonical={} canonical_root_contains_canonical={}\n",
+        "MANAGED_PROXY_PATH_DIAG role={role} observation=host-after-failure absolute={} regular={:?} symlink={:?} exec_mode={:?} identity={:?} canonical_equals_logical={:?} declared_root_contains_canonical={:?} canonical_root_contains_canonical={:?}\n",
         path.is_absolute(),
-        metadata.as_ref().is_some_and(|info| info.is_file()),
+        metadata.as_ref().map(|info| info.is_file()),
         std::fs::symlink_metadata(path)
             .ok()
-            .is_some_and(|info| info.file_type().is_symlink()),
-        metadata
-            .as_ref()
-            .is_some_and(|info| info.mode() & 0o111 != 0),
+            .map(|info| info.file_type().is_symlink()),
+        metadata.as_ref().map(|info| info.mode() & 0o111 != 0),
         metadata.as_ref().map(|info| (info.dev(), info.ino())),
-        canonical.as_ref().is_some_and(|value| value == path),
+        canonical.as_ref().map(|value| value == path),
         canonical
             .as_ref()
-            .is_some_and(|value| value.starts_with(declared_root)),
-        canonical.as_ref().is_some_and(|value| canonical_root
+            .map(|value| value.starts_with(declared_root)),
+        canonical
             .as_ref()
-            .is_some_and(|root| value.starts_with(root))),
+            .zip(canonical_root.as_ref())
+            .map(|(value, root)| value.starts_with(root)),
     )
 }
 
@@ -281,6 +281,8 @@ fn emit_managed_proxy_path_diagnostics(helper: &Path, declared_root: &Path) {
             &test_runner,
             declared_root,
         ));
+    } else {
+        facts.push_str("MANAGED_PROXY_PATH_DIAG role=test-runner observation=unavailable\n");
     }
     match helper_elf_interpreter(helper) {
         Ok(Some(interpreter)) => facts.push_str(&managed_proxy_path_facts(
