@@ -812,6 +812,10 @@ impl LocalAgentControl {
         if !threads
             .get(&child_thread_id)
             .is_some_and(|registered| std::ptr::eq(registered.as_ref(), child_thread))
+            || !self
+                .runtime
+                .registry
+                .graph_open_is_current(&child_thread.session)
         {
             return;
         }

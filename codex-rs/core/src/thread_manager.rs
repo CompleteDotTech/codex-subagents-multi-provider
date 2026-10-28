@@ -442,6 +442,15 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
     pub(crate) client_mcp_extensions: Option<ClientMcpExtensions>,
 }
 
+/// Captured under one manager write/revoke operation. The root Arc/absence
+/// cannot be supplied by a caller or reconstructed from history/config.
+pub(crate) struct NativeShutdownCapture {
+    pub(crate) threads: Vec<(ThreadId, Arc<CodexThread>)>,
+    root: ThreadId,
+    root_allocation: Option<Arc<CodexThread>>,
+    graph_stamp: crate::agent::NativeGraphCloseStamp,
+}
+
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
 /// `Arc` reference that can be downgraded to by `LocalAgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
@@ -2144,8 +2153,32 @@ impl ThreadManagerState {
         runtime: &LocalAgentRuntime,
         root: ThreadId,
         descendants: bool,
-        mut unloaded: impl FnMut(ThreadId),
+        unloaded: impl FnMut(ThreadId),
     ) -> Vec<(ThreadId, Arc<CodexThread>)> {
+        self.capture_native_shutdown(runtime, root, descendants, unloaded, false)
+            .await
+            .threads
+    }
+
+    pub(crate) async fn fence_native_subtree_with_graph_stamp(
+        &self,
+        runtime: &LocalAgentRuntime,
+        root: ThreadId,
+        descendants: bool,
+        unloaded: impl FnMut(ThreadId),
+    ) -> NativeShutdownCapture {
+        self.capture_native_shutdown(runtime, root, descendants, unloaded, true)
+            .await
+    }
+
+    async fn capture_native_shutdown(
+        &self,
+        runtime: &LocalAgentRuntime,
+        root: ThreadId,
+        descendants: bool,
+        mut unloaded: impl FnMut(ThreadId),
+        explicit_graph_close: bool,
+    ) -> NativeShutdownCapture {
         let threads = self.threads.write().await;
         let mut edges = runtime.child_provider_origins.ownership_edges();
         edges.extend(threads.iter().filter_map(|(id, thread)| {
@@ -2154,20 +2187,61 @@ impl ThreadManagerState {
                 .parent_thread_id()
                 .map(|parent| (*id, parent))
         }));
-        let closed = if descendants {
-            runtime.revoke_subtree_with_edges(root, edges)
+        let root_allocation = threads.get(&root).cloned();
+        let (closed, graph_stamp) = if descendants {
+            runtime.revoke_subtree_with_edges(root, edges, explicit_graph_close)
         } else {
-            runtime.revoke_single_caller(root);
-            std::collections::HashSet::from([root])
+            (
+                std::collections::HashSet::from([root]),
+                runtime.revoke_single_caller(root, explicit_graph_close),
+            )
         };
         for id in closed.iter().filter(|id| !threads.contains_key(id)) {
             unloaded(*id);
         }
-        threads
+        let captured = threads
             .iter()
             .filter(|(id, _)| closed.contains(id))
             .map(|(id, thread)| (*id, Arc::clone(thread)))
-            .collect()
+            .collect();
+        NativeShutdownCapture {
+            threads: captured,
+            root,
+            root_allocation,
+            graph_stamp,
+        }
+    }
+
+    /// Manager map -> short canonical stamp check -> graph await with only map
+    /// write held. New registration invalidates old close intent; same-registration
+    /// teardown transfers that intent even after exact removal to absence.
+    pub(crate) async fn persist_native_graph_closed(
+        &self,
+        runtime: &LocalAgentRuntime,
+        capture: &NativeShutdownCapture,
+    ) -> codex_agent_graph_store::AgentGraphStoreResult<()> {
+        let threads = self.threads.write().await;
+        // Absence after exact same-registration removal may inherit Closed;
+        // it is NEVER sufficient without the canonical generation check below.
+        let compatible_residency = match (&capture.root_allocation, threads.get(&capture.root)) {
+            (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+            (None, None) => true,
+            (Some(_), None) => capture.graph_stamp.can_transfer_from_loaded(),
+            _ => false,
+        };
+        if !compatible_residency || !runtime.graph_close_is_current(&capture.graph_stamp) {
+            return Ok(());
+        }
+        if let Some(store) = self.agent_graph_store() {
+            store
+                .set_thread_spawn_edge_status(
+                    capture.root,
+                    codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
+                )
+                .await?;
+        }
+        drop(threads);
+        Ok(())
     }
 
     pub(crate) async fn remove_thread_if_matches(

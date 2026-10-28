@@ -11718,3 +11718,1010 @@ stream_idle_timeout_ms = 1000
     parent.shutdown_and_wait().await.unwrap();
     harness.manager.remove_thread(&parent_id).await;
 }
+
+#[derive(Clone, Copy)]
+enum GraphClosedGatePosition {
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[derive(Debug)]
+struct GraphClosedBarrier {
+    child: ThreadId,
+    committed: bool,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+struct LifecycleGraphGate {
+    inner: Arc<dyn codex_agent_graph_store::AgentGraphStore>,
+    armed: std::sync::Mutex<Option<(ThreadId, GraphClosedGatePosition)>>,
+    entered: tokio::sync::mpsc::UnboundedSender<GraphClosedBarrier>,
+}
+
+impl codex_agent_graph_store::AgentGraphStore for LifecycleGraphGate {
+    fn upsert_thread_spawn_edge(
+        &self,
+        parent: ThreadId,
+        child: ThreadId,
+        status: codex_agent_graph_store::ThreadSpawnEdgeStatus,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<'_, ()> {
+        self.inner.upsert_thread_spawn_edge(parent, child, status)
+    }
+
+    fn set_thread_spawn_edge_status(
+        &self,
+        child: ThreadId,
+        status: codex_agent_graph_store::ThreadSpawnEdgeStatus,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let gate = {
+                let mut armed = self.armed.lock().unwrap();
+                if status == codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed
+                    && armed.as_ref().is_some_and(|(id, _)| *id == child)
+                {
+                    armed.take().map(|(_, position)| position)
+                } else {
+                    None
+                }
+            };
+            let Some(position) = gate else {
+                return self.inner.set_thread_spawn_edge_status(child, status).await;
+            };
+            let committed = matches!(position, GraphClosedGatePosition::AfterCommit);
+            if committed {
+                self.inner
+                    .set_thread_spawn_edge_status(child, status)
+                    .await?;
+            }
+            let (release, released) = tokio::sync::oneshot::channel();
+            self.entered
+                .send(GraphClosedBarrier {
+                    child,
+                    committed,
+                    release,
+                })
+                .expect("actual graph close barrier receiver");
+            released.await.expect("release actual graph status write");
+            if !committed {
+                self.inner
+                    .set_thread_spawn_edge_status(child, status)
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_thread_spawn_children(
+        &self,
+        parent: ThreadId,
+        status: Option<codex_agent_graph_store::ThreadSpawnEdgeStatus>,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<'_, Vec<ThreadId>> {
+        self.inner.list_thread_spawn_children(parent, status)
+    }
+
+    fn list_thread_spawn_descendants(
+        &self,
+        root: ThreadId,
+        status: Option<codex_agent_graph_store::ThreadSpawnEdgeStatus>,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<'_, Vec<ThreadId>> {
+        self.inner.list_thread_spawn_descendants(root, status)
+    }
+}
+
+async fn graph_lifecycle_harness() -> (
+    AgentControlHarness,
+    Arc<LifecycleGraphGate>,
+    tokio::sync::mpsc::UnboundedReceiver<GraphClosedBarrier>,
+) {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.model = Some("gpt-5.6-sol".into());
+    config.multi_agent_v2.max_concurrent_threads_per_session = 8;
+    config.agent_max_depth = 8;
+    assert!(!config.ephemeral);
+    let state_db = init_state_db(&config)
+        .await
+        .expect("actual graph SQLite state");
+    let inner = crate::thread_manager::local_agent_graph_store_from_state_db(Some(&state_db))
+        .expect("actual LocalAgentGraphStore");
+    let (entered, pending) = tokio::sync::mpsc::unbounded_channel();
+    let graph = Arc::new(LifecycleGraphGate {
+        inner,
+        armed: std::sync::Mutex::new(None),
+        entered,
+    });
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        crate::thread_manager::thread_store_from_config(&config, Some(state_db.clone())),
+        Some(graph.clone()),
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let control = manager.agent_control();
+    (
+        AgentControlHarness {
+            _home: home,
+            config,
+            state_db: Some(state_db),
+            manager,
+            control,
+        },
+        graph,
+        pending,
+    )
+}
+
+async fn graph_edge_has_status(
+    graph: &LifecycleGraphGate,
+    parent: ThreadId,
+    child: ThreadId,
+    status: codex_agent_graph_store::ThreadSpawnEdgeStatus,
+) -> bool {
+    graph
+        .inner
+        .list_thread_spawn_children(parent, Some(status))
+        .await
+        .unwrap()
+        .contains(&child)
+}
+
+async fn graph_publish_actual_open(harness: &AgentControlHarness, child: &Arc<CodexThread>) {
+    harness
+        .control
+        .persist_thread_spawn_edge_for_source(
+            child.as_ref(),
+            child.session.thread_id,
+            Some(&child.session_source),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn graph_current_registered_open_publication_remains_supported() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child = post_admission_registered_idle_child(&harness, &root, "graph_current").await;
+    let child_id = child.session.thread_id;
+    let epoch = harness
+        .control
+        .runtime
+        .retained_authority(child_id)
+        .unwrap();
+    let revision = harness.control.runtime.teardown_revision(child_id);
+    graph_publish_actual_open(&harness, &child).await;
+    let is_open =
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Open).await;
+    assert!(Arc::ptr_eq(
+        &harness.manager.get_thread(child_id).await.unwrap(),
+        &child
+    ));
+    assert!(
+        harness
+            .control
+            .runtime
+            .retained_authority(child_id)
+            .unwrap()
+            .same_registration(&epoch)
+    );
+    assert_eq!(
+        harness.control.runtime.teardown_revision(child_id),
+        revision
+    );
+    assert!(child.is_running() && root.is_running());
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+    assert!(
+        is_open,
+        "current exact registration must publish actual SQLite Open"
+    );
+}
+
+#[tokio::test]
+async fn graph_delayed_open_cannot_reopen_closed_same_registered_arc() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, mut pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child =
+        post_admission_registered_idle_child(&harness, &root, "graph_closed_same_arc").await;
+    let sibling =
+        post_admission_registered_idle_child(&harness, &root, "graph_same_arc_sibling").await;
+    let child_id = child.session.thread_id;
+    graph_publish_actual_open(&harness, &sibling).await;
+    graph_publish_actual_open(&harness, &child).await;
+    assert!(graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Open).await);
+    let epoch = harness
+        .control
+        .runtime
+        .retained_authority(child_id)
+        .unwrap();
+    let revision = harness.control.runtime.teardown_revision(child_id);
+    let state = harness.control.runtime.upgrade().unwrap();
+    // Construct but do not poll this actual production publication until Closed committed.
+    let delayed_open = graph_publish_actual_open(&harness, &child);
+    *graph.armed.lock().unwrap() = Some((child_id, GraphClosedGatePosition::AfterCommit));
+    let close = harness.control.close_agent(child_id);
+    tokio::pin!(close);
+    let barrier = tokio::select! {
+        _ = &mut close => panic!("close returned before actual ClosedAfterCommit barrier"),
+        entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
+    };
+    assert_eq!(barrier.child, child_id);
+    assert!(barrier.committed);
+    assert!(graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Closed).await);
+    assert!(harness.control.runtime.teardown_revision(child_id) > revision);
+    assert!(
+        harness
+            .control
+            .runtime
+            .retained_authority(child_id)
+            .unwrap()
+            .same_registration(&epoch)
+    );
+    assert!(
+        child.is_running(),
+        "Closed barrier precedes actual captured Session shutdown"
+    );
+    // Scheduling probe only: a repaired Closed writer owns map.write across storage.
+    let serialized_close = state.threads.try_write().is_err();
+    if serialized_close {
+        barrier.release.send(()).unwrap();
+        timeout(Duration::from_secs(10), &mut close)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(10), delayed_open)
+            .await
+            .unwrap();
+    } else {
+        assert!(Arc::ptr_eq(
+            &harness.manager.get_thread(child_id).await.unwrap(),
+            &child
+        ));
+        timeout(Duration::from_secs(10), delayed_open)
+            .await
+            .unwrap();
+        barrier.release.send(()).unwrap();
+        timeout(Duration::from_secs(10), &mut close)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let final_closed =
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Closed).await;
+    let stale_open =
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Open).await;
+    assert!(!child.is_running());
+    assert!(harness.manager.get_thread(child_id).await.is_err());
+    assert!(
+        root.is_running() && sibling.is_running(),
+        "explicit child close preserves outside root and sibling"
+    );
+    assert!(
+        graph_edge_has_status(
+            &graph,
+            root_id,
+            sibling.session.thread_id,
+            ThreadSpawnEdgeStatus::Open
+        )
+        .await
+    );
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+    assert!(
+        final_closed && !stale_open,
+        "delayed Open must not reopen actual Closed same Arc; serialized_close={serialized_close}, final_closed={final_closed}, stale_open={stale_open}"
+    );
+}
+
+#[tokio::test]
+async fn graph_delayed_unloaded_close_cannot_relabel_new_resume_open() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, mut pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let old = post_admission_registered_idle_child(&harness, &root, "graph_unloaded_target").await;
+    let sibling =
+        post_admission_registered_idle_child(&harness, &root, "graph_unloaded_sibling").await;
+    let child_id = old.session.thread_id;
+    let source = old.session_source.clone();
+    graph_publish_actual_open(&harness, &sibling).await;
+    graph_publish_actual_open(&harness, &old).await;
+    assert!(graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Open).await);
+    let old_epoch = harness
+        .control
+        .runtime
+        .retained_authority(child_id)
+        .unwrap();
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(old.clone())
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Evicted
+    );
+    assert!(!old.is_running());
+    assert!(harness.manager.get_thread(child_id).await.is_err());
+    assert!(harness.control.get_agent_metadata(child_id).is_some());
+    let revision = harness.control.runtime.teardown_revision(child_id);
+    let state = harness.control.runtime.upgrade().unwrap();
+    *graph.armed.lock().unwrap() = Some((child_id, GraphClosedGatePosition::BeforeCommit));
+    let close = harness.control.close_agent(child_id);
+    tokio::pin!(close);
+    let barrier = tokio::select! {
+        _ = &mut close => panic!("unloaded close returned before actual ClosedBeforeCommit barrier"),
+        entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
+    };
+    assert_eq!(barrier.child, child_id);
+    assert!(!barrier.committed);
+    assert!(harness.control.runtime.teardown_revision(child_id) > revision);
+    let close_revision = harness.control.runtime.teardown_revision(child_id);
+    let serialized_close = state.threads.try_write().is_err();
+    // NEW operation prepared after canonical close, preserving deliberate resume-after-close.
+    let resume =
+        harness
+            .control
+            .resume_agent_from_rollout(harness.config.clone(), child_id, source);
+    if serialized_close {
+        barrier.release.send(()).unwrap();
+        timeout(Duration::from_secs(10), &mut close)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(10), resume)
+                .await
+                .unwrap()
+                .unwrap(),
+            child_id
+        );
+    } else {
+        assert_eq!(
+            timeout(Duration::from_secs(10), resume)
+                .await
+                .unwrap()
+                .unwrap(),
+            child_id
+        );
+        assert!(
+            graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Open).await
+        );
+        barrier.release.send(()).unwrap();
+        timeout(Duration::from_secs(10), &mut close)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let replacement = harness.manager.get_thread(child_id).await.unwrap();
+    let new_epoch = harness
+        .control
+        .runtime
+        .retained_authority(child_id)
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    assert!(!old_epoch.same_registration(&new_epoch));
+    assert!(new_epoch.matches_session(&replacement.session));
+    assert!(harness.control.runtime.teardown_revision(child_id) > close_revision);
+    assert!(replacement.is_running() && root.is_running() && sibling.is_running());
+    assert!(
+        graph_edge_has_status(
+            &graph,
+            root_id,
+            sibling.session.thread_id,
+            ThreadSpawnEdgeStatus::Open
+        )
+        .await
+    );
+    let final_open =
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Open).await;
+    let stale_closed =
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Closed).await;
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+    assert!(
+        final_open && !stale_closed,
+        "old unloaded Closed must preserve actual new resume Open; serialized_close={serialized_close}, final_open={final_open}, stale_closed={stale_closed}"
+    );
+}
+
+// This deliberately has NO manager close lock: exact residency alone must not
+// authorize a delayed Open for a canonically revoked, still loaded allocation.
+#[tokio::test]
+async fn graph_revoked_same_resident_cannot_publish_open_without_close_serialization() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child =
+        post_admission_registered_idle_child(&harness, &root, "graph_revoked_resident").await;
+    let sibling =
+        post_admission_registered_idle_child(&harness, &root, "graph_revoked_sibling").await;
+    let child_id = child.session.thread_id;
+    graph_publish_actual_open(&harness, &child).await;
+    graph_publish_actual_open(&harness, &sibling).await;
+    assert!(
+        harness
+            .control
+            .runtime
+            .registry
+            .graph_open_is_current(&child.session)
+    );
+    harness.control.runtime.registry.revoke_caller(child_id);
+    assert!(
+        !harness
+            .control
+            .runtime
+            .registry
+            .graph_open_is_current(&child.session)
+    );
+    let state = harness.control.runtime.upgrade().unwrap();
+    assert!(
+        state.threads.try_write().is_ok(),
+        "no close map lock may hide this canonical phase check"
+    );
+    assert!(Arc::ptr_eq(
+        &child,
+        &harness.manager.get_thread(child_id).await.unwrap()
+    ));
+    assert!(child.is_running());
+    graph
+        .inner
+        .set_thread_spawn_edge_status(child_id, ThreadSpawnEdgeStatus::Closed)
+        .await
+        .unwrap();
+    assert!(graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Closed).await);
+    graph_publish_actual_open(&harness, &child).await;
+    let closed =
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Closed).await;
+    let reopened =
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Open).await;
+    assert!(root.is_running() && sibling.is_running());
+    assert!(
+        harness
+            .control
+            .runtime
+            .registry
+            .graph_open_is_current(&sibling.session)
+    );
+    assert!(
+        graph_edge_has_status(
+            &graph,
+            root_id,
+            sibling.session.thread_id,
+            ThreadSpawnEdgeStatus::Open
+        )
+        .await
+    );
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+    assert!(
+        closed && !reopened,
+        "canonical Revoked must independently reject Open for the SAME registered Arc"
+    );
+}
+
+#[tokio::test]
+async fn graph_same_registration_explicit_close_intent_survives_newer_explicit_stamp() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child = post_admission_registered_idle_child(&harness, &root, "graph_close_stamp").await;
+    let child_id = child.session.thread_id;
+    graph_publish_actual_open(&harness, &child).await;
+    let state = harness.control.runtime.upgrade().unwrap();
+    let old = state
+        .fence_native_subtree_with_graph_stamp(&harness.control.runtime, child_id, true, |_| {})
+        .await;
+    let old_revision = harness.control.runtime.teardown_revision(child_id);
+    let current = state
+        .fence_native_subtree_with_graph_stamp(&harness.control.runtime, child_id, true, |_| {})
+        .await;
+    assert!(harness.control.runtime.teardown_revision(child_id) > old_revision);
+    assert!(Arc::ptr_eq(
+        &child,
+        &harness.manager.get_thread(child_id).await.unwrap()
+    ));
+    assert!(
+        child.is_running(),
+        "same Arc/registration remains loaded across the two close generations"
+    );
+    state
+        .persist_native_graph_closed(&harness.control.runtime, &old)
+        .await
+        .unwrap();
+    assert!(
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Closed).await,
+        "a newer teardown in the SAME registration cannot erase explicit Closed intent"
+    );
+    state
+        .persist_native_graph_closed(&harness.control.runtime, &current)
+        .await
+        .unwrap();
+    assert!(
+        graph_edge_has_status(&graph, root_id, child_id, ThreadSpawnEdgeStatus::Closed).await,
+        "the actual current close generation can persist Closed"
+    );
+    assert!(root.is_running());
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+async fn graph_explicit_close_survives_ordinary_shutdown(tree: bool) {
+    use crate::agent::registry::GraphLifecycleTestPoint;
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child = post_admission_registered_idle_child(&harness, &root, "graph_intent_child").await;
+    let sibling =
+        post_admission_registered_idle_child(&harness, &root, "graph_intent_sibling").await;
+    let id = child.session.thread_id;
+    graph_publish_actual_open(&harness, &child).await;
+    graph_publish_actual_open(&harness, &sibling).await;
+    let original = harness.control.runtime.retained_authority(id).unwrap();
+    let explicit_pause = harness
+        .control
+        .runtime
+        .registry
+        .pause_graph_at(GraphLifecycleTestPoint::AfterExplicitCapture);
+    let control = harness.control.clone();
+    let close = tokio::spawn(async move { control.close_agent(id).await });
+    timeout(Duration::from_secs(10), explicit_pause.entered.notified())
+        .await
+        .unwrap();
+    let explicit_revision = harness.control.runtime.teardown_revision(id);
+    let ordinary_pause = harness
+        .control
+        .runtime
+        .registry
+        .pause_graph_at(GraphLifecycleTestPoint::AfterOrdinaryCapture);
+    let control = harness.control.clone();
+    let ordinary = tokio::spawn(async move {
+        if tree {
+            control.shutdown_agent_tree(id).await
+        } else {
+            control.shutdown_live_agent(id).await
+        }
+    });
+    timeout(Duration::from_secs(10), ordinary_pause.entered.notified())
+        .await
+        .unwrap();
+    assert!(harness.control.runtime.teardown_revision(id) > explicit_revision);
+    assert!(original.same_registration(&harness.control.runtime.retained_authority(id).unwrap()));
+    assert!(Arc::ptr_eq(
+        &child,
+        &harness.manager.get_thread(id).await.unwrap()
+    ));
+    assert!(child.is_running());
+    // Both actual callers have fenced the SAME allocation; neither holds map.
+    // The ordinary caller will never publish graph Closed on this path.
+    explicit_pause.release.notify_one();
+    let closed = timeout(Duration::from_secs(10), close)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(closed, AgentInfo::Loaded { .. }));
+    assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Closed).await);
+    assert!(!graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+    ordinary_pause.release.notify_one();
+    // The exact writer may already be stopped by explicit close. Preserve its
+    // actual result; graph intent must not depend on this redundant cleanup.
+    let _ordinary_result = timeout(Duration::from_secs(10), ordinary)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(root.is_running() && sibling.is_running());
+    assert!(
+        graph_edge_has_status(
+            &graph,
+            root_id,
+            sibling.session.thread_id,
+            ThreadSpawnEdgeStatus::Open
+        )
+        .await
+    );
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+#[tokio::test]
+async fn graph_explicit_closed_intent_survives_shutdown_live_agent() {
+    graph_explicit_close_survives_ordinary_shutdown(false).await;
+}
+#[tokio::test]
+async fn graph_explicit_closed_intent_survives_shutdown_agent_tree() {
+    graph_explicit_close_survives_ordinary_shutdown(true).await;
+}
+
+#[tokio::test]
+async fn graph_explicit_closed_intent_survives_newer_cancelled_explicit_close() {
+    use crate::agent::registry::GraphLifecycleTestPoint;
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child =
+        post_admission_registered_idle_child(&harness, &root, "graph_cancelled_reclose").await;
+    let sibling =
+        post_admission_registered_idle_child(&harness, &root, "graph_cancelled_sibling").await;
+    let id = child.session.thread_id;
+    graph_publish_actual_open(&harness, &child).await;
+    graph_publish_actual_open(&harness, &sibling).await;
+    let old_pause = harness
+        .control
+        .runtime
+        .registry
+        .pause_graph_at(GraphLifecycleTestPoint::AfterExplicitCapture);
+    let control = harness.control.clone();
+    let old_close = tokio::spawn(async move { control.close_agent(id).await });
+    timeout(Duration::from_secs(10), old_pause.entered.notified())
+        .await
+        .unwrap();
+    let revision = harness.control.runtime.teardown_revision(id);
+    let cancelled_pause = harness
+        .control
+        .runtime
+        .registry
+        .pause_graph_at(GraphLifecycleTestPoint::BeforeExplicitCapture);
+    let control = harness.control.clone();
+    let cancelled_close = tokio::spawn(async move { control.close_agent(id).await });
+    timeout(Duration::from_secs(10), cancelled_pause.entered.notified())
+        .await
+        .unwrap();
+    assert!(harness.control.runtime.teardown_revision(id) > revision);
+    assert!(Arc::ptr_eq(
+        &child,
+        &harness.manager.get_thread(id).await.unwrap()
+    ));
+    cancelled_close.abort();
+    assert!(cancelled_close.await.unwrap_err().is_cancelled());
+    old_pause.release.notify_one();
+    assert!(matches!(
+        timeout(Duration::from_secs(10), old_close)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentInfo::Loaded { .. }
+    ));
+    assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Closed).await);
+    assert!(!graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+    assert!(root.is_running() && sibling.is_running());
+    assert!(
+        graph_edge_has_status(
+            &graph,
+            root_id,
+            sibling.session.thread_id,
+            ThreadSpawnEdgeStatus::Open
+        )
+        .await
+    );
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn graph_explicit_stamp_transfers_to_same_registration_absence_after_shutdown() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    for tree in [false, true] {
+        let (harness, graph, _pending) = graph_lifecycle_harness().await;
+        let (root_id, root) = harness.start_thread().await;
+        let child =
+            post_admission_registered_idle_child(&harness, &root, "graph_transfer_absence").await;
+        let id = child.session.thread_id;
+        graph_publish_actual_open(&harness, &child).await;
+        let old_registration = harness.control.runtime.retained_authority(id).unwrap();
+        let state = harness.control.runtime.upgrade().unwrap();
+        let captured = state
+            .fence_native_subtree_with_graph_stamp(&harness.control.runtime, id, true, |_| {})
+            .await;
+        if tree {
+            harness.control.shutdown_agent_tree(id).await.unwrap();
+        } else {
+            harness.control.shutdown_live_agent(id).await.unwrap();
+        }
+        assert!(harness.manager.get_thread(id).await.is_err());
+        assert!(
+            old_registration
+                .same_registration(&harness.control.runtime.retained_authority(id).unwrap())
+        );
+        assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+        state
+            .persist_native_graph_closed(&harness.control.runtime, &captured)
+            .await
+            .unwrap();
+        assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Closed).await);
+        assert!(!graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+        timeout(
+            Duration::from_secs(10),
+            harness.control.shutdown_agent_tree(root_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(harness.manager.list_thread_ids().await.is_empty());
+    }
+}
+
+async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(
+    missing_retained: bool,
+) {
+    use crate::agent::registry::GraphLifecycleTestPoint;
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (mut harness, graph, _pending) = graph_lifecycle_harness().await;
+    if missing_retained {
+        // A real missing-ceiling resume must use the production sealed cold
+        // authority path. Protect the host store before any Session starts.
+        harness
+            .config
+            .permissions
+            .set_permission_profile(PermissionProfile::read_only())
+            .unwrap();
+    }
+    let (root_id, root) = harness.start_thread().await;
+    let old = post_admission_registered_idle_child(&harness, &root, "graph_absence_aba").await;
+    let sibling = post_admission_registered_idle_child(&harness, &root, "graph_aba_sibling").await;
+    let id = old.session.thread_id;
+    let source = old.session_source.clone();
+    graph_publish_actual_open(&harness, &old).await;
+    graph_publish_actual_open(&harness, &sibling).await;
+    let metadata = harness.control.get_agent_metadata(id).unwrap();
+    let old_registration = harness.control.runtime.retained_authority(id).unwrap();
+    let root_authority = harness.control.runtime.retained_authority(root_id).unwrap();
+    let sibling_authority = harness
+        .control
+        .runtime
+        .retained_authority(sibling.session.thread_id)
+        .unwrap();
+    if missing_retained {
+        // Persist the actual selected runtime context, as a normal completed
+        // turn would, so cold admission need not infer a model from a ceiling.
+        let turn = old.session.new_default_turn().await;
+        assert!(
+            old.session
+                .persist_rollout_items(&[RolloutItem::TurnContext(turn.to_turn_context_item())])
+                .await
+        );
+        old.session.flush_rollout().await.unwrap();
+        assert_eq!(
+            old.read_thread(false, false)
+                .await
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("gpt-5.6-sol")
+        );
+    }
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(old.clone())
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Evicted
+    );
+    let state = harness.control.runtime.upgrade().unwrap();
+    let control = harness.control.clone();
+    if missing_retained {
+        let storage = state.native_authority_storage().unwrap();
+        assert!(
+            crate::agent::child_provider_authorization::durable::protected_storage(
+                &storage,
+                &root_authority.scope,
+            )
+        );
+        assert!(
+            crate::agent::child_provider_authorization::durable::protected_storage(
+                &storage,
+                &old_registration.scope,
+            )
+        );
+        let receipt = state
+            .read_native_authority_receipt(id)
+            .await
+            .unwrap()
+            .expect("actual completed eviction must seal cold authority before fault injection");
+        assert_eq!(receipt.epoch.thread_id, id);
+        assert_eq!(receipt.epoch.parent_thread_id, Some(root_id));
+        assert_eq!(receipt.epoch.root_thread_id, root_id);
+        // Controlled missing-retained fixture state in the ACTUAL host runtime.
+        // Remove only this target ceiling; preserve its generation tombstone,
+        // metadata, root/sibling authority, and private provider-origin map.
+        let revision = control.runtime.teardown_revision(id);
+        control
+            .runtime
+            .registry
+            .remove_retained_authority_for_graph_fixture(id);
+        assert_eq!(control.runtime.teardown_revision(id), revision);
+        let current_metadata = control.get_agent_metadata(id).unwrap();
+        assert_eq!(current_metadata.agent_id, metadata.agent_id);
+        assert_eq!(current_metadata.agent_path, metadata.agent_path);
+        assert_eq!(current_metadata.agent_nickname, metadata.agent_nickname);
+        assert_eq!(current_metadata.agent_role, metadata.agent_role);
+        assert!(control.runtime.retained_authority(id).is_none());
+        assert!(Arc::ptr_eq(
+            &root_authority,
+            &control.runtime.retained_authority(root_id).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &sibling_authority,
+            &control
+                .runtime
+                .retained_authority(sibling.session.thread_id)
+                .unwrap()
+        ));
+    }
+    assert!(Arc::ptr_eq(
+        &control.runtime.child_provider_origins,
+        &root
+            .session
+            .services
+            .local_agent_runtime
+            .child_provider_origins
+    ));
+    let pause = control
+        .runtime
+        .registry
+        .pause_graph_at(GraphLifecycleTestPoint::AfterExplicitCapture);
+    let close_control = control.clone();
+    let old_close = tokio::spawn(async move { close_control.close_agent(id).await });
+    timeout(Duration::from_secs(10), pause.entered.notified())
+        .await
+        .unwrap();
+    assert!(harness.manager.get_thread(id).await.is_err());
+    if missing_retained {
+        assert!(control.runtime.retained_authority(id).is_none());
+    }
+    assert_eq!(
+        control
+            .resume_agent_from_rollout(harness.config.clone(), id, source)
+            .await
+            .unwrap(),
+        id
+    );
+    let replacement = harness.manager.get_thread(id).await.unwrap();
+    let new_registration = control.runtime.retained_authority(id).unwrap();
+    assert!(new_registration.matches_session(&replacement.session));
+    assert!(!old_registration.same_registration(&new_registration));
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(replacement)
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Evicted
+    );
+    assert!(harness.manager.get_thread(id).await.is_err());
+    assert!(new_registration.same_registration(&control.runtime.retained_authority(id).unwrap()));
+    pause.release.notify_one();
+    assert!(matches!(
+        timeout(Duration::from_secs(10), old_close)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentInfo::Unloaded(_)
+    ));
+    assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+    assert!(!graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Closed).await);
+    assert!(root.is_running() && sibling.is_running());
+    assert!(
+        graph_edge_has_status(
+            &graph,
+            root_id,
+            sibling.session.thread_id,
+            ThreadSpawnEdgeStatus::Open
+        )
+        .await
+    );
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+#[tokio::test]
+async fn graph_old_retained_absent_close_rejects_new_registration_aba() {
+    graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(false).await;
+}
+#[tokio::test]
+async fn graph_old_missing_retained_close_rejects_new_registration_aba() {
+    graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(true).await;
+}
+
+#[tokio::test]
+async fn graph_loaded_missing_registration_cannot_transfer_close_to_absence() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child =
+        post_admission_registered_idle_child(&harness, &root, "graph_unproven_loaded").await;
+    let id = child.session.thread_id;
+    graph_publish_actual_open(&harness, &child).await;
+    let state = harness.control.runtime.upgrade().unwrap();
+    let cold_control = LocalAgentControl::new(
+        Arc::downgrade(&state),
+        crate::thread_manager::default_thread_id_generator(),
+        None,
+    );
+    assert!(cold_control.runtime.retained_authority(id).is_none());
+    let unproven = state
+        .fence_native_subtree_with_graph_stamp(&cold_control.runtime, id, true, |_| {})
+        .await;
+    assert!(Arc::ptr_eq(
+        &child,
+        &harness.manager.get_thread(id).await.unwrap()
+    ));
+    harness.control.shutdown_live_agent(id).await.unwrap();
+    assert!(harness.manager.get_thread(id).await.is_err());
+    state
+        .persist_native_graph_closed(&cold_control.runtime, &unproven)
+        .await
+        .unwrap();
+    assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+    assert!(!graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Closed).await);
+    assert!(root.is_running());
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}

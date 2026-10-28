@@ -202,6 +202,7 @@ pub(super) async fn finish_thread_owned(
             entry.writer_lock.clone(),
         )
     };
+    owner.closing();
     let delete_fresh = discard && fresh && owner.is_provisional();
     let path = recorder.rollout_path().to_path_buf();
     if !stopped {
@@ -249,6 +250,7 @@ pub(super) async fn finish_thread_owned(
     }
     // Leave the stopped owned entry in place on any failure so exact cleanup is
     // retryable and no replacement can acquire the writer while cleanup is partial.
+    owner.retired();
     store.live_recorders.lock().await.remove(&thread);
     Ok(())
 }
@@ -283,18 +285,28 @@ pub(super) async fn flush_thread(
     write_and_project(store, thread_id, RolloutWriteOp::Flush).await
 }
 
-pub(super) async fn shutdown_thread(
+async fn shutdown_thread_inner(
     store: &LocalThreadStore,
     thread_id: ThreadId,
+    owner: crate::ThreadWriterOwner,
 ) -> ThreadStoreResult<()> {
     let mut pending_metadata = store.pending_thread_metadata.lock(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
-    if matches!(history_mode, ThreadHistoryMode::Legacy) {
+    let stopped = store
+        .live_recorders
+        .lock()
+        .await
+        .get(&thread_id)
+        .is_some_and(|entry| entry.stopped);
+    if !stopped {
         recorder.shutdown().await.map_err(thread_store_io_error)?;
-    } else {
-        recorder.shutdown().await.map_err(thread_store_io_error)?;
+        if let Some(entry) = store.live_recorders.lock().await.get_mut(&thread_id) {
+            entry.stopped = true;
+        }
+    }
+    if history_mode == ThreadHistoryMode::Paginated {
         if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
             store,
             rollout_id,
@@ -321,34 +333,37 @@ pub(super) async fn shutdown_thread(
             true
         }
     };
-    store.live_recorders.lock().await.remove(&thread_id);
-    drop(_live_writer_guard);
     if !rollout_exists && pending_metadata.take().is_some() {
         store.pending_thread_metadata.remove(thread_id).await;
     }
+    owner.retired();
+    store.live_recorders.lock().await.remove(&thread_id);
     Ok(())
 }
 
-pub(super) async fn discard_thread(
+async fn discard_thread_inner(
     store: &LocalThreadStore,
     thread_id: ThreadId,
+    owner: crate::ThreadWriterOwner,
 ) -> ThreadStoreResult<()> {
     let mut pending_metadata = store.pending_thread_metadata.lock(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     if pending_metadata.take().is_some() {
         store.pending_thread_metadata.remove(thread_id).await;
     }
-    let entry = store
+    let (recorder, stopped) = store
         .live_recorders
         .lock()
         .await
-        .remove(&thread_id)
+        .get(&thread_id)
+        .map(|entry| (entry.recorder.clone(), entry.stopped))
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    entry
-        .recorder
-        .discard()
-        .await
-        .map_err(thread_store_io_error)
+    if !stopped {
+        recorder.discard().await.map_err(thread_store_io_error)?;
+    }
+    owner.retired();
+    store.live_recorders.lock().await.remove(&thread_id);
+    Ok(())
 }
 
 pub(super) async fn rollout_path(
@@ -515,5 +530,56 @@ async fn durable_write(recorder: &RolloutRecorder, write: RolloutWriteOp) -> Thr
         }
         RolloutWriteOp::Persist => recorder.persist().await.map_err(thread_store_io_error),
         RolloutWriteOp::Flush => recorder.flush().await.map_err(thread_store_io_error),
+    }
+}
+
+pub(super) async fn shutdown_thread(
+    store: &LocalThreadStore,
+    thread: ThreadId,
+) -> ThreadStoreResult<()> {
+    finish_current_writer(store, thread, false).await
+}
+pub(super) async fn discard_thread(
+    store: &LocalThreadStore,
+    thread: ThreadId,
+) -> ThreadStoreResult<()> {
+    finish_current_writer(store, thread, true).await
+}
+async fn finish_current_writer(
+    store: &LocalThreadStore,
+    thread: ThreadId,
+    discard: bool,
+) -> ThreadStoreResult<()> {
+    loop {
+        let owner = store
+            .live_recorders
+            .lock()
+            .await
+            .get(&thread)
+            .ok_or(ThreadStoreError::ThreadNotFound { thread_id: thread })?
+            .owner
+            .clone();
+        let mut operation = owner.lifecycle().await?;
+        if !store
+            .live_recorders
+            .lock()
+            .await
+            .get(&thread)
+            .is_some_and(|entry| entry.owner.matches(&owner))
+        {
+            operation.complete();
+            continue;
+        }
+        operation.legacy_intent(discard)?;
+        operation.closing();
+        let store = store.clone();
+        return crate::store::complete_writer_operation(operation, async move {
+            if discard {
+                discard_thread_inner(&store, thread, owner).await
+            } else {
+                shutdown_thread_inner(&store, thread, owner).await
+            }
+        })
+        .await;
     }
 }
