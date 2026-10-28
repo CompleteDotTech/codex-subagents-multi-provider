@@ -6,110 +6,165 @@ use std::os::fd::IntoRawFd;
 /// A matching mount authenticates its original inode and closes the inherited descriptor.
 #[test]
 fn matching_mount_closes_inherited_descriptor() {
-    let root = tempfile::tempdir().expect("temporary directory should be created");
-    let descriptor = File::open(root.path())
-        .expect("directory descriptor should open")
-        .into_raw_fd();
-    let marker = format!("{descriptor}:{}", root.path().display());
+    in_fresh_fd_observer_with_output(
+        "matching_mount_closes_inherited_descriptor",
+        "original_matching_mount_closes_inherited_descriptor",
+        false,
+        || {
+            let root = tempfile::tempdir().expect("temporary directory should be created");
+            let descriptor = File::open(root.path())
+                .expect("directory descriptor should open")
+                .into_raw_fd();
+            let marker = format!("{descriptor}:{}", root.path().display());
 
-    verify_fd_mounts(&[marker]).expect("matching mount should verify");
+            let result = verify_fd_mounts(&[marker]);
+            let closed_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            let closed_errno = std::io::Error::last_os_error().raw_os_error();
 
-    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
+            result.expect("matching mount should verify");
+
+            assert_eq!(closed_flags, -1);
+            assert_eq!(closed_errno, Some(libc::EBADF));
+        },
     );
 }
 
 /// A swapped destination fails closed without leaking the original descriptor.
 #[test]
 fn mismatched_mount_closes_inherited_descriptor() {
-    let source = tempfile::tempdir().expect("source directory should be created");
-    let destination = tempfile::tempdir().expect("destination directory should be created");
-    let descriptor = File::open(source.path())
-        .expect("source directory descriptor should open")
-        .into_raw_fd();
-    let marker = format!("{descriptor}:{}", destination.path().display());
+    in_fresh_fd_observer_with_output(
+        "mismatched_mount_closes_inherited_descriptor",
+        "original_mismatched_mount_closes_inherited_descriptor",
+        false,
+        || {
+            let source = tempfile::tempdir().expect("source directory should be created");
+            let destination = tempfile::tempdir().expect("destination directory should be created");
+            let descriptor = File::open(source.path())
+                .expect("source directory descriptor should open")
+                .into_raw_fd();
+            let marker = format!("{descriptor}:{}", destination.path().display());
 
-    let error = verify_fd_mounts(&[marker]).expect_err("different inodes must be rejected");
+            let result = verify_fd_mounts(&[marker]);
+            let closed_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            let closed_errno = std::io::Error::last_os_error().raw_os_error();
 
-    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
+            let error = result.expect_err("different inodes must be rejected");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(closed_flags, -1);
+            assert_eq!(closed_errno, Some(libc::EBADF));
+        },
     );
 }
 
 /// A symlink to the original inode is not itself the authenticated mount.
 #[test]
 fn symlinked_mount_destination_closes_inherited_descriptor() {
-    let root = tempfile::tempdir().expect("temporary directory should be created");
-    let source = root.path().join("source");
-    let destination = root.path().join("destination");
-    std::fs::create_dir(&source).expect("source directory should be created");
-    std::os::unix::fs::symlink(&source, &destination)
-        .expect("mount destination symlink should be created");
-    let descriptor = File::open(&source)
-        .expect("source directory descriptor should open")
-        .into_raw_fd();
-    let marker = format!("{descriptor}:{}", destination.display());
+    in_fresh_fd_observer_with_output(
+        "symlinked_mount_destination_closes_inherited_descriptor",
+        "original_symlinked_mount_destination_closes_inherited_descriptor",
+        false,
+        || {
+            let root = tempfile::tempdir().expect("temporary directory should be created");
+            let source = root.path().join("source");
+            let destination = root.path().join("destination");
+            std::fs::create_dir(&source).expect("source directory should be created");
+            std::os::unix::fs::symlink(&source, &destination)
+                .expect("mount destination symlink should be created");
+            let descriptor = File::open(&source)
+                .expect("source directory descriptor should open")
+                .into_raw_fd();
+            let marker = format!("{descriptor}:{}", destination.display());
 
-    let error = verify_fd_mounts(&[marker]).expect_err("symlinked mounts must be rejected");
+            let result = verify_fd_mounts(&[marker]);
+            let closed_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            let closed_errno = std::io::Error::last_os_error().raw_os_error();
 
-    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
+            let error = result.expect_err("symlinked mounts must be rejected");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(closed_flags, -1);
+            assert_eq!(closed_errno, Some(libc::EBADF));
+        },
     );
 }
 
 /// Malformed mount markers cannot claim standard streams or relative destinations.
 #[test]
 fn malformed_mount_markers_are_rejected() {
-    for marker in [
-        "missing-separator",
-        "invalid:/tmp",
-        "0:/tmp",
-        "1:/tmp",
-        "2:/tmp",
-    ] {
-        let error = verify_fd_mounts(&[marker.to_string()])
-            .expect_err("malformed mount marker must be rejected");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    }
+    in_fresh_fd_observer_with_output(
+        "malformed_mount_markers_are_rejected",
+        "original_malformed_mount_markers_are_rejected",
+        false,
+        || {
+            for marker in [
+                "missing-separator",
+                "invalid:/tmp",
+                "0:/tmp",
+                "1:/tmp",
+                "2:/tmp",
+            ] {
+                let error = verify_fd_mounts(&[marker.to_string()])
+                    .expect_err("malformed mount marker must be rejected");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            }
 
-    let root = tempfile::tempdir().expect("temporary directory should be created");
-    let descriptor = File::open(root.path())
-        .expect("directory descriptor should open")
-        .into_raw_fd();
-    let error = verify_fd_mounts(&[format!("{descriptor}:relative")])
-        .expect_err("relative mount destinations must be rejected");
+            let root = tempfile::tempdir().expect("temporary directory should be created");
+            let descriptor = File::open(root.path())
+                .expect("directory descriptor should open")
+                .into_raw_fd();
+            let result = verify_fd_mounts(&[format!("{descriptor}:relative")]);
+            let closed_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            let closed_errno = std::io::Error::last_os_error().raw_os_error();
 
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+            let error = result.expect_err("relative mount destinations must be rejected");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(closed_flags, -1);
+            assert_eq!(closed_errno, Some(libc::EBADF));
+        },
+    );
 }
 
 /// A transferred descriptor can be consumed only once even if a marker is repeated.
 #[test]
 fn duplicate_mount_descriptors_are_rejected() {
-    let root = tempfile::tempdir().expect("temporary directory should be created");
-    let descriptor = File::open(root.path())
-        .expect("directory descriptor should open")
-        .into_raw_fd();
-    let marker = format!("{descriptor}:{}", root.path().display());
+    in_fresh_fd_observer_with_output(
+        "duplicate_mount_descriptors_are_rejected",
+        "original_duplicate_mount_descriptors_are_rejected",
+        false,
+        || {
+            let root = tempfile::tempdir().expect("temporary directory should be created");
+            let descriptor = File::open(root.path())
+                .expect("directory descriptor should open")
+                .into_raw_fd();
+            let marker = format!("{descriptor}:{}", root.path().display());
 
-    let error = verify_fd_mounts(&[marker.clone(), marker])
-        .expect_err("a mount descriptor must not be consumed twice");
+            let result = verify_fd_mounts(&[marker.clone(), marker]);
+            let closed_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            let closed_errno = std::io::Error::last_os_error().raw_os_error();
 
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+            let error = result.expect_err("a mount descriptor must not be consumed twice");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(closed_flags, -1);
+            assert_eq!(closed_errno, Some(libc::EBADF));
+        },
+    );
 }
 
 /// Run the observer in a newly exec-created exact-test process. The outer suite
 /// stays parallel; only this child has one synchronous test and no async runtime.
 fn in_fresh_fd_observer(test: &str, observation: &str, observe: impl FnOnce()) {
+    in_fresh_fd_observer_with_output(test, observation, true, observe);
+}
+
+fn in_fresh_fd_observer_with_output(
+    test: &str,
+    observation: &str,
+    relay_output: bool,
+    observe: impl FnOnce(),
+) {
     const CHILD: &str = "CODEX_FD_CLOSE_OBSERVER_CHILD";
     let module = module_path!()
         .split_once("::")
@@ -129,7 +184,7 @@ fn in_fresh_fd_observer(test: &str, observation: &str, observe: impl FnOnce()) {
         );
         assert_eq!(std::env::var("RUST_TEST_THREADS").as_deref(), Ok("1"));
         observe();
-        println!("FD_CLOSE_OBSERVER_COMPLETE {observation}");
+        println!("\nFD_CLOSE_OBSERVER_COMPLETE {observation}");
     } else {
         let output = std::process::Command::new(
             std::env::current_exe().expect("current test executable should be known"),
@@ -156,9 +211,44 @@ fn in_fresh_fd_observer(test: &str, observation: &str, observe: impl FnOnce()) {
                 .lines()
                 .filter(|line| *line == format!("FD_CLOSE_OBSERVER_COMPLETE {observation}"))
                 .count(),
-            1
+            1,
+            "unexpected completion marker: {stdout}\n{stderr}"
         );
-        print!("{stdout}");
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| *line == "running 1 test")
+                .count(),
+            1,
+            "unexpected child test count: {stdout}\n{stderr}"
+        );
+        assert_eq!(
+            stdout.matches(&format!("test {exact_name} ... ")).count(),
+            1,
+            "unexpected child name: {stdout}\n{stderr}"
+        );
+        let summaries = stdout
+            .lines()
+            .filter(|line| line.starts_with("test result:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "unexpected observer summaries: {stdout}"
+        );
+        assert!(
+            summaries[0]
+                .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "),
+            "unexpected observer result: {stdout}"
+        );
+        assert_eq!(
+            stdout.lines().filter(|line| !line.is_empty()).last(),
+            Some(summaries[0]),
+            "child output after terminal summary: {stdout}\n{stderr}"
+        );
+        if relay_output {
+            print!("{stdout}");
+        }
     }
 }
 
