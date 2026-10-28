@@ -1443,7 +1443,6 @@ fn assert_native_continuation_workspace(
     fixture: &Fixture,
     config: &codex_core::config::Config,
     selections: &[codex_protocol::protocol::TurnEnvironmentSelection],
-    require_ready: bool,
 ) {
     assert_eq!(config.cwd.as_path(), fixture.test.cwd.path());
     assert_eq!(config.workspace_roots, vec![config.cwd.clone()]);
@@ -1455,10 +1454,13 @@ fn assert_native_continuation_workspace(
     assert_eq!(selection.workspace_roots, vec![expected.cwd.clone()]);
     let owner = match &selection.config {
         codex_protocol::protocol::EnvironmentConfigState::Ready(owner) => owner.clone(),
-        codex_protocol::protocol::EnvironmentConfigState::FromThread if !require_ready => {
+        // Active selection readback preserves ownership as FromThread. This is an
+        // effective filesystem permission projection from the actual child defaults
+        // and selected roots, not readback of its full internal resolved config.
+        codex_protocol::protocol::EnvironmentConfigState::FromThread => {
             core_test_support::test_codex::environment_config_for_selection(config, selection)
         }
-        _ => panic!("actual active child executor configuration must be Ready"),
+        _ => panic!("selected executor configuration must be available"),
     };
     assert_eq!(owner.workspace_roots, selection.workspace_roots);
     let filesystem = owner
@@ -1544,7 +1546,6 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
         &fixture,
         &config,
         &fixture.test.codex.environment_selections().await,
-        /*require_ready*/ false,
     );
     let (cmd, shell) = native_owned_barrier_command(&started, &release, &done);
     let arguments = json!({"cmd":cmd,"shell":shell,"login":false,"tty":false,"yield_time_ms":10000,"timeout_ms":5000,"max_output_tokens":1000});
@@ -1636,7 +1637,6 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
             &fixture,
             &child_config,
             &child.environment_selections().await,
-            /*require_ready*/ false,
         );
         assert_native_continuation_workspace(
             &fixture,
@@ -1645,7 +1645,6 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
                 .active_turn_environment_selections()
                 .await
                 .expect("actual owned tool keeps the child turn active"),
-            /*require_ready*/ true,
         );
         if change != 0 {
             revoke_native_fixture_a(fixture.home.path())?;
