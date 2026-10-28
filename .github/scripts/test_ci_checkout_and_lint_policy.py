@@ -13,6 +13,8 @@ class CheckoutAndLintPolicyTest(unittest.TestCase):
     def test_fork_cold_build_budgets_preserve_upstream_and_short_jobs(self):
         policies = {
             "bazel.yml": {
+                "plan-package-shards": ("5", None),
+                "linux-package-manifest": ("20", None),
                 "test": ("30", 90),
                 "test-windows-shard": ("30", 90),
                 "test-windows-native-main": ("40", None),
