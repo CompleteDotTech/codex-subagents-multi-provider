@@ -70,10 +70,16 @@ fn packaged_daemon_launch(action: &str, initial: InitialDaemon) -> Result<()> {
     if initial == InitialDaemon::Missing {
         std::fs::remove_file(state.join("app-server.stderr.log"))?;
     }
-    std::fs::write(
-        state.join("settings.json"),
-        br#"{"shutdownGraceSeconds":0}"#,
-    )?;
+    let mut settings = serde_json::json!({"shutdownGraceSeconds": 0});
+    if action == "bootstrap" {
+        // This local-package case deliberately does not run an automatic updater.
+        settings["updater"] = serde_json::json!({"autoUpdateEnabled": false});
+    }
+    std::fs::write(state.join("settings.json"), serde_json::to_vec(&settings)?)?;
+    if action == "bootstrap" {
+        let saved: Value = serde_json::from_slice(&std::fs::read(state.join("settings.json"))?)?;
+        assert_eq!(saved["updater"]["autoUpdateEnabled"], false);
+    }
     let cli_before = daemon.codex.canonicalize()?;
     let result = daemon
         .command()
@@ -194,6 +200,8 @@ fn packaged_daemon_launch(action: &str, initial: InitialDaemon) -> Result<()> {
     }
     if action == "bootstrap" {
         assert_eq!(output["autoUpdateEnabled"], false);
+        assert!(!state.join("daemon-updater.pid").exists());
+        assert!(!state.join("app-server-updater.pid").exists());
     }
     Ok(())
 }
