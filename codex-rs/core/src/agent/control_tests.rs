@@ -12950,6 +12950,17 @@ stream_idle_timeout_ms = 1000
             .unwrap()
             .matches_session(&observed.session)
     );
+    let comparison_guard = crate::agent::child_provider_authorization::current::prepare_loaded(
+        &harness.control.runtime,
+        target_id,
+        parent_id,
+    )
+    .await
+    .unwrap()
+    .expect("actual ordinary native V1 target has an operation fence");
+    comparison_guard
+        .check()
+        .expect("actual original authority is current");
     observed.io.submit(Op::Interrupt).await.unwrap();
     let handler = SendInputHandler;
     let invocation = ToolInvocation {
@@ -13034,6 +13045,7 @@ stream_idle_timeout_ms = 1000
         4 => harness.control.runtime.registry.revoke_caller(target_id),
         _ => unreachable!(),
     }
+    let publication_fence_denied = comparison_guard.check().is_err();
     assert!(matches!(rx.recv().await.unwrap().op, Op::Interrupt));
     // The controlled receiver only acknowledges actual queue admission. No Core
     // task consumes this queue, starts inference, or contacts any provider.
@@ -13074,6 +13086,14 @@ stream_idle_timeout_ms = 1000
     assert!(
         same_allocation,
         "only the submission queue was instrumented"
+    );
+    assert_eq!(
+        publication_fence_denied,
+        change != 0,
+        "the actual independent operation fence must observe this publication"
+    );
+    eprintln!(
+        "V1_PUBLIC_QUEUE_OBSERVED selected={selected} change={change} accepted={accepted} fence_denied={publication_fence_denied} cleanup=complete"
     );
     if change == 0 {
         assert!(accepted, "unchanged V1 must reach the target queue");
