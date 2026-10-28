@@ -21,6 +21,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::net::Shutdown;
@@ -189,6 +191,114 @@ fn linux_sandbox_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
+}
+
+// Observe only the declared test helper, never arbitrary environment paths. An
+// interpreter path is used internally for fixed numeric facts, not printed.
+fn helper_elf_interpreter(path: &Path) -> Result<Option<std::path::PathBuf>, &'static str> {
+    if !std::fs::metadata(path).map_err(|_| "metadata")?.is_file() {
+        return Err("not-regular");
+    }
+    let mut file = std::fs::File::open(path).map_err(|_| "open")?;
+    let size = file.metadata().map_err(|_| "metadata")?.len();
+    let mut header = [0_u8; 64];
+    file.read_exact(&mut header).map_err(|_| "header")?;
+    if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+        return Err("unsupported-format");
+    }
+    let offset = u64::from_le_bytes(header[32..40].try_into().map_err(|_| "header")?);
+    let entry_size = u16::from_le_bytes([header[54], header[55]]);
+    let count = u16::from_le_bytes([header[56], header[57]]);
+    if entry_size != 56
+        || count > 128
+        || offset
+            .checked_add(u64::from(count) * u64::from(entry_size))
+            .is_none_or(|end| end > size)
+    {
+        return Err("program-headers");
+    }
+    for index in 0..count {
+        file.seek(SeekFrom::Start(offset + u64::from(index) * 56))
+            .map_err(|_| "program-header")?;
+        let mut entry = [0_u8; 56];
+        file.read_exact(&mut entry).map_err(|_| "program-header")?;
+        if u32::from_le_bytes(entry[..4].try_into().map_err(|_| "program-header")?) != 3 {
+            continue;
+        }
+        let start = u64::from_le_bytes(entry[8..16].try_into().map_err(|_| "interpreter")?);
+        let length = u64::from_le_bytes(entry[32..40].try_into().map_err(|_| "interpreter")?);
+        if !(2..=4096).contains(&length) || start.checked_add(length).is_none_or(|end| end > size) {
+            return Err("interpreter");
+        }
+        file.seek(SeekFrom::Start(start))
+            .map_err(|_| "interpreter")?;
+        let mut bytes = vec![0; length as usize];
+        file.read_exact(&mut bytes).map_err(|_| "interpreter")?;
+        if bytes.pop() != Some(0) || bytes.contains(&0) {
+            return Err("interpreter");
+        }
+        let value = String::from_utf8(bytes).map_err(|_| "interpreter")?;
+        let path = std::path::PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err("interpreter");
+        }
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+fn managed_proxy_path_facts(role: &str, path: &Path, declared_root: &Path) -> String {
+    let metadata = std::fs::metadata(path).ok();
+    let canonical = path.canonicalize().ok();
+    let canonical_root = declared_root.canonicalize().ok();
+    format!(
+        "MANAGED_PROXY_PATH_DIAG role={role} observation=host-after-failure absolute={} regular={} symlink={} exec_mode={} identity={:?} canonical_equals_logical={} declared_root_contains_canonical={} canonical_root_contains_canonical={}\n",
+        path.is_absolute(),
+        metadata.as_ref().is_some_and(|info| info.is_file()),
+        std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|info| info.file_type().is_symlink()),
+        metadata
+            .as_ref()
+            .is_some_and(|info| info.mode() & 0o111 != 0),
+        metadata.as_ref().map(|info| (info.dev(), info.ino())),
+        canonical.as_ref().is_some_and(|value| value == path),
+        canonical
+            .as_ref()
+            .is_some_and(|value| value.starts_with(declared_root)),
+        canonical.as_ref().is_some_and(|value| canonical_root
+            .as_ref()
+            .is_some_and(|root| value.starts_with(root))),
+    )
+}
+
+fn emit_managed_proxy_path_diagnostics(helper: &Path, declared_root: &Path) {
+    let mut facts = managed_proxy_path_facts("declared-helper", helper, declared_root);
+    if let Ok(test_runner) = std::env::current_exe() {
+        // This is the integration test executable, NOT the sandbox's current_exe.
+        facts.push_str(&managed_proxy_path_facts(
+            "test-runner",
+            &test_runner,
+            declared_root,
+        ));
+    }
+    match helper_elf_interpreter(helper) {
+        Ok(Some(interpreter)) => facts.push_str(&managed_proxy_path_facts(
+            "helper-interpreter",
+            &interpreter,
+            declared_root,
+        )),
+        Ok(None) => facts.push_str("MANAGED_PROXY_PATH_DIAG interpreter=absent\n"),
+        Err(reason) => facts.push_str(&format!(
+            "MANAGED_PROXY_PATH_DIAG interpreter=unknown reason={reason}\n"
+        )),
+    }
+    // Direct bounded stderr survives libtest buffering. Diagnostics never replace
+    // the original failure, and do not probe or broaden the inner sandbox view.
+    let bytes = facts.as_bytes();
+    let _ = std::io::stderr()
+        .lock()
+        .write_all(&bytes[..bytes.len().min(4096)]);
 }
 
 #[tokio::test]
@@ -830,6 +940,12 @@ async fn managed_proxy_mode_routes_through_bridge_and_blocks_direct_egress() {
     )
     .await;
 
+    if !routed_output.status.success() {
+        emit_managed_proxy_path_diagnostics(
+            Path::new(env!("CARGO_BIN_EXE_codex-linux-sandbox")),
+            sandbox_helper_dir,
+        );
+    }
     assert_eq!(
         routed_output.status.success(),
         true,
