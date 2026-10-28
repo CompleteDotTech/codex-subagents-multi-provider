@@ -136,6 +136,15 @@ impl Fixture {
         default_provider: Option<&str>,
         setup: fn(&mut codex_core::config::Config),
     ) -> Result<Self> {
+        Self::with_host_source_setup(version, default_provider, |_| {}, setup).await
+    }
+
+    async fn with_host_source_setup(
+        version: MultiAgentVersion,
+        default_provider: Option<&str>,
+        source_setup: fn(&mut toml::Value),
+        setup: fn(&mut codex_core::config::Config),
+    ) -> Result<Self> {
         let root = start_mock_server().await;
         let a = start_mock_server().await;
         let b = start_mock_server().await;
@@ -248,6 +257,7 @@ request_max_retries = 0
             blocked.insert("auth".into(), helper_auth).is_none(),
             "the helper is configured exactly once"
         );
+        source_setup(&mut config);
         std::fs::write(home.path().join("config.toml"), toml::to_string(&config)?)?;
         let mut builder = test_codex()
             .with_home(home.clone())
@@ -1966,25 +1976,55 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
     Ok(())
 }
 
-fn native_lower_http_retry_setup(config: &mut codex_core::config::Config) {
-    let file = config.codex_home.join("config.toml");
-    let mut source: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+fn native_lower_http_retry_source_setup(source: &mut toml::Value) {
     source["model_providers"]["a"]["request_max_retries"] = toml::Value::Integer(2);
-    std::fs::write(file, toml::to_string(&source).unwrap()).unwrap();
-    config
-        .model_providers
-        .get_mut("a")
-        .unwrap()
-        .request_max_retries = Some(2);
 }
 
 #[test_case::test_case(false; "actual native configured lower HTTP retry unchanged positive")]
 #[test_case::test_case(true; "actual native configured lower HTTP retry publication denies second POST")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -> Result<()> {
-    let fixture =
-        Fixture::with_host_setup(MultiAgentVersion::V2, None, native_lower_http_retry_setup)
-            .await?;
+    // Configure the owned source BEFORE ConfigBuilder captures its trusted
+    // layers/policy. Mutating only flat runtime fields after loading leaves a
+    // conflicting host provider definition for the current-operation guard.
+    let fixture = Fixture::with_host_source_setup(
+        MultiAgentVersion::V2,
+        None,
+        native_lower_http_retry_source_setup,
+        |_| {},
+    )
+    .await?;
+    let initial = fixture.test.codex.config().await;
+    assert_eq!(
+        initial.config_layer_stack.effective_config()["model_providers"]["a"]["request_max_retries"].as_integer(),
+        Some(2),
+        "actual captured host layer must contain the configured retry count"
+    );
+    let resolved = initial
+        .child_provider_policy
+        .resolve(codex_config::child_provider::ChildProviderRequest {
+            explicit_provider: Some("a"),
+            role_provider: None,
+            parent_provider_id: &initial.model_provider_id,
+            parent_provider: &initial.model_provider,
+            parent_model: initial.model.as_deref().expect("fixture root model"),
+            authorization_origin: None,
+            explicit_model: None,
+            role_model: None,
+            default_subagent_model: None,
+            full_history: false,
+            host_owned: false,
+        })
+        .expect("the actual captured host policy resolves A");
+    assert_eq!(resolved.provider.request_max_retries, Some(2));
+    assert_eq!(
+        initial
+            .model_providers
+            .get("a")
+            .unwrap()
+            .request_max_retries,
+        Some(2)
+    );
     let entered = Arc::new(tokio::sync::Notify::new());
     let response_started = Arc::new(std::sync::Mutex::new(None));
     let response_clock = Arc::clone(&response_started);
@@ -2013,9 +2053,65 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
     )
     .await;
     fixture.turn("spawn the hook barrier child").await?;
-    tokio::time::timeout(Duration::from_secs(15), entered.notified())
-        .await
-        .expect("actual first lower HTTP attempt must reach the retryable response barrier");
+    let arrived = tokio::time::timeout(Duration::from_secs(15), entered.notified()).await;
+    if arrived.is_err() {
+        let mut children = Vec::new();
+        for id in fixture
+            .test
+            .thread_manager
+            .list_thread_ids()
+            .await
+            .into_iter()
+            .take(5)
+        {
+            if id != fixture.test.session_configured.thread_id {
+                let child = fixture.test.thread_manager.get_thread(id).await?;
+                let config = child.config_snapshot().await;
+                children.push(
+                    format!(
+                        "{}/{}: {:?}",
+                        config.model_provider_id,
+                        config.model,
+                        child.agent_status().await
+                    )
+                    .chars()
+                    .take(512)
+                    .collect::<String>(),
+                );
+            }
+        }
+        let mut spawn_outputs = Vec::new();
+        'requests: for request in fixture
+            .root
+            .received_requests()
+            .await
+            .expect("root fixture recording")
+        {
+            if request.method.as_str() != "POST" || request.url.path() != "/v1/responses" {
+                continue;
+            }
+            let value = body(&request);
+            if let Some(input) = value.get("input").and_then(Value::as_array) {
+                for item in input {
+                    if item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                        && let Some(output) = item.get("output").and_then(Value::as_str)
+                    {
+                        spawn_outputs.push(output.chars().take(512).collect::<String>());
+                        if spawn_outputs.len() == 4 {
+                            break 'requests;
+                        }
+                    }
+                }
+            }
+        }
+        panic!(
+            "actual first lower HTTP attempt must reach the retryable response barrier: {arrived:?}; synthetic child statuses={children:?}; spawn outputs={spawn_outputs:?}; root_posts={}, a_posts={}, b_posts={}, blocked_helper={}",
+            native_post_count(&fixture.root).await,
+            native_post_count(&fixture.a).await,
+            native_post_count(&fixture.b).await,
+            fixture.home.path().join("helper-marker").exists()
+        );
+    }
     let children = fixture.children(1).await?;
     let child = &children[0];
     let child_id = child.read_thread(true, false).await?.thread_id;

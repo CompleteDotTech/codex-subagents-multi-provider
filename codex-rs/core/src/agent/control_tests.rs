@@ -10828,6 +10828,19 @@ stream_idle_timeout_ms = 1000
     );
     assert!(original.same_registration(&runtime.retained_authority(owner_id).unwrap()));
     check().expect("same-registration snapshot refresh preserves the ownership binding");
+    let parent_settings = parent.thread_settings_snapshot().await;
+    let descendant_settings = descendant.thread_settings_snapshot().await;
+    assert_eq!(original.settings.model, "shared-loaded");
+    assert_ne!(parent_settings.model, original.settings.model);
+    assert!(
+        owner
+            .read_thread(true, false)
+            .await
+            .unwrap()
+            .model
+            .is_none(),
+        "this idle legacy child has no persisted TurnContext model"
+    );
     let turn = owner.session.new_default_turn().await;
     owner
         .session
@@ -10862,6 +10875,11 @@ stream_idle_timeout_ms = 1000
         .await
         .expect("private owned resume creates the actual replacement registration");
     let replacement = harness.manager.get_thread(owner_id).await.unwrap();
+    assert_eq!(
+        replacement.thread_settings_snapshot().await.model,
+        original.settings.model,
+        "an absent saved model must use the retained target selection, never the parent model"
+    );
     assert!(!Arc::ptr_eq(&owner, &replacement));
     assert!(!original.same_registration(&runtime.retained_authority(owner_id).unwrap()));
     assert!(Arc::ptr_eq(
@@ -10881,6 +10899,77 @@ stream_idle_timeout_ms = 1000
         before,
         "pure lineage denial performs no target submission/helper/network call"
     );
+    // A real persisted conflicting model remains an error. The new None path
+    // must never turn an explicit saved selection into retained authority.
+    let replacement_turn = replacement.session.new_default_turn().await;
+    let mut conflicting = replacement_turn.to_turn_context_item();
+    conflicting.model = parent_settings.model.clone();
+    assert_ne!(conflicting.model, original.settings.model);
+    assert!(
+        replacement
+            .session
+            .persist_rollout_items(&[RolloutItem::TurnContext(conflicting)])
+            .await
+    );
+    replacement.session.flush_rollout().await.unwrap();
+    assert_eq!(
+        replacement
+            .read_thread(true, false)
+            .await
+            .unwrap()
+            .model
+            .as_deref(),
+        Some(parent_settings.model.as_str())
+    );
+    replacement
+        .session
+        .send_event(
+            replacement_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
+                turn_id: replacement_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("conflicting saved model fixture".into()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        harness
+            .manager
+            .try_evict_v2_thread(Arc::clone(&replacement))
+            .await
+            .unwrap(),
+        ThreadEvictionOutcome::Evicted
+    );
+    let retained_replacement = runtime.retained_authority(owner_id).unwrap();
+    let before = harness.manager.captured_ops().len();
+    let error = harness
+        .control
+        .ensure_child_loaded(parent_id, owner_id)
+        .await
+        .expect_err("an explicit saved model mismatch cannot be filled from retained selection");
+    assert!(
+        matches!(error.details(), CodexErrorDetails::InvalidRequest(message)
+        if message.contains("saved model differs from its retained actual selection")),
+        "{error}"
+    );
+    assert!(harness.manager.get_thread(owner_id).await.is_err());
+    assert!(retained_replacement.same_registration(&runtime.retained_authority(owner_id).unwrap()));
+    assert_eq!(harness.manager.captured_ops().len(), before);
+    assert!(parent.thread_settings_snapshot().await == parent_settings);
+    assert!(descendant.thread_settings_snapshot().await == descendant_settings);
+    assert!(Arc::ptr_eq(
+        &parent,
+        &harness.manager.get_thread(parent_id).await.unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &descendant,
+        &harness.manager.get_thread(descendant_id).await.unwrap()
+    ));
     descendant.shutdown_and_wait().await.unwrap();
     harness.manager.remove_thread(&descendant_id).await;
     replacement.shutdown_and_wait().await.unwrap();

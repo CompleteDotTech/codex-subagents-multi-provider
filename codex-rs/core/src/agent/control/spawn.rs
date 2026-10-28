@@ -536,9 +536,11 @@ impl LocalAgentControl {
                 })?;
         }
         config.service_tier = self.root_service_tier();
-        if let Some(model) = stored_model {
-            config.model = Some(model);
-        }
+        // Absence is target metadata too: retaining the parent's model here
+        // would impersonate a saved selection before the private resume permit
+        // can fill it from the exact retained target registration. A cold
+        // target without that proof still fails the permit's missing-model gate.
+        config.model = stored_model;
         if config.model_provider_id != stored_model_provider {
             config.model_provider = config
                 .model_providers
