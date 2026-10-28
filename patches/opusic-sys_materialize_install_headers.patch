@@ -1,0 +1,21 @@
+--- a/opus/CMakeLists.txt
++++ b/opus/CMakeLists.txt
+@@ -278,6 +278,18 @@
+ if(OPUS_CUSTOM_MODES)
+   list(APPEND Opus_PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/include/opus_custom.h)
+ endif()
++
++# Bazel source inputs may be symlinks into an action's input tree. CMake's
++# install(FILES) preserves those links, which would escape the output tree.
++# Stage regular files for installation without changing header contents.
++set(Opus_INSTALL_HEADER)
++foreach(header IN LISTS Opus_PUBLIC_HEADER)
++  get_filename_component(header_name "${header}" NAME)
++  set(install_header "${CMAKE_CURRENT_BINARY_DIR}/install-headers/${header_name}")
++  configure_file("${header}" "${install_header}" COPYONLY)
++  list(APPEND Opus_INSTALL_HEADER "${install_header}")
++endforeach()
++set(Opus_PUBLIC_HEADER ${Opus_INSTALL_HEADER})
+ 
+ if(MSVC)
+   if(OPUS_STATIC_RUNTIME)
