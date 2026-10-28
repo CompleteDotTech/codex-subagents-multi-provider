@@ -1151,14 +1151,23 @@ mod tests {
                 .await
                 .unwrap();
             assert!(path.exists());
-            let saved = store
-                .load_history(LoadThreadHistoryParams {
-                    thread_id: thread,
-                    include_archived: true,
-                })
-                .await
-                .unwrap();
-            let text = serde_json::to_string(&saved.items).unwrap();
+            let history_params = LoadThreadHistoryParams {
+                thread_id: thread,
+                include_archived: true,
+            };
+            let saved_items = match mode {
+                ThreadHistoryMode::Legacy => {
+                    store.load_history(history_params).await.unwrap().items
+                }
+                ThreadHistoryMode::Paginated => {
+                    store
+                        .load_latest_model_context(history_params)
+                        .await
+                        .unwrap()
+                        .items
+                }
+            };
+            let text = serde_json::to_string(&saved_items).unwrap();
             assert!(text.contains("owned saved history"));
             assert!(text.contains("replacement still owns writer"));
         }
