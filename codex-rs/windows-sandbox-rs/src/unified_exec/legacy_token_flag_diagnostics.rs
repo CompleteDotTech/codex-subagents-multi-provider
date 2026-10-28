@@ -94,20 +94,24 @@ impl FlagFixture {
         ]) {
             fs::write(path, contents).expect("reset owned read sentinel");
         }
-        fs::write(&self.script, concat!(
-            "@echo off\r\n",
-            "echo EXECUTE_OK\r\n",
-            "type \"%WORKSPACE_READ%\"\r\necho WORKSPACE_READ_STATUS=%errorlevel%\r\n",
-            "type \"%TEMP_READ%\"\r\necho TEMP_READ_STATUS=%errorlevel%\r\n",
-            "type \"%TMP_READ%\"\r\necho TMP_READ_STATUS=%errorlevel%\r\n",
-            "type \"%OUTSIDE_READ%\"\r\necho OUTSIDE_READ_STATUS=%errorlevel%\r\n",
-            "del /f /q \"%WORKSPACE_DELETE%\"\r\necho WORKSPACE_STATUS=%errorlevel%\r\n",
-            "del /f /q \"%TEMP_DELETE%\"\r\necho TEMP_STATUS=%errorlevel%\r\n",
-            "del /f /q \"%TMP_DELETE%\"\r\necho TMP_STATUS=%errorlevel%\r\n",
-            "del /f /q \"%OUTSIDE_DELETE%\"\r\necho OUTSIDE_STATUS=%errorlevel%\r\n",
-            "rmdir \"%PROTECTED_GIT_DIR%\"\r\necho GIT_STATUS=%errorlevel%\r\n",
-            "exit /b 0\r\n",
-        )).expect("write fixed owned command script");
+        fs::write(
+            &self.script,
+            concat!(
+                "@echo off\r\n",
+                "echo EXECUTE_OK\r\n",
+                "type \"%WORKSPACE_READ%\"\r\necho WORKSPACE_READ_STATUS=%errorlevel%\r\n",
+                "type \"%TEMP_READ%\"\r\necho TEMP_READ_STATUS=%errorlevel%\r\n",
+                "type \"%TMP_READ%\"\r\necho TMP_READ_STATUS=%errorlevel%\r\n",
+                "type \"%OUTSIDE_READ%\"\r\necho OUTSIDE_READ_STATUS=%errorlevel%\r\n",
+                "del /f /q \"%WORKSPACE_DELETE%\"\r\necho WORKSPACE_STATUS=%errorlevel%\r\n",
+                "del /f /q \"%TEMP_DELETE%\"\r\necho TEMP_STATUS=%errorlevel%\r\n",
+                "del /f /q \"%TMP_DELETE%\"\r\necho TMP_STATUS=%errorlevel%\r\n",
+                "del /f /q \"%OUTSIDE_DELETE%\"\r\necho OUTSIDE_STATUS=%errorlevel%\r\n",
+                "rmdir \"%PROTECTED_GIT_DIR%\"\r\necho GIT_STATUS=%errorlevel%\r\n",
+                "exit /b 0\r\n",
+            ),
+        )
+        .expect("write fixed owned command script");
         for path in self
             .targets
             .iter()
