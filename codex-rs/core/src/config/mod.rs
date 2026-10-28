@@ -163,6 +163,8 @@ use toml_edit::DocumentMut;
 
 mod auth_keyring;
 pub mod edit;
+mod embedded;
+pub use embedded::EmbeddedHostConfigOptions;
 mod managed_features;
 mod metrics;
 mod network_config;

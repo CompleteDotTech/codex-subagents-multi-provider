@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::io::Write;
@@ -9,62 +7,26 @@ use anyhow::Context;
 use anyhow::bail;
 use clap::Parser;
 use codex_core_api::AbsolutePathBuf;
-use codex_core_api::AltScreenMode;
-use codex_core_api::ApprovalsReviewer;
 use codex_core_api::Arg0DispatchPaths;
-use codex_core_api::AskForApproval;
-use codex_core_api::AuthKeyringBackendKind;
 use codex_core_api::AuthManager;
-use codex_core_api::AutoCompactTokenLimitScope;
 use codex_core_api::CodexAppsToolsCache;
 use codex_core_api::CodexHomeUserInstructionsProvider;
 use codex_core_api::CodexThread;
 use codex_core_api::Config;
-use codex_core_api::ConfigLayerStack;
 use codex_core_api::ConfigLoadOptions;
-use codex_core_api::ConfigRequirements;
-use codex_core_api::ConfigRequirementsToml;
-use codex_core_api::Constrained;
 use codex_core_api::EnvironmentManager;
 use codex_core_api::EventMsg;
 use codex_core_api::ExecServerRuntimeOptions;
 use codex_core_api::ExtensionRegistryBuilder;
-use codex_core_api::Feature;
-use codex_core_api::Features;
-use codex_core_api::GhostSnapshotConfig;
-use codex_core_api::History;
-use codex_core_api::MemoriesConfig;
-use codex_core_api::ModelAvailabilityNuxConfig;
-use codex_core_api::MultiAgentV2Config;
 use codex_core_api::NewThread;
-use codex_core_api::Notice;
-use codex_core_api::OPENAI_PROVIDER_ID;
-use codex_core_api::OtelConfig;
-use codex_core_api::PermissionProfile;
-use codex_core_api::Permissions;
-use codex_core_api::ProjectConfig;
-use codex_core_api::RealtimeAudioConfig;
-use codex_core_api::RealtimeConfig;
-use codex_core_api::SessionPickerViewMode;
 use codex_core_api::SessionSource;
-use codex_core_api::SqliteConfig;
 use codex_core_api::StartIfIdleSubmission;
 use codex_core_api::StartThreadOptions;
-use codex_core_api::TerminalResizeReflowConfig;
 use codex_core_api::ThreadManager;
-use codex_core_api::ThreadStoreConfig;
-use codex_core_api::ToolSuggestConfig;
-use codex_core_api::TuiKeymap;
-use codex_core_api::TuiNotificationSettings;
-use codex_core_api::TuiPetAnchor;
 use codex_core_api::TurnInputRequest;
-use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
-use codex_core_api::WebSearchMode;
 use codex_core_api::arg0_dispatch_or_else;
-use codex_core_api::bootstrap_auth_config;
 use codex_core_api::build_models_manager;
-use codex_core_api::built_in_model_providers;
 use codex_core_api::find_codex_home;
 use codex_core_api::init_state_db;
 use codex_core_api::install_image_generation_extension;
@@ -72,7 +34,6 @@ use codex_core_api::item_event_to_server_notification;
 use codex_core_api::load_config_toml_with_layer_stack;
 use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::passthrough_image_store;
-use codex_core_api::resolve_bootstrap_respect_system_proxy;
 use codex_core_api::resolve_installation_id;
 use codex_core_api::set_default_originator;
 use codex_core_api::thread_store_from_config;
@@ -188,6 +149,21 @@ async fn new_config(
 ) -> anyhow::Result<Config> {
     let codex_home = find_codex_home().context("find Codex home")?;
     let cwd = AbsolutePathBuf::current_dir().context("resolve current directory")?;
+    new_config_for_paths(
+        model,
+        arg0_paths,
+        AbsolutePathBuf::from_absolute_path(codex_home)?,
+        cwd,
+    )
+    .await
+}
+
+async fn new_config_for_paths(
+    model: Option<String>,
+    arg0_paths: Arg0DispatchPaths,
+    codex_home: AbsolutePathBuf,
+    cwd: AbsolutePathBuf,
+) -> anyhow::Result<Config> {
     // Resolve auth through the shared bootstrap path so cargo-run builds retain the configured
     // secure store instead of the full Config loader's local-development file-store override.
     let bootstrap = load_config_toml_with_layer_stack(
@@ -198,219 +174,18 @@ async fn new_config(
     )
     .await
     .context("load authentication configuration")?;
-    let auth_config = bootstrap_auth_config(codex_home.as_path(), &bootstrap)?;
-    let requirements = bootstrap.config_layer_stack.requirements();
-    let requirements_toml = bootstrap.config_layer_stack.requirements_toml();
-    // Preserve auth restrictions for every manager rebuilt from Config without importing
-    // execution settings, plugins, or hooks from the bootstrap configuration.
-    let config_layer_stack = ConfigLayerStack::new(
-        Vec::new(),
-        ConfigRequirements {
-            allowed_login_methods: requirements.allowed_login_methods.clone(),
-            allowed_chatgpt_workspaces: requirements.allowed_chatgpt_workspaces.clone(),
-            ..Default::default()
+    Config::for_embedded_host(
+        codex_core_api::EmbeddedHostConfigOptions {
+            codex_home,
+            cwd,
+            model,
+            codex_self_exe: arg0_paths.codex_self_exe,
+            codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
         },
-        ConfigRequirementsToml {
-            allowed_login_methods: requirements_toml.allowed_login_methods.clone(),
-            allowed_chatgpt_workspaces: requirements_toml.allowed_chatgpt_workspaces.clone(),
-            ..Default::default()
-        },
-    )?;
-    let mcp_oauth_credentials_store_mode = bootstrap
-        .config_toml
-        .mcp_oauth_credentials_store
-        .unwrap_or_default();
-    let respect_system_proxy = resolve_bootstrap_respect_system_proxy(
-        &bootstrap.config_toml,
-        bootstrap
-            .config_layer_stack
-            .requirements()
-            .feature_requirements
-            .as_ref(),
-    )?;
-    let model_provider_id = OPENAI_PROVIDER_ID.to_string();
-    let model_providers = built_in_model_providers(/*openai_base_url*/ None);
-    let model_provider = model_providers
-        .get(&model_provider_id)
-        .context("OpenAI model provider should be available")?
-        .clone();
-
-    let mut config = Config {
-        application_network_policy: Default::default(),
-        application_auth_route_config: Some(auth_config.auth_route_config.clone()),
-        config_layer_stack,
-        plugins: Default::default(),
-        startup_warnings: Vec::new(),
-        bypass_hook_trust: false,
-        model,
-        daybreak_enabled: false,
-        service_tier: None,
-        review_model: None,
-        model_context_window: None,
-        model_auto_compact_token_limit: None,
-        model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope::Total,
-        model_post_turn_compact_threshold_percent: 0,
-        async_compaction_threshold_percent: 65,
-        model_provider_id,
-        model_provider,
-        personality: None,
-        permissions: Permissions::from_approval_and_profile(
-            Constrained::allow_any(AskForApproval::Never),
-            Constrained::allow_any(PermissionProfile::read_only()),
-        )?,
-        explicit_permission_profile_mode: false,
-        custom_permission_profiles: Vec::new(),
-        approvals_reviewer: ApprovalsReviewer::User,
-        enforce_residency: Constrained::allow_any(/*initial_value*/ None),
-        hide_agent_reasoning: false,
-        show_raw_agent_reasoning: false,
-        base_instructions: None,
-        base_instructions_provenance: None,
-        developer_instructions: None,
-        guardian_policy_config: None,
-        guardian_extra_policy: None,
-        guardian_policy_template: None,
-        guardian_transcript_mode: Default::default(),
-        guardian_conversation_history_prompt: None,
-        guardian_conversation_history_max_output_tokens: None,
-        guardian_circuit_break_action: Default::default(),
-        include_permissions_instructions: false,
-        include_apps_instructions: false,
-        include_collaboration_mode_instructions: false,
-        include_skill_instructions: false,
-        skill_max_context_tokens: None,
-        cloud_skill_enabled: false,
-        orchestrator_mcp_enabled: false,
-        include_environment_context: false,
-        include_environment_context_time: true,
-        compact_prompt: None,
-        notify: None,
-        tui_notifications: TuiNotificationSettings::default(),
-        animations: true,
-        tui_effects: Default::default(),
-        tui_rendering: Default::default(),
-        show_tooltips: true,
-        tui_show_server_version_notice: true,
-        tui_auto_recap: true,
-        model_availability_nux: ModelAvailabilityNuxConfig::default(),
-        tui_fullscreen_transcript: false,
-        tui_mouse_scroll_speed: None,
-        tui_copy_on_select: Default::default(),
-        tui_copy_on_select_clear_selection: false,
-        tui_right_click_paste: Default::default(),
-        tui_alternate_screen: AltScreenMode::Auto,
-        tui_status_line: None,
-        tui_status_line_use_colors: true,
-        tui_terminal_title: None,
-        tui_theme: None,
-        tui_raw_output_mode: false,
-        tui_pet: None,
-        tui_pet_anchor: TuiPetAnchor::Composer,
-        terminal_resize_reflow: TerminalResizeReflowConfig::default(),
-        tui_keymap: TuiKeymap::default(),
-        tui_quick_dials: BTreeMap::new(),
-        tui_session_picker_view: SessionPickerViewMode::Dense,
-        tui_agents_overview_grouping: Default::default(),
-        tui_resume_cwd: None,
-        tui_vim_mode_default: false,
-        tui_question_esc_back: true,
-        cwd: cwd.clone(),
-        workspace_roots: vec![cwd],
-        workspace_roots_explicit: false,
-        cli_auth_credentials_store_mode: auth_config.auth_credentials_store_mode,
-        mcp_servers: Constrained::allow_any(HashMap::new()),
-        mcp_enterprise_managed_auth: None,
-        non_prefixed_mcp_tool_servers: None,
-        mcp_oauth_credentials_store_mode,
-        mcp_oauth_callback_port: None,
-        mcp_oauth_callback_url: None,
-        mcp_optional_startup_grace: std::time::Duration::from_secs(1),
-        model_providers,
-        project_doc_max_bytes: 32 * 1024,
-        project_doc_fallback_filenames: Vec::new(),
-        tool_output_token_limit: None,
-        agents_enabled: true,
-        agent_max_threads: Some(6),
-        agent_default_subagent_model: None,
-        agent_default_subagent_reasoning_effort: None,
-        agent_interrupt_message_enabled: false,
-        agent_max_depth: 1,
-        agent_roles: BTreeMap::new(),
-        memories: MemoriesConfig::default(),
-        sqlite: SqliteConfig::from_sqlite_home(codex_home.clone()),
-        log_dir: codex_home.join("log").to_path_buf(),
-        codex_home,
-        history: History::default(),
-        ephemeral: true,
-        extra_config: None,
-        file_opener: UriBasedFileOpener::VsCode,
-        codex_self_exe: arg0_paths.codex_self_exe,
-        codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
-        main_execve_wrapper_exe: None,
-        zsh_path: None,
-        model_reasoning_effort: None,
-        plan_mode_reasoning_effort: None,
-        model_reasoning_summary: None,
-        model_catalog: None,
-        model_verbosity: None,
-        chatgpt_base_url: auth_config
-            .chatgpt_base_url
-            .clone()
-            .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
-        respect_system_proxy,
-        apps_mcp_product_sku: None,
-        responses_api_metadata: BTreeMap::new(),
-        realtime_audio: RealtimeAudioConfig::default(),
-        experimental_realtime_ws_base_url: None,
-        experimental_realtime_webrtc_call_base_url: None,
-        experimental_realtime_ws_model: None,
-        realtime: RealtimeConfig::default(),
-        experimental_realtime_ws_backend_prompt: None,
-        experimental_realtime_ws_startup_context: None,
-        experimental_realtime_start_instructions: None,
-        experimental_thread_store: ThreadStoreConfig::Local,
-        forced_chatgpt_workspace_id: auth_config.forced_chatgpt_workspace_id.clone(),
-        forced_login_method: auth_config.forced_login_method,
-        web_search_mode: Constrained::allow_any(WebSearchMode::Disabled),
-        web_search_config: None,
-        experimental_request_user_input_enabled: true,
-        update_plan_enabled: true,
-        tool_registry: Default::default(),
-        code_mode: Default::default(),
-        background_terminal_max_timeout: 300_000,
-        thread_unload_delay: std::time::Duration::from_secs(/*secs*/ 1800),
-        ghost_snapshot: GhostSnapshotConfig::default(),
-        multi_agent_v2: MultiAgentV2Config::default(),
-        max_goal_token_budget: None,
-        token_budget: None,
-        token_budget_startup_config: None,
-        rollout_budget: None,
-        current_time_reminder: None,
-        sleep_tool_mode: Default::default(),
-        features: Default::default(),
-        prefer_mxc: false,
-
-        runtime_feature_defaults: Default::default(),
-        suppress_unstable_features_warning: false,
-        active_project: ProjectConfig { trust_level: None },
-        notices: Notice::default(),
-        check_for_update_on_startup: false,
-        disable_paste_burst: false,
-        analytics_enabled: Some(false),
-        feedback_enabled: false,
-        tool_suggest: ToolSuggestConfig::default(),
-        otel: OtelConfig::default(),
-    };
-    config
-        .features
-        .set(Features::with_defaults())
-        .context("configure default features")?;
-    // AuthManager and MCP both derive their credential backend from Config.
-    config.features.set_enabled(
-        Feature::SecretAuthStorage,
-        auth_config.keyring_backend_kind == AuthKeyringBackendKind::Secrets,
-    )?;
-    Ok(config)
+        &bootstrap,
+    )
+    .await
+    .context("construct isolated embedded configuration")
 }
 
 async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyhow::Result<()> {
@@ -505,5 +280,84 @@ async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyh
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn public_facade_constructs_isolated_host_with_bootstrap_stores() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let cwd = tempfile::tempdir()?;
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+model = "foreign-model"
+openai_base_url = "https://foreign.invalid/v1"
+sandbox_mode = "danger-full-access"
+cli_auth_credentials_store = "keyring"
+mcp_oauth_credentials_store = "auto"
+notify = ["foreign-program"]
+[tools.update_plan]
+enabled = false
+[features]
+secret_auth_storage = true
+[mcp_servers.foreign]
+command = "foreign-program"
+"#,
+        )?;
+        let config = new_config_for_paths(
+            Some("host-model".to_string()),
+            Arg0DispatchPaths::default(),
+            AbsolutePathBuf::from_absolute_path(home.path())?,
+            AbsolutePathBuf::from_absolute_path(cwd.path())?,
+        )
+        .await?;
+        assert_eq!(config.model.as_deref(), Some("host-model"));
+        assert_eq!(config.model_provider_id, "openai");
+        assert_eq!(config.model_provider.base_url, None);
+        assert!(config.ephemeral);
+        assert_eq!(
+            config.permissions.approval_policy.value(),
+            codex_core_api::AskForApproval::Never
+        );
+        assert_eq!(
+            config.permissions.permission_profile(),
+            &codex_core_api::PermissionProfile::read_only()
+        );
+        assert!(config.mcp_servers.get().is_empty());
+        assert!(config.agent_roles.is_empty());
+        assert!(config.notify.is_none());
+        assert!(
+            config
+                .config_layer_stack
+                .layers_low_to_high()
+                .next()
+                .is_none()
+        );
+        assert_eq!(config.sqlite.home(), home.path());
+        assert_eq!(config.log_dir, home.path().join("log"));
+        assert_eq!(
+            config.sqlite.logs_db_path(),
+            codex_core_api::SqliteConfig::from_sqlite_home(config.codex_home.clone())
+                .logs_db_path()
+        );
+        assert!(config.update_plan_enabled);
+        assert_eq!(
+            config.cli_auth_credentials_store_mode,
+            codex_core_api::AuthCredentialsStoreMode::Keyring
+        );
+        assert_eq!(
+            config.mcp_oauth_credentials_store_mode,
+            codex_core_api::OAuthCredentialsStoreMode::Auto
+        );
+        assert!(
+            config
+                .features
+                .enabled(codex_core_api::Feature::SecretAuthStorage)
+        );
+        Ok(())
     }
 }

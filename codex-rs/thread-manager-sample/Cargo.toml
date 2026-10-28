@@ -16,3 +16,7 @@ serde_json = { workspace = true }
 # additional `codex-*` crates here.
 codex-core-api = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
