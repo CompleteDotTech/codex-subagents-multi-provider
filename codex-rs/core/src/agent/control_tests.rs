@@ -12725,3 +12725,365 @@ async fn graph_loaded_missing_registration_cannot_transfer_close_to_absence() {
     .unwrap();
     assert!(harness.manager.list_thread_ids().await.is_empty());
 }
+
+// A public V1 handler must retain its current-operation fence through the real
+// submission channel's capacity wait, not only its earlier loaded-target check.
+#[test_case::test_case(false, 0; "ordinary V1 current queue positive")]
+#[test_case::test_case(false, 1; "ordinary V1 host publication while queued")]
+#[test_case::test_case(false, 2; "ordinary V1 managed invalidation while queued")]
+#[test_case::test_case(false, 3; "ordinary V1 executor widening while queued")]
+#[test_case::test_case(false, 4; "ordinary V1 registration revoked while queued")]
+#[test_case::test_case(true, 0; "selected V1 current queue positive")]
+#[test_case::test_case(true, 1; "selected V1 host publication while queued")]
+#[test_case::test_case(true, 2; "selected V1 managed invalidation while queued")]
+#[test_case::test_case(true, 3; "selected V1 executor widening while queued")]
+#[test_case::test_case(true, 4; "selected V1 registration revoked while queued")]
+#[tokio::test]
+async fn public_v1_send_input_rechecks_publication_after_real_queue_wait(
+    selected: bool,
+    change: u8,
+) {
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::handlers::multi_agents::SendInputHandler;
+    use crate::tools::registry::ToolExecutor;
+
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    std::fs::write(
+        &host_file,
+        r#"
+model = "gpt-5.5"
+model_catalog_json = "root-v1.json"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "selected-v1.json"
+[model_providers.a]
+name = "V1 queue fixture"
+base_url = "http://127.0.0.1:9/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+    )
+    .unwrap();
+    let mut root_info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .unwrap();
+    root_info.multi_agent_version = Some(MultiAgentVersion::V1);
+    root_info.supports_search_tool = false;
+    root_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    root_info.used_fallback_model_metadata = false;
+    let mut selected_info = root_info.clone();
+    selected_info.slug = "shared-loaded".into();
+    for (file, info) in [
+        ("root-v1.json", root_info),
+        ("selected-v1.json", selected_info),
+    ] {
+        std::fs::write(
+            home.path().join(file),
+            serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+        )
+        .unwrap();
+    }
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut binding = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut binding);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(binding.binding);
+    // Use the config-aware production manager so the root's actual model is V1.
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    let state_db = init_state_db(&config).await;
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        Arc::new(LocalThreadStore::new(
+            LocalThreadStoreConfig {
+                codex_home: config.codex_home.to_path_buf(),
+                sqlite: codex_state::SqliteConfig::new_for_testing(config.codex_home.clone()),
+                default_model_provider_id: "openai".into(),
+            },
+            state_db.clone(),
+        )),
+        crate::thread_manager::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    )
+    .with_code_mode_session_provider(Arc::new(codex_code_mode::DisabledCodeModeSessionProvider));
+    let control = manager.agent_control();
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db,
+        manager,
+        control,
+    };
+    let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.multi_agent_version(), Some(MultiAgentVersion::V1));
+    let turn = parent.session.new_default_turn().await;
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let mut prepared = crate::agent::child_config::prepare_agent_spawn_config(
+        &parent.session,
+        &step,
+        crate::agent::child_config::SpawnConfigOptions {
+            resolved_provider: None,
+            model_provider: selected.then_some("a"),
+            version: crate::agent::child_config::SpawnConfigVersion::V1,
+            full_history_fork: false,
+            role_name: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap()
+    .config;
+    let mut reservation = harness
+        .control
+        .runtime
+        .registry
+        .reserve_spawn_slot(None)
+        .unwrap();
+    let (source, mut metadata) = harness
+        .control
+        .prepare_thread_spawn(
+            &mut reservation,
+            &prepared,
+            parent_id,
+            next_thread_spawn_depth(&parent.session_source),
+            Some(AgentPath::from_string("/root/public_v1_queue_target".into()).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+    let permit = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &harness.control.runtime,
+            parent_id,
+            &prepared,
+            false,
+            &source,
+        )
+        .await
+        .unwrap();
+    let started = fresh_lifetime_lower_start(&harness, &parent, prepared, source, permit)
+        .await
+        .unwrap();
+    metadata.agent_id = Some(started.thread_id);
+    reservation.commit(metadata);
+    let target_id = started.thread_id;
+    let original = started.thread;
+    assert_eq!(original.multi_agent_version(), Some(MultiAgentVersion::V1));
+    assert_eq!(
+        original.config_snapshot().await.model_provider_id,
+        if selected { "a" } else { "openai" }
+    );
+    original.ensure_rollout_materialized().await;
+    original.flush_rollout().await.unwrap();
+
+    let (tx, rx) = crate::session::bounded_submission_channel(1);
+    let capacity_wait = tx.capacity_wait_observer_for_test();
+    let mut io = original.io.clone();
+    io.tx_sub = tx;
+    let mut observed = CodexThread::new(
+        Arc::clone(&original.session),
+        io,
+        original.startup_metadata().clone(),
+        original.rollout_path(),
+        original.session_source.clone(),
+    );
+    observed.residency_gate = Arc::clone(&original.residency_gate);
+    let observed = Arc::new(observed);
+    let state = harness.control.runtime.upgrade().unwrap();
+    let replaced = state
+        .threads
+        .write()
+        .await
+        .insert(target_id, Arc::clone(&observed))
+        .unwrap();
+    assert!(Arc::ptr_eq(&replaced, &original));
+    assert!(Arc::ptr_eq(&observed.session, &original.session));
+    assert!(
+        harness
+            .control
+            .runtime
+            .retained_authority(target_id)
+            .unwrap()
+            .matches_session(&observed.session)
+    );
+    observed.io.submit(Op::Interrupt).await.unwrap();
+    let handler = SendInputHandler;
+    let invocation = ToolInvocation {
+        session: Arc::clone(&parent.session), turn: Arc::clone(&turn), step_context: step,
+        cancellation_token: CancellationToken::new(),
+        tracker: Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::default())),
+        call_id: "public-v1-capacity-call".into(),
+        tool_name: codex_tools::ToolName::namespaced(
+            crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE,
+            "send_input",
+        ),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: serde_json::json!({"target": target_id.to_string(), "message": "public V1 queued followup"}).to_string(),
+        },
+    };
+    let mut send = Box::pin(handler.handle(invocation));
+    tokio::select! {
+        result = &mut send => panic!("actual V1 handler must block at the full queue; success={}", result.is_ok()),
+        waited = timeout(Duration::from_secs(10), capacity_wait.notified()) => {
+            waited.expect("actual V1 handler reached submission capacity wait");
+        }
+    }
+    assert_eq!(rx.len(), 1, "receiver stays full through publication");
+    match change {
+        0 => {}
+        1 => {
+            let mut host: TomlValue =
+                toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
+            host["agents"]["allowed_model_providers"] = TomlValue::Array(vec![TomlValue::String(
+                if selected { "openai" } else { "a" }.into(),
+            )]);
+            std::fs::write(&host_file, toml::to_string(&host).unwrap()).unwrap();
+            let next = ConfigBuilder::without_managed_config_for_tests()
+                .codex_home(harness.config.codex_home.to_path_buf())
+                .harness_overrides(crate::config::ConfigOverrides {
+                    cwd: Some(project.path().to_path_buf()),
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap();
+            let current = parent.config().await;
+            assert_eq!(
+                parent.refresh_runtime_config(current, next).await,
+                crate::ConfigRefreshOutcome::Published
+            );
+        }
+        2 => {
+            let mut bundle = codex_config::CloudConfigBundle::default();
+            bundle
+                .config_toml
+                .enterprise_managed
+                .push(codex_config::CloudConfigFragment {
+                    id: "public-v1-queue-revocation".into(),
+                    name: "publish managed revocation".into(),
+                    contents: "[agents]\nallowed_model_providers=['openai']\n".into(),
+                });
+            policy.observe_remote_bundle(&bundle).unwrap();
+        }
+        3 => {
+            let environments = parent.session.inherited_environment_snapshot().await;
+            let ready = environments.primary().unwrap();
+            let mut owner = ready.config().clone();
+            owner.permission_profile = codex_protocol::models::PermissionProfileSnapshot::legacy(
+                PermissionProfile::Disabled,
+            );
+            let mut selection = ready.selection();
+            selection.config = EnvironmentConfigState::Ready(owner);
+            parent
+                .update_thread_settings(ThreadSettingsOverrides {
+                    permission_profile: Some(PermissionProfile::Disabled),
+                    environments: Some(TurnEnvironmentRequests::new(
+                        parent.thread_settings_snapshot().await.cwd,
+                        vec![selection.into_request()],
+                    )),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        4 => harness.control.runtime.registry.revoke_caller(target_id),
+        _ => unreachable!(),
+    }
+    assert!(matches!(rx.recv().await.unwrap().op, Op::Interrupt));
+    // The controlled receiver only acknowledges actual queue admission. No Core
+    // task consumes this queue, starts inference, or contacts any provider.
+    let (result, accepted) = timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut send => (result, false),
+            submission = rx.recv() => {
+                let submission = submission.unwrap();
+                let Op::TurnInput { request, reply, .. } = submission.op else {
+                    panic!("public V1 must submit the real TurnInput operation");
+                };
+                assert!(matches!(request.input, codex_protocol::turn_input::TurnInput::UserInput { ref content, .. } if content == &text_input("public V1 queued followup")));
+                assert!(reply.send(Ok(codex_protocol::turn_input::TurnInputSubmission::Started {
+                    turn_id: "observed-public-v1-turn".into(), root_turn_id: "observed-public-v1-turn".into(),
+                })).is_ok());
+                (send.as_mut().await, true)
+            }
+        }
+    }).await.expect("public V1 queue decision is bounded after capacity release");
+    assert!(rx.try_recv().is_err());
+    let same_allocation = Arc::ptr_eq(
+        &observed,
+        &harness.manager.get_thread(target_id).await.unwrap(),
+    );
+    let restored = state
+        .threads
+        .write()
+        .await
+        .insert(target_id, Arc::clone(&original))
+        .unwrap();
+    assert!(Arc::ptr_eq(&restored, &observed));
+    drop(send);
+    // Complete actual owned Session cleanup before asserting the expected RED.
+    original.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&target_id).await;
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
+    assert!(
+        same_allocation,
+        "only the submission queue was instrumented"
+    );
+    if change == 0 {
+        assert!(accepted, "unchanged V1 must reach the target queue");
+        assert!(result.is_ok(), "unchanged V1 public handler should succeed");
+    } else {
+        assert!(
+            !accepted,
+            "revoked public V1 must reject BEFORE target enqueue; selected={selected}, change={change}"
+        );
+        let error = result.err().expect("revoked V1 handler must deny");
+        assert!(loaded_fixture_policy_denial(&error.to_string()), "{error}");
+    }
+}

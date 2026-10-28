@@ -14,6 +14,8 @@ use tokio::sync::Notify;
 pub(crate) struct SubmissionSender {
     inner: async_channel::Sender<Submission>,
     capacity_changed: Arc<Notify>,
+    #[cfg(test)]
+    capacity_waiting_for_test: Arc<Notify>,
 }
 
 pub(crate) struct SubmissionReceiver {
@@ -43,6 +45,8 @@ fn wrap_submission_channel(
         SubmissionSender {
             inner: sender,
             capacity_changed: Arc::clone(&capacity_changed),
+            #[cfg(test)]
+            capacity_waiting_for_test: Arc::new(Notify::new()),
         },
         SubmissionReceiver {
             inner: receiver,
@@ -56,6 +60,10 @@ impl SubmissionSender {
         &self,
         submission: Submission,
     ) -> Result<(), async_channel::SendError<Submission>> {
+        #[cfg(test)]
+        if self.inner.is_full() {
+            self.capacity_waiting_for_test.notify_one();
+        }
         self.inner.send(submission).await
     }
 
@@ -82,7 +90,11 @@ impl SubmissionSender {
                 Err(async_channel::TrySendError::Closed(_)) => {
                     return Err(CodexErr::InternalAgentDied);
                 }
-                Err(async_channel::TrySendError::Full(pending)) => submission = pending,
+                Err(async_channel::TrySendError::Full(pending)) => {
+                    #[cfg(test)]
+                    self.capacity_waiting_for_test.notify_one();
+                    submission = pending;
+                }
             }
             changed.await;
         }
@@ -95,6 +107,12 @@ impl SubmissionSender {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Observe the real capacity-block point, without changing queue admission.
+    #[cfg(test)]
+    pub(crate) fn capacity_wait_observer_for_test(&self) -> Arc<Notify> {
+        Arc::clone(&self.capacity_waiting_for_test)
     }
 }
 
