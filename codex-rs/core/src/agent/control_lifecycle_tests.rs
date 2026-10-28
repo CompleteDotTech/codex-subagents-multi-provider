@@ -5198,3 +5198,616 @@ async fn copied_fork_standard_checkpoint_precedes_input_and_ack(fail: bool) {
         );
     }
 }
+
+async fn publish_native_startup_policy_change(caller: &Arc<CodexThread>, change: u8) {
+    let before = *caller.session.child_policy_revision.lock().unwrap();
+    if change == 1 {
+        let before_profile = caller.thread_settings_snapshot().await.permission_profile;
+        assert_ne!(before_profile, PermissionProfile::read_only());
+        let environments = caller.session.inherited_environment_snapshot().await;
+        let ready = environments.primary().expect("actual primary executor");
+        let before_executor_profile = ready.config().permission_profile.clone();
+        let mut owner = ready.config().clone();
+        owner.permission_profile = codex_protocol::models::PermissionProfileSnapshot::legacy(
+            PermissionProfile::read_only(),
+        );
+        assert_ne!(before_executor_profile, owner.permission_profile);
+        caller
+            .update_thread_settings(ThreadSettingsOverrides {
+                permission_profile: Some(PermissionProfile::read_only()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Settings publish future defaults; the host owner separately publishes
+        // ready executor configuration to both active and future attachments.
+        caller
+            .environment_ready(&ready.selection(), owner)
+            .await
+            .unwrap();
+        let after_environments = caller.session.inherited_environment_snapshot().await;
+        let after_executor_profile = after_environments
+            .primary()
+            .unwrap()
+            .config()
+            .permission_profile
+            .clone();
+        assert_eq!(
+            after_executor_profile,
+            codex_protocol::models::PermissionProfileSnapshot::legacy(
+                PermissionProfile::read_only()
+            )
+        );
+        assert_ne!(before_executor_profile, after_executor_profile);
+        let after_profile = caller.thread_settings_snapshot().await.permission_profile;
+        assert_eq!(after_profile, PermissionProfile::read_only());
+        assert_ne!(
+            before_profile, after_profile,
+            "actual effective permission must change"
+        );
+    } else {
+        assert_eq!(change, 2);
+        let current = caller.config().await;
+        std::fs::write(
+            current.codex_home.join("config.toml"),
+            "model = \"gpt-5.6-sol\"\n[agents]\nallowed_model_providers = []\n",
+        )
+        .unwrap();
+        let next = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(current.codex_home.to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            caller.refresh_runtime_config(current, next).await,
+            crate::ConfigRefreshOutcome::Published
+        );
+        let published = caller.config().await;
+        assert!(
+            published.config_layer_stack.effective_config()["agents"]["allowed_model_providers"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "real file policy was published"
+        );
+    }
+    assert_ne!(
+        *caller.session.child_policy_revision.lock().unwrap(),
+        before
+    );
+}
+
+#[test_case::test_case(false, 0; "unchanged retained startup admission")]
+#[test_case::test_case(true, 0; "nested unchanged retained startup admission")]
+#[test_case::test_case(true, 1; "nested host permission publication invalidates admission")]
+#[test_case::test_case(true, 2; "nested host user file publication invalidates admission")]
+#[test_case::test_case(false, 1; "permission publication invalidates retained startup admission")]
+#[test_case::test_case(false, 2; "real user file publication invalidates retained startup admission")]
+#[tokio::test]
+async fn retained_native_admission_keeps_original_policy_revision(nested: bool, change: u8) {
+    let (mut harness, _, _) = post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
+    harness
+        .config
+        .permissions
+        .set_permission_profile(PermissionProfile::Disabled)
+        .unwrap();
+    let (root_id, root) = harness.start_thread().await;
+    let caller = if nested {
+        post_admission_registered_idle_child(&harness, &root, "nested_policy_owner").await
+    } else {
+        Arc::clone(&root)
+    };
+    let (prepared, _, permit) = fresh_lifetime_permit(&harness, &caller, "retained_policy").await;
+    let (_, _, admission) = permit
+        .consume(
+            &harness.control.runtime,
+            Some(caller.session.thread_id),
+            &prepared,
+        )
+        .unwrap();
+    admission.admit().unwrap();
+    let epoch = harness.control.runtime.retained_authority(root_id).unwrap();
+    assert!(
+        root.config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none()
+    );
+    let revision_before = *root.session.child_policy_revision.lock().unwrap();
+    let profile_before = root.thread_settings_snapshot().await.permission_profile;
+    if change != 0 {
+        publish_native_startup_policy_change(&root, change).await;
+    }
+    assert!(root.is_running());
+    assert!(*root.session.fresh_child_admission_live.lock().unwrap());
+    assert!(Arc::ptr_eq(
+        &root,
+        &harness.manager.get_thread(root_id).await.unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &epoch,
+        &harness.control.runtime.retained_authority(root_id).unwrap()
+    ));
+    assert!(caller.is_running());
+    assert!(*caller.session.fresh_child_admission_live.lock().unwrap());
+    assert!(Arc::ptr_eq(
+        &caller,
+        &harness
+            .manager
+            .get_thread(caller.session.thread_id)
+            .await
+            .unwrap()
+    ));
+    assert!(
+        root.config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none()
+    );
+    assert!(
+        caller
+            .config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none()
+    );
+    let revision_after = *root.session.child_policy_revision.lock().unwrap();
+    let profile_changed =
+        profile_before != root.thread_settings_snapshot().await.permission_profile;
+    let same_allocation = Arc::ptr_eq(
+        &caller,
+        &harness
+            .manager
+            .get_thread(caller.session.thread_id)
+            .await
+            .unwrap(),
+    );
+    let same_epoch = Arc::ptr_eq(
+        &epoch,
+        &harness.control.runtime.retained_authority(root_id).unwrap(),
+    );
+    let live = caller.is_running() && *caller.session.fresh_child_admission_live.lock().unwrap();
+    let managed_unchanged = root
+        .config()
+        .await
+        .config_layer_stack
+        .cloud_config_binding()
+        .is_none()
+        && caller
+            .config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none();
+    let publication_observed = revision_after != revision_before;
+    let file_policy_empty = change == 2 && root.config().await.config_layer_stack.effective_config()["agents"]["allowed_model_providers"].as_array().is_some_and(|list| list.is_empty());
+    let result = admission.admit();
+    if nested {
+        caller.shutdown_and_wait().await.unwrap();
+        harness
+            .manager
+            .remove_thread(&caller.session.thread_id)
+            .await;
+    }
+    root.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&root_id).await;
+    eprintln!(
+        "NATIVE_POLICY_RETAINED_CLEANUP nested={nested} change={change} revision_before={revision_before} revision_after={revision_after} profile_changed={profile_changed} publication_observed={publication_observed} file_policy_empty={file_policy_empty} same_allocation={same_allocation} same_epoch={same_epoch} live={live} managed_unchanged={managed_unchanged} denied={} cleanup=complete",
+        result.is_err()
+    );
+    std::assert_eq!(
+        result.is_err(),
+        change != 0,
+        "retained native admission must preserve the original publication revision"
+    );
+}
+
+#[test_case::test_case(false, 0; "fresh unchanged post consume startup")]
+#[test_case::test_case(false, 1; "fresh permission publication after consume")]
+#[test_case::test_case(false, 2; "fresh real user file publication after consume")]
+#[test_case::test_case(true, 0; "resume unchanged post consume startup")]
+#[test_case::test_case(true, 1; "resume permission publication after consume")]
+#[test_case::test_case(true, 2; "resume real user file publication after consume")]
+#[tokio::test]
+async fn post_consume_native_startup_rejects_completed_policy_publication(
+    resume: bool,
+    change: u8,
+) {
+    let (mut harness, store, mut pending) =
+        post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
+    harness
+        .config
+        .permissions
+        .set_permission_profile(PermissionProfile::Disabled)
+        .unwrap();
+    let (root_id, root) = harness.start_thread().await;
+    let root_turn = root.session.new_default_turn().await;
+    assert_eq!(root_turn.multi_agent_version, MultiAgentVersion::V2);
+    let existing = if resume {
+        let target =
+            post_admission_registered_idle_child(&harness, &root, "publication_resume").await;
+        let context = target
+            .session
+            .new_default_turn()
+            .await
+            .to_turn_context_item();
+        assert!(
+            target
+                .session
+                .persist_rollout_items(&[RolloutItem::TurnContext(context)])
+                .await
+        );
+        target.session.flush_rollout().await.unwrap();
+        assert_eq!(
+            harness
+                .manager
+                .try_evict_v2_thread(Arc::clone(&target))
+                .await
+                .unwrap(),
+            ThreadEvictionOutcome::Evicted
+        );
+        Some(target)
+    } else {
+        None
+    };
+    let epoch = harness.control.runtime.retained_authority(root_id).unwrap();
+    let start = async {
+        if let Some(target) = &existing {
+            *store.armed_resume.lock().unwrap() = Some((target.session.thread_id, root_id));
+            harness
+                .control
+                .resume_agent_from_rollout(
+                    harness.config.clone(),
+                    target.session.thread_id,
+                    target.session_source.clone(),
+                )
+                .await
+        } else {
+            let (prepared, source, permit) =
+                fresh_lifetime_permit(&harness, &root, "publication_fresh").await;
+            *store.armed_parent.lock().unwrap() = Some(root_id);
+            fresh_lifetime_lower_start(&harness, &root, prepared, source, permit)
+                .await
+                .map(|child| child.thread_id)
+        }
+    };
+    tokio::pin!(start);
+    let blocked = tokio::select! {
+        result = &mut start => panic!("must reach actual post-consume owned store gate: {result:?}"),
+        entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
+    };
+    let child_id = blocked.child;
+    assert_eq!(blocked.parent, root_id);
+    assert!(harness.manager.get_thread(child_id).await.is_err());
+    let revision_before = *root.session.child_policy_revision.lock().unwrap();
+    let profile_before = root.thread_settings_snapshot().await.permission_profile;
+    if change != 0 {
+        publish_native_startup_policy_change(&root, change).await;
+    }
+    assert!(root.is_running());
+    assert!(*root.session.fresh_child_admission_live.lock().unwrap());
+    assert!(Arc::ptr_eq(
+        &root,
+        &harness.manager.get_thread(root_id).await.unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &epoch,
+        &harness.control.runtime.retained_authority(root_id).unwrap()
+    ));
+    assert!(
+        root.config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none()
+    );
+    let revision_after = *root.session.child_policy_revision.lock().unwrap();
+    let profile_changed =
+        profile_before != root.thread_settings_snapshot().await.permission_profile;
+    let same_allocation = Arc::ptr_eq(&root, &harness.manager.get_thread(root_id).await.unwrap());
+    let same_epoch = Arc::ptr_eq(
+        &epoch,
+        &harness.control.runtime.retained_authority(root_id).unwrap(),
+    );
+    let live = root.is_running() && *root.session.fresh_child_admission_live.lock().unwrap();
+    let managed_unchanged = root
+        .config()
+        .await
+        .config_layer_stack
+        .cloud_config_binding()
+        .is_none();
+    let publication_observed = revision_after != revision_before;
+    let file_policy_empty = change == 2 && root.config().await.config_layer_stack.effective_config()["agents"]["allowed_model_providers"].as_array().is_some_and(|list| list.is_empty());
+    let owned_gate = blocked.parent == root_id && blocked.child != root_id;
+    blocked.release.send(()).unwrap();
+    let result = timeout(Duration::from_secs(10), start).await.unwrap();
+    let registered = harness.manager.get_thread(child_id).await.ok();
+    let prewarmed = if let Some(child) = &registered {
+        child.session.has_startup_prewarm_for_test().await
+    } else {
+        false
+    };
+    let history = store
+        .inner
+        .load_history(codex_thread_store::LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: true,
+        })
+        .await;
+    let history_present = history
+        .as_ref()
+        .is_ok_and(|history| !history.items.is_empty());
+    if let Some(child) = registered.as_ref() {
+        child.shutdown_and_wait().await.unwrap();
+        harness.manager.remove_thread(&child_id).await;
+    }
+    root.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&root_id).await;
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+    eprintln!(
+        "NATIVE_POLICY_STARTUP_CLEANUP resume={resume} change={change} revision_before={revision_before} revision_after={revision_after} profile_changed={profile_changed} publication_observed={publication_observed} file_policy_empty={file_policy_empty} same_allocation={same_allocation} same_epoch={same_epoch} live={live} managed_unchanged={managed_unchanged} owned_gate={owned_gate} denied={} registered={} prewarmed={prewarmed} history_present={history_present} cleanup=complete",
+        result.is_err(),
+        registered.is_some()
+    );
+    if change == 0 {
+        assert!(
+            result.is_ok() && registered.is_some(),
+            "unchanged native startup must remain supported"
+        );
+    } else {
+        assert!(
+            result.is_err() && registered.is_none(),
+            "completed policy publication must reject post-consume native registration"
+        );
+        assert!(
+            !prewarmed,
+            "denied startup must not schedule helper prewarm"
+        );
+        assert_eq!(
+            history_present, resume,
+            "denied fresh history is discarded; existing resume history is preserved"
+        );
+    }
+}
+
+#[test_case::test_case(false, 0; "nested fresh exact root remains current")]
+#[test_case::test_case(false, 1; "nested fresh root client removal after consume")]
+#[test_case::test_case(false, 2; "nested fresh root same ID replacement after consume")]
+#[test_case::test_case(false, 3; "nested fresh root registry revocation after consume")]
+#[test_case::test_case(true, 0; "nested resume exact root remains current")]
+#[test_case::test_case(true, 1; "nested resume root client removal after consume")]
+#[test_case::test_case(true, 2; "nested resume root same ID replacement after consume")]
+#[test_case::test_case(true, 3; "nested resume root registry revocation after consume")]
+#[tokio::test]
+async fn post_consume_nested_startup_requires_exact_current_host_root(resume: bool, change: u8) {
+    let (harness, store, mut pending) =
+        post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
+    let (root_id, root) = harness.start_thread().await;
+    let root_turn = root.session.new_default_turn().await;
+    assert_eq!(root_turn.multi_agent_version, MultiAgentVersion::V2);
+    root.ensure_rollout_materialized().await;
+    root.session.flush_rollout().await.unwrap();
+    let stored_root = root
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
+    let root_history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: root_id,
+        history: Arc::new(stored_root.history.unwrap().items),
+        rollout_path: stored_root.rollout_path,
+    });
+    let caller = post_admission_registered_idle_child(&harness, &root, "nested_root_caller").await;
+    let caller_id = caller.session.thread_id;
+    let caller_epoch = harness
+        .control
+        .runtime
+        .retained_authority(caller_id)
+        .unwrap();
+    let root_epoch = harness.control.runtime.retained_authority(root_id).unwrap();
+    let revision_before = *root.session.child_policy_revision.lock().unwrap();
+    let existing = if resume {
+        let target =
+            post_admission_registered_idle_child(&harness, &caller, "nested_root_resume").await;
+        let context = target
+            .session
+            .new_default_turn()
+            .await
+            .to_turn_context_item();
+        assert!(
+            target
+                .session
+                .persist_rollout_items(&[RolloutItem::TurnContext(context)])
+                .await
+        );
+        target.session.flush_rollout().await.unwrap();
+        assert_eq!(
+            harness
+                .manager
+                .try_evict_v2_thread(Arc::clone(&target))
+                .await
+                .unwrap(),
+            ThreadEvictionOutcome::Evicted
+        );
+        Some(target)
+    } else {
+        None
+    };
+    let start = async {
+        if let Some(target) = &existing {
+            *store.armed_resume.lock().unwrap() = Some((target.session.thread_id, caller_id));
+            harness
+                .control
+                .ensure_child_loaded(caller_id, target.session.thread_id)
+                .await
+                .map(|()| target.session.thread_id)
+        } else {
+            let (prepared, source, permit) =
+                fresh_lifetime_permit(&harness, &caller, "nested_root_fresh").await;
+            *store.armed_parent.lock().unwrap() = Some(caller_id);
+            fresh_lifetime_lower_start(&harness, &caller, prepared, source, permit)
+                .await
+                .map(|child| child.thread_id)
+        }
+    };
+    tokio::pin!(start);
+    let blocked = tokio::select! {
+        result = &mut start => panic!("nested real startup must reach owned store gate: {result:?}"),
+        entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
+    };
+    let child_id = blocked.child;
+    assert_eq!(blocked.parent, caller_id);
+    let mut replacement = None;
+    if change == 1 || change == 2 {
+        let removed = harness
+            .manager
+            .remove_thread_for_client(&root_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&removed, &root));
+        if change == 2 {
+            root.shutdown_and_wait().await.unwrap();
+            let new_root = harness
+                .manager
+                .start_thread_with_control_for_tests(
+                    StartThreadOptions {
+                        initial_history: root_history,
+                        history_mode: Some(ThreadHistoryMode::Legacy),
+                        session_source: Some(root.session_source.clone()),
+                        ..StartThreadOptions::new(harness.config.clone())
+                    },
+                    harness.control.clone(),
+                )
+                .await
+                .unwrap()
+                .thread;
+            assert_eq!(new_root.session.thread_id, root_id);
+            assert!(!Arc::ptr_eq(&new_root, &root));
+            replacement = Some(new_root);
+        }
+    } else if change == 3 {
+        harness
+            .control
+            .runtime
+            .retire_authority(Arc::clone(&root_epoch));
+    }
+    let revision_after = *root.session.child_policy_revision.lock().unwrap();
+    assert_eq!(
+        revision_before, revision_after,
+        "root ownership change does not fake a policy publication"
+    );
+    let caller_current = caller.is_running()
+        && *caller.session.fresh_child_admission_live.lock().unwrap()
+        && Arc::ptr_eq(
+            &caller,
+            &harness.manager.get_thread(caller_id).await.unwrap(),
+        )
+        && Arc::ptr_eq(
+            &caller_epoch,
+            &harness
+                .control
+                .runtime
+                .retained_authority(caller_id)
+                .unwrap(),
+        )
+        && harness
+            .control
+            .runtime
+            .with_resume_caller(&caller_epoch, /*live*/ true, || Ok(()))
+            .is_ok();
+    assert!(
+        caller_current,
+        "immediate caller stays current while only host root changes"
+    );
+    assert!(
+        root.config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none()
+    );
+    assert!(
+        caller
+            .config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none()
+    );
+    let root_current = harness
+        .control
+        .runtime
+        .with_resume_caller(
+            &root_epoch,
+            root.is_running() && *root.session.fresh_child_admission_live.lock().unwrap(),
+            || Ok(()),
+        )
+        .is_ok();
+    assert_eq!(root_current, change == 0);
+    let owned_gate = blocked.parent == caller_id && blocked.child != caller_id;
+    let managed_unchanged = root
+        .config()
+        .await
+        .config_layer_stack
+        .cloud_config_binding()
+        .is_none()
+        && caller
+            .config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .is_none();
+    blocked.release.send(()).unwrap();
+    let result = timeout(Duration::from_secs(10), start).await.unwrap();
+    let registered = harness.manager.get_thread(child_id).await.ok();
+    let history_present = store
+        .inner
+        .load_history(codex_thread_store::LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: true,
+        })
+        .await
+        .as_ref()
+        .is_ok_and(|history| !history.items.is_empty());
+    if let Some(child) = registered.as_ref() {
+        child.shutdown_and_wait().await.unwrap();
+        harness.manager.remove_thread(&child_id).await;
+    }
+    caller.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&caller_id).await;
+    if let Some(new_root) = replacement {
+        new_root.shutdown_and_wait().await.unwrap();
+        harness.manager.remove_thread(&root_id).await;
+    }
+    if change != 2 {
+        root.shutdown_and_wait().await.unwrap();
+        harness.manager.remove_thread(&root_id).await;
+    }
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+    eprintln!(
+        "NATIVE_ROOT_STARTUP_CLEANUP resume={resume} change={change} revision_before={revision_before} revision_after={revision_after} caller_current={caller_current} root_current={root_current} owned_gate={owned_gate} managed_unchanged={managed_unchanged} denied={} registered={} history_present={history_present} cleanup=complete",
+        result.is_err(),
+        registered.is_some()
+    );
+    if change == 0 {
+        assert!(
+            result.is_ok() && registered.is_some(),
+            "unchanged exact host root permits nested startup"
+        );
+    } else {
+        assert!(
+            result.is_err() && registered.is_none(),
+            "nested startup must reject removed replaced or revoked actual host root"
+        );
+        assert_eq!(
+            history_present, resume,
+            "root-fenced denial cleans only provisional fresh history"
+        );
+    }
+}
