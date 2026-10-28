@@ -11274,3 +11274,45 @@ async fn graph_old_retained_absent_close_rejects_new_registration_aba() {
 async fn graph_old_missing_retained_close_rejects_new_registration_aba() {
     graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(true).await;
 }
+
+#[tokio::test]
+async fn graph_loaded_missing_registration_cannot_transfer_close_to_absence() {
+    use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (root_id, root) = harness.start_thread().await;
+    let child =
+        post_admission_registered_idle_child(&harness, &root, "graph_unproven_loaded").await;
+    let id = child.session.thread_id;
+    graph_publish_actual_open(&harness, &child).await;
+    let state = harness.control.runtime.upgrade().unwrap();
+    let cold_control = LocalAgentControl::new(
+        Arc::downgrade(&state),
+        crate::thread_manager::default_thread_id_generator(),
+        None,
+    );
+    assert!(cold_control.runtime.retained_authority(id).is_none());
+    let unproven = state
+        .fence_native_subtree_with_graph_stamp(&cold_control.runtime, id, true, |_| {})
+        .await;
+    assert!(Arc::ptr_eq(
+        &child,
+        &harness.manager.get_thread(id).await.unwrap()
+    ));
+    harness.control.shutdown_live_agent(id).await.unwrap();
+    assert!(harness.manager.get_thread(id).await.is_err());
+    state
+        .persist_native_graph_closed(&cold_control.runtime, &unproven)
+        .await
+        .unwrap();
+    assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
+    assert!(!graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Closed).await);
+    assert!(root.is_running());
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}

@@ -2191,7 +2191,8 @@ impl ThreadManagerState {
         // it is NEVER sufficient without the canonical generation check below.
         let compatible_residency = match (&capture.root_allocation, threads.get(&capture.root)) {
             (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
-            (None, None) | (Some(_), None) => true,
+            (None, None) => true,
+            (Some(_), None) => capture.graph_stamp.can_transfer_from_loaded(),
             _ => false,
         };
         if !compatible_residency

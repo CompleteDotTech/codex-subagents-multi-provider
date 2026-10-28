@@ -133,6 +133,14 @@ pub(crate) struct NativeGraphCloseStamp {
     explicit_intent: bool,
 }
 
+impl NativeGraphCloseStamp {
+    /// A missing identity can fence an originally unloaded observation, but it
+    /// cannot prove that a removed loaded allocation was this registration.
+    pub(crate) fn can_transfer_from_loaded(&self) -> bool {
+        self.registration_generation.is_some()
+            && self.registration_generation == self.retained_registration
+    }
+}
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum GraphLifecycleTestPoint {
