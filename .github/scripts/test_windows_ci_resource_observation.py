@@ -23,7 +23,31 @@ m = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(m)
 
 
-def ownership_fixture_timeout_summary(stderr):
+def ownership_capture_metadata(value):
+    """Count only bounded bytes; text counts use UTF-8 replacement encoding."""
+    if isinstance(value, bytes):
+        size = len(value)
+        kind = "bytes"
+    elif isinstance(value, str):
+        # At most 8193 characters are encoded, even for an oversized capture.
+        size = len(value[:8193].encode("utf-8", errors="replace"))
+        kind = "text"
+    else:
+        return {
+            "present": value is not None,
+            "kind": "none" if value is None else "unsupported",
+            "byte_count": None,
+            "byte_count_clamped": False,
+        }
+    return {
+        "present": True,
+        "kind": kind,
+        "byte_count": min(size, 8192),
+        "byte_count_clamped": size > 8192,
+    }
+
+
+def ownership_fixture_timeout_summary(stderr, stdout=None):
     """Retain only bounded fixed-stage/numeric observations, never raw errors."""
     stages = {
         "entered",
@@ -38,6 +62,10 @@ def ownership_fixture_timeout_summary(stderr):
         "vhd-test",
         "vhd-item",
     }
+    captures = {
+        "stdout_capture": ownership_capture_metadata(stdout),
+        "stderr_capture": ownership_capture_metadata(stderr),
+    }
     if isinstance(stderr, bytes):
         stderr = stderr[-8192:].decode("utf-8", errors="replace")
     elif isinstance(stderr, str):
@@ -47,7 +75,8 @@ def ownership_fixture_timeout_summary(stderr):
     observed = []
     elapsed = None
     version = None
-    for line in stderr.splitlines()[-64:]:
+    retained_lines = stderr.splitlines()[-64:]
+    for line in retained_lines:
         match = re.fullmatch(
             r"OWNERSHIP_FIXTURE stage=([a-z-]+) elapsed_ms=([0-9]{1,5}) "
             r"pwsh_major=([0-9]{1,3}) pwsh_minor=([0-9]{1,3})",
@@ -62,7 +91,19 @@ def ownership_fixture_timeout_summary(stderr):
             observed.append(match[1])
         elapsed, version = milliseconds, [major, minor]
     return "ownership-fixture-timeout " + json.dumps(
-        {"stages": observed[-16:], "elapsed_ms": elapsed, "pwsh_version": version},
+        {
+            "stages": observed[-16:],
+            "elapsed_ms": elapsed,
+            "pwsh_version": version,
+            "literal_entry_seen_in_retained_stderr": "OWNERSHIP_FIXTURE_ENTRY"
+            in retained_lines,
+            "capture_byte_count_limit": 8192,
+            "text_byte_count_encoding": "utf8-replace",
+            "stderr_window_limit": 8192,
+            "stderr_window_units": "bytes-before-utf8-decode-or-text-characters",
+            "stderr_line_limit": 64,
+            **captures,
+        },
         separators=(",", ":"),
     )
 
@@ -92,18 +133,75 @@ class ObservationTests(unittest.TestCase):
         ):
             with self.subTest(value=type(value).__name__):
                 self.assertEqual(
-                    json.loads(
-                        ownership_fixture_timeout_summary(value).split(" ", 1)[1]
-                    ),
+                    {
+                        key: result
+                        for key, result in json.loads(
+                            ownership_fixture_timeout_summary(value).split(" ", 1)[1]
+                        ).items()
+                        if key in {"stages", "elapsed_ms", "pwsh_version"}
+                    },
                     {"stages": [], "elapsed_ms": None, "pwsh_version": None},
                 )
+
+    def test_ownership_timeout_capture_metadata_distinguishes_absence_and_empty(self):
+        for value, present, kind, count in (
+            (None, False, "none", None),
+            (b"", True, "bytes", 0),
+            ("", True, "text", 0),
+            (b"SECRET", True, "bytes", 6),
+            ("é", True, "text", 2),
+            (b"\xff", True, "bytes", 1),
+            (42, True, "unsupported", None),
+        ):
+            summary = ownership_fixture_timeout_summary(value, value)
+            data = json.loads(summary.split(" ", 1)[1])
+            for key in ("stdout_capture", "stderr_capture"):
+                self.assertEqual(
+                    data[key],
+                    {
+                        "present": present,
+                        "kind": kind,
+                        "byte_count": count,
+                        "byte_count_clamped": False,
+                    },
+                )
+            self.assertFalse(data["literal_entry_seen_in_retained_stderr"])
+            self.assertEqual(data["stages"], [])
+            self.assertNotIn("SECRET", summary)
+
+    def test_ownership_timeout_literal_and_capture_windows_are_bounded(self):
+        literal = "OWNERSHIP_FIXTURE_ENTRY"
+        for value in (literal, literal.encode()):
+            data = json.loads(ownership_fixture_timeout_summary(value).split(" ", 1)[1])
+            self.assertTrue(data["literal_entry_seen_in_retained_stderr"])
+            self.assertEqual(data["stages"], [])
+            self.assertIsNone(data["elapsed_ms"])
+        for value in (
+            "prefix" + literal,
+            literal + " suffix",
+            literal + "\n" + "\n".join(["SECRET"] * 65),
+            literal + "\n" + "é" * 9000,
+            literal.encode() + b"\n" + b"SECRET" * 2000,
+        ):
+            summary = ownership_fixture_timeout_summary(value, value)
+            data = json.loads(summary.split(" ", 1)[1])
+            self.assertFalse(data["literal_entry_seen_in_retained_stderr"])
+            self.assertEqual(data["stderr_window_limit"], 8192)
+            self.assertEqual(data["stderr_line_limit"], 64)
+            self.assertNotIn("SECRET", summary)
+            if len(value) > 8192:
+                for key in ("stdout_capture", "stderr_capture"):
+                    self.assertEqual(data[key]["byte_count"], 8192)
+                    self.assertTrue(data[key]["byte_count_clamped"])
 
     def test_ownership_timeout_diagnostics_never_turn_timeout_into_success(self):
         for stderr in (
             b"SECRET\nOWNERSHIP_FIXTURE stage=entered elapsed_ms=0 pwsh_major=7 pwsh_minor=4\n",
             b"SECRET unrecognized failure",
         ):
-            error = subprocess.TimeoutExpired(["SECRET"], 10, stderr=stderr)
+            error = subprocess.TimeoutExpired(
+                ["SECRET"], 10, output=b"SECRET stdout", stderr=stderr
+            )
             output = io.StringIO()
             with (
                 patch.object(subprocess, "run", side_effect=error),
@@ -464,6 +562,7 @@ class ObservationTests(unittest.TestCase):
     ):
         script = Path(__file__).with_name("observe_windows_ci_resources.ps1").resolve()
         fixture = r"""
+[Console]::Error.WriteLine('OWNERSHIP_FIXTURE_ENTRY')
 $global:ownershipFixtureClock = [Diagnostics.Stopwatch]::StartNew()
 $global:ownershipFixtureStageCount = 0
 function global:Write-OwnershipFixtureStage {
@@ -558,7 +657,10 @@ Write-OwnershipFixtureStage 'collector-return'
                     check=True,
                 )
             except subprocess.TimeoutExpired as error:
-                print(ownership_fixture_timeout_summary(error.stderr), file=sys.stderr)
+                print(
+                    ownership_fixture_timeout_summary(error.stderr, error.stdout),
+                    file=sys.stderr,
+                )
                 raise
         return json.loads(result.stdout)
 
