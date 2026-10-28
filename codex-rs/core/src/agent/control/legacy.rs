@@ -1,4 +1,5 @@
 use super::*;
+use crate::CodexThread;
 use crate::agent::api::AgentInfo;
 use codex_protocol::error::CodexErrorDetails;
 use codex_thread_store::PersistContext;
