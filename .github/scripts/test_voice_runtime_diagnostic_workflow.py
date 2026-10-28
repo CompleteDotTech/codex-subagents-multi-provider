@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import ast
+import itertools
 import re
 import unittest
 
@@ -36,6 +37,7 @@ class WorkflowTests(unittest.TestCase):
             | {
                 "voice-runtime-diagnostic",
                 "ownership-fixture-diagnostic",
+                "ownership-fixture-full-module-diagnostic",
                 "reject-conflicting-diagnostics",
             },
         )
@@ -47,7 +49,7 @@ class WorkflowTests(unittest.TestCase):
                     "needs.plan-package-shards.outputs.package-shards == 'true'", gate
                 )
             self.assertIn(
-                "!(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic))",
+                "!(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic))",
                 gate,
             )
             # The added conjunction is true for normal dispatch, call, PR, push;
@@ -90,18 +92,30 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'voice-diagnostic' || 'normal'", self.text.split("jobs:", 1)[0])
 
     @staticmethod
-    def evaluate_route_gate(expression, event, voice, ownership):
+    def evaluate_route_gate(expression, event, voice, ownership, full=False, refname="topic"):
         # Parse ONLY boolean/comparison syntax used by these actual job gates.
         # No eval, function calls or workflow code is executed by the tests.
         expression = expression.replace("github.event_name", "event")
+        expression = expression.replace("github.ref_name", "refname")
+        expression = expression.replace("inputs.ownership_fixture_full_module_diagnostic", "full")
         expression = expression.replace("inputs.voice_runtime_diagnostic", "voice")
         expression = expression.replace(
             "inputs.ownership_fixture_diagnostic", "ownership"
         )
         expression = (
-            expression.replace("&&", " and ").replace("||", " or ").replace("!", "not ")
+            expression.replace("&&", " and ")
+            .replace("||", " or ")
+            .replace("!=", " NOT_EQUAL ")
+            .replace("!", "not ")
+            .replace("NOT_EQUAL", "!=")
         )
-        bindings = {"event": event, "voice": voice, "ownership": ownership}
+        bindings = {
+            "event": event,
+            "voice": voice,
+            "ownership": ownership,
+            "full": full,
+            "refname": refname,
+        }
 
         def value(node):
             if isinstance(node, ast.Name):
@@ -121,9 +135,10 @@ class WorkflowTests(unittest.TestCase):
             if (
                 isinstance(node, ast.Compare)
                 and len(node.ops) == 1
-                and isinstance(node.ops[0], ast.Eq)
+                and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
             ):
-                return value(node.left) == value(node.comparators[0])
+                same = value(node.left) == value(node.comparators[0])
+                return same if isinstance(node.ops[0], ast.Eq) else not same
             raise AssertionError("unexpected route expression shape")
 
         return value(ast.parse(expression.strip(), mode="eval").body)
@@ -232,6 +247,71 @@ class WorkflowTests(unittest.TestCase):
             r"ownership_fixture_diagnostic:\n(?:        [^\n]+\n)*        type: boolean\n        default: false",
         )
 
+
+    def test_full_module_route_is_single_original_command_without_warmup(self):
+        job = self.jobs["ownership-fixture-full-module-diagnostic"]
+        command = "python3 -m unittest discover -s .github/scripts -p test_windows_ci_resource_observation.py"
+        self.assertEqual(job.count(command), 1)
+        self.assertIn("runs-on: ubuntu-24.04", job)
+        self.assertIn("timeout-minutes: 5", job)
+        self.assertIn("contents: read", job)
+        self.assertIn("persist-credentials: false", job)
+        self.assertIn('"$head" != "$GITHUB_SHA"', job)
+        self.assertIn('fixture_tmp="$HOME/.cache/codex-ci/tmp"', job)
+        self.assertIn('echo "TEMP=$fixture_tmp"', job)
+        self.assertIn('echo "TMP=$fixture_tmp"', job)
+        for forbidden in (
+            "strategy:", "OWNERSHIP_STARTUP_MODE",
+            "diagnose_ownership_fixture_startup.py", "pwsh ", "powershell ",
+            "uses: ./.github/actions/setup-ci", "setup-python", "bazel test",
+            "secrets.", "continue-on-error", "upload-artifact", "retry", "warmup.py",
+        ):
+            self.assertNotIn(forbidden, job)
+
+    def test_three_manual_choices_are_exclusive_and_guard_all_normal_jobs(self):
+        routes = {
+            "voice-runtime-diagnostic", "ownership-fixture-diagnostic",
+            "ownership-fixture-full-module-diagnostic", "reject-conflicting-diagnostics",
+        }
+        for event in ("workflow_dispatch", "workflow_call", "pull_request", "push"):
+            for voice, ownership, full in itertools.product((False, None, True), repeat=3):
+                actual = {
+                    name for name in routes
+                    if self.evaluate_route_gate(
+                        re.search(r"^    if: (.+)$", self.jobs[name], re.M).group(1),
+                        event, voice, ownership, full,
+                    )
+                }
+                selected = sum(bool(value) for value in (voice, ownership, full))
+                expected = set()
+                if event == "workflow_dispatch" and selected:
+                    if selected > 1:
+                        expected = {"reject-conflicting-diagnostics"}
+                    elif voice:
+                        expected = {"voice-runtime-diagnostic"}
+                    elif ownership:
+                        expected = {"ownership-fixture-diagnostic"}
+                    else:
+                        expected = {"ownership-fixture-full-module-diagnostic"}
+                self.assertEqual(actual, expected, (event, voice, ownership, full))
+        for name in set(self.jobs) - routes:
+            gate = re.search(r"^    if: (.+)$", self.jobs[name], re.M).group(1)
+            self.assertIn("inputs.ownership_fixture_full_module_diagnostic", gate)
+
+    def test_manual_full_module_never_cancels_existing_runs(self):
+        prefix = self.text.split("jobs:", 1)[0]
+        self.assertIn("(github.ref_name == 'main' || (github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_full_module_diagnostic)) && format('::{0}', github.run_id)", prefix)
+        self.assertIn("'ownership-full-module'", prefix)
+        cancel = re.search(
+            r"^  cancel-in-progress: \$\{\{ (.*?) \}\}$", prefix, re.M
+        ).group(1)
+        for event in ("workflow_dispatch", "workflow_call", "pull_request", "push"):
+            for refname, full in itertools.product(("main", "topic"), (False, None, True)):
+                actual = self.evaluate_route_gate(cancel, event, False, False, full, refname)
+                self.assertEqual(
+                    actual,
+                    refname != "main" and not (event == "workflow_dispatch" and bool(full)),
+                )
 
 if __name__ == "__main__":
     unittest.main()

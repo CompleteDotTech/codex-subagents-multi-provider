@@ -15,16 +15,20 @@ on:
         description: Run only the bounded Linux ownership fixture diagnostic
         type: boolean
         default: false
+      ownership_fixture_full_module_diagnostic:
+        description: Run the unchanged 44-test ownership module once on a fresh Linux host
+        type: boolean
+        default: false
 
 concurrency:
-  # Cancel previous actions from the same PR or branch except 'main' branch.
+  # Keep normal cancellation behavior; each manual full-module run is independent.
   # See https://docs.github.com/en/actions/using-jobs/using-concurrency and https://docs.github.com/en/actions/learn-github-actions/contexts for more info.
-  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}::${{ github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && inputs.ownership_fixture_diagnostic && 'diagnostic-conflict' || github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_diagnostic && 'ownership-diagnostic' || github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && 'voice-diagnostic' || 'normal' }}
-  cancel-in-progress: ${{ github.ref_name != 'main' }}
+  group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ (github.ref_name == 'main' || (github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_full_module_diagnostic)) && format('::{0}', github.run_id) || ''}}::${{ github.event_name == 'workflow_dispatch' && ((inputs.voice_runtime_diagnostic && inputs.ownership_fixture_diagnostic) || (inputs.voice_runtime_diagnostic && inputs.ownership_fixture_full_module_diagnostic) || (inputs.ownership_fixture_diagnostic && inputs.ownership_fixture_full_module_diagnostic)) && 'diagnostic-conflict' || github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_full_module_diagnostic && 'ownership-full-module' || github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_diagnostic && 'ownership-diagnostic' || github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && 'voice-diagnostic' || 'normal' }}
+  cancel-in-progress: ${{ github.ref_name != 'main' && !(github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_full_module_diagnostic) }}
 
 jobs:
   plan-package-shards:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic)) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic)) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment:
@@ -47,7 +51,7 @@ jobs:
 
   linux-package-manifest:
     needs: plan-package-shards
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic)) && needs.plan-package-shards.outputs.package-shards == 'true' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic)) && needs.plan-package-shards.outputs.package-shards == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment:
@@ -83,7 +87,7 @@ jobs:
 
   test:
     needs: [plan-package-shards, linux-package-manifest]
-    if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic)) && needs.plan-package-shards.result == 'success' && (needs.plan-package-shards.outputs.package-shards == 'false' || needs.linux-package-manifest.result == 'success') }}
+    if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic)) && needs.plan-package-shards.result == 'success' && (needs.plan-package-shards.outputs.package-shards == 'false' || needs.linux-package-manifest.result == 'success') }}
     # PRs use the sharded Windows cross-compiled test jobs below. Post-merge
     # pushes to main also run the native Windows test job for broader Windows
     # signal without putting PR latency back on the critical path. When
@@ -250,7 +254,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   test-windows-shard:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic)) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic)) }}
     # Split the Windows Bazel test leg across separate Windows hosts. Jobs with
     # BuildBuddy credentials use Linux RBE for build actions; test execution
     # remains on a Windows runner.
@@ -360,7 +364,7 @@ jobs:
   test-windows:
     # Preserve the existing required-check surface while the real work happens
     # in the sharded Windows jobs above.
-    if: always() && !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic))
+    if: always() && !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic))
     needs: test-windows-shard
     runs-on: ubuntu-24.04
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm
@@ -378,7 +382,7 @@ jobs:
     # Native Windows Bazel tests are slower and frequently approach the
     # 30-minute PR budget. Run this only for post-merge commits to main and give
     # it a larger timeout. Also allow manual runs for native toolchain changes.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic)) && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic)) && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
     timeout-minutes: 40
     runs-on: ${{ github.repository == 'openai/codex' && fromJSON(format('{{"group":"{0}-runners","labels":"{0}-windows-x64"}}', github.event.repository.name)) || 'windows-2025' }}
     name: Bazel test on windows-latest for x86_64-pc-windows-msvc (native main)
@@ -461,7 +465,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   clippy:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic)) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic)) }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -606,7 +610,7 @@ jobs:
 
   verify-release-build:
     needs: [plan-package-shards, linux-package-manifest]
-    if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic)) && needs.plan-package-shards.result == 'success' && (needs.plan-package-shards.outputs.package-shards == 'false' || needs.linux-package-manifest.result == 'success') }}
+    if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && (inputs.voice_runtime_diagnostic || inputs.ownership_fixture_diagnostic || inputs.ownership_fixture_full_module_diagnostic)) && needs.plan-package-shards.result == 'success' && (needs.plan-package-shards.outputs.package-shards == 'false' || needs.linux-package-manifest.result == 'success') }}
     timeout-minutes: ${{ github.repository == 'openai/codex' && 30 || 90 }}
     strategy:
       fail-fast: false
@@ -787,7 +791,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   voice-runtime-diagnostic:
-    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && !inputs.ownership_fixture_diagnostic
+    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && !inputs.ownership_fixture_diagnostic && !inputs.ownership_fixture_full_module_diagnostic
     runs-on: windows-2025
     timeout-minutes: 60
     permissions:
@@ -901,7 +905,7 @@ jobs:
           if-no-files-found: warn
 
   reject-conflicting-diagnostics:
-    if: github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic && inputs.ownership_fixture_diagnostic
+    if: github.event_name == 'workflow_dispatch' && ((inputs.voice_runtime_diagnostic && inputs.ownership_fixture_diagnostic) || (inputs.voice_runtime_diagnostic && inputs.ownership_fixture_full_module_diagnostic) || (inputs.ownership_fixture_diagnostic && inputs.ownership_fixture_full_module_diagnostic))
     runs-on: ubuntu-24.04
     timeout-minutes: 1
     permissions:
@@ -913,7 +917,7 @@ jobs:
           exit 1
 
   ownership-fixture-diagnostic:
-    if: github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_diagnostic && !inputs.voice_runtime_diagnostic
+    if: github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_diagnostic && !inputs.voice_runtime_diagnostic && !inputs.ownership_fixture_full_module_diagnostic
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     strategy:
@@ -955,3 +959,41 @@ jobs:
         env:
           OWNERSHIP_STARTUP_MODE: ${{ matrix.mode }}
         run: python3 .github/scripts/diagnose_ownership_fixture_startup.py
+
+  ownership-fixture-full-module-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.ownership_fixture_full_module_diagnostic && !inputs.voice_runtime_diagnostic && !inputs.ownership_fixture_diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Record exact ownership diagnostic source
+        shell: bash
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo "Ownership diagnostic source does not match requested SHA." >&2
+            exit 1
+          fi
+          printf 'OWNERSHIP_DIAGNOSTIC_HEAD=%s\n' "$head"
+          printf 'OWNERSHIP_DIAGNOSTIC_TREE=%s\n' "$tree"
+      - name: Match GNU shard fixture temporary paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GNU policy tests use runner system python3; setup-ci installs no Python.
+          # Copy only its relevant TEMP/TMP route, without Bazel/tool setup.
+          fixture_tmp="$HOME/.cache/codex-ci/tmp"
+          mkdir -p "$fixture_tmp"
+          {
+            echo "TEMP=$fixture_tmp"
+            echo "TMP=$fixture_tmp"
+          } >> "$GITHUB_ENV"
+      - name: Run unchanged ownership module once without warmup
+        shell: bash
+        run: python3 -m unittest discover -s .github/scripts -p test_windows_ci_resource_observation.py
