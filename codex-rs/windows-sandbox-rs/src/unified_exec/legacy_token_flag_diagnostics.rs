@@ -237,8 +237,9 @@ async fn record_flag_sample(
             (true, stdout, stderr, exit_code)
         }
         Err(error) => {
-            eprintln!("LEGACY_TOKEN_FLAGS sample={label} spawn_error={error:#}");
-            (false, Vec::new(), Vec::new(), -1)
+            // No spawn error is a recoverable sample: do not reset/reuse paths
+            // or gather a subsequent arm after failed experimental setup.
+            panic!("LEGACY_TOKEN_FLAGS invalid_setup sample={label} spawn_error={error:#}");
         }
     };
     let stdout = String::from_utf8_lossy(&stdout);
@@ -353,6 +354,16 @@ fn legacy_delete_diagnostic_actual_child_token_flag_pair() {
                 /*additional_deny_read_paths*/ &[], /*additional_deny_write_paths*/ &[],
                 /*tty*/ false, /*stdin_open*/ false, /*private_desktop_name*/ None, Some(Arc::clone(&observer)),
             ).await;
+            if let Err(error) = &spawned {
+                if error.downcast_ref::<crate::token::flag_experiment::CleanupFailure>().is_some() {
+                    // The exact child may still be live. Retain BOTH private
+                    // directories, including on unwind, with no further ACL,
+                    // file or capability mutation. ROOT owns the failed receipt.
+                    let _retained_fixture = owned.keep();
+                    let _retained_home = home.keep();
+                    panic!("LEGACY_TOKEN_FLAGS cleanup_uncertain experiment_aborted=true fixture_preserved=true error={error:#}");
+                }
+            }
             samples.push(record_flag_sample(&fixture, &format!("restricted-input-{:#04x}", mode.input_flags()), spawned, /*unrestricted*/ false).await);
             let result = observer.result.lock().expect("observation lock").take();
             observations.push(result);
@@ -372,9 +383,10 @@ fn legacy_delete_diagnostic_actual_child_token_flag_pair() {
             },
             _ => false,
         };
-        let default_reproduced_prior_full_owner_deletions = samples[0].executed && samples[0].compatibility && samples[0].all_five_deleted;
+        let default_reproduced_prior_full_owner_deletions = samples[0].executed && samples[0].compatibility && samples[0].statuses && samples[0].all_five_deleted;
         eprintln!("LEGACY_TOKEN_FLAGS default_reproduced_prior_full_owner_deletions={default_reproduced_prior_full_owner_deletions} pair_inputs_equal={pair} causal_interpretation_requires_both=true");
         assert!(ordinary.executed && ordinary.compatibility && ordinary.statuses && ordinary.security, "ordinary full-owner positive failed");
+        assert!(default_reproduced_prior_full_owner_deletions, "invalid_seam_reproduction: default observer arm must reproduce prior full-owner deletions with execution/read positives and command-status observations before interpreting the flag pair");
         assert!(pair, "flag pair is not isolated; missing metadata or unequal token/root/ACL inputs earns no causal credit");
         for sample in samples {
             assert!(sample.executed && sample.compatibility && sample.statuses && sample.security, "restricted sample must satisfy execution/read positives and original six security expectations; no production repair is asserted");

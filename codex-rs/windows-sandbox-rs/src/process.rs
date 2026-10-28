@@ -266,9 +266,18 @@ unsafe fn create_process_as_user_inner(
             observer.observe(h_token, pi.hProcess)?;
             guard.resume_once()
         }));
-        match observed {
-            Ok(result) => result?,
-            Err(_) => return Err(anyhow!("read-only test token observation unwound")),
+        let observed = match observed {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("read-only test token observation unwound")),
+        };
+        if let Err(error) = observed {
+            // Propagate typed cleanup uncertainty through the pipe error path.
+            // The fixture owner must preserve its directories and stop all arms.
+            guard
+                .abort_checked()
+                .map_err(anyhow::Error::new)
+                .context("test observation failed and owned cleanup was not confirmed")?;
+            return Err(error);
         }
         guard.disarm();
     }

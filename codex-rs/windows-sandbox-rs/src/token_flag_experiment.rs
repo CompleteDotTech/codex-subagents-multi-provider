@@ -20,6 +20,7 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Security::GetTokenInformation;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Security::TokenIsRestricted;
@@ -495,19 +496,71 @@ impl SuspendedChild {
     }
 }
 
+/// Numeric-only receipt: no token identities or fixture contents.
+#[derive(Debug)]
+pub(crate) struct CleanupFailure {
+    job_error: Option<i32>,
+    terminate_error: Option<u32>,
+    wait: u32,
+    wait_error: Option<u32>,
+    thread_close_error: Option<u32>,
+    process_close_error: Option<u32>,
+}
+
+impl std::fmt::Display for CleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "owned child cleanup uncertain: {self:?}")
+    }
+}
+
+impl std::error::Error for CleanupFailure {}
+
+impl SuspendedChild {
+    /// Checked cleanup is required on the ordinary error path. Drop is only the
+    /// nonpanicking fallback; a failed receipt aborts the entire experiment.
+    pub(crate) fn abort_checked(&mut self) -> std::result::Result<(), CleanupFailure> {
+        let job_error = self
+            .job
+            .terminate()
+            .err()
+            .map(|error| error.raw_os_error().unwrap_or(-1));
+        let terminate_error =
+            unsafe { (TerminateProcess(self.pi.hProcess, 1) == 0).then(|| GetLastError()) };
+        let wait = unsafe { WaitForSingleObject(self.pi.hProcess, 2000) };
+        let wait_error = (wait == u32::MAX).then(|| unsafe { GetLastError() });
+        // Consume each exact owned handle once, including on a failed close.
+        // Never repeat a close against a potentially recycled handle value.
+        self.armed = false;
+        let thread_close_error =
+            unsafe { (CloseHandle(self.pi.hThread) == 0).then(|| GetLastError()) };
+        let process_close_error =
+            unsafe { (CloseHandle(self.pi.hProcess) == 0).then(|| GetLastError()) };
+        let receipt = CleanupFailure {
+            job_error,
+            terminate_error,
+            wait,
+            wait_error,
+            thread_close_error,
+            process_close_error,
+        };
+        let confirmed = receipt.job_error.is_none()
+            && receipt.terminate_error.is_none()
+            && receipt.wait == WAIT_OBJECT_0
+            && receipt.wait_error.is_none()
+            && receipt.thread_close_error.is_none()
+            && receipt.process_close_error.is_none();
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "LEGACY_TOKEN_FLAGS cleanup_owned_child=true confirmed={confirmed} receipt={receipt:?}"
+        );
+        if confirmed { Ok(()) } else { Err(receipt) }
+    }
+}
+
 impl Drop for SuspendedChild {
     fn drop(&mut self) {
         if self.armed {
-            // Never panic during cleanup; retain the exact handles through the bounded wait.
-            let job_terminated = self.job.terminate().is_ok();
-            let process_terminated = unsafe { TerminateProcess(self.pi.hProcess, 1) } != 0;
-            let wait = unsafe { WaitForSingleObject(self.pi.hProcess, 2000) };
-            let thread_closed = unsafe { CloseHandle(self.pi.hThread) } != 0;
-            let process_closed = unsafe { CloseHandle(self.pi.hProcess) } != 0;
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "LEGACY_TOKEN_FLAGS cleanup_owned_child=true job_terminated={job_terminated} process_terminated={process_terminated} wait={wait} thread_closed={thread_closed} process_closed={process_closed}"
-            );
+            let _ = self.abort_checked();
         }
     }
 }
