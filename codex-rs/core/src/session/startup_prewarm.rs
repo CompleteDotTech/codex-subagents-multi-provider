@@ -206,6 +206,11 @@ impl SessionStartupPrewarmHandle {
 }
 
 impl Session {
+    #[cfg(test)]
+    pub(crate) async fn has_startup_prewarm_for_test(&self) -> bool {
+        self.state.lock().await.startup_prewarm.is_some()
+    }
+
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, input: PrewarmInput) {
         // Optional idle/startup work cannot borrow a turn's current-operation
         // fence. Defer native children to their guarded regular turn instead.

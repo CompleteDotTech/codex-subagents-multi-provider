@@ -259,6 +259,8 @@ pub(crate) use submission::Submission;
 pub(crate) use submission_channel::SubmissionReceiver;
 pub(crate) use submission_channel::SubmissionSender;
 pub(crate) use submission_channel::bounded_submission_channel;
+#[cfg(test)]
+pub(crate) use submission_channel::unbounded_submission_channel;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;

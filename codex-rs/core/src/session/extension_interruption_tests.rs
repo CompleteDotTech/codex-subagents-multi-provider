@@ -41,7 +41,7 @@ async fn interrupt_if_no_pending_input_handles_cancelled_submission() {
         .expect("active task")
         .cancellation_token
         .clone();
-    let (tx_sub, rx_sub) = super::bounded_submission_channel(/*capacity*/ 1);
+    let (tx_sub, rx_sub) = crate::session::bounded_submission_channel(/*capacity*/ 1);
     let thread = CodexThread::new(
         Arc::clone(&session),
         SessionIo {

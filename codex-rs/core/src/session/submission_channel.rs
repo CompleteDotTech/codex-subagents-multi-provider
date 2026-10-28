@@ -25,6 +25,19 @@ pub(crate) fn bounded_submission_channel(
     capacity: usize,
 ) -> (SubmissionSender, SubmissionReceiver) {
     let (sender, receiver) = async_channel::bounded(capacity);
+    wrap_submission_channel(sender, receiver)
+}
+
+#[cfg(test)]
+pub(crate) fn unbounded_submission_channel() -> (SubmissionSender, SubmissionReceiver) {
+    let (sender, receiver) = async_channel::unbounded();
+    wrap_submission_channel(sender, receiver)
+}
+
+fn wrap_submission_channel(
+    sender: async_channel::Sender<Submission>,
+    receiver: async_channel::Receiver<Submission>,
+) -> (SubmissionSender, SubmissionReceiver) {
     let capacity_changed = Arc::new(Notify::new());
     (
         SubmissionSender {

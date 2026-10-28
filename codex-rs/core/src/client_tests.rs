@@ -2016,6 +2016,7 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
         &provider,
         /*event_sender*/ None,
         /*turn_id*/ None,
+        /*guard*/ None,
     )
     .await
     .expect_err("expired Bedrock signature should fail");
@@ -2113,6 +2114,7 @@ async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_fail
             &provider,
             Some(&event_sender),
             Some("turn-1"),
+            /*guard*/ None,
         )
         .await;
 
@@ -2132,6 +2134,7 @@ async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_fail
                 &provider,
                 Some(&event_sender),
                 Some("turn-1"),
+                /*guard*/ None,
             )
             .await
             .expect_err("provider recovery should not run more than once")

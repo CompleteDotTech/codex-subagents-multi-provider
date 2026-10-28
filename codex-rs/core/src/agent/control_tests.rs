@@ -10509,8 +10509,18 @@ stream_idle_timeout_ms = 1000
         })
         .await
         .expect("receiver drop wakes both capacity waiters");
-        assert!(matches!(first, Err(CodexErr::InternalAgentDied)));
-        assert!(matches!(second, Err(CodexErr::InternalAgentDied)));
+        assert!(matches!(
+            first
+                .expect_err("first capacity waiter must fail on receiver drop")
+                .details(),
+            CodexErrorDetails::InternalAgentDied
+        ));
+        assert!(matches!(
+            second
+                .expect_err("second capacity waiter must fail on receiver drop")
+                .details(),
+            CodexErrorDetails::InternalAgentDied
+        ));
         guard
             .check()
             .expect("receiver closure does not revoke policy");
@@ -11340,7 +11350,7 @@ stream_idle_timeout_ms = 1000
             .responses_websocket_enabled(),
         websockets
     );
-    assert!(target.session.state.lock().await.startup_prewarm.is_none());
+    assert!(!target.session.has_startup_prewarm_for_test().await);
     assert!(
         !marker.exists(),
         "preregistration startup must also defer native helper prewarm"
@@ -11394,7 +11404,7 @@ stream_idle_timeout_ms = 1000
     target.prewarm().await;
     target.prewarm_with_history().await;
     assert!(
-        target.session.state.lock().await.startup_prewarm.is_none(),
+        !target.session.has_startup_prewarm_for_test().await,
         "no optional WS task may be scheduled"
     );
     assert!(

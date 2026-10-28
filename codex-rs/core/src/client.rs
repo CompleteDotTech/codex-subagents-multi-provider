@@ -3502,7 +3502,9 @@ pub(crate) async fn exercise_current_http_boundary(
         .mount(&server).await;
     let denial = Arc::new(StdMutex::new(None));
     let transport = GuardedRequestTransport {
-        inner: ReqwestTransport::new(reqwest::Client::new()),
+        inner: ReqwestTransport::from_http_client(
+            codex_login::default_client::create_client_without_request_logging(),
+        ),
         operation: Some(operation.clone()),
         denial: Arc::clone(&denial),
     };
@@ -3560,7 +3562,13 @@ pub(crate) async fn exercise_current_http_boundary(
         ));
         let error = original
             .expect("the original typed child denial must survive the lower-layer sentinel");
-        assert!(matches!(error, CodexErr::InvalidRequest(_)), "{error:?}");
+        assert!(
+            matches!(
+                error.details(),
+                codex_protocol::error::CodexErrorDetails::InvalidRequest(_)
+            ),
+            "{error:?}"
+        );
         assert!(
             error.to_string().contains("child_provider_policy_conflict"),
             "{error}"

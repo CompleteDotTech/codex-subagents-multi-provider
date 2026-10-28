@@ -575,7 +575,7 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
     };
     let expected_destination = with_config_overrides(expected_destination, &model_manager_config);
     let desired = desired_step_settings(&session).await;
-    let (submissions, receiver) = async_channel::unbounded();
+    let (submissions, receiver) = crate::session::unbounded_submission_channel();
     let loop_task = tokio::spawn(submission_loop(
         Arc::clone(&session),
         session.get_config().await,
