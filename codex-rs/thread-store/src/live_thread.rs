@@ -44,6 +44,8 @@ pub struct LiveThread {
     persistence_telemetry: RolloutPersistenceTelemetry,
     owner: Option<crate::ThreadWriterOwner>,
     fresh: bool,
+    // Shared only by clones of this writer acquisition, never by thread ID.
+    shutdown_completion: Arc<Mutex<Option<ThreadStoreResult<()>>>>,
     provisional: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -215,9 +217,42 @@ impl LiveThread {
         .await
     }
 
+    /// Materialize and flush an active acquisition, or return its completed shutdown result.
+    /// The gate excludes retirement throughout both writes; observing session status is insufficient.
+    pub async fn prepare_shutdown(&self) -> ThreadStoreResult<()> {
+        let completion = self.shutdown_completion.lock().await;
+        if let Some(result) = completion.as_ref() {
+            return result.clone();
+        }
+        self.persist(PersistContext::Standard).await?;
+        self.flush().await
+    }
+
+    /// Return the actual completed shutdown result for this acquisition, waiting for admitted work.
+    pub async fn completed_shutdown(&self) -> ThreadStoreResult<()> {
+        self.shutdown_completion
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| {
+                Err(ThreadStoreError::Conflict {
+                    message: "thread writer shutdown has not completed".into(),
+                })
+            })
+    }
+
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+        let mut completion = self.shutdown_completion.clone().lock_owned().await;
+        if matches!(completion.as_ref(), Some(Ok(()))) {
+            return Ok(());
+        }
         let Some(owner) = &self.owner else {
-            return self.shutdown_inner().await;
+            let result = self.shutdown_inner().await;
+            if completion.is_none() || result.is_ok() {
+                *completion = Some(result.clone());
+            }
+            return result;
         };
         // Wait for admission in the caller. No detached operation can start if
         // that wait is cancelled. Once admitted, own metadata AND final cleanup.
@@ -243,7 +278,13 @@ impl LiveThread {
                 }
                 Err(error) => Err(error),
             };
-            thread.finish_shutdown(metadata_result).await
+            let result = thread.finish_shutdown(metadata_result).await;
+            // Keep the gate in this detached task until metadata and retirement both finish.
+            // Cancellation of the waiter cannot expose a premature terminal receipt.
+            if completion.is_none() || result.is_ok() {
+                *completion = Some(result.clone());
+            }
+            result
         })
         .await
         .map_err(|error| ThreadStoreError::Internal {
@@ -298,6 +339,7 @@ impl LiveThread {
         provisional.store(false, std::sync::atomic::Ordering::Release);
         Ok(Self {
             owner,
+            shutdown_completion: Arc::new(Mutex::new(None)),
             fresh: true,
             provisional,
             thread_id,
@@ -422,6 +464,7 @@ impl LiveThread {
         Ok((
             Self {
                 owner,
+                shutdown_completion: Arc::new(Mutex::new(None)),
                 fresh: false,
                 provisional,
                 thread_id,
@@ -705,3 +748,7 @@ impl LiveThread {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "live_thread_shutdown_tests.rs"]
+mod shutdown_tests;

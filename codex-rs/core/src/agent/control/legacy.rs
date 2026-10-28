@@ -2,7 +2,6 @@ use super::*;
 use crate::CodexThread;
 use crate::agent::api::AgentInfo;
 use codex_protocol::error::CodexErrorDetails;
-use codex_thread_store::PersistContext;
 
 impl LocalAgentControl {
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
@@ -22,11 +21,7 @@ impl LocalAgentControl {
         agent_id: ThreadId,
         thread: Arc<CodexThread>,
     ) -> CodexResult<String> {
-        thread
-            .session
-            .ensure_rollout_materialized(PersistContext::Standard)
-            .await;
-        let flush_result = thread.session.flush_rollout().await;
+        let flush_result = thread.session.prepare_rollout_shutdown().await;
         let result = if matches!(thread.agent_status().await, AgentStatus::Shutdown) {
             Ok(String::new())
         } else {
@@ -41,6 +36,7 @@ impl LocalAgentControl {
             })
             .await;
         flush_result?;
+        thread.session.completed_rollout_shutdown().await?;
         result
     }
     /// Mark `agent_id` as explicitly closed in persisted spawn-edge state, then shut down the
