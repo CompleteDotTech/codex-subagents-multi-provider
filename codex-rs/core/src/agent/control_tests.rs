@@ -11626,9 +11626,62 @@ stream_idle_timeout_ms = 1000
     config.model = Some("shared-loaded".into());
     config.model_catalog =
         Some(serde_json::from_slice(&std::fs::read(&catalog_file).unwrap()).unwrap());
-    let harness = AgentControlHarness::new_with_config(home, config).await;
+    assert_eq!(config.model.as_deref(), Some("shared-loaded"));
+    let catalog = config
+        .model_catalog
+        .as_ref()
+        .expect("actual fixture catalog");
+    assert_eq!(catalog.models.len(), 1);
+    assert_eq!(catalog.models[0].slug, "shared-loaded");
+    assert!(!catalog.models[0].used_fallback_model_metadata);
+
+    // The generic test manager intentionally has no Config/catalog input. This
+    // root control must retain its real static catalog rather than discover it
+    // over HTTP before auth-only prewarm. Keep the other test-manager services.
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    let state_db = init_state_db(&config).await;
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let models = crate::thread_manager::build_models_manager(&config, auth.clone());
+    let retained_models = models.get_remote_models().await;
+    assert_eq!(retained_models.len(), 1);
+    assert_eq!(retained_models[0].slug, "shared-loaded");
+    let store = Arc::new(LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: config.codex_home.to_path_buf(),
+            sqlite: codex_state::SqliteConfig::new_for_testing(config.codex_home.clone()),
+            default_model_provider_id: codex_model_provider_info::OPENAI_PROVIDER_ID.to_string(),
+        },
+        state_db.clone(),
+    ));
+    let manager = ThreadManager::new(
+        &config,
+        auth,
+        models,
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        store,
+        crate::thread_manager::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    )
+    .with_code_mode_session_provider(Arc::new(codex_code_mode::DisabledCodeModeSessionProvider));
+    let control = manager.agent_control();
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db,
+        manager,
+        control,
+    };
     let (parent_id, parent) = harness.start_thread().await;
     assert_eq!(parent.config_snapshot().await.model_provider_id, "a");
+    assert_eq!(parent.config_snapshot().await.model, "shared-loaded");
 
     assert!(parent.session_source.parent_thread_id().is_none());
     let requests_before_prewarm = server.received_requests().await.unwrap().len();
