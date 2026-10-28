@@ -8,8 +8,13 @@ remote_download_toplevel=0
 windows_msvc_host_platform=0
 windows_cross_compile=0
 hosted_storage=0
+hosted_storage_policy=0
 if [[ "${GITHUB_ACTIONS:-}" == true && "${GITHUB_REPOSITORY:-}" == CompleteDotTech/codex-subagents-multi-provider && "${RUNNER_ENVIRONMENT:-}" == github-hosted && ( "${RUNNER_OS:-}" == Linux || "${RUNNER_OS:-}" == macOS ) && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
   hosted_storage=1
+fi
+# Windows shares only the cache argument policy, not Unix observation/query APIs.
+if [[ $hosted_storage -eq 1 || ( "${GITHUB_ACTIONS:-}" == true && "${GITHUB_REPOSITORY:-}" == CompleteDotTech/codex-subagents-multi-provider && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "${RUNNER_OS:-}" == Windows && -z "${BUILDBUDDY_API_KEY:-}" && "${HOSTED_STORAGE_REMOTE_CREDENTIALS:-}" != true ) ]]; then
+  hosted_storage_policy=1
 fi
 storage_script="$(dirname "${BASH_SOURCE[0]}")/hosted_storage.py"
 
@@ -563,7 +568,7 @@ fi
 if (( ${#post_config_bazel_args[@]} > 0 )); then
   bazel_run_args+=("${post_config_bazel_args[@]}")
 fi
-if [[ $hosted_storage -eq 1 ]]; then
+if [[ $hosted_storage_policy -eq 1 ]]; then
   # Use the backend's keyless config classification before deciding defaults;
   # BUILD and INFO must see the same effective local arguments.
   effective_bazel_args=()
@@ -575,6 +580,8 @@ if [[ $hosted_storage -eq 1 ]]; then
     exit 1
   fi
   bazel_run_args=("${effective_bazel_args[@]}")
+fi
+if [[ $hosted_storage -eq 1 ]]; then
   python3 "$storage_script" observe before-build none "${bazel_run_args[@]}" || echo "Hosted storage observation unavailable" >&2
 fi
 set +e

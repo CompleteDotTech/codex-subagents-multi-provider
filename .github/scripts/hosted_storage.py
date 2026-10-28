@@ -33,15 +33,20 @@ INFO_OPTIONS = {
 REMOTE_OPTIONS = {"--remote_executor", "--remote_cache", "--strategy"}
 
 
-def scoped(env):
+def policy_scoped(env):
     return (
         env.get("GITHUB_ACTIONS") == "true"
         and env.get("GITHUB_REPOSITORY") == FORK
         and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
-        and env.get("RUNNER_OS") in ("Linux", "macOS")
+        and env.get("RUNNER_OS") in ("Linux", "macOS", "Windows")
         and not env.get("BUILDBUDDY_API_KEY")
         and env.get("HOSTED_STORAGE_REMOTE_CREDENTIALS") != "true"
     )
+
+
+def scoped(env):
+    """Unix observation/query scope; Windows uses only the argument policy."""
+    return policy_scoped(env) and env.get("RUNNER_OS") in ("Linux", "macOS")
 
 
 def options(args, names=INFO_OPTIONS):
@@ -75,7 +80,7 @@ def defaults(args, env):
         if name == "--strategy" and equal:
             strategies[mnemonic] = choices.split(",")
     if (
-        scoped(env)
+        policy_scoped(env)
         and args
         and args[0] in ("build", "test", "coverage", "run", "info")
         and not any(name == "--disk_cache" for name, _ in explicit)
@@ -96,7 +101,7 @@ def local_arguments(args, env):
     Other routes retain their original bytes. Only configs already classified by
     the backend as credential-dependent remote CI are canonicalized and removed.
     """
-    if not scoped(env):
+    if not policy_scoped(env):
         return list(args)
     normalized = []
     index = 0

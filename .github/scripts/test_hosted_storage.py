@@ -27,7 +27,7 @@ ENV = dict(
 
 class PolicyTests(unittest.TestCase):
     def test_default_is_scoped_and_keeps_remote_configs_out(self):
-        for os_name in ("Linux", "macOS"):
+        for os_name in ("Linux", "macOS", "Windows"):
             self.assertEqual(
                 storage.defaults(["test"], dict(ENV, RUNNER_OS=os_name)),
                 ["--disk_cache="],
@@ -36,7 +36,7 @@ class PolicyTests(unittest.TestCase):
             {"GITHUB_ACTIONS": "false"},
             {"GITHUB_REPOSITORY": "openai/codex"},
             {"RUNNER_ENVIRONMENT": "self-hosted"},
-            {"RUNNER_OS": "Windows"},
+            {"RUNNER_OS": "FreeBSD"},
             {"BUILDBUDDY_API_KEY": "synthetic"},
         ):
             self.assertEqual(storage.defaults(["test"], dict(ENV, **change)), [])
@@ -79,6 +79,34 @@ class PolicyTests(unittest.TestCase):
             ["--strategy=Rustc=local", "--strategy=Genrule=remote"],
         ):
             self.assertEqual(storage.defaults(["test", *flags], ENV), [])
+
+    def test_windows_policy_preserves_explicit_routes_and_keeps_observation_disabled(
+        self,
+    ):
+        env = dict(ENV, RUNNER_OS="Windows")
+        self.assertFalse(storage.scoped(env))
+        for flags in (
+            ["--disk_cache="],
+            ["--disk_cache", "owned cache"],
+            ["--disk_cache=first", "--disk_cache", "last"],
+            ["--config=buildbuddy-generic-rbe"],
+            ["--config", "remote"],
+            ["--remote_executor=grpcs://synthetic"],
+            ["--strategy=Rustc=remote"],
+        ):
+            args = ["test", *flags, "--", "//target", "--disk_cache=payload"]
+            self.assertEqual(storage.effective_arguments(args, env), args)
+        for change in (
+            {"BUILDBUDDY_API_KEY": "synthetic"},
+            {"HOSTED_STORAGE_REMOTE_CREDENTIALS": "true"},
+            {"GITHUB_REPOSITORY": "openai/codex"},
+            {"GITHUB_ACTIONS": "false"},
+            {"RUNNER_ENVIRONMENT": "self-hosted"},
+        ):
+            self.assertEqual(
+                storage.effective_arguments(["test"], dict(env, **change)), ["test"]
+            )
+        self.assertEqual(storage.actual_paths(["test"], env), ("out-of-scope", None))
 
 
 class BackendInteractionTests(unittest.TestCase):
@@ -197,7 +225,7 @@ class BackendInteractionTests(unittest.TestCase):
         for change in (
             {"BUILDBUDDY_API_KEY": "synthetic-key"},
             {"GITHUB_REPOSITORY": "openai/codex"},
-            {"RUNNER_OS": "Windows"},
+            {"RUNNER_OS": "FreeBSD"},
             {"GITHUB_ACTIONS": "false"},
         ):
             env = dict(ENV, **change)
@@ -721,7 +749,7 @@ class ObservationTests(unittest.TestCase):
 
 
 class ShellTests(unittest.TestCase):
-    def invoke(self, flags=(), extra=()):
+    def invoke(self, flags=(), extra=(), environment=None):
         bash = (
             str(
                 Path(os.environ.get("ProgramFiles", "C:/Program Files"))
@@ -757,6 +785,7 @@ class ShellTests(unittest.TestCase):
                 " if 'info' in sys.argv: print('/nonexistent-testlogs'); sys.exit(0)\n"
                 " sys.exit(37)\n",
                 encoding="utf-8",
+                newline="\n",
             )
             (root / "run_bazel_with_buildbuddy.py").chmod(0o755)
             record = root / "record"
@@ -766,6 +795,9 @@ class ShellTests(unittest.TestCase):
                 if key in ("PATH", "SYSTEMROOT", "SystemRoot", "TEMP", "TMP")
             }
             env.update(ENV, RECORD=str(record), MSYS2_ARG_CONV_EXCL="*")
+            env.update(environment or {})
+            if env["RUNNER_OS"] == "Windows":
+                env["CODEX_BAZEL_WINDOWS_PATH"] = "synthetic-no-execution"
             result = subprocess.run(
                 [
                     bash,
@@ -784,9 +816,59 @@ class ShellTests(unittest.TestCase):
                 text=True,
                 timeout=20,
             )
+            self.assertTrue(record.exists(), result.stderr)
             return result, [
                 json.loads(line) for line in record.read_text().splitlines()
             ]
+
+    def test_windows_policy_routes_without_unix_observers_or_queries(self):
+        for flags, expected in (
+            ([], ["--disk_cache="]),
+            (["--disk_cache=owned"], ["--disk_cache=owned"]),
+            (["--disk_cache", ""], ["--disk_cache", ""]),
+            (
+                ["--disk_cache=first", "--disk_cache", "last"],
+                ["--disk_cache=first", "--disk_cache", "last"],
+            ),
+            (
+                ["--remote_cache=https://synthetic"],
+                ["--remote_cache=https://synthetic"],
+            ),
+        ):
+            with self.subTest(flags=flags):
+                result, calls = self.invoke(
+                    flags, ["--disk_cache=payload"], {"RUNNER_OS": "Windows"}
+                )
+                self.assertEqual(result.returncode, 37, result.stderr)
+                self.assertEqual(len(calls), 2, calls)
+                build, info = calls
+                self.assertEqual(
+                    build[build.index("test") + 1 : build.index("--")],
+                    expected
+                    + [
+                        "--repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1",
+                        "--action_env=PATH=synthetic-no-execution",
+                        "--host_action_env=PATH=synthetic-no-execution",
+                        "--test_env=PATH=synthetic-no-execution",
+                    ],
+                )
+                self.assertEqual(
+                    build[build.index("--") + 1 :], ["//target", "--disk_cache=payload"]
+                )
+                self.assertIn("info", info)
+                self.assertNotIn("Hosted Bazel paths unavailable", result.stderr)
+
+    def test_windows_credentials_leave_wrapper_policy_unchanged(self):
+        for credentials in (
+            {"BUILDBUDDY_API_KEY": "synthetic"},
+            {"HOSTED_STORAGE_REMOTE_CREDENTIALS": "true"},
+        ):
+            result, calls = self.invoke(
+                environment=dict(credentials, RUNNER_OS="Windows")
+            )
+            self.assertEqual(result.returncode, 37, result.stderr)
+            self.assertEqual(len(calls), 2, calls)
+            self.assertNotIn("--disk_cache=", calls[0])
 
     def test_failure_snapshot_precedes_info_and_original_exit_survives(self):
         result, calls = self.invoke(
