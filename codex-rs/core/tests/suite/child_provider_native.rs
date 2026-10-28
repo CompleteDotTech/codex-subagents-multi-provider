@@ -1309,7 +1309,7 @@ async fn script_native_followup(server: &MockServer, target: codex_protocol::Thr
 #[test_case::test_case(2; "loaded selected provider caller executor scope widened")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_loaded_followup_rechecks_policy_before_target_network(change: u8) -> Result<()> {
-    let fixture = Fixture::new(MultiAgentVersion::V2, None).await?;
+    let fixture = Fixture::new(MultiAgentVersion::V2, /*default_provider*/ None).await?;
     scripted_spawn(
         &fixture.root,
         MultiAgentVersion::V2,
@@ -1325,7 +1325,7 @@ async fn native_loaded_followup_rechecks_policy_before_target_network(change: u8
     fixture
         .turn("create an ordinary selected-provider child")
         .await?;
-    let children = fixture.children(1).await?;
+    let children = fixture.children(/*expected*/ 1).await?;
     assert_eq!(children.len(), 1);
     let child = Arc::clone(&children[0]);
     let id = child
@@ -1343,7 +1343,7 @@ async fn native_loaded_followup_rechecks_policy_before_target_network(change: u8
 
     if change == 1 {
         revoke_native_fixture_a(fixture.home.path())?;
-        publish_native_fixture_host_config(&fixture, None).await?;
+        publish_native_fixture_host_config(&fixture, /*target*/ None).await?;
     } else if change == 2 {
         widen_native_fixture_executor(&fixture).await?;
     }
@@ -1542,9 +1542,12 @@ fn native_owned_barrier_command(
 async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     change: u8,
 ) -> Result<()> {
-    let fixture =
-        Fixture::with_host_setup(MultiAgentVersion::V2, None, native_continuation_exec_setup)
-            .await?;
+    let fixture = Fixture::with_host_setup(
+        MultiAgentVersion::V2,
+        /*default_provider*/ None,
+        native_continuation_exec_setup,
+    )
+    .await?;
     let started = fixture.test.cwd.path().join("native-continuation-started");
     let release = fixture.test.cwd.path().join("native-continuation-release");
     let done = fixture.test.cwd.path().join("native-continuation-done");
@@ -1639,7 +1642,7 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
         })
         .await
         .expect("actual exec_command reaches owned barrier")?;
-        let children = fixture.children(1).await?;
+        let children = fixture.children(/*expected*/ 1).await?;
         assert_eq!(children.len(), 1);
         let child = &children[0];
         let child_config = child.config().await;
@@ -1658,7 +1661,7 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
         );
         if change != 0 {
             revoke_native_fixture_a(fixture.home.path())?;
-            let children = fixture.children(1).await?;
+            let children = fixture.children(/*expected*/ 1).await?;
             assert_eq!(children.len(), 1);
             publish_native_fixture_host_config(
                 &fixture,
@@ -1679,7 +1682,7 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     );
     root_result?;
     policy_result?;
-    let children = fixture.children(1).await?;
+    let children = fixture.children(/*expected*/ 1).await?;
     assert_eq!(children.len(), 1);
     let child = Arc::clone(&children[0]);
     let status = native_terminal_status(&child).await;
@@ -1795,12 +1798,12 @@ print("{{}}")
 
 #[cfg(unix)]
 fn native_first_request_barrier_setup(config: &mut codex_core::config::Config) {
-    native_request_barrier_setup(config, 1);
+    native_request_barrier_setup(config, /*attempt*/ 1);
 }
 
 #[cfg(unix)]
 fn native_retry_request_barrier_setup(config: &mut codex_core::config::Config) {
-    native_request_barrier_setup(config, 2);
+    native_request_barrier_setup(config, /*attempt*/ 2);
 }
 
 #[cfg(unix)]
@@ -1818,7 +1821,8 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
     } else {
         native_first_request_barrier_setup
     };
-    let fixture = Fixture::with_host_setup(MultiAgentVersion::V2, None, setup).await?;
+    let fixture =
+        Fixture::with_host_setup(MultiAgentVersion::V2, /*default_provider*/ None, setup).await?;
     if retry {
         // A real accepted HTTP/SSE attempt lacks response.completed. Core must
         // observe this as a stream error and enter its actual normal retry loop.
@@ -1861,9 +1865,13 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
     })
     .await
     .expect("actual PreModelRequest command must enter the owned barrier");
-    let children = fixture.children(1).await?;
+    let children = fixture.children(/*expected*/ 1).await?;
     let child = &children[0];
-    let stored = child.read_thread(true, false).await?;
+    let stored = child
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await?;
     let child_id = stored.thread_id;
     let hook_input: Value = serde_json::from_slice(&std::fs::read(&entered)?)?;
     assert_eq!(hook_input["hook_event_name"], "PreModelRequest");
@@ -1887,7 +1895,7 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
     assert!(!fixture.home.path().join("helper-marker").exists());
     if revoke {
         revoke_native_fixture_a(fixture.home.path())?;
-        publish_native_fixture_host_config(&fixture, None).await?;
+        publish_native_fixture_host_config(&fixture, /*target*/ None).await?;
         assert_native_fixture_published_revocation(fixture.test.codex.config().await.as_ref());
     }
     std::fs::write(&release, b"release actual request hook")?;
@@ -1955,7 +1963,7 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
     )
     .await;
     fixture.turn("spawn the unaffected B sibling").await?;
-    let children = fixture.children(2).await?;
+    let children = fixture.children(/*expected*/ 2).await?;
     let mut found_b = false;
     for sibling in children {
         if sibling.config_snapshot().await.model_provider_id == "b" {
@@ -1989,7 +1997,7 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
     // conflicting host provider definition for the current-operation guard.
     let fixture = Fixture::with_host_source_setup(
         MultiAgentVersion::V2,
-        None,
+        /*default_provider*/ None,
         native_lower_http_retry_source_setup,
         |_| {},
     )
@@ -2112,9 +2120,14 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
             fixture.home.path().join("helper-marker").exists()
         );
     }
-    let children = fixture.children(1).await?;
+    let children = fixture.children(/*expected*/ 1).await?;
     let child = &children[0];
-    let child_id = child.read_thread(true, false).await?.thread_id;
+    let child_id = child
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await?
+        .thread_id;
     assert_eq!(
         child.config().await.model_provider.request_max_retries,
         Some(2),
@@ -2130,7 +2143,7 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
     assert!(!fixture.home.path().join("helper-marker").exists());
     if revoke {
         revoke_native_fixture_a(fixture.home.path())?;
-        publish_native_fixture_host_config(&fixture, None).await?;
+        publish_native_fixture_host_config(&fixture, /*target*/ None).await?;
         assert_native_fixture_published_revocation(fixture.test.codex.config().await.as_ref());
     }
     assert!(
@@ -2201,7 +2214,7 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
     )
     .await;
     fixture.turn("spawn the unaffected B sibling").await?;
-    let children = fixture.children(2).await?;
+    let children = fixture.children(/*expected*/ 2).await?;
     let mut found_b = false;
     for sibling in children {
         if sibling.config_snapshot().await.model_provider_id == "b" {

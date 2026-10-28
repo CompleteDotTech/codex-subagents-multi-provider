@@ -1240,7 +1240,8 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self, routing: ClientRouting) -> Result<CurrentClientSetup> {
-        self.current_client_setup_guarded(routing, None).await
+        self.current_client_setup_guarded(routing, /*guard*/ None)
+            .await
     }
 
     async fn current_client_setup_guarded(
@@ -1781,7 +1782,7 @@ impl ModelClientSession {
                             &provider,
                             self.client.event_sender.as_ref(),
                             responses_metadata.turn_id.as_deref(),
-                            None,
+                            /*guard*/ None,
                         )
                         .await?,
                     );
@@ -2060,7 +2061,11 @@ impl ResponsesHttpExecutor<'_> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             if let Some(error) = denied {
-                inference_trace_attempt.record_failed(&error, None, /*output_items*/ &[]);
+                inference_trace_attempt.record_failed(
+                    &error,
+                    /*upstream_request_id*/ None,
+                    /*output_items*/ &[],
+                );
                 return Err(error);
             }
 
@@ -2511,7 +2516,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
-                None,
+                /*guard*/ None,
             )
             .await
         {
@@ -2563,7 +2568,7 @@ impl ModelClientSession {
             service_tier,
             responses_metadata,
             inference_trace,
-            None,
+            /*guard*/ None,
         )
         .await
     }
@@ -3540,7 +3545,7 @@ pub(crate) async fn exercise_current_http_boundary(
         serde_json::json!({"model":"shared-loaded","input":[]}),
         ApiHeaderMap::new(),
         Compression::default(),
-        None,
+        /*turn_state*/ None,
     );
     let change = async {
         tokio::time::timeout(Duration::from_secs(10), entered.notified())

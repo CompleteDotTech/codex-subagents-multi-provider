@@ -194,10 +194,10 @@ impl ThreadStore for IndependentStore {
         })
     }
     fn shutdown_thread(&self, thread: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(self.legacy_release(thread, false))
+        Box::pin(self.legacy_release(thread, /*discard*/ false))
     }
     fn discard_thread(&self, thread: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(self.legacy_release(thread, true))
+        Box::pin(self.legacy_release(thread, /*discard*/ true))
     }
 }
 impl IndependentStore {
@@ -279,7 +279,7 @@ async fn replacement(store: Arc<IndependentStore>, thread: ThreadId) -> LiveThre
             include_archived: true,
             metadata: params(thread).metadata,
         },
-        None,
+        /*preparation*/ None,
     )
     .await
     .unwrap()
@@ -300,7 +300,7 @@ async fn scenario(bypass: bool) {
     store.entered.notified().await;
     // This is the public retirement admission future itself. Its only first
     // suspension is the contested owner mutex: no task spawn or storage I/O.
-    let mut admission = Box::pin(owner.retirement(false));
+    let mut admission = Box::pin(owner.retirement(/*discard*/ false));
     std::future::poll_fn(|cx| match admission.as_mut().poll(cx) {
         std::task::Poll::Pending => std::task::Poll::Ready(()),
         std::task::Poll::Ready(_) => panic!("public retirement bypassed an admitted mutation"),
@@ -363,29 +363,35 @@ async fn scenario(bypass: bool) {
 }
 #[tokio::test]
 async fn independent_public_store_drains_cancelled_mutation_and_rejects_stale_writer() {
-    tokio::time::timeout(std::time::Duration::from_secs(30), scenario(false))
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        scenario(/*bypass*/ false),
+    )
+    .await
+    .unwrap();
 }
 #[tokio::test]
 async fn independent_public_store_fixture_detects_exact_match_without_lease() {
-    tokio::time::timeout(std::time::Duration::from_secs(30), scenario(true))
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        scenario(/*bypass*/ true),
+    )
+    .await
+    .unwrap();
 }
 #[tokio::test]
 async fn public_retirement_marker_cannot_complete_outside_its_running_task() {
     let owner = ThreadWriterOwner::new();
-    let operation = owner.retirement(false).await.unwrap();
+    let operation = owner.retirement(/*discard*/ false).await.unwrap();
     let marker = operation.retirement_marker().unwrap();
     assert!(marker.retire().is_err());
     let escaped = operation.run(async move { Ok(marker) }).await.unwrap();
     assert!(escaped.retire().is_err());
     assert!(owner.operation().await.is_err()); // cleanup never certified Retired
-    assert!(owner.retirement(true).await.is_err());
-    assert!(owner.legacy_retirement(false).await.is_err());
-    assert!(owner.legacy_retirement(true).await.is_err());
-    let retry = owner.retirement(false).await.unwrap();
+    assert!(owner.retirement(/*discard*/ true).await.is_err());
+    assert!(owner.legacy_retirement(/*discard*/ false).await.is_err());
+    assert!(owner.legacy_retirement(/*discard*/ true).await.is_err());
+    let retry = owner.retirement(/*discard*/ false).await.unwrap();
     let marker = retry.retirement_marker().unwrap();
     retry.run(async move { marker.retire() }).await.unwrap();
     assert!(owner.operation().await.is_err());

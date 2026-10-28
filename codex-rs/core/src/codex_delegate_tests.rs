@@ -146,7 +146,7 @@ async fn forward_ops_preserves_submission_trace_context() {
         agent_status,
         session_loop_termination: completed_session_loop_termination(),
     });
-    let (tx_ops, rx_ops) = crate::session::bounded_submission_channel(1);
+    let (tx_ops, rx_ops) = crate::session::bounded_submission_channel(/*capacity*/ 1);
     let cancel = CancellationToken::new();
     let forward = tokio::spawn(forward_ops(Arc::clone(&io), rx_ops, cancel));
 

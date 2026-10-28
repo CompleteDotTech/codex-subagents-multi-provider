@@ -431,7 +431,7 @@ impl AgentRegistry {
 
     /// Explicit loaded or unloaded close sets a tombstone before its first await.
     pub(crate) fn revoke_caller(&self, thread_id: ThreadId) {
-        let _ = self.revoke_caller_stamped(thread_id, false);
+        let _ = self.revoke_caller_stamped(thread_id, /*explicit_intent*/ false);
     }
 
     pub(crate) fn revoke_caller_stamped(

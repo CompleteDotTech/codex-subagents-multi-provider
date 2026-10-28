@@ -157,7 +157,7 @@ impl LocalAgentControl {
         input: Vec<UserInput>,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
-        self.send_input_to_thread_guarded(thread, input, start_options, None)
+        self.send_input_to_thread_guarded(thread, input, start_options, /*guard*/ None)
             .await
     }
 
@@ -296,7 +296,7 @@ impl LocalAgentControl {
             communication,
             context,
             start_options,
-            None,
+            /*expected*/ None,
         )
         .await
     }

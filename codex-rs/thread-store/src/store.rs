@@ -377,16 +377,16 @@ impl ThreadWriterOwner {
     /// Admit an Active mutation. Await before taking the store's own locks;
     /// pass all actual effects and acknowledgment to the returned lease's run.
     pub async fn operation(&self) -> ThreadStoreResult<ThreadWriterOperation> {
-        self.acquire_operation(false).await
+        self.acquire_operation(/*retirement*/ false).await
     }
     pub(crate) async fn lifecycle(&self) -> ThreadStoreResult<WriterOperation> {
-        self.acquire_operation(true).await
+        self.acquire_operation(/*retirement*/ true).await
     }
     /// Admit exact cleanup. A Closing retry must keep the original discard/shutdown
     /// intent. Independent stores must use this protocol for owned finish and
     /// protect every legacy replacement/release path with the same identity lease.
     pub async fn retirement(&self, discard: bool) -> ThreadStoreResult<ThreadWriterOperation> {
-        let mut operation = self.acquire_operation(true).await?;
+        let mut operation = self.acquire_operation(/*retirement*/ true).await?;
         let phase = self.0.phase.load(std::sync::atomic::Ordering::Acquire);
         let intent = self
             .0
@@ -407,7 +407,7 @@ impl ThreadWriterOwner {
         &self,
         discard: bool,
     ) -> ThreadStoreResult<ThreadWriterOperation> {
-        let mut operation = self.acquire_operation(true).await?;
+        let mut operation = self.acquire_operation(/*retirement*/ true).await?;
         operation.legacy_intent(discard)?;
         Ok(operation)
     }

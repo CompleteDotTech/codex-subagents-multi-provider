@@ -168,7 +168,7 @@ pub(super) async fn resume_thread(
             rollout_id,
             history_mode,
             writer_lock,
-            false,
+            /*fresh*/ false,
         )
         .await?;
     Ok((history, owner))
@@ -537,13 +537,13 @@ pub(super) async fn shutdown_thread(
     store: &LocalThreadStore,
     thread: ThreadId,
 ) -> ThreadStoreResult<()> {
-    finish_current_writer(store, thread, false).await
+    finish_current_writer(store, thread, /*discard*/ false).await
 }
 pub(super) async fn discard_thread(
     store: &LocalThreadStore,
     thread: ThreadId,
 ) -> ThreadStoreResult<()> {
-    finish_current_writer(store, thread, true).await
+    finish_current_writer(store, thread, /*discard*/ true).await
 }
 async fn finish_current_writer(
     store: &LocalThreadStore,

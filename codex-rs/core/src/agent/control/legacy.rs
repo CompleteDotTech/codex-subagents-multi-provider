@@ -10,7 +10,9 @@ impl LocalAgentControl {
     pub(crate) async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         self.runtime.registry.revoke_caller(agent_id);
         let state = self.runtime.upgrade()?;
-        let mut captured = self.capture_shutdown(&state, agent_id, false).await;
+        let mut captured = self
+            .capture_shutdown(&state, agent_id, /*descendants*/ false)
+            .await;
         let (_, thread) = captured.pop().ok_or(CodexErr::ThreadNotFound(agent_id))?;
         self.shutdown_captured_agent(&state, agent_id, thread).await
     }
@@ -54,7 +56,7 @@ impl LocalAgentControl {
         let metadata = self.get_agent_metadata(agent_id);
         let known_agent = metadata.is_some();
         let captured = self
-            .capture_shutdown_with_graph_stamp(&state, agent_id, true)
+            .capture_shutdown_with_graph_stamp(&state, agent_id, /*descendants*/ true)
             .await;
         #[cfg(test)]
         self.runtime
@@ -120,7 +122,9 @@ impl LocalAgentControl {
     #[cfg(test)]
     pub(crate) async fn shutdown_agent_tree(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.runtime.upgrade()?;
-        let captured = self.capture_shutdown(&state, agent_id, true).await;
+        let captured = self
+            .capture_shutdown(&state, agent_id, /*descendants*/ true)
+            .await;
         self.shutdown_captured_tree(&state, agent_id, captured)
             .await
     }

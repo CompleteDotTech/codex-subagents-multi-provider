@@ -6164,7 +6164,7 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
         .expect("fill event channel");
     let session = Arc::new(session);
     let (reply, mut accepted) = tokio::sync::oneshot::channel();
-    let (tx_sub, rx_sub) = bounded_submission_channel(1);
+    let (tx_sub, rx_sub) = bounded_submission_channel(/*capacity*/ 1);
     tx_sub
         .send(Submission {
             id: "settings".into(),
@@ -8110,7 +8110,7 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
 #[tokio::test]
 async fn submit_with_trace_captures_current_span_trace_context() {
     let (_session, _turn_context) = make_session_and_context().await;
-    let (tx_sub, rx_sub) = bounded_submission_channel(1);
+    let (tx_sub, rx_sub) = bounded_submission_channel(/*capacity*/ 1);
     let (_tx_event, rx_event) = async_channel::unbounded();
     let io = SessionIo {
         tx_sub,
@@ -8840,7 +8840,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
         .thread_extension_data
         .insert(ThreadStopMarker);
 
-    let (tx_sub, rx_sub) = bounded_submission_channel(1);
+    let (tx_sub, rx_sub) = bounded_submission_channel(/*capacity*/ 1);
     drop(tx_sub);
     let session = Arc::new(session);
     submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
@@ -8926,7 +8926,7 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
         )
         .await;
 
-    let (tx_sub, rx_sub) = bounded_submission_channel(1);
+    let (tx_sub, rx_sub) = bounded_submission_channel(/*capacity*/ 1);
     drop(tx_sub);
     submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
 
@@ -8941,7 +8941,7 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
 #[tokio::test]
 async fn shutdown_and_wait_allows_multiple_waiters() {
     let (_session, _turn_context) = make_session_and_context().await;
-    let (tx_sub, rx_sub) = bounded_submission_channel(4);
+    let (tx_sub, rx_sub) = bounded_submission_channel(/*capacity*/ 4);
     let (_tx_event, rx_event) = async_channel::unbounded();
     let session_loop_handle = tokio::spawn(async move {
         let shutdown = rx_sub.recv().await.expect("shutdown submission");
@@ -8977,7 +8977,7 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
 #[tokio::test]
 async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
     let (_session, _turn_context) = make_session_and_context().await;
-    let (tx_sub, rx_sub) = bounded_submission_channel(4);
+    let (tx_sub, rx_sub) = bounded_submission_channel(/*capacity*/ 4);
     drop(rx_sub);
     let (_tx_event, rx_event) = async_channel::unbounded();
     let (shutdown_complete_tx, shutdown_complete_rx) = tokio::sync::oneshot::channel();

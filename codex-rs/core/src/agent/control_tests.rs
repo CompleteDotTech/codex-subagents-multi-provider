@@ -9394,7 +9394,10 @@ async fn loaded_custom_provider_resident(
     .expect("real trusted custom-provider preparation")
     .config;
     assert_eq!(prepared.model_provider_id, "a");
-    let mut reservation = runtime.registry.reserve_spawn_slot(None).unwrap();
+    let mut reservation = runtime
+        .registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .unwrap();
     let (source, mut metadata) = harness
         .control
         .prepare_thread_spawn(
@@ -9403,8 +9406,8 @@ async fn loaded_custom_provider_resident(
             parent.session.thread_id,
             next_thread_spawn_depth(&parent.session_source),
             Some(AgentPath::from_string("/root/loaded_custom_authority_target".into()).unwrap()),
-            None,
-            None,
+            /*agent_role*/ None,
+            /*preferred_agent_nickname*/ None,
         )
         .unwrap();
     let permit = prepared
@@ -9434,7 +9437,13 @@ async fn loaded_custom_provider_resident(
         child.thread.multi_agent_version(),
         Some(MultiAgentVersion::V2)
     );
-    let stored = child.thread.read_thread(true, true).await.unwrap();
+    let stored = child
+        .thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     let history = stored
         .history
         .expect("actual lower-start persisted startup history");
@@ -9973,20 +9982,20 @@ async fn post_admission_registered_idle_child(
         parent_id,
         &parent.session_source,
         next_thread_spawn_depth(&parent.session_source),
-        None,
+        /*agent_role*/ None,
         Some(name.into()),
     )
     .unwrap();
     let mut prepared = harness
         .control
-        .prepare_spawn_fixture(&harness.config, &source, false)
+        .prepare_spawn_fixture(&harness.config, &source, /*full_history*/ false)
         .await
         .unwrap();
     let mut reservation = harness
         .control
         .runtime
         .registry
-        .reserve_spawn_slot(None)
+        .reserve_spawn_slot(/*max_threads*/ None)
         .unwrap();
     let role = prepared
         .prepared_child_authorization
@@ -10002,7 +10011,7 @@ async fn post_admission_registered_idle_child(
             next_thread_spawn_depth(&parent.session_source),
             source.get_agent_path(),
             role,
-            None,
+            /*preferred_agent_nickname*/ None,
         )
         .unwrap();
     let permit = prepared
@@ -10013,7 +10022,7 @@ async fn post_admission_registered_idle_child(
             &harness.control.runtime,
             parent_id,
             &prepared,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await
@@ -10618,12 +10627,19 @@ stream_idle_timeout_ms = 1000
     guard
         .check()
         .expect("prepared current helper stage is admitted");
-    let (tx, rx) = crate::session::bounded_submission_channel(1);
+    let (tx, rx) = crate::session::bounded_submission_channel(/*capacity*/ 1);
     let mut io = target.io.clone();
     io.tx_sub = tx;
     io.submit(Op::Interrupt).await.unwrap();
-    let submit =
-        io.submit_with_trace_guarded(Op::Interrupt, None, None, None, None, None, Some(&guard));
+    let submit = io.submit_with_trace_guarded(
+        Op::Interrupt,
+        /*trace*/ None,
+        /*parent_turn_id*/ None,
+        /*root_turn_id*/ None,
+        /*residency_guard*/ None,
+        /*message_delivery*/ None,
+        Some(&guard),
+    );
     let mut submit = Box::pin(submit);
     assert!(
         matches!(futures::poll!(submit.as_mut()), std::task::Poll::Pending),
@@ -10632,11 +10648,11 @@ stream_idle_timeout_ms = 1000
     if change == 4 {
         let mut other = Box::pin(io.submit_with_trace_guarded(
             Op::Interrupt,
-            None,
-            None,
-            None,
-            None,
-            None,
+            /*trace*/ None,
+            /*parent_turn_id*/ None,
+            /*root_turn_id*/ None,
+            /*residency_guard*/ None,
+            /*message_delivery*/ None,
             Some(&guard),
         ));
         assert!(futures::poll!(other.as_mut()).is_pending());
@@ -10672,7 +10688,15 @@ stream_idle_timeout_ms = 1000
         ));
         let next_id = timeout(
             Duration::from_secs(5),
-            io.submit_with_trace_guarded(Op::Interrupt, None, None, None, None, None, Some(&guard)),
+            io.submit_with_trace_guarded(
+                Op::Interrupt,
+                /*trace*/ None,
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+                /*residency_guard*/ None,
+                /*message_delivery*/ None,
+                Some(&guard),
+            ),
         )
         .await
         .expect("later guarded operation does not hang behind a cancelled waiter")
@@ -10806,7 +10830,10 @@ async fn loaded_custom_provider_resident_nested(
     .expect("real trusted custom-provider preparation")
     .config;
     assert_eq!(prepared.model_provider_id, "a");
-    let mut reservation = runtime.registry.reserve_spawn_slot(None).unwrap();
+    let mut reservation = runtime
+        .registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .unwrap();
     let (source, mut metadata) = harness
         .control
         .prepare_thread_spawn(
@@ -10821,8 +10848,8 @@ async fn loaded_custom_provider_resident_nested(
                 ))
                 .unwrap(),
             ),
-            None,
-            None,
+            /*agent_role*/ None,
+            /*preferred_agent_nickname*/ None,
         )
         .unwrap();
     let permit = prepared
@@ -10852,7 +10879,13 @@ async fn loaded_custom_provider_resident_nested(
         child.thread.multi_agent_version(),
         Some(MultiAgentVersion::V2)
     );
-    let stored = child.thread.read_thread(true, true).await.unwrap();
+    let stored = child
+        .thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     let history = stored
         .history
         .expect("actual lower-start persisted startup history");
@@ -10971,7 +11004,9 @@ stream_idle_timeout_ms = 1000
     assert_ne!(parent_settings.model, original.settings.model);
     assert!(
         owner
-            .read_thread(true, false)
+            .read_thread(
+                /*include_archived*/ true, /*include_history*/ false
+            )
             .await
             .unwrap()
             .model
@@ -11051,7 +11086,9 @@ stream_idle_timeout_ms = 1000
     replacement.session.flush_rollout().await.unwrap();
     assert_eq!(
         replacement
-            .read_thread(true, false)
+            .read_thread(
+                /*include_archived*/ true, /*include_history*/ false
+            )
             .await
             .unwrap()
             .model
@@ -11775,7 +11812,7 @@ stream_idle_timeout_ms = 1000
     // The generic test manager intentionally has no Config/catalog input. This
     // root control must retain its real static catalog rather than discover it
     // over HTTP before auth-only prewarm. Keep the other test-manager services.
-    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(/*enabled*/ true);
     let state_db = init_state_db(&config).await;
     let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let models = crate::thread_manager::build_models_manager(&config, auth.clone());
@@ -12381,11 +12418,21 @@ async fn graph_same_registration_explicit_close_intent_survives_newer_explicit_s
     graph_publish_actual_open(&harness, &child).await;
     let state = harness.control.runtime.upgrade().unwrap();
     let old = state
-        .fence_native_subtree_with_graph_stamp(&harness.control.runtime, child_id, true, |_| {})
+        .fence_native_subtree_with_graph_stamp(
+            &harness.control.runtime,
+            child_id,
+            /*descendants*/ true,
+            |_| {},
+        )
         .await;
     let old_revision = harness.control.runtime.teardown_revision(child_id);
     let current = state
-        .fence_native_subtree_with_graph_stamp(&harness.control.runtime, child_id, true, |_| {})
+        .fence_native_subtree_with_graph_stamp(
+            &harness.control.runtime,
+            child_id,
+            /*descendants*/ true,
+            |_| {},
+        )
         .await;
     assert!(harness.control.runtime.teardown_revision(child_id) > old_revision);
     assert!(Arc::ptr_eq(
@@ -12508,11 +12555,11 @@ async fn graph_explicit_close_survives_ordinary_shutdown(tree: bool) {
 }
 #[tokio::test]
 async fn graph_explicit_closed_intent_survives_shutdown_live_agent() {
-    graph_explicit_close_survives_ordinary_shutdown(false).await;
+    graph_explicit_close_survives_ordinary_shutdown(/*tree*/ false).await;
 }
 #[tokio::test]
 async fn graph_explicit_closed_intent_survives_shutdown_agent_tree() {
-    graph_explicit_close_survives_ordinary_shutdown(true).await;
+    graph_explicit_close_survives_ordinary_shutdown(/*tree*/ true).await;
 }
 
 #[tokio::test]
@@ -12600,7 +12647,12 @@ async fn graph_explicit_stamp_transfers_to_same_registration_absence_after_shutd
         let old_registration = harness.control.runtime.retained_authority(id).unwrap();
         let state = harness.control.runtime.upgrade().unwrap();
         let captured = state
-            .fence_native_subtree_with_graph_stamp(&harness.control.runtime, id, true, |_| {})
+            .fence_native_subtree_with_graph_stamp(
+                &harness.control.runtime,
+                id,
+                /*descendants*/ true,
+                |_| {},
+            )
             .await;
         if tree {
             harness.control.shutdown_agent_tree(id).await.unwrap();
@@ -12671,11 +12723,13 @@ async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence
         );
         old.session.flush_rollout().await.unwrap();
         assert_eq!(
-            old.read_thread(false, false)
-                .await
-                .unwrap()
-                .model
-                .as_deref(),
+            old.read_thread(
+                /*include_archived*/ false, /*include_history*/ false
+            )
+            .await
+            .unwrap()
+            .model
+            .as_deref(),
             Some("gpt-5.6-sol")
         );
     }
@@ -12814,11 +12868,17 @@ async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence
 }
 #[tokio::test]
 async fn graph_old_retained_absent_close_rejects_new_registration_aba() {
-    graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(false).await;
+    graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(
+        /*missing_retained*/ false,
+    )
+    .await;
 }
 #[tokio::test]
 async fn graph_old_missing_retained_close_rejects_new_registration_aba() {
-    graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(true).await;
+    graph_old_absent_close_rejects_new_registration_evicted_back_to_absence(
+        /*missing_retained*/ true,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -12834,11 +12894,16 @@ async fn graph_loaded_missing_registration_cannot_transfer_close_to_absence() {
     let cold_control = LocalAgentControl::new(
         Arc::downgrade(&state),
         crate::thread_manager::default_thread_id_generator(),
-        None,
+        /*rollout_budget*/ None,
     );
     assert!(cold_control.runtime.retained_authority(id).is_none());
     let unproven = state
-        .fence_native_subtree_with_graph_stamp(&cold_control.runtime, id, true, |_| {})
+        .fence_native_subtree_with_graph_stamp(
+            &cold_control.runtime,
+            id,
+            /*descendants*/ true,
+            |_| {},
+        )
         .await;
     assert!(Arc::ptr_eq(
         &child,
@@ -12955,7 +13020,7 @@ stream_idle_timeout_ms = 1000
         .config_layer_stack
         .with_cloud_config_binding(binding.binding);
     // Use the config-aware production manager so the root's actual model is V1.
-    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(/*enabled*/ true);
     let state_db = init_state_db(&config).await;
     let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = ThreadManager::new(
@@ -13021,7 +13086,7 @@ stream_idle_timeout_ms = 1000
         .control
         .runtime
         .registry
-        .reserve_spawn_slot(None)
+        .reserve_spawn_slot(/*max_threads*/ None)
         .unwrap();
     let (source, mut metadata) = harness
         .control
@@ -13031,8 +13096,8 @@ stream_idle_timeout_ms = 1000
             parent_id,
             next_thread_spawn_depth(&parent.session_source),
             Some(AgentPath::from_string("/root/public_v1_queue_target".into()).unwrap()),
-            None,
-            None,
+            /*agent_role*/ None,
+            /*preferred_agent_nickname*/ None,
         )
         .unwrap();
     let permit = prepared
@@ -13043,7 +13108,7 @@ stream_idle_timeout_ms = 1000
             &harness.control.runtime,
             parent_id,
             &prepared,
-            false,
+            /*full_history*/ false,
             &source,
         )
         .await
@@ -13071,7 +13136,7 @@ stream_idle_timeout_ms = 1000
     original.ensure_rollout_materialized().await;
     original.flush_rollout().await.unwrap();
 
-    let (tx, rx) = crate::session::bounded_submission_channel(1);
+    let (tx, rx) = crate::session::bounded_submission_channel(/*capacity*/ 1);
     let capacity_wait = tx.capacity_wait_observer_for_test();
     let mut io = original.io.clone();
     io.tx_sub = tx;
@@ -13301,7 +13366,10 @@ async fn public_v1_cold_compat_resident(
         prepared.model_provider_id,
         if selected { "a" } else { "openai" }
     );
-    let mut reservation = runtime.registry.reserve_spawn_slot(None).unwrap();
+    let mut reservation = runtime
+        .registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .unwrap();
     let (source, mut metadata) = harness
         .control
         .prepare_thread_spawn(
@@ -13310,8 +13378,8 @@ async fn public_v1_cold_compat_resident(
             parent.session.thread_id,
             next_thread_spawn_depth(&parent.session_source),
             Some(AgentPath::from_string("/root/public_v1_cold_compat_target".into()).unwrap()),
-            None,
-            None,
+            /*agent_role*/ None,
+            /*preferred_agent_nickname*/ None,
         )
         .unwrap();
     let permit = prepared
@@ -13341,7 +13409,13 @@ async fn public_v1_cold_compat_resident(
         child.thread.multi_agent_version(),
         Some(MultiAgentVersion::V2)
     );
-    let stored = child.thread.read_thread(true, true).await.unwrap();
+    let stored = child
+        .thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .unwrap();
     let history = stored
         .history
         .expect("actual lower-start persisted startup history");
@@ -13454,7 +13528,7 @@ stream_idle_timeout_ms = 1000
         .config_layer_stack
         .with_cloud_config_binding(binding.binding);
     // Use actual V2 sessions for the protected eviction/reload path; invoke the V1 tool below.
-    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(/*enabled*/ true);
     let state_db = init_state_db(&config).await;
     let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = ThreadManager::new(
@@ -13967,7 +14041,7 @@ async fn copied_fork_standard_checkpoint_precedes_input_and_ack(fail: bool) {
         entered,
         io_fault_path: blocked_parent.join("checkpoint"),
     });
-    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(/*enabled*/ true);
     let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = ThreadManager::new(
         &config,
@@ -13978,13 +14052,13 @@ async fn copied_fork_standard_checkpoint_precedes_input_and_ack(fail: bool) {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        None,
+        /*analytics_events_client*/ None,
         crate::thread_manager::passthrough_image_store(),
         store.clone(),
-        None,
+        /*agent_graph_store*/ None,
         uuid::Uuid::new_v4().to_string(),
-        None,
-        None,
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
     )
     .with_code_mode_session_provider(Arc::new(codex_code_mode::DisabledCodeModeSessionProvider));
     let control = manager.agent_control();

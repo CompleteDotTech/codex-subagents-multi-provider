@@ -182,7 +182,7 @@ async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMo
             include_archived: true,
             metadata: thread_metadata(),
         },
-        None,
+        /*preparation*/ None,
     )
     .await
     .expect("actual replacement acquires the released writer");
@@ -197,12 +197,17 @@ async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMo
                 preview: Some("current replacement preview".into()),
                 ..Default::default()
             },
-            true,
+            /*include_archived*/ true,
         )
         .await
         .expect("distinguishable actual replacement metadata");
     replacement.flush().await.unwrap();
-    let before = replacement.read_thread(true, false).await.unwrap();
+    let before = replacement
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await
+        .unwrap();
     if mode == ThreadHistoryMode::Paginated {
         assert_eq!(before.preview, "current replacement preview");
     }
@@ -224,7 +229,12 @@ async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMo
     // must not write its retained patch before the exact owner check.
     let retry = old.shutdown().await;
     replacement.flush().await.unwrap();
-    let after = replacement.read_thread(true, false).await.unwrap();
+    let after = replacement
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await
+        .unwrap();
     let metadata_after = state.get_thread(thread).await.unwrap().unwrap();
     let (history_after, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
         .await
@@ -399,7 +409,7 @@ async fn owned_mutation_cancellation_drains_admitted_work_before_retirement() {
                         preview: Some("admitted write".into()),
                         ..Default::default()
                     },
-                    true,
+                    /*include_archived*/ true,
                 )
                 .await
         });
@@ -418,7 +428,7 @@ async fn owned_mutation_cancellation_drains_admitted_work_before_retirement() {
                 preview: Some("cancelled before admission".into()),
                 ..Default::default()
             },
-            true,
+            /*include_archived*/ true,
         ));
         poll_writer_blocked(never_admitted.as_mut(), &owner).await;
         drop(never_admitted);
@@ -497,7 +507,7 @@ async fn retired_owned_handle_rejects_every_mutation_and_preserves_replacement()
             include_archived: true,
             metadata: thread_metadata(),
         },
-        None,
+        /*preparation*/ None,
     )
     .await
     .unwrap();
@@ -507,7 +517,7 @@ async fn retired_owned_handle_rejects_every_mutation_and_preserves_replacement()
                 preview: Some("replacement".into()),
                 ..Default::default()
             },
-            true,
+            /*include_archived*/ true,
         )
         .await
         .unwrap();
@@ -537,9 +547,12 @@ async fn retired_owned_handle_rejects_every_mutation_and_preserves_replacement()
     }
     assert!(old.flush().await.is_err());
     assert!(
-        old.update_memory_mode(codex_protocol::protocol::ThreadMemoryMode::Disabled, true)
-            .await
-            .is_err()
+        old.update_memory_mode(
+            codex_protocol::protocol::ThreadMemoryMode::Disabled,
+            /*include_archived*/ true
+        )
+        .await
+        .is_err()
     );
     assert!(
         old.update_metadata(
@@ -547,7 +560,7 @@ async fn retired_owned_handle_rejects_every_mutation_and_preserves_replacement()
                 preview: Some("stale".into()),
                 ..Default::default()
             },
-            true
+            /*include_archived*/ true
         )
         .await
         .is_err()
@@ -637,9 +650,12 @@ async fn owned_metadata_failure_remains_retryable_for_current_owner() {
             .as_deref(),
         Some("retry current owner")
     );
-    live.update_memory_mode(codex_protocol::protocol::ThreadMemoryMode::Disabled, true)
-        .await
-        .unwrap();
+    live.update_memory_mode(
+        codex_protocol::protocol::ThreadMemoryMode::Disabled,
+        /*include_archived*/ true,
+    )
+    .await
+    .unwrap();
     live.shutdown().await.unwrap();
 }
 #[tokio::test]
@@ -699,7 +715,7 @@ async fn owned_mutation_orders_active_single_and_batch_delete() {
                             preview: Some("before delete".into()),
                             ..Default::default()
                         },
-                        true,
+                        /*include_archived*/ true,
                     )
                     .await
             });
@@ -916,7 +932,7 @@ async fn owned_memory_mutation_orders_legacy_overwrite_and_delete() {
                             preview: Some("admitted memory".into()),
                             ..Default::default()
                         },
-                        true,
+                        /*include_archived*/ true,
                     )
                     .await
             });
@@ -976,7 +992,7 @@ async fn owned_memory_mutation_orders_legacy_overwrite_and_delete() {
                         preview: Some("stale memory".into()),
                         ..Default::default()
                     },
-                    true
+                    /*include_archived*/ true
                 )
                 .await
                 .is_err()
@@ -1115,7 +1131,7 @@ async fn owned_finish_failure_keeps_closing_writer_until_exact_retry() {
                 include_archived: true,
                 metadata: thread_metadata(),
             },
-            None
+            /*preparation*/ None
         )
         .await
         .is_err()
@@ -1177,7 +1193,7 @@ async fn owned_operation_panic_after_real_commit_fails_closed() {
                 preview: Some("committed before panic".into()),
                 ..Default::default()
             },
-            true
+            /*include_archived*/ true
         )
         .await
         .is_err()
@@ -1269,7 +1285,7 @@ async fn owned_local_mutation_orders_legacy_shutdown_and_discard() {
                             preview: Some("before legacy finish".into()),
                             ..Default::default()
                         },
-                        true,
+                        /*include_archived*/ true,
                     )
                     .await
             });
@@ -1298,7 +1314,7 @@ async fn owned_local_mutation_orders_legacy_shutdown_and_discard() {
                     include_archived: true,
                     metadata: thread_metadata(),
                 },
-                None,
+                /*preparation*/ None,
             )
             .await
             .unwrap();
@@ -1367,7 +1383,7 @@ async fn owned_delete_barrier_detects_intentional_lease_bypass() {
                         preview: Some("held admitted metadata".into()),
                         ..Default::default()
                     },
-                    true,
+                    /*include_archived*/ true,
                 )
                 .await
         });
@@ -1481,7 +1497,7 @@ async fn owned_local_failed_discard_rejects_legacy_release_and_changed_intent() 
                 include_archived: true,
                 metadata: thread_metadata(),
             },
-            None
+            /*preparation*/ None
         )
         .await
         .is_err(),

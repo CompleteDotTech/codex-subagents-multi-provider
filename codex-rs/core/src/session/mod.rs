@@ -1147,7 +1147,7 @@ impl SessionIo {
             root_turn_id,
             residency_guard,
             message_delivery,
-            None,
+            /*guard*/ None,
         )
         .await
     }
@@ -1184,7 +1184,7 @@ impl SessionIo {
 
     /// Use sparingly: prefer `submit()` so submission IDs are generated consistently.
     pub(crate) async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
-        self.submit_with_id_guarded(sub, None).await
+        self.submit_with_id_guarded(sub, /*guard*/ None).await
     }
 
     pub(crate) async fn submit_with_id_guarded(
@@ -1207,7 +1207,8 @@ impl SessionIo {
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
-        self.submit_turn_input_guarded(request, mode, None).await
+        self.submit_turn_input_guarded(request, mode, /*guard*/ None)
+            .await
     }
 
     pub(crate) async fn submit_turn_input_guarded(

@@ -2083,7 +2083,7 @@ impl ThreadManagerState {
             parent_turn_id,
             root_turn_id,
             message_delivery,
-            None,
+            /*guard*/ None,
         )
         .await
     }
@@ -2156,9 +2156,15 @@ impl ThreadManagerState {
         descendants: bool,
         unloaded: impl FnMut(ThreadId),
     ) -> Vec<(ThreadId, Arc<CodexThread>)> {
-        self.capture_native_shutdown(runtime, root, descendants, unloaded, false)
-            .await
-            .threads
+        self.capture_native_shutdown(
+            runtime,
+            root,
+            descendants,
+            unloaded,
+            /*explicit_graph_close*/ false,
+        )
+        .await
+        .threads
     }
 
     pub(crate) async fn fence_native_subtree_with_graph_stamp(
@@ -2168,8 +2174,14 @@ impl ThreadManagerState {
         descendants: bool,
         unloaded: impl FnMut(ThreadId),
     ) -> NativeShutdownCapture {
-        self.capture_native_shutdown(runtime, root, descendants, unloaded, true)
-            .await
+        self.capture_native_shutdown(
+            runtime,
+            root,
+            descendants,
+            unloaded,
+            /*explicit_graph_close*/ true,
+        )
+        .await
     }
 
     async fn capture_native_shutdown(

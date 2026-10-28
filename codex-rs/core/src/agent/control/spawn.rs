@@ -414,7 +414,7 @@ impl LocalAgentControl {
             crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
                 Arc::clone(&thread),
                 Some(Arc::clone(&caller)),
-                None,
+                /*scope*/ None,
             )
             .await?;
             return Ok(pin);
@@ -478,7 +478,7 @@ impl LocalAgentControl {
                 self.validate_loaded_v2_child(&thread, parent_thread_id)?;
                 let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
                 crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
-                Arc::clone(&thread), Some(Arc::clone(&caller)), None,
+                Arc::clone(&thread), Some(Arc::clone(&caller)), /*scope*/ None,
             ).await?;
                 return Ok(pin);
             }
@@ -818,7 +818,7 @@ impl LocalAgentControl {
                     drop(residency_slot);
                     let pin = self.runtime.pin_v2_residency(&state, &thread).await?;
                     crate::agent::child_provider_authorization::current::CurrentChildOperation::prepare(
-                Arc::clone(&thread), Some(Arc::clone(&caller)), None,
+                Arc::clone(&thread), Some(Arc::clone(&caller)), /*scope*/ None,
             ).await?;
                     return Ok(pin);
                 }

@@ -551,7 +551,7 @@ struct InMemoryThreadStoreState {
 impl InMemoryThreadStore {
     #[cfg(test)]
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
-        self.create_thread_owned_impl(params, false)
+        self.create_thread_owned_impl(params, /*exclusive*/ false)
             .await
             .map(|_| ())
     }
@@ -560,7 +560,7 @@ impl InMemoryThreadStore {
         &self,
         params: ResumeThreadParams,
     ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
-        self.resume_thread_owned_impl(params, false)
+        self.resume_thread_owned_impl(params, /*exclusive*/ false)
             .await
             .map(|(history, _)| history)
     }
@@ -1110,7 +1110,7 @@ impl ThreadStore for InMemoryThreadStore {
         params: CreateThreadParams,
     ) -> ThreadStoreFuture<'_, crate::ThreadWriterOwner> {
         Box::pin(InMemoryThreadStore::create_thread_owned_impl(
-            self, params, true,
+            self, params, /*exclusive*/ true,
         ))
     }
     fn resume_thread_owned(
@@ -1124,7 +1124,7 @@ impl ThreadStore for InMemoryThreadStore {
                     operation: "resume_thread_with_preparation",
                 });
             }
-            InMemoryThreadStore::resume_thread_owned_impl(self, params, true).await
+            InMemoryThreadStore::resume_thread_owned_impl(self, params, /*exclusive*/ true).await
         })
     }
     fn finish_thread_owned(
@@ -1282,7 +1282,7 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            InMemoryThreadStore::create_thread_owned_impl(self, params, false)
+            InMemoryThreadStore::create_thread_owned_impl(self, params, /*exclusive*/ false)
                 .await
                 .map(|_| ())
         })
@@ -1293,7 +1293,7 @@ impl ThreadStore for InMemoryThreadStore {
         params: ResumeThreadParams,
     ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
         Box::pin(async move {
-            InMemoryThreadStore::resume_thread_owned_impl(self, params, false)
+            InMemoryThreadStore::resume_thread_owned_impl(self, params, /*exclusive*/ false)
                 .await
                 .map(|(history, _)| history)
         })
@@ -1326,7 +1326,7 @@ impl ThreadStore for InMemoryThreadStore {
             let (operation, mut state) = self.lock_writer_lifecycle(thread_id).await?;
             let mut operation = operation;
             if let Some(operation) = operation.as_mut() {
-                operation.legacy_intent(false)?;
+                operation.legacy_intent(/*discard*/ false)?;
                 operation.start_retirement();
             }
             state.calls.shutdown_thread += 1;
@@ -1348,7 +1348,7 @@ impl ThreadStore for InMemoryThreadStore {
             let (operation, mut state) = self.lock_writer_lifecycle(thread_id).await?;
             let mut operation = operation;
             if let Some(operation) = operation.as_mut() {
-                operation.legacy_intent(true)?;
+                operation.legacy_intent(/*discard*/ true)?;
                 operation.start_retirement();
             }
             state.calls.discard_thread += 1;

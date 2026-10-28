@@ -309,13 +309,13 @@ impl LiveThread {
         thread_store: Arc<dyn ThreadStore>,
         params: CreateThreadParams,
     ) -> ThreadStoreResult<Self> {
-        Self::create_impl(thread_store, params, false).await
+        Self::create_impl(thread_store, params, /*require_owned*/ false).await
     }
     pub async fn create_owned(
         thread_store: Arc<dyn ThreadStore>,
         params: CreateThreadParams,
     ) -> ThreadStoreResult<Self> {
-        Self::create_impl(thread_store, params, true).await
+        Self::create_impl(thread_store, params, /*require_owned*/ true).await
     }
     async fn create_impl(
         thread_store: Arc<dyn ThreadStore>,
@@ -359,8 +359,14 @@ impl LiveThread {
         inherited_model_context: &[RolloutItem],
         guard: &mut LiveThreadInitGuard,
     ) -> ThreadStoreResult<Self> {
-        Self::create_inherited_impl(thread_store, params, inherited_model_context, guard, false)
-            .await
+        Self::create_inherited_impl(
+            thread_store,
+            params,
+            inherited_model_context,
+            guard,
+            /*require_owned*/ false,
+        )
+        .await
     }
     pub async fn create_owned_with_inherited_model_context(
         thread_store: Arc<dyn ThreadStore>,
@@ -368,8 +374,14 @@ impl LiveThread {
         inherited_model_context: &[RolloutItem],
         guard: &mut LiveThreadInitGuard,
     ) -> ThreadStoreResult<Self> {
-        Self::create_inherited_impl(thread_store, params, inherited_model_context, guard, true)
-            .await
+        Self::create_inherited_impl(
+            thread_store,
+            params,
+            inherited_model_context,
+            guard,
+            /*require_owned*/ true,
+        )
+        .await
     }
     async fn create_inherited_impl(
         thread_store: Arc<dyn ThreadStore>,
@@ -406,7 +418,14 @@ impl LiveThread {
         params: ResumeThreadParams,
         preparation: Option<ThreadStoreResumePreparation>,
     ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
-        Self::resume_impl(thread_store, history_mode, params, preparation, false).await
+        Self::resume_impl(
+            thread_store,
+            history_mode,
+            params,
+            preparation,
+            /*require_owned*/ false,
+        )
+        .await
     }
     pub async fn resume_owned(
         thread_store: Arc<dyn ThreadStore>,
@@ -414,7 +433,14 @@ impl LiveThread {
         params: ResumeThreadParams,
         preparation: Option<ThreadStoreResumePreparation>,
     ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
-        Self::resume_impl(thread_store, history_mode, params, preparation, true).await
+        Self::resume_impl(
+            thread_store,
+            history_mode,
+            params,
+            preparation,
+            /*require_owned*/ true,
+        )
+        .await
     }
     async fn resume_impl(
         thread_store: Arc<dyn ThreadStore>,

@@ -558,7 +558,9 @@ impl ThreadStore for LocalThreadStore {
         &self,
         params: CreateThreadParams,
     ) -> ThreadStoreFuture<'_, crate::ThreadWriterOwner> {
-        Box::pin(async move { live_writer::create_thread(self, params, true).await })
+        Box::pin(async move {
+            live_writer::create_thread(self, params, /*exclusive*/ true).await
+        })
     }
     fn resume_thread_owned(
         &self,
@@ -717,7 +719,7 @@ impl ThreadStore for LocalThreadStore {
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            live_writer::create_thread(self, params, false)
+            live_writer::create_thread(self, params, /*exclusive*/ false)
                 .await
                 .map(|_| ())
         })
@@ -1091,7 +1093,7 @@ mod tests {
     #[tokio::test]
     async fn owned_writer_cleanup_preserves_replacement_and_resumed_history() {
         let home = TempDir::new().expect("temp dir");
-        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
             let thread = ThreadId::default();
             // Paginated history persists canonical completed items, not legacy user events.
@@ -1288,7 +1290,10 @@ mod tests {
     #[tokio::test]
     async fn cancelled_owned_acquisition_discards_materialized_fresh_writer() {
         let home = TempDir::new().expect("temp dir");
-        let store = Arc::new(LocalThreadStore::new(test_config(home.path()), None));
+        let store = Arc::new(LocalThreadStore::new(
+            test_config(home.path()),
+            /*state_db*/ None,
+        ));
         let thread = ThreadId::default();
         let (release, wait) = tokio::sync::oneshot::channel();
         let (started, ready) = tokio::sync::oneshot::channel();
@@ -1338,7 +1343,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_owned_cleanup_retains_writer_until_discard_completes() {
         let home = TempDir::new().expect("temp dir");
-        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let thread = ThreadId::default();
         let owner = store
             .create_thread_owned(create_thread_params(thread))
@@ -1551,7 +1556,7 @@ mod tests {
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
-            /*resume_preparation*/ None,
+            /*preparation*/ None,
         )
         .await
         .expect("resume paginated thread from its requested rollout");
@@ -1902,7 +1907,7 @@ mod tests {
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
-            /*resume_preparation*/ None,
+            /*preparation*/ None,
         )
         .await
         .expect("resume live thread");
@@ -1959,7 +1964,7 @@ mod tests {
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
-            /*resume_preparation*/ None,
+            /*preparation*/ None,
         )
         .await
         .expect("resume external live thread");

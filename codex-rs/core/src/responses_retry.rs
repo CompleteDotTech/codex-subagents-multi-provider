@@ -71,7 +71,7 @@ pub(crate) async fn handle_response_stream_error(
         sess,
         step_context,
         request,
-        None,
+        /*current_operation*/ None,
     )
     .await
 }

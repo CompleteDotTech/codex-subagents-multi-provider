@@ -383,7 +383,7 @@ pub(crate) async fn prepare_inference(
     }
     CurrentChildOperation::prepare(
         target,
-        None,
+        /*caller*/ None,
         Some(ChildProviderScope::from_step(
             &step.turn.config,
             &step.environments,
@@ -401,7 +401,7 @@ pub(crate) async fn prepare_loaded(
     CurrentChildOperation::prepare(
         manager.get_thread(target).await?,
         Some(manager.get_thread(caller).await?),
-        None,
+        /*scope*/ None,
     )
     .await
 }
