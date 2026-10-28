@@ -61,8 +61,18 @@ impl ThreadManagerState {
             let _residency_guard = residency_guard;
             let authority = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(&thread.session, &thread.session_source).await;
             if !thread.session.services.local_agent_runtime.registry.begin_residency_eviction(&authority) {
+                // Revocation can fence an idle allocation before explicit close removes it.
+                // That still-counted allocation is busy, not capacity progress.
+                let current = manager
+                    .get_thread(thread_id)
+                    .await
+                    .is_ok_and(|registered| Arc::ptr_eq(&registered, &thread));
                 teardown.complete();
-                return Ok(ThreadEvictionOutcome::NotCurrent);
+                return Ok(if current {
+                    ThreadEvictionOutcome::Busy
+                } else {
+                    ThreadEvictionOutcome::NotCurrent
+                });
             }
             thread.ensure_rollout_materialized().await;
             if let Err(err) = thread.shutdown_and_wait().await {

@@ -1096,13 +1096,19 @@ impl LocalAgentControl {
         }));
         let durability_wait_started_at = Instant::now();
         if options.fork_mode.is_some() {
-            tokio::join!(
+            let (checkpoint, ()) = tokio::join!(
                 new_thread
                     .thread
                     .session
-                    .ensure_rollout_materialized(PersistContext::Standard),
+                    .try_ensure_rollout_materialized(PersistContext::Standard),
                 pending_spawn.wait_for_edge(),
             );
+            // Keep PendingSpawn armed until copied history crosses its required
+            // checkpoint and the earlier Open task has finished. No initial input
+            // or acknowledgement may survive a failed Standard checkpoint.
+            checkpoint.map_err(|error| {
+                CodexErr::from(error).with_agent_context(AgentErrorContext::ForkHistory)
+            })?;
         } else {
             pending_spawn.wait_for_edge().await;
         }
