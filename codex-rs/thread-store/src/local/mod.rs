@@ -525,28 +525,33 @@ impl ThreadStore for LocalThreadStore {
         epoch: crate::NativeAuthorityEpoch,
         owner: crate::ThreadWriterOwner,
     ) -> ThreadStoreFuture<'_, ()> {
+        let store = self.clone();
         Box::pin(async move {
-            let _writer = self.live_writer_locks.lock(epoch.thread_id).await;
-            if !self
-                .live_recorders
-                .lock()
-                .await
-                .get(&epoch.thread_id)
-                .is_some_and(|entry| entry.owner.matches(&owner))
-            {
-                return Err(ThreadStoreError::Conflict {
-                    message: "native authority writer was replaced".into(),
-                });
-            }
-            let thread = epoch.thread_id;
-            let generation = epoch.generation;
-            if let Some(entry) = self.live_recorders.lock().await.get_mut(&thread) {
-                entry.authority_generation = Some(generation);
-            }
-            // Bind the expected generation before the storage await so a
-            // cancelled commit can still clean exactly its own provisional row.
-            self.begin_native_authority_epoch(epoch).await?;
-            Ok(())
+            let operation = owner.operation().await?;
+            crate::store::complete_writer_operation(operation, async move {
+                let _writer = store.live_writer_locks.lock(epoch.thread_id).await;
+                if !store
+                    .live_recorders
+                    .lock()
+                    .await
+                    .get(&epoch.thread_id)
+                    .is_some_and(|entry| entry.owner.matches(&owner))
+                {
+                    return Err(ThreadStoreError::Conflict {
+                        message: "native authority writer was replaced".into(),
+                    });
+                }
+                let thread = epoch.thread_id;
+                let generation = epoch.generation;
+                if let Some(entry) = store.live_recorders.lock().await.get_mut(&thread) {
+                    entry.authority_generation = Some(generation);
+                }
+                // Bind the expected generation before the storage await so a
+                // cancelled commit can still clean exactly its own provisional row.
+                store.begin_native_authority_epoch(epoch).await?;
+                Ok(())
+            })
+            .await
         })
     }
     fn create_thread_owned(
@@ -577,13 +582,11 @@ impl ThreadStore for LocalThreadStore {
     ) -> ThreadStoreFuture<'_, ()> {
         let store = self.clone();
         Box::pin(async move {
-            tokio::spawn(async move {
+            let operation = owner.retirement().await?;
+            crate::store::complete_writer_operation(operation, async move {
                 live_writer::finish_thread_owned(&store, thread, owner, discard).await
             })
             .await
-            .map_err(|error| ThreadStoreError::Internal {
-                message: format!("owned writer cleanup task failed: {error}"),
-            })?
         })
     }
     fn native_authority_storage(&self) -> Option<crate::NativeAuthorityStorage> {

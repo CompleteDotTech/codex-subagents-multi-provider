@@ -156,6 +156,101 @@ impl Drop for LiveThreadInitGuard {
 }
 
 impl LiveThread {
+    async fn mutate<T, F, Fut>(&self, work: F) -> ThreadStoreResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut,
+        Fut: Future<Output = ThreadStoreResult<T>> + Send + 'static,
+    {
+        let Some(owner) = &self.owner else {
+            return work(self.clone()).await;
+        };
+        let operation = owner.operation().await?;
+        crate::store::complete_writer_operation(operation, work(self.clone())).await
+    }
+
+    pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let items = raw_items.to_vec();
+        self.mutate(move |thread| async move { thread.append_items_inner(&items).await })
+            .await
+    }
+
+    async fn persist_inherited_items(
+        &self,
+        raw_items: &[RolloutItem],
+    ) -> ThreadStoreResult<Vec<RolloutItem>> {
+        let items = raw_items.to_vec();
+        self.mutate(move |thread| async move { thread.persist_appended_items(&items).await })
+            .await
+    }
+
+    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        self.mutate(move |thread| async move { thread.persist_inner(context).await })
+            .await
+    }
+    pub async fn flush(&self) -> ThreadStoreResult<()> {
+        self.mutate(|thread| async move { thread.flush_inner().await })
+            .await
+    }
+    pub async fn update_memory_mode(
+        &self,
+        mode: ThreadMemoryMode,
+        include_archived: bool,
+    ) -> ThreadStoreResult<()> {
+        self.mutate(move |thread| async move {
+            thread
+                .update_memory_mode_inner(mode, include_archived)
+                .await
+        })
+        .await
+    }
+    pub async fn update_metadata(
+        &self,
+        patch: ThreadMetadataPatch,
+        include_archived: bool,
+    ) -> ThreadStoreResult<StoredThread> {
+        self.mutate(move |thread| async move {
+            thread.update_metadata_inner(patch, include_archived).await
+        })
+        .await
+    }
+
+    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+        let Some(owner) = &self.owner else {
+            return self.shutdown_inner().await;
+        };
+        // Wait for admission in the caller. No detached operation can start if
+        // that wait is cancelled. Once admitted, own metadata AND final cleanup.
+        let operation = owner.operation().await;
+        let thread = self.clone();
+        tokio::spawn(async move {
+            let metadata_result = match operation {
+                Ok(operation) => {
+                    let metadata_thread = thread.clone();
+                    crate::store::complete_writer_operation(operation, async move {
+                        if metadata_thread
+                            .provisional
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            Ok(())
+                        } else {
+                            metadata_thread
+                                .flush_pending_metadata_update_for_existing_history()
+                                .await
+                        }
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            thread.finish_shutdown(metadata_result).await
+        })
+        .await
+        .map_err(|error| ThreadStoreError::Internal {
+            message: format!("owned shutdown task failed: {error}"),
+        })?
+    }
+
     pub async fn begin_native_authority_epoch(
         &self,
         epoch: crate::NativeAuthorityEpoch,
@@ -258,7 +353,7 @@ impl LiveThread {
             .acquire(Self::create_impl(thread_store, params, require_owned))
             .await?;
         live_thread
-            .persist_appended_items(inherited_model_context)
+            .persist_inherited_items(inherited_model_context)
             .await?;
         Ok(live_thread)
     }
@@ -344,7 +439,7 @@ impl LiveThread {
         skip_all,
         fields(item_count = raw_items.len())
     )]
-    pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+    async fn append_items_inner(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
         let items = self.persist_appended_items(raw_items).await?;
         if items.is_empty() {
             return Ok(());
@@ -398,7 +493,7 @@ impl LiveThread {
         Ok(items)
     }
 
-    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+    async fn persist_inner(&self, context: PersistContext) -> ThreadStoreResult<()> {
         if context.allows_background_persistence() {
             let update = self
                 .metadata_sync
@@ -414,19 +509,26 @@ impl LiveThread {
         self.apply_pending_metadata_update(update, context).await
     }
 
-    pub async fn flush(&self) -> ThreadStoreResult<()> {
+    async fn flush_inner(&self) -> ThreadStoreResult<()> {
         self.thread_store.flush_thread(self.thread_id).await?;
         self.flush_pending_metadata_update_for_existing_history()
             .await
     }
 
-    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+    async fn shutdown_inner(&self) -> ThreadStoreResult<()> {
         let metadata_result = if self.provisional.load(std::sync::atomic::Ordering::Acquire) {
             Ok(())
         } else {
             self.flush_pending_metadata_update_for_existing_history()
                 .await
         };
+        self.finish_shutdown(metadata_result).await
+    }
+
+    async fn finish_shutdown(
+        &self,
+        metadata_result: ThreadStoreResult<()>,
+    ) -> ThreadStoreResult<()> {
         let shutdown_result = match &self.owner {
             Some(owner) => {
                 self.thread_store
@@ -487,7 +589,7 @@ impl LiveThread {
             .await
     }
 
-    pub async fn update_memory_mode(
+    async fn update_memory_mode_inner(
         &self,
         mode: ThreadMemoryMode,
         include_archived: bool,
@@ -510,7 +612,7 @@ impl LiveThread {
     ///
     /// Stores may successfully return no thread for a no-op update, so this reads the thread as a
     /// fallback in that case.
-    pub async fn update_metadata(
+    async fn update_metadata_inner(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,

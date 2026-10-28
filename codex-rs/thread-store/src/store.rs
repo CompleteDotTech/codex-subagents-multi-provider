@@ -139,16 +139,152 @@ pub enum NativeAuthorityStorage {
 
 /// Storage-neutral thread persistence boundary.
 /// Store-generated identity only; it grants no native provider authority and
-/// does not retain the operating system writer lock.
+/// does not retain the operating system writer lock. Built-in stores share its
+/// private operation lease with every writer retirement/replacement path; an
+/// admitted LiveThread mutation owns that lease through storage and metadata
+/// acknowledgment. Legacy handles without an owner keep their existing contract.
+/// An incomplete task fails closed rather than treating a dropped future as an
+/// I/O drain. This adds no native authority or serialized identity.
 #[derive(Clone, Debug)]
-pub struct ThreadWriterOwner(Arc<()>, Arc<std::sync::atomic::AtomicBool>);
+pub struct ThreadWriterOwner(Arc<WriterLifetime>, Arc<std::sync::atomic::AtomicBool>);
 
+#[derive(Debug)]
+struct WriterLifetime {
+    operation: Arc<tokio::sync::Mutex<()>>,
+    phase: std::sync::atomic::AtomicU8,
+}
+
+const WRITER_ACTIVE: u8 = 0;
+const WRITER_CLOSING: u8 = 1;
+const WRITER_RETIRED: u8 = 2;
+const WRITER_INCOMPLETE: u8 = 3;
+
+/// A task dropping this lease without completing may have queued storage work.
+/// Keep its writer fail-closed: unlocking a Rust mutex is not an I/O drain.
+pub(crate) struct WriterOperation {
+    owner: ThreadWriterOwner,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    completed: bool,
+    armed: bool,
+}
+
+impl WriterOperation {
+    pub(crate) fn require_active(&self) -> ThreadStoreResult<()> {
+        if self
+            .owner
+            .0
+            .phase
+            .load(std::sync::atomic::Ordering::Acquire)
+            != WRITER_ACTIVE
+        {
+            return Err(ThreadStoreError::Conflict {
+                message: "writer teardown must complete before replacement".into(),
+            });
+        }
+        Ok(())
+    }
+    pub(crate) fn start_retirement(&mut self) {
+        self.armed = true;
+        self.closing();
+    }
+    pub(crate) fn complete(mut self) {
+        self.completed = true;
+    }
+    pub(crate) fn closing(&self) {
+        self.owner
+            .0
+            .phase
+            .store(WRITER_CLOSING, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn retired(&self) {
+        self.owner
+            .0
+            .phase
+            .store(WRITER_RETIRED, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for WriterOperation {
+    fn drop(&mut self) {
+        if self.armed && !self.completed {
+            self.owner
+                .0
+                .phase
+                .store(WRITER_INCOMPLETE, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Admission happens in the caller before spawning. Cancellation while waiting
+/// cannot enqueue a later unwanted operation; after admission the task owns all
+/// real store awaits and the caller may stop waiting without abandoning I/O.
+pub(crate) async fn complete_writer_operation<T: Send + 'static>(
+    operation: WriterOperation,
+    future: impl Future<Output = ThreadStoreResult<T>> + Send + 'static,
+) -> ThreadStoreResult<T> {
+    complete_writer_operations(vec![operation], future).await
+}
+
+pub(crate) async fn complete_writer_operations<T: Send + 'static>(
+    mut operations: Vec<WriterOperation>,
+    future: impl Future<Output = ThreadStoreResult<T>> + Send + 'static,
+) -> ThreadStoreResult<T> {
+    tokio::spawn(async move {
+        for operation in &mut operations {
+            operation.armed = true;
+        }
+        let result = future.await;
+        for operation in &mut operations {
+            operation.completed = true;
+        }
+        result
+    })
+    .await
+    .map_err(|error| ThreadStoreError::Internal {
+        message: format!("owned writer operation did not complete: {error}"),
+    })?
+}
 impl ThreadWriterOwner {
     pub fn new() -> Self {
         Self(
-            Arc::new(()),
+            Arc::new(WriterLifetime {
+                operation: Arc::new(tokio::sync::Mutex::new(())),
+                phase: std::sync::atomic::AtomicU8::new(WRITER_ACTIVE),
+            }),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         )
+    }
+    // Call only while holding this identity's operation lease.
+    pub(crate) fn closing(&self) {
+        self.0
+            .phase
+            .store(WRITER_CLOSING, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn retired(&self) {
+        self.0
+            .phase
+            .store(WRITER_RETIRED, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) async fn operation(&self) -> ThreadStoreResult<WriterOperation> {
+        self.acquire_operation(false).await
+    }
+    pub(crate) async fn retirement(&self) -> ThreadStoreResult<WriterOperation> {
+        self.acquire_operation(true).await
+    }
+    async fn acquire_operation(&self, retirement: bool) -> ThreadStoreResult<WriterOperation> {
+        let guard = self.0.operation.clone().lock_owned().await;
+        let phase = self.0.phase.load(std::sync::atomic::Ordering::Acquire);
+        if phase == WRITER_INCOMPLETE || (!retirement && phase != WRITER_ACTIVE) {
+            return Err(ThreadStoreError::Conflict {
+                message: "thread writer is retired, closing, or has incomplete storage work".into(),
+            });
+        }
+        Ok(WriterOperation {
+            owner: self.clone(),
+            _guard: guard,
+            completed: false,
+            armed: false,
+        })
     }
     pub fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
