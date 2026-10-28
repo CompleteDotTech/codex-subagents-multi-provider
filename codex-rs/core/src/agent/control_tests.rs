@@ -9710,7 +9710,10 @@ async fn post_admission_lifecycle_harness(
     let (home, mut config) = test_config().await;
     config.features.enable(Feature::MultiAgentV2).unwrap();
     if version == MultiAgentVersion::V1 {
-        config.features.disable(Feature::MultiAgentV2);
+        config
+            .features
+            .disable(Feature::MultiAgentV2)
+            .expect("disable MultiAgentV2 for the V1 lifecycle fixture");
     }
     config.model = Some("gpt-5.6-sol".into());
     config.multi_agent_v2.max_concurrent_threads_per_session = 8;

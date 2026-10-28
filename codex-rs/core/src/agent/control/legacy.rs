@@ -7,6 +7,7 @@ use codex_thread_store::PersistContext;
 impl LocalAgentControl {
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
     /// persisted spawn-edge state.
+    #[cfg(test)]
     pub(crate) async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         self.runtime.registry.revoke_caller(agent_id);
         let state = self.runtime.upgrade()?;
@@ -120,6 +121,7 @@ impl LocalAgentControl {
     }
 
     /// Shut down `agent_id` and any live descendants reachable from the in-memory spawn tree.
+    #[cfg(test)]
     pub(crate) async fn shutdown_agent_tree(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.runtime.upgrade()?;
         let captured = self.capture_shutdown(&state, agent_id, true).await;
@@ -127,6 +129,7 @@ impl LocalAgentControl {
             .await
     }
 
+    #[cfg(test)]
     async fn capture_shutdown(
         &self,
         state: &ThreadManagerState,

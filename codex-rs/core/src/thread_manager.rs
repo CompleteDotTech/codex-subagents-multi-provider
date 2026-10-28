@@ -2148,6 +2148,7 @@ impl ThreadManagerState {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn fence_native_subtree(
         &self,
         runtime: &LocalAgentRuntime,
