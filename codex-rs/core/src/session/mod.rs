@@ -253,8 +253,12 @@ mod handlers;
 mod inject;
 mod reasoning_effort;
 mod submission;
+mod submission_channel;
 pub(crate) use reasoning_effort::RequestEffortUsage;
 pub(crate) use submission::Submission;
+pub(crate) use submission_channel::SubmissionReceiver;
+pub(crate) use submission_channel::SubmissionSender;
+pub(crate) use submission_channel::bounded_submission_channel;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;
@@ -424,7 +428,7 @@ pub(crate) enum TokenUsageContext {
 /// completion future observes that shutdown.
 #[derive(Clone)]
 pub(crate) struct SessionIo {
-    pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) tx_sub: SubmissionSender,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
@@ -700,7 +704,7 @@ impl Session {
         if let Some(startup) = &startup {
             startup.check_native_current()?;
         }
-        let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (tx_sub, rx_sub) = bounded_submission_channel(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
         let isolation = thread_extension_init
@@ -1189,22 +1193,7 @@ impl SessionIo {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
         }
-        let permit = self
-            .tx_sub
-            .reserve()
-            .await
-            .map_err(|_| CodexErr::InternalAgentDied)?;
-        if let Some(guard) = guard {
-            // Capacity has already been reserved. This callback only enqueues;
-            // it cannot wait, invoke hooks, or execute the submitted operation.
-            guard.with_current(|| {
-                permit.send(sub);
-                Ok(())
-            })?;
-        } else {
-            permit.send(sub);
-        }
-        Ok(())
+        self.tx_sub.send_guarded(sub, guard).await
     }
 
     /// Submits an ordered turn-input call and waits only for Core's routing decision.

@@ -970,7 +970,9 @@ async fn prepared_fresh_spawn_rejects_stopped_or_replaced_caller(replace: bool) 
     let parent = started.thread;
     persist_thread_for_tree_resume(&parent, "original caller lifetime fixture").await;
     let stored = parent
-        .read_thread(/*include_archived*/ true, /*include_history*/ true)
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
         .await
         .expect("persisted root history");
     let initial = InitialHistory::Resumed(ResumedHistory {
@@ -7130,7 +7132,9 @@ async fn cold_attachment_restriction_declines_sealing_before_any_resume_effect(m
     );
     let stored_root = root
         .thread
-        .read_thread(/*include_archived*/ true, /*include_history*/ true)
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
         .await
         .unwrap();
     let initial = InitialHistory::Resumed(ResumedHistory {
@@ -8643,7 +8647,9 @@ async fn hold_synchronous_read_barrier<T: Send + Sync + 'static>(
             if let Ok(guard) = lock.try_read() {
                 let _ = ready.send(());
                 assert!(
-                    released.recv_timeout(Duration::from_secs(/*secs*/ 30)).is_ok(),
+                    released
+                        .recv_timeout(Duration::from_secs(/*secs*/ 30))
+                        .is_ok(),
                     "synchronous read barrier must be explicitly released"
                 );
                 drop(guard);
@@ -10378,13 +10384,15 @@ async fn legacy_custom_store_root_remains_supported_without_native_owned_writer_
     assert!(harness.manager.list_thread_ids().await.is_empty());
 }
 
-// Exercise the actual reserved-queue implementation with actual registered
+// Exercise the actual guarded-queue implementation with actual registered
 // sessions. A cloned SessionIo replaces only the queue with a bounded observed
 // queue, so no Core task can consume capacity before the publication barrier.
 #[test_case::test_case(0; "prepared operation queue unchanged positive")]
 #[test_case::test_case(1; "publication while queue capacity pending")]
 #[test_case::test_case(2; "permission and environment publication while queue capacity pending")]
 #[test_case::test_case(3; "no-op settings preserves pending operation")]
+#[test_case::test_case(4; "receiver drop wakes every guarded producer")]
+#[test_case::test_case(5; "cancelled guarded producer never queues after capacity release")]
 #[tokio::test]
 async fn loaded_operation_publication_between_check_and_enqueue(change: u8) {
     let revoke = matches!(change, 1 | 2);
@@ -10473,17 +10481,62 @@ stream_idle_timeout_ms = 1000
     guard
         .check()
         .expect("prepared current helper stage is admitted");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (tx, rx) = crate::session::bounded_submission_channel(1);
     let mut io = target.io.clone();
     io.tx_sub = tx;
     io.submit(Op::Interrupt).await.unwrap();
     let submit =
         io.submit_with_trace_guarded(Op::Interrupt, None, None, None, None, None, Some(&guard));
-    let mut submit = std::pin::pin!(submit);
+    let mut submit = Box::pin(submit);
     assert!(
         matches!(futures::poll!(submit.as_mut()), std::task::Poll::Pending),
         "the actual guarded queue must wait for capacity after the initial policy check"
     );
+    if change == 4 {
+        let mut other = Box::pin(io.submit_with_trace_guarded(
+            Op::Interrupt,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&guard),
+        ));
+        assert!(futures::poll!(other.as_mut()).is_pending());
+        drop(rx);
+        let (first, second) = timeout(Duration::from_secs(5), async {
+            (submit.await, other.await)
+        })
+        .await
+        .expect("receiver drop wakes both capacity waiters");
+        assert!(matches!(first, Err(CodexErr::InternalAgentDied)));
+        assert!(matches!(second, Err(CodexErr::InternalAgentDied)));
+        guard
+            .check()
+            .expect("receiver closure does not revoke policy");
+        return;
+    }
+    if change == 5 {
+        drop(submit);
+        assert!(matches!(rx.recv().await.unwrap().op, Op::Interrupt));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        let next_id = timeout(
+            Duration::from_secs(5),
+            io.submit_with_trace_guarded(Op::Interrupt, None, None, None, None, None, Some(&guard)),
+        )
+        .await
+        .expect("later guarded operation does not hang behind a cancelled waiter")
+        .expect("cancelled waiter leaves capacity available to a later operation");
+        assert_eq!(rx.recv().await.unwrap().id, next_id);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        return;
+    }
     if change == 2 {
         let environments = parent.session.inherited_environment_snapshot().await;
         let ready = environments.primary().expect("actual invoking executor");
@@ -10537,10 +10590,7 @@ stream_idle_timeout_ms = 1000
             outcome.expect_err("a prepared operation cannot cross a completed policy publication");
         assert!(loaded_fixture_policy_denial(&error.to_string()), "{error}");
         assert!(
-            matches!(
-                rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
+            matches!(rx.try_recv(), Err(async_channel::TryRecvError::Empty)),
             "the final admission must not enqueue the denied operation"
         );
         let mut later_stage_ran = false;

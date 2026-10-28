@@ -207,6 +207,10 @@ pub(crate) struct LocalAgentRuntime {
 }
 
 impl LocalAgentRuntime {
+    pub(crate) fn shares_registry_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registry, &other.registry)
+    }
+
     pub(crate) fn register_authority(
         &self,
         authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,

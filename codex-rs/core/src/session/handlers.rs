@@ -5,7 +5,6 @@ use crate::realtime_conversation::handle_close as handle_realtime_conversation_c
 use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
-use async_channel::Receiver;
 use codex_features::Feature;
 use codex_otel::set_parent_from_w3c_trace_context;
 use tracing::Instrument;
@@ -444,7 +443,7 @@ pub async fn review(
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
-    rx_sub: Receiver<Submission>,
+    rx_sub: super::SubmissionReceiver,
 ) {
     // Session shutdown and tree shutdown both use the existing teardown handler.
     let mut shutdown_received = false;

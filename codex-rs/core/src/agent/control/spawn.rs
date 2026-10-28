@@ -725,7 +725,7 @@ impl LocalAgentControl {
         }
         let authorization = crate::agent::child_provider_authorization::ChildResumePermit::prepare(
             &self.runtime,
-            caller,
+            Arc::clone(&caller),
             caller_epoch,
             &mut config,
             &initial_history,

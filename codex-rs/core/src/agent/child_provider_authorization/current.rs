@@ -52,20 +52,15 @@ impl CurrentChildOperation {
             .get_thread(origin.root_thread_id())
             .await
             .map_err(|_| invalid("current host policy owner is unavailable"))?;
-        if !Arc::ptr_eq(
-            &runtime.registry,
-            &root.session.services.local_agent_runtime.registry,
-        ) || root.session_source.parent_thread_id().is_some()
+        if !runtime.shares_registry_with(&root.session.services.local_agent_runtime)
+            || root.session_source.parent_thread_id().is_some()
             || root.session.session_id() != ceiling.root_session_id
         {
             return Err(invalid("current host policy owner was replaced"));
         }
         let mut threads = vec![Arc::clone(&root), Arc::clone(&target)];
         if let Some(caller) = &caller {
-            if !Arc::ptr_eq(
-                &runtime.registry,
-                &caller.session.services.local_agent_runtime.registry,
-            ) {
+            if !runtime.shares_registry_with(&caller.session.services.local_agent_runtime) {
                 return Err(invalid("operation caller belongs to another runtime"));
             }
             threads.push(Arc::clone(caller));
@@ -381,14 +376,7 @@ pub(crate) async fn prepare_inference(
             "inference session is no longer the registered allocation",
         ));
     }
-    if step.settings.model_info.slug
-        != target
-            .config_snapshot()
-            .await
-            .model
-            .as_deref()
-            .unwrap_or_default()
-    {
+    if step.settings.model_info.slug != target.config_snapshot().await.model {
         return Err(invalid(
             "inference model differs from the selected runtime model",
         ));

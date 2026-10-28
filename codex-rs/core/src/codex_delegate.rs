@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::session::Submission;
-use async_channel::Receiver;
 use async_channel::Sender;
 use codex_async_utils::OrCancelExt;
 use codex_protocol::protocol::AskForApproval;
@@ -203,7 +202,7 @@ pub(crate) async fn run_codex_thread_interactive(
 /// Keeps delegate IO cancellation identical for standalone and manager-owned reviewers.
 pub(crate) fn forward_session_io(io: Arc<SessionIo>, cancel_token: CancellationToken) -> SessionIo {
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_ops, rx_ops) = crate::session::bounded_submission_channel(SUBMISSION_CHANNEL_CAPACITY);
     // Use a child token so parent cancel cascades but we can scope it to this task
     let cancel_token_events = cancel_token.child_token();
     let cancel_token_ops = cancel_token.child_token();
@@ -323,7 +322,8 @@ pub(crate) async fn run_codex_thread_one_shot(
     // For one-shot usage, return a closed `tx_sub` so callers cannot submit
     // additional ops after the initial request. Create a channel and drop the
     // receiver to close it immediately.
-    let (tx_closed, rx_closed) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_closed, rx_closed) =
+        crate::session::bounded_submission_channel(SUBMISSION_CHANNEL_CAPACITY);
     drop(rx_closed);
 
     Ok((
@@ -413,7 +413,7 @@ async fn forward_event_or_shutdown(
 /// Forward ops from a caller to a sub-agent, respecting cancellation.
 async fn forward_ops(
     io: Arc<SessionIo>,
-    rx_ops: Receiver<Submission>,
+    rx_ops: crate::session::SubmissionReceiver,
     cancel_token_ops: CancellationToken,
 ) {
     loop {
