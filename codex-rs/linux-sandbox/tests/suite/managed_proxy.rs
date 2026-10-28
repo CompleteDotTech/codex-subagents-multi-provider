@@ -255,7 +255,7 @@ fn managed_proxy_path_facts(role: &str, path: &Path, declared_root: &Path) -> St
     format!(
         "MANAGED_PROXY_PATH_DIAG role={role} observation=host-after-failure absolute={} regular={:?} symlink={:?} exec_mode={:?} identity={:?} canonical_equals_logical={:?} declared_root_contains_canonical={:?} canonical_root_contains_canonical={:?}\n",
         path.is_absolute(),
-        metadata.as_ref().map(|info| info.is_file()),
+        metadata.as_ref().map(std::fs::Metadata::is_file),
         std::fs::symlink_metadata(path)
             .ok()
             .map(|info| info.file_type().is_symlink()),
