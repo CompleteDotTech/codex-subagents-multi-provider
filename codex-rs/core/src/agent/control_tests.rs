@@ -9740,6 +9740,8 @@ async fn post_admission_lifecycle_harness(
             .find(|info| info.slug == "gpt-5.5")
             .unwrap();
         info.multi_agent_version = Some(MultiAgentVersion::V1);
+        info.supports_search_tool = false;
+        info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
         info.used_fallback_model_metadata = false;
         std::fs::write(
             home.path().join("lifecycle-v1.json"),
