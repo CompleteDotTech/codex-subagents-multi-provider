@@ -1,0 +1,40 @@
+"""Bazel 9.2 cquery providers(target); raw output stays private.
+
+Provider keys: AbstractConfiguredTarget.tryAddProviderForQuery in Bazel 9.2.0.
+Native keys use key.toString(); Starlark keys use extensionLabel%exportedName.
+Unknown crate fields remain explicit, never synthesized as qualification.
+"""
+def files(value):
+    return sorted([f.path for f in value.to_list()])
+
+def file(value):
+    return value.path if value != None else None
+
+def format(target):
+    ps = providers(target)
+    result = {"label": str(target.label), "provider_keys": sorted(ps.keys())}
+    for key, p in ps.items():
+        if key == "DefaultInfo":
+            result["default"] = {"files": files(p.files), "executable": file(p.files_to_run.executable), "default_runfiles": files(p.default_runfiles.files), "data_runfiles": files(p.data_runfiles.files)}
+        elif key == "RunEnvironmentInfo":
+            result["run_environment"] = {"environment": p.environment, "inherited_environment_names": sorted(p.inherited_environment)}
+        elif key == "OutputGroupInfo":
+            result["output_groups"] = {name: files(getattr(p, name)) for name in dir(p) if type(getattr(p, name)) == "depset"}
+        elif key.endswith("%VoiceExecutablePackageInfo"):
+            result["voice_package"] = {"raw_executable": file(p.raw_executable), "executable": file(p.executable), "dlls": sorted([f.path for f in p.dlls]), "receipt": file(p.receipt)}
+        elif "CrateInfo" in key or "crate_info" in key:
+            # Provider names/available fields are evidence; never synthesize one.
+            fields = {}
+            for name in ["name", "type", "is_test", "edition", "root", "output", "metadata", "rustc_env", "crate"]:
+                if hasattr(p, name):
+                    value = getattr(p, name)
+                    if name in ["root", "output", "metadata"]:
+                        fields[name] = file(value)
+                    elif name == "crate":
+                        fields[name] = {"fields": dir(value), "output": file(getattr(value, "output", None)), "is_test": getattr(value, "is_test", None)}
+                    elif name == "rustc_env":
+                        fields[name] = value
+                    else:
+                        fields[name] = value
+            result[key] = {"fields": dir(p), "selected": fields}
+    return "VOICE_PROVIDER_JSON:" + json.encode(result)

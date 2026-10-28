@@ -296,7 +296,7 @@ jobs:
           output="voice-unsigned/${TARGET}"
           mkdir -p "$output"
           cp -R "$runtime" "$output/runtime"
-          cp bazel-bin/codex-rs/voice-host/codex-voice-host.exe "$output/codex-voice-host.exe"
+          cp bazel-bin/codex-rs/voice-host/codex-voice-host__windows-runtime/codex-voice-host.exe "$output/codex-voice-host.exe"
           chmod -R u+w "$output"
           tar -C "$output" -czf "voice-unsigned-${TARGET}.tar.gz" runtime codex-voice-host.exe
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
