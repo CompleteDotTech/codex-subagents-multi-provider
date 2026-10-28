@@ -12855,8 +12855,14 @@ stream_idle_timeout_ms = 1000
         control,
     };
     let (parent_id, parent) = harness.start_thread().await;
-    assert_eq!(parent.multi_agent_version(), Some(MultiAgentVersion::V1));
+    // Idle V1 sessions resolve their actual backend on the first full turn context.
     let turn = parent.session.new_default_turn().await;
+    assert_eq!(
+        turn.model_info().multi_agent_version,
+        Some(MultiAgentVersion::V1)
+    );
+    assert_eq!(turn.multi_agent_version, MultiAgentVersion::V1);
+    assert_eq!(parent.multi_agent_version(), Some(MultiAgentVersion::V1));
     let step = StepContext::for_test(Arc::clone(&turn));
     let mut prepared = crate::agent::child_config::prepare_agent_spawn_config(
         &parent.session,
@@ -12912,7 +12918,15 @@ stream_idle_timeout_ms = 1000
     reservation.commit(metadata);
     let target_id = started.thread_id;
     let original = started.thread;
+    // Resolve the idle child through the same production full-context path.
+    let target_turn = original.session.new_default_turn().await;
+    assert_eq!(
+        target_turn.model_info().multi_agent_version,
+        Some(MultiAgentVersion::V1)
+    );
+    assert_eq!(target_turn.multi_agent_version, MultiAgentVersion::V1);
     assert_eq!(original.multi_agent_version(), Some(MultiAgentVersion::V1));
+    drop(target_turn);
     assert_eq!(
         original.config_snapshot().await.model_provider_id,
         if selected { "a" } else { "openai" }
