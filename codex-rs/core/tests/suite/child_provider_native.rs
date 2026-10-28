@@ -1188,6 +1188,7 @@ async fn widen_native_fixture_executor(fixture: &Fixture) -> Result<()> {
     let host_file = fixture.home.path().join("config.toml");
     let catalog = fixture.home.path().join("catalog.json");
     let current = fixture.test.codex.environment_selections().await;
+    let current_config = fixture.test.codex.config().await;
     assert!(
         !current.is_empty(),
         "actual invoking environment is required"
@@ -1195,6 +1196,19 @@ async fn widen_native_fixture_executor(fixture: &Fixture) -> Result<()> {
     let requests = current
         .into_iter()
         .map(|mut selection| {
+            // Configured local selections normally inherit FromThread; they
+            // are not the active turn's resolved Ready environment snapshot.
+            if matches!(
+                selection.config,
+                codex_protocol::protocol::EnvironmentConfigState::FromThread
+            ) {
+                selection.config = codex_protocol::protocol::EnvironmentConfigState::Ready(
+                    core_test_support::test_codex::environment_config_for_selection(
+                        &current_config,
+                        &selection,
+                    ),
+                );
+            }
             let codex_protocol::protocol::EnvironmentConfigState::Ready(owner) =
                 &mut selection.config
             else {
@@ -1248,6 +1262,18 @@ async fn native_post_count(server: &MockServer) -> usize {
             request.method.as_str() == "POST" && request.url.path() == "/v1/responses"
         })
         .count()
+}
+
+fn native_advertises_exec_command(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            (object.get("type").and_then(Value::as_str) == Some("function")
+                && object.get("name").and_then(Value::as_str) == Some("exec_command"))
+                || object.values().any(native_advertises_exec_command)
+        }
+        Value::Array(values) => values.iter().any(native_advertises_exec_command),
+        _ => false,
+    }
 }
 
 async fn script_native_followup(server: &MockServer, target: codex_protocol::ThreadId) {
@@ -1481,11 +1507,28 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     let change_policy = async {
         tokio::time::timeout(Duration::from_secs(30), async {
             while !started.exists() {
+                let requests = fixture.a.received_requests().await.expect("recording enabled");
+                if let Some(first) = requests.iter().find(|request| request.method.as_str() == "POST") {
+                    let tools = body(first)["tools"].clone();
+                    assert!(
+                        native_advertises_exec_command(&tools),
+                        "actual selected-provider request must advertise exec_command before the owned tool barrier: {tools}"
+                    );
+                }
+                for request in requests.iter().filter(|request| request.method.as_str() == "POST") {
+                    if let Some(output) = body(request)["input"].as_array().and_then(|items| items.iter().find(|item| {
+                        item["type"].as_str() == Some("function_call_output")
+                            && item["call_id"].as_str() == Some("native-owned-tool-call")
+                    })) {
+                        anyhow::bail!("owned exec_command returned before creating the barrier; setup failure, not policy RED: {output}");
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            Ok::<_, anyhow::Error>(())
         })
         .await
-        .expect("actual exec_command reaches owned barrier");
+        .expect("actual exec_command reaches owned barrier")?;
         if change != 0 {
             revoke_native_fixture_a(fixture.home.path())?;
             let children = fixture.children(1).await?;
