@@ -8973,3 +8973,232 @@ async fn fresh_revoked_running_caller_cannot_cross_final_admission(stage: u8) {
     );
     assert!(harness.manager.list_thread_ids().await.is_empty());
 }
+
+struct PendingPostAdmissionCreate {
+    child: ThreadId,
+    parent: ThreadId,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+struct PostAdmissionCreateGate {
+    inner: InMemoryThreadStore,
+    armed_parent: std::sync::Mutex<Option<ThreadId>>,
+    entered: tokio::sync::mpsc::UnboundedSender<PendingPostAdmissionCreate>,
+}
+
+impl ThreadStore for PostAdmissionCreateGate {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    delegate_fresh_revocation_store! {
+        fn resume_thread(params: codex_thread_store::ResumeThreadParams) -> Arc<Vec<RolloutItem>>;
+        fn append_items(params: codex_thread_store::AppendThreadItemsParams) -> ();
+        fn discard_thread(thread_id: ThreadId) -> ();
+        fn load_history(params: codex_thread_store::LoadThreadHistoryParams) -> codex_thread_store::StoredThreadHistory;
+        fn load_latest_model_context(params: codex_thread_store::LoadThreadHistoryParams) -> codex_thread_store::StoredModelContext;
+        fn read_thread(params: codex_thread_store::ReadThreadParams) -> codex_thread_store::StoredThread;
+        fn read_thread_by_rollout_path(params: codex_thread_store::ReadThreadByRolloutPathParams) -> codex_thread_store::StoredThread;
+        fn list_threads(params: codex_thread_store::ListThreadsParams) -> codex_thread_store::ThreadPage;
+        fn update_thread_metadata(params: codex_thread_store::UpdateThreadMetadataParams) -> Option<codex_thread_store::StoredThread>;
+        fn archive_thread(params: codex_thread_store::ArchiveThreadParams) -> ();
+        fn unarchive_thread(params: codex_thread_store::ArchiveThreadParams) -> codex_thread_store::StoredThread;
+        fn delete_thread(params: codex_thread_store::DeleteThreadParams) -> ();
+        fn flush_thread(thread_id: ThreadId) -> ();
+        fn shutdown_thread(thread_id: ThreadId) -> ();
+    }
+
+    fn persist_thread(
+        &self,
+        thread_id: ThreadId,
+        context: codex_thread_store::PersistContext,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.persist_thread(thread_id, context)
+    }
+
+    fn create_thread(
+        &self,
+        params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let armed = *self.armed_parent.lock().unwrap();
+            if params.parent_thread_id.is_some() && params.parent_thread_id == armed {
+                let parent = armed.expect("armed actual parent");
+                assert_eq!(params.source.parent_thread_id(), Some(parent));
+                assert!(matches!(
+                    &params.source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                ));
+                *self.armed_parent.lock().unwrap() = None;
+                let (release, released) = tokio::sync::oneshot::channel();
+                self.entered
+                    .send(PendingPostAdmissionCreate {
+                        child: params.thread_id,
+                        parent,
+                        release,
+                    })
+                    .expect("actual store gate receiver");
+                released
+                    .await
+                    .expect("release actual post-admission create");
+            }
+            self.inner.create_thread(params).await
+        })
+    }
+}
+
+#[test_case::test_case(0; "current post admission startup registers")]
+#[test_case::test_case(1; "explicit close fences admitted unregistered child")]
+#[test_case::test_case(2; "tree shutdown fences admitted unregistered child")]
+#[tokio::test]
+async fn post_admission_startup_cannot_escape_completed_subtree_shutdown(stage: u8) {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.model = Some("gpt-5.6-sol".into());
+    let (entered, mut pending) = tokio::sync::mpsc::unbounded_channel();
+    let store = Arc::new(PostAdmissionCreateGate {
+        inner: InMemoryThreadStore::default(),
+        armed_parent: std::sync::Mutex::new(None),
+        entered,
+    });
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        store.clone(),
+        /*agent_graph_store*/ None,
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let control = manager.agent_control();
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db: None,
+        manager,
+        control,
+    };
+    let (caller_id, caller) = harness.start_thread().await;
+    caller.ensure_rollout_materialized().await;
+    caller.session.flush_rollout().await.unwrap();
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &caller, "post_admission_child").await;
+    *store.armed_parent.lock().unwrap() = Some(caller_id);
+    let start = fresh_lifetime_lower_start(&harness, &caller, prepared, source, permit);
+    tokio::pin!(start);
+    let blocked = tokio::select! {
+        result = &mut start => panic!("must reach real post-admission store create: {}", result.is_ok()),
+        reached = timeout(Duration::from_secs(/*secs*/ 10), pending.recv()) => reached.unwrap().expect("actual child store create"),
+    };
+    assert_eq!(blocked.parent, caller_id);
+    assert_ne!(blocked.child, caller_id);
+    assert!(caller.is_running());
+    assert_eq!(harness.manager.list_thread_ids().await, vec![caller_id]);
+    if stage == 0 {
+        blocked.release.send(()).unwrap();
+        let child = timeout(Duration::from_secs(/*secs*/ 10), start)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.thread_id, blocked.child);
+        assert!(child.thread.is_running());
+        assert!(Arc::ptr_eq(
+            &child.thread,
+            &harness.manager.get_thread(blocked.child).await.unwrap()
+        ));
+        timeout(
+            Duration::from_secs(/*secs*/ 10),
+            child.thread.shutdown_and_wait(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            harness
+                .manager
+                .remove_thread(&blocked.child)
+                .await
+                .is_some()
+        );
+        timeout(Duration::from_secs(/*secs*/ 10), caller.shutdown_and_wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(harness.manager.remove_thread(&caller_id).await.is_some());
+        return;
+    }
+    let shutdown = async {
+        if stage == 1 {
+            harness.control.close_agent(caller_id).await.map(|_| ())
+        } else {
+            harness
+                .control
+                .shutdown_agent_tree(caller_id)
+                .await
+                .map(|_| ())
+        }
+    };
+    tokio::pin!(shutdown);
+    // Keep polling the independent startup as teardown runs: a repaired owner
+    // may cancel and drain it instead of only rejecting its final registration.
+    // The store gate itself remains closed until teardown has completed.
+    let early = timeout(Duration::from_secs(/*secs*/ 10), async {
+        tokio::select! {
+            result = &mut shutdown => {
+                result.unwrap();
+                None
+            },
+            outcome = &mut start => {
+                assert!(outcome.is_err(), "held real store creation cannot publish a successful child");
+                shutdown.await.unwrap();
+                Some(outcome)
+            },
+        }
+    }).await.expect("actual subtree teardown completes while the admitted store gate is held");
+    assert!(!caller.is_running());
+    assert!(harness.manager.get_thread(caller_id).await.is_err());
+    assert!(harness.manager.get_thread(blocked.child).await.is_err());
+    let released = blocked.release.send(());
+    let outcome = if let Some(outcome) = early {
+        outcome
+    } else {
+        released.expect("independent unfinished startup still owns its store gate");
+        timeout(Duration::from_secs(/*secs*/ 10), start)
+            .await
+            .unwrap()
+    };
+    let registered = harness.manager.get_thread(blocked.child).await.ok();
+    let survivor_present = registered.is_some();
+    let survivor =
+        registered.or_else(|| outcome.as_ref().ok().map(|child| Arc::clone(&child.thread)));
+    let survivor_running = survivor.as_ref().is_some_and(|child| child.is_running());
+    tracing::info!(
+        "POST_ADMISSION_SUBTREE_OBSERVED stage={stage} returned_success={} survivor_present={survivor_present} survivor_running={survivor_running}",
+        outcome.is_ok()
+    );
+    if let Some(child) = survivor {
+        timeout(Duration::from_secs(/*secs*/ 10), child.shutdown_and_wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = harness.manager.remove_thread(&blocked.child).await;
+    }
+    assert!(
+        outcome.is_err(),
+        "completed subtree teardown must reject independently awaited in-flight native startup"
+    );
+    assert!(
+        !survivor_present && !survivor_running,
+        "no admitted child may register or run after completed subtree teardown"
+    );
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
