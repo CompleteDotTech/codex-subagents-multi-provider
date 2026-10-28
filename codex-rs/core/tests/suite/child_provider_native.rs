@@ -1878,7 +1878,7 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
     if revoke {
         revoke_native_fixture_a(fixture.home.path())?;
         publish_native_fixture_host_config(&fixture, None).await?;
-        assert_native_fixture_published_revocation(&fixture.test.codex.config().await);
+        assert_native_fixture_published_revocation(fixture.test.codex.config().await.as_ref());
     }
     std::fs::write(&release, b"release actual request hook")?;
     let status = native_terminal_status(child).await;
@@ -2035,7 +2035,7 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
     if revoke {
         revoke_native_fixture_a(fixture.home.path())?;
         publish_native_fixture_host_config(&fixture, None).await?;
-        assert_native_fixture_published_revocation(&fixture.test.codex.config().await);
+        assert_native_fixture_published_revocation(fixture.test.codex.config().await.as_ref());
     }
     assert!(
         response_started.lock().unwrap().unwrap().elapsed() < Duration::from_secs(10),
