@@ -83,6 +83,28 @@ impl ThreadStore for MetadataFailureStore {
     }
 }
 
+fn owned_user_message(mode: ThreadHistoryMode, thread: ThreadId, text: &str) -> RolloutItem {
+    match mode {
+        ThreadHistoryMode::Legacy => user_message_item(text),
+        ThreadHistoryMode::Paginated => {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: thread,
+                turn_id: "owned-write-retry-turn".into(),
+                item: TurnItem::UserMessage(UserMessageItem {
+                    id: format!("owned-write-{text}"),
+                    client_id: None,
+                    content: vec![codex_protocol::user_input::UserInput::Text {
+                        text: text.into(),
+                        text_elements: Vec::new(),
+                    }],
+                }),
+                started_at_ms: Some(0),
+                completed_at_ms: 1,
+            }))
+        }
+    }
+}
+
 async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMode) {
     let home = TempDir::new().expect("owned temporary home");
     let config = test_config(home.path());
@@ -98,6 +120,15 @@ async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMo
         injected_failures: AtomicUsize::new(0),
     });
     let thread = ThreadId::default();
+    let original_message = owned_user_message(mode, thread, "retired original preview");
+    let replacement_message = owned_user_message(mode, thread, "replacement writer remains usable");
+    for item in [&original_message, &replacement_message] {
+        assert_eq!(
+            codex_rollout::persisted_rollout_items(std::slice::from_ref(item), mode).len(),
+            1,
+            "actual selected history mode must retain each owned user message"
+        );
+    }
     let mut params = create_thread_params(thread);
     params.history_mode = mode;
     params.metadata.cwd = Some(home.path().to_path_buf());
@@ -115,9 +146,7 @@ async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMo
     // The append reaches the real writer first. Only its metadata update fails,
     // leaving an actual append-derived patch retained by the original LiveThread.
     store.fail_metadata.store(true, Ordering::SeqCst);
-    let appended = old
-        .append_items(&[user_message_item("retired original preview")])
-        .await;
+    let appended = old.append_items(&[original_message]).await;
     assert!(
         matches!(appended, Err(ThreadStoreError::Internal { ref message }) if message == "injected owned metadata write failure")
     );
@@ -182,9 +211,7 @@ async fn assert_owned_shutdown_retry_preserves_replacement(mode: ThreadHistoryMo
     let retry = old.shutdown().await;
     let after = replacement.read_thread(true, true).await.unwrap();
     let history_after = serde_json::to_value(&after.history).unwrap();
-    let usable = replacement
-        .append_items(&[user_message_item("replacement writer remains usable")])
-        .await;
+    let usable = replacement.append_items(&[replacement_message]).await;
     let flushed = replacement.flush().await;
     let saved = replacement.load_history(true).await.unwrap();
     let usable_message_saved = serde_json::to_string(&saved.items)
