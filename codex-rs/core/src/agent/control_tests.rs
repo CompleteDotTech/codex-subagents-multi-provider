@@ -9827,12 +9827,50 @@ async fn post_admission_descendant_registration_orders_with_ancestor_shutdown(
     let owner = post_admission_registered_idle_child(&harness, &root, "subtree_owner").await;
     let caller =
         post_admission_registered_idle_child(&harness, &owner, "loaded_grandchild_caller").await;
-    for thread in [&sibling, &owner, &caller] {
-        residency_checkpoint_mark_idle(thread).await;
-    }
+    residency_checkpoint_mark_idle(&sibling).await;
+    residency_checkpoint_mark_idle(&owner).await;
+    // A terminal caller would enqueue its completion in the owner's SessionIo,
+    // retaining the owner's residency read guard until that submission dispatches.
+    // This race needs a loaded caller, not a completed caller with pending mail.
+    let caller_turn = caller.session.new_default_turn().await;
+    assert_eq!(caller_turn.multi_agent_version, MultiAgentVersion::V2);
+    assert_eq!(caller.multi_agent_version(), Some(MultiAgentVersion::V2));
+    assert_eq!(caller.agent_status().await, AgentStatus::PendingInit);
+    assert!(caller.session.active_turn.lock().await.is_none());
     let owner_id = owner.session.thread_id;
     let caller_id = caller.session.thread_id;
     if unloaded {
+        let status = owner.agent_status().await;
+        let active = owner.session.active_turn.lock().await.is_some();
+        let sleeping = owner.session.has_outstanding_durable_sleep();
+        let trigger_mail = owner
+            .session
+            .input_queue
+            .has_trigger_turn_mailbox_items()
+            .await;
+        let same = Arc::ptr_eq(&owner, &harness.manager.get_thread(owner_id).await.unwrap());
+        let registry_current = harness
+            .control
+            .runtime
+            .registry
+            .graph_open_is_current(&owner.session);
+        let retained_matches = harness
+            .control
+            .runtime
+            .retained_authority(owner_id)
+            .is_some_and(|authority| authority.matches_session(&owner.session));
+        let gate_available = owner.residency_gate.try_write().is_ok();
+        assert!(
+            matches!(status, AgentStatus::Completed(_))
+                && !active
+                && !sleeping
+                && !trigger_mail
+                && same
+                && registry_current
+                && retained_matches
+                && gate_available,
+            "actual owner eviction prerequisites: status={status:?} active={active} sleeping={sleeping} trigger_mail={trigger_mail} same={same} registry_current={registry_current} retained_matches={retained_matches} gate_available={gate_available}"
+        );
         assert_eq!(
             harness
                 .manager
@@ -10011,6 +10049,32 @@ async fn post_admission_resume_target_revision_fences_outside_live_caller(stage:
     assert_eq!(turn.multi_agent_version, MultiAgentVersion::V2);
     assert_eq!(root.multi_agent_version(), Some(MultiAgentVersion::V2));
     let target = post_admission_registered_idle_child(&harness, &root, "resume_target").await;
+    // An idle lower-start has no real execution TurnContext yet. Persist its
+    // actual policy observation instead of inheriting the memory store's defaults.
+    let target_turn = target.session.new_default_turn().await;
+    let target_context = target_turn.to_turn_context_item();
+    let caller_context = turn.to_turn_context_item();
+    assert_eq!(
+        target_context.approval_policy,
+        caller_context.approval_policy
+    );
+    assert_eq!(
+        target_context.permission_profile(),
+        caller_context.permission_profile()
+    );
+    assert!(
+        target
+            .session
+            .persist_rollout_items(&[RolloutItem::TurnContext(target_context.clone())])
+            .await
+    );
+    target.session.flush_rollout().await.unwrap();
+    let stored = target.read_thread(false, false).await.unwrap();
+    assert_eq!(stored.approval_mode, caller_context.approval_policy);
+    assert_eq!(
+        stored.permission_profile,
+        caller_context.permission_profile()
+    );
     let target_id = target.session.thread_id;
     let source = target.session_source.clone();
     if stage == 2 {
