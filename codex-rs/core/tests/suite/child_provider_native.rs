@@ -1061,3 +1061,507 @@ async fn explicit_provider_does_not_replace_an_incompatible_role_model_or_fall_b
     }
     Ok(())
 }
+
+async fn native_terminal_status(
+    child: &codex_core::CodexThread,
+) -> codex_protocol::protocol::AgentStatus {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = child.agent_status().await;
+            if matches!(
+                status,
+                codex_protocol::protocol::AgentStatus::Completed(_)
+                    | codex_protocol::protocol::AgentStatus::Errored(_)
+            ) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual child reaches terminal turn status")
+}
+
+fn revoke_native_fixture_a(home: &std::path::Path) -> Result<()> {
+    let path = home.join("config.toml");
+    let mut value: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    let definition = value["model_providers"]["a"].clone();
+    let defaults = value["agents"]["provider_defaults"]["a"].clone();
+    value["agents"]["allowed_model_providers"] = toml::Value::Array(vec![
+        toml::Value::String("openai".into()),
+        toml::Value::String("b".into()),
+    ]);
+    std::fs::write(path, toml::to_string(&value)?)?;
+    assert_eq!(value["model_providers"]["a"], definition);
+    assert_eq!(value["agents"]["provider_defaults"]["a"], defaults);
+    Ok(())
+}
+
+fn native_fixture_policy_denial(error: &str) -> bool {
+    [
+        "child_provider_not_authorized",
+        "child_provider_untrusted_source",
+        "child_provider_policy_conflict",
+    ]
+    .iter()
+    .any(|code| error.contains(code))
+}
+
+fn assert_native_fixture_published_revocation(config: &codex_core::config::Config) {
+    let effective = config.config_layer_stack.effective_config();
+    let allowed = effective["agents"]["allowed_model_providers"]
+        .as_array()
+        .expect("published owned allowlist");
+    assert!(!allowed.iter().any(|id| id.as_str() == Some("a")));
+    assert!(allowed.iter().any(|id| id.as_str() == Some("openai")));
+    assert!(allowed.iter().any(|id| id.as_str() == Some("b")));
+    assert!(
+        effective["model_providers"]["a"].as_table().is_some(),
+        "revocation does not delete the provider definition"
+    );
+    assert!(
+        effective["agents"]["provider_defaults"]["a"]["model_catalog_json"]
+            .as_str()
+            .is_some(),
+        "catalog selection remains present"
+    );
+}
+
+async fn publish_native_fixture_host_config(
+    fixture: &Fixture,
+    target: Option<&codex_core::CodexThread>,
+) -> Result<()> {
+    // A file write is not a publication. Load the real owned user source and use
+    // the same public compare-and-publish operation as an ordinary host refresh.
+    let next = codex_core::config::ConfigBuilder::default()
+        .codex_home(fixture.home.path().to_path_buf())
+        .loader_overrides(codex_config::LoaderOverrides::without_managed_config_for_tests())
+        .harness_overrides(codex_core::config::ConfigOverrides {
+            cwd: Some(fixture.test.cwd.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    let current = fixture.test.codex.config().await;
+    let root_provider = current.model_provider.clone();
+    let root_model = current.model.clone();
+    assert_eq!(
+        fixture
+            .test
+            .codex
+            .refresh_runtime_config(current, next.clone())
+            .await,
+        codex_core::ConfigRefreshOutcome::Published
+    );
+    let published = fixture.test.codex.config().await;
+    assert_native_fixture_published_revocation(&published);
+    assert_eq!(published.model_provider_id, "openai");
+    assert!(
+        published.model_provider == root_provider && published.model == root_model,
+        "actual root model and transport stay unchanged"
+    );
+    if let Some(target) = target {
+        let current = target.config().await;
+        let provider = current.model_provider.clone();
+        let model = current.model.clone();
+        assert_eq!(
+            target.refresh_runtime_config(current, next).await,
+            codex_core::ConfigRefreshOutcome::Published
+        );
+        let published = target.config().await;
+        assert_native_fixture_published_revocation(&published);
+        assert_eq!(published.model_provider_id, "a");
+        assert!(
+            published.model_provider == provider && published.model == model,
+            "publishing host inputs does not reroute the existing selected child"
+        );
+    }
+    tracing::info!(
+        target_published = target.is_some(),
+        "NATIVE_HOST_POLICY_PUBLICATION_OBSERVED"
+    );
+    Ok(())
+}
+
+async fn widen_native_fixture_executor(fixture: &Fixture) -> Result<()> {
+    let cwd = fixture.test.codex.thread_settings_snapshot().await.cwd;
+    let host_file = fixture.home.path().join("config.toml");
+    let catalog = fixture.home.path().join("catalog.json");
+    let current = fixture.test.codex.environment_selections().await;
+    assert!(
+        !current.is_empty(),
+        "actual invoking environment is required"
+    );
+    let requests = current
+        .into_iter()
+        .map(|mut selection| {
+            let codex_protocol::protocol::EnvironmentConfigState::Ready(owner) =
+                &mut selection.config
+            else {
+                panic!("actual invoking environment must be ready")
+            };
+            owner.permission_profile = codex_protocol::models::PermissionProfileSnapshot::legacy(
+                codex_protocol::models::PermissionProfile::Disabled,
+            );
+            selection.into_request()
+        })
+        .collect();
+    fixture
+        .test
+        .codex
+        .update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+            permission_profile: Some(codex_protocol::models::PermissionProfile::Disabled),
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                cwd.clone(),
+                requests,
+            )),
+            ..Default::default()
+        })
+        .await?;
+    let published = fixture.test.codex.environment_selections().await;
+    assert!(!published.is_empty());
+    for selection in published {
+        let codex_protocol::protocol::EnvironmentConfigState::Ready(owner) = selection.config
+        else {
+            panic!("accepted executor configuration must be ready")
+        };
+        let filesystem = owner
+            .permission_profile
+            .permission_profile()
+            .file_system_sandbox_policy();
+        assert!(filesystem.can_write_local_path_with_cwd(&host_file, cwd.as_path()));
+        assert!(filesystem.can_write_local_path_with_cwd(&catalog, cwd.as_path()));
+    }
+    Ok(())
+}
+
+async fn native_post_count(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("actual loopback recording enabled")
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/v1/responses"
+        })
+        .count()
+}
+
+async fn script_native_followup(server: &MockServer, target: codex_protocol::ThreadId) {
+    Mock::given(method("POST")).and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+            .set_body_string(sse(vec![
+                ev_response_created("loaded-followup"),
+                ev_function_call_with_namespace("loaded-followup-call", "collaboration", "followup_task",
+                    &json!({"target":target.to_string(),"message":"continue the existing loaded allocation"}).to_string()),
+                ev_completed("loaded-followup"),
+            ])))
+        .with_priority(1).up_to_n_times(1).mount(server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("root-after-loaded-followup"))
+        .with_priority(2)
+        .mount(server)
+        .await;
+}
+
+#[test_case::test_case(0; "loaded selected provider remains authorized")]
+#[test_case::test_case(1; "loaded selected provider host authorization revoked")]
+#[test_case::test_case(2; "loaded selected provider caller executor scope widened")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_loaded_followup_rechecks_policy_before_target_network(change: u8) -> Result<()> {
+    let fixture = Fixture::new(MultiAgentVersion::V2, None).await?;
+    scripted_spawn(
+        &fixture.root,
+        MultiAgentVersion::V2,
+        "loaded_network_worker",
+        json!({"message":"initial selected-provider turn","model_provider":"a"}),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("loaded-a-complete"))
+        .mount(&fixture.a)
+        .await;
+    fixture
+        .turn("create an ordinary selected-provider child")
+        .await?;
+    let children = fixture.children(1).await?;
+    assert_eq!(children.len(), 1);
+    let child = Arc::clone(&children[0]);
+    let id = child
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await?
+        .thread_id;
+    assert!(matches!(
+        native_terminal_status(&child).await,
+        codex_protocol::protocol::AgentStatus::Completed(_)
+    ));
+    assert_eq!(native_post_count(&fixture.a).await, 1);
+    assert_eq!(child.config_snapshot().await.model_provider_id, "a");
+
+    if change == 1 {
+        revoke_native_fixture_a(fixture.home.path())?;
+        publish_native_fixture_host_config(&fixture, None).await?;
+    } else if change == 2 {
+        widen_native_fixture_executor(&fixture).await?;
+    }
+    fixture.root.reset().await;
+    script_native_followup(&fixture.root, id).await;
+    fixture
+        .turn("follow up without evicting or replacing the existing child")
+        .await?;
+    if change == 0 {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while native_post_count(&fixture.a).await < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("current loaded child makes another real inference");
+        assert!(matches!(
+            native_terminal_status(&child).await,
+            codex_protocol::protocol::AgentStatus::Completed(_)
+        ));
+    }
+    assert!(Arc::ptr_eq(
+        &child,
+        &fixture.test.thread_manager.get_thread(id).await?
+    ));
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        if change == 0 { 2 } else { 1 },
+        "revocation must stop new target HTTP, not merely hide the result"
+    );
+    assert_eq!(
+        native_post_count(&fixture.b).await,
+        0,
+        "no provider fallback"
+    );
+    if change != 0 {
+        assert!(
+            fixture
+                .root
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .iter()
+                .filter(|request| request.method.as_str() == "POST")
+                .any(
+                    |request| body(request)["input"].as_array().is_some_and(|items| items
+                        .iter()
+                        .any(|item| item["type"].as_str() == Some("function_call_output")
+                            && item["call_id"].as_str() == Some("loaded-followup-call")
+                            && native_fixture_policy_denial(&item["output"].to_string())))
+                ),
+            "actual followup tool must report denial before accepting work"
+        );
+    }
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    let root_before = native_post_count(&fixture.root).await;
+    fixture
+        .turn("ordinary OpenAI parent remains usable after child decision")
+        .await?;
+    assert!(native_post_count(&fixture.root).await > root_before);
+    assert_eq!(
+        fixture.test.codex.config_snapshot().await.model_provider_id,
+        "openai"
+    );
+    assert!(Arc::ptr_eq(
+        &child,
+        &fixture.test.thread_manager.get_thread(id).await?
+    ));
+    Ok(())
+}
+
+fn native_continuation_exec_setup(config: &mut codex_core::config::Config) {
+    config
+        .permissions
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)
+        .unwrap();
+    config
+        .permissions
+        .set_permission_profile(codex_protocol::models::PermissionProfile::workspace_write())
+        .unwrap();
+    config.features.enable(Feature::ShellTool).unwrap();
+    for feature in [
+        Feature::CodeMode,
+        Feature::CodeModeOnly,
+        Feature::ToolSearch,
+        Feature::CodeModeToolSearch,
+    ] {
+        config.features.disable(feature).unwrap();
+    }
+}
+
+fn native_owned_barrier_command(
+    started: &std::path::Path,
+    release: &std::path::Path,
+    done: &std::path::Path,
+) -> (String, &'static str) {
+    if core_test_support::test_target_os() == core_test_support::TestTargetOs::Windows {
+        let quote =
+            |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
+        (
+            format!(
+                "Set-Content -LiteralPath {} -Value started; $limit=[DateTime]::UtcNow.AddSeconds(5); while(-not(Test-Path -LiteralPath {})) {{ if([DateTime]::UtcNow -ge $limit) {{ throw 'owned continuation barrier expired' }}; Start-Sleep -Milliseconds 10 }}; Set-Content -LiteralPath {} -Value done; Write-Output 'owned continuation tool completed'",
+                quote(started),
+                quote(release),
+                quote(done)
+            ),
+            "powershell.exe",
+        )
+    } else {
+        let quote =
+            |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        (
+            format!(
+                "printf started > {}; i=0; while ! test -f {}; do i=$((i+1)); if test \"$i\" -ge 500; then exit 77; fi; sleep 0.01; done; printf done > {}; printf 'owned continuation tool completed\\n'",
+                quote(started),
+                quote(release),
+                quote(done)
+            ),
+            "/bin/sh",
+        )
+    }
+}
+
+#[test_case::test_case(0; "existing native turn current before next inference")]
+#[test_case::test_case(1; "existing native turn host publication revokes next inference")]
+#[test_case::test_case(2; "existing native turn host and target publication revoke next inference")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
+    change: u8,
+) -> Result<()> {
+    let fixture =
+        Fixture::with_host_setup(MultiAgentVersion::V2, None, native_continuation_exec_setup)
+            .await?;
+    let started = fixture.test.cwd.path().join("native-continuation-started");
+    let release = fixture.test.cwd.path().join("native-continuation-release");
+    let done = fixture.test.cwd.path().join("native-continuation-done");
+    for path in [&started, &release, &done] {
+        assert!(!path.exists());
+    }
+    let (cmd, shell) = native_owned_barrier_command(&started, &release, &done);
+    let arguments = json!({"cmd":cmd,"shell":shell,"login":false,"tty":false,"yield_time_ms":10000,"timeout_ms":5000,"max_output_tokens":1000});
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse(vec![
+                    ev_response_created("native-owned-tool"),
+                    core_test_support::responses::ev_exec_command_call_with_args(
+                        "native-owned-tool-call",
+                        &arguments,
+                    ),
+                    ev_completed("native-owned-tool"),
+                ])),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&fixture.a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("native-after-owned-tool"))
+        .with_priority(2)
+        .mount(&fixture.a)
+        .await;
+    scripted_spawn(&fixture.root, MultiAgentVersion::V2, "continuation_worker",
+        json!({"message":"execute the supplied bounded owned tool then continue","model_provider":"a"})).await;
+    // The real host changes its own source only after the actual tool is running.
+    // No child tool receives authority to modify the host provider definition.
+    let change_policy = async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual exec_command reaches owned barrier");
+        if change != 0 {
+            revoke_native_fixture_a(fixture.home.path())?;
+            let children = fixture.children(1).await?;
+            assert_eq!(children.len(), 1);
+            publish_native_fixture_host_config(
+                &fixture,
+                if change == 2 {
+                    Some(children[0].as_ref())
+                } else {
+                    None
+                },
+            )
+            .await?;
+        }
+        std::fs::write(&release, "release")?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (root_result, policy_result) = tokio::join!(
+        fixture.turn("delegate actual running child tool work"),
+        change_policy
+    );
+    root_result?;
+    policy_result?;
+    let children = fixture.children(1).await?;
+    assert_eq!(children.len(), 1);
+    let child = Arc::clone(&children[0]);
+    let status = native_terminal_status(&child).await;
+    assert_eq!(
+        std::fs::read_to_string(&done)?.trim(),
+        "done",
+        "actual owned tool must succeed, never convert a missing executable or barrier timeout into policy RED"
+    );
+    let stored = child
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await?;
+    let id = stored.thread_id;
+    let history = stored
+        .history
+        .expect("actual child history including tool result");
+    let successful_tool = history.items.iter().any(|item| matches!(item,
+        codex_history::RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id), output, ..
+        }) if call_id == "native-owned-tool-call" && output.text_content().is_some_and(|text| text.contains("Process exited with code 0") && text.contains("owned continuation tool completed"))));
+    assert!(
+        successful_tool,
+        "actual successful function result must precede the guarded next inference"
+    );
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        if change != 0 { 1 } else { 2 },
+        "no next target network request after revocation inside an existing turn"
+    );
+    if change != 0 {
+        assert!(
+            matches!(status, codex_protocol::protocol::AgentStatus::Errored(ref error) if native_fixture_policy_denial(error)),
+            "{status:?}"
+        );
+    } else {
+        assert!(
+            matches!(status, codex_protocol::protocol::AgentStatus::Completed(_)),
+            "{status:?}"
+        );
+    }
+    assert_eq!(native_post_count(&fixture.b).await, 0);
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    let root_before = native_post_count(&fixture.root).await;
+    fixture
+        .turn("OpenAI parent subsequent turn after actual child tool and decision")
+        .await?;
+    assert!(native_post_count(&fixture.root).await > root_before);
+    assert_eq!(
+        fixture.test.codex.config_snapshot().await.model_provider_id,
+        "openai"
+    );
+    assert!(Arc::ptr_eq(
+        &child,
+        &fixture.test.thread_manager.get_thread(id).await?
+    ));
+    Ok(())
+}
