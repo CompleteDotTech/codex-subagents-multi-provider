@@ -11154,7 +11154,16 @@ async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence
 ) {
     use crate::agent::registry::GraphLifecycleTestPoint;
     use codex_agent_graph_store::ThreadSpawnEdgeStatus;
-    let (harness, graph, _pending) = graph_lifecycle_harness().await;
+    let (mut harness, graph, _pending) = graph_lifecycle_harness().await;
+    if missing_retained {
+        // A real missing-ceiling resume must use the production sealed cold
+        // authority path. Protect the host store before any Session starts.
+        harness
+            .config
+            .permissions
+            .set_permission_profile(PermissionProfile::read_only())
+            .unwrap();
+    }
     let (root_id, root) = harness.start_thread().await;
     let old = post_admission_registered_idle_child(&harness, &root, "graph_absence_aba").await;
     let sibling = post_admission_registered_idle_child(&harness, &root, "graph_aba_sibling").await;
@@ -11163,6 +11172,32 @@ async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence
     graph_publish_actual_open(&harness, &old).await;
     graph_publish_actual_open(&harness, &sibling).await;
     let metadata = harness.control.get_agent_metadata(id).unwrap();
+    let old_registration = harness.control.runtime.retained_authority(id).unwrap();
+    let root_authority = harness.control.runtime.retained_authority(root_id).unwrap();
+    let sibling_authority = harness
+        .control
+        .runtime
+        .retained_authority(sibling.session.thread_id)
+        .unwrap();
+    if missing_retained {
+        // Persist the actual selected runtime context, as a normal completed
+        // turn would, so cold admission need not infer a model from a ceiling.
+        let turn = old.session.new_default_turn().await;
+        assert!(
+            old.session
+                .persist_rollout_items(&[RolloutItem::TurnContext(turn.to_turn_context_item())])
+                .await
+        );
+        old.session.flush_rollout().await.unwrap();
+        assert_eq!(
+            old.read_thread(false, false)
+                .await
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("gpt-5.6-sol")
+        );
+    }
     assert_eq!(
         harness
             .manager
@@ -11172,38 +11207,64 @@ async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence
         ThreadEvictionOutcome::Evicted
     );
     let state = harness.control.runtime.upgrade().unwrap();
-    let control = if missing_retained {
-        // Actual known durable edge/rollout and metadata reservation, with a
-        // fresh canonical controller that has never registered this child.
-        // Restore ONLY the real still-loaded root Session, never saved Config.
-        let control = LocalAgentControl::new(
-            Arc::downgrade(&state),
-            crate::thread_manager::default_thread_id_generator(),
-            None,
-        )
-        .with_session_id(root_id.into(), 8);
-        let root_authority =
-            crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
-                &root.session,
-                &root.session_source,
+    let control = harness.control.clone();
+    if missing_retained {
+        let storage = state.native_authority_storage().unwrap();
+        assert!(
+            crate::agent::child_provider_authorization::durable::protected_storage(
+                &storage,
+                &root_authority.scope,
             )
-            .await;
-        let threads = state.threads.write().await;
-        assert!(Arc::ptr_eq(threads.get(&root_id).unwrap(), &root));
-        control.runtime.register_authority(root_authority);
-        drop(threads);
+        );
+        assert!(
+            crate::agent::child_provider_authorization::durable::protected_storage(
+                &storage,
+                &old_registration.scope,
+            )
+        );
+        let receipt = state
+            .read_native_authority_receipt(id)
+            .await
+            .unwrap()
+            .expect("actual completed eviction must seal cold authority before fault injection");
+        assert_eq!(receipt.epoch.thread_id, id);
+        assert_eq!(receipt.epoch.parent_thread_id, Some(root_id));
+        assert_eq!(receipt.epoch.root_thread_id, root_id);
+        // Controlled missing-retained fixture state in the ACTUAL host runtime.
+        // Remove only this target ceiling; preserve its generation tombstone,
+        // metadata, root/sibling authority, and private provider-origin map.
+        let revision = control.runtime.teardown_revision(id);
         control
             .runtime
             .registry
-            .reserve_spawn_slot(Some(8))
-            .unwrap()
-            .commit(metadata);
-        assert!(control.get_agent_metadata(id).is_some());
+            .remove_retained_authority_for_graph_fixture(id);
+        assert_eq!(control.runtime.teardown_revision(id), revision);
+        let current_metadata = control.get_agent_metadata(id).unwrap();
+        assert_eq!(current_metadata.agent_id, metadata.agent_id);
+        assert_eq!(current_metadata.agent_path, metadata.agent_path);
+        assert_eq!(current_metadata.agent_nickname, metadata.agent_nickname);
+        assert_eq!(current_metadata.agent_role, metadata.agent_role);
         assert!(control.runtime.retained_authority(id).is_none());
-        control
-    } else {
-        harness.control.clone()
-    };
+        assert!(Arc::ptr_eq(
+            &root_authority,
+            &control.runtime.retained_authority(root_id).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &sibling_authority,
+            &control
+                .runtime
+                .retained_authority(sibling.session.thread_id)
+                .unwrap()
+        ));
+    }
+    assert!(Arc::ptr_eq(
+        &control.runtime.child_provider_origins,
+        &root
+            .session
+            .services
+            .local_agent_runtime
+            .child_provider_origins
+    ));
     let pause = control
         .runtime
         .registry
@@ -11214,6 +11275,9 @@ async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence
         .await
         .unwrap();
     assert!(harness.manager.get_thread(id).await.is_err());
+    if missing_retained {
+        assert!(control.runtime.retained_authority(id).is_none());
+    }
     assert_eq!(
         control
             .resume_agent_from_rollout(harness.config.clone(), id, source)
@@ -11224,6 +11288,7 @@ async fn graph_old_absent_close_rejects_new_registration_evicted_back_to_absence
     let replacement = harness.manager.get_thread(id).await.unwrap();
     let new_registration = control.runtime.retained_authority(id).unwrap();
     assert!(new_registration.matches_session(&replacement.session));
+    assert!(!old_registration.same_registration(&new_registration));
     assert!(!Arc::ptr_eq(&old, &replacement));
     assert!(graph_edge_has_status(&graph, root_id, id, ThreadSpawnEdgeStatus::Open).await);
     assert_eq!(

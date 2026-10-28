@@ -156,6 +156,26 @@ pub(crate) struct GraphLifecyclePause {
 }
 
 impl AgentRegistry {
+    /// Controlled missing-retained graph fixture only. Keep the canonical
+    /// registration tombstone, metadata, and every other authority untouched.
+    #[cfg(test)]
+    pub(crate) fn remove_retained_authority_for_graph_fixture(&self, thread: ThreadId) {
+        let mut state = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.retained_authority.remove(&thread).unwrap();
+        assert!(entry.phase == CallerPhase::CompletedResidencyEviction);
+        assert_eq!(
+            state
+                .lifecycles
+                .get(&thread)
+                .unwrap()
+                .registration_generation,
+            Some(entry.authority.registration_id())
+        );
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_graph_at(
         &self,
