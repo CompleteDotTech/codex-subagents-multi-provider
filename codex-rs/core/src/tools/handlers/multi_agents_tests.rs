@@ -4431,11 +4431,22 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
     assert_eq!(result.previous_status, status_before);
     assert_eq!(success, Some(true));
 
-    let ops = manager.captured_ops();
-    let submitted_shutdown = ops
-        .iter()
-        .any(|(id, op)| *id == agent_id && matches!(op, Op::Shutdown));
-    assert_eq!(submitted_shutdown, true);
+    // close_agent now tears down through the original SessionIo rather than
+    // manager send_op. Observe the real target's shutdown, not that old wrapper.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                thread.thread.next_event().await.unwrap().msg,
+                EventMsg::ShutdownComplete
+            ) {
+                break;
+            }
+        }
+        thread.thread.wait_until_terminated().await;
+    })
+    .await
+    .expect("actual closed target must publish ShutdownComplete and terminate");
+    assert!(!thread.thread.is_running());
 
     let status_after = manager.agent_control().get_status(agent_id).await;
     assert_eq!(status_after, AgentStatus::NotFound);

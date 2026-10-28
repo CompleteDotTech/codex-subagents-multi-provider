@@ -1214,7 +1214,6 @@ async fn cancelled_spawn_after_input_admission_discards_child() {
         "cancelled spawn must not leave an accepted child registered"
     );
     child.wait_until_terminated().await;
-    assert_thread_not_loaded(&harness.manager, child_id).await;
     harness
         .control
         .runtime
@@ -1222,6 +1221,7 @@ async fn cancelled_spawn_after_input_admission_discards_child() {
         .wait()
         .await
         .expect("provisional cleanup releases tree membership");
+    assert_thread_not_loaded(&harness.manager, child_id).await;
 }
 
 #[tokio::test]
@@ -5915,10 +5915,34 @@ async fn list_agent_subtree_thread_ids_finds_live_descendants_of_unloaded_root()
     assert_eq!(subtree_thread_ids, expected_subtree_thread_ids);
 }
 
+// Tree teardown submits through the actual SessionIo, not the manager send_op
+// observer. Retain each original allocation and prove its own shutdown event.
+async fn completed_shutdown_ids(threads: &[Arc<CodexThread>]) -> Vec<ThreadId> {
+    let mut ids = Vec::new();
+    for thread in threads {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    thread.next_event().await.unwrap().msg,
+                    EventMsg::ShutdownComplete
+                ) {
+                    break;
+                }
+            }
+            thread.wait_until_terminated().await;
+        })
+        .await
+        .expect("actual retained allocation must publish ShutdownComplete and terminate");
+        assert!(!thread.is_running());
+        ids.push(thread.session.thread_id);
+    }
+    ids
+}
+
 #[tokio::test]
 async fn shutdown_agent_tree_closes_live_descendants() {
     let harness = AgentControlHarness::new().await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
         .control
@@ -5987,12 +6011,12 @@ async fn shutdown_agent_tree_closes_live_descendants() {
         AgentStatus::NotFound
     );
 
-    let shutdown_ids = harness
-        .manager
-        .captured_ops()
-        .into_iter()
-        .filter_map(|(thread_id, op)| matches!(op, Op::Shutdown).then_some(thread_id))
-        .collect::<Vec<_>>();
+    let shutdown_ids = completed_shutdown_ids(&[
+        Arc::clone(&parent_thread),
+        Arc::clone(&child_thread),
+        Arc::clone(&grandchild_thread),
+    ])
+    .await;
     let mut expected_shutdown_ids = vec![parent_thread_id, child_thread_id, grandchild_thread_id];
     expected_shutdown_ids.sort_by_key(std::string::ToString::to_string);
     let mut shutdown_ids = shutdown_ids;
@@ -6003,7 +6027,7 @@ async fn shutdown_agent_tree_closes_live_descendants() {
 #[tokio::test]
 async fn shutdown_agent_tree_closes_descendants_when_started_at_child() {
     let harness = AgentControlHarness::new().await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
         .control
@@ -6078,12 +6102,12 @@ async fn shutdown_agent_tree_closes_descendants_when_started_at_child() {
         AgentStatus::NotFound
     );
 
-    let shutdown_ids = harness
-        .manager
-        .captured_ops()
-        .into_iter()
-        .filter_map(|(thread_id, op)| matches!(op, Op::Shutdown).then_some(thread_id))
-        .collect::<Vec<_>>();
+    let shutdown_ids = completed_shutdown_ids(&[
+        Arc::clone(&parent_thread),
+        Arc::clone(&child_thread),
+        Arc::clone(&grandchild_thread),
+    ])
+    .await;
     let mut expected_shutdown_ids = vec![parent_thread_id, child_thread_id, grandchild_thread_id];
     expected_shutdown_ids.sort_by_key(std::string::ToString::to_string);
     let mut shutdown_ids = shutdown_ids;
@@ -9707,7 +9731,35 @@ async fn post_admission_lifecycle_harness(
     Arc<PostAdmissionCreateGate>,
     tokio::sync::mpsc::UnboundedReceiver<PendingPostAdmissionCreate>,
 ) {
-    let (home, mut config) = test_config().await;
+    let (home, mut config) = if version == MultiAgentVersion::V1 {
+        let home = TempDir::new().unwrap();
+        let mut info = codex_models_manager::bundled_models_response()
+            .unwrap()
+            .models
+            .into_iter()
+            .find(|info| info.slug == "gpt-5.5")
+            .unwrap();
+        info.multi_agent_version = Some(MultiAgentVersion::V1);
+        info.used_fallback_model_metadata = false;
+        std::fs::write(
+            home.path().join("lifecycle-v1.json"),
+            serde_json::to_vec(&serde_json::json!({"models": [info]})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model = \"gpt-5.5\"\nmodel_catalog_json = \"lifecycle-v1.json\"\n",
+        )
+        .unwrap();
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        (home, config)
+    } else {
+        test_config().await
+    };
     config.features.enable(Feature::MultiAgentV2).unwrap();
     if version == MultiAgentVersion::V1 {
         config
@@ -9715,7 +9767,9 @@ async fn post_admission_lifecycle_harness(
             .disable(Feature::MultiAgentV2)
             .expect("disable MultiAgentV2 for the V1 lifecycle fixture");
     }
-    config.model = Some("gpt-5.6-sol".into());
+    if version == MultiAgentVersion::V2 {
+        config.model = Some("gpt-5.6-sol".into());
+    }
     config.multi_agent_v2.max_concurrent_threads_per_session = 8;
     config.agent_max_depth = 8;
     let (entered, pending) = tokio::sync::mpsc::unbounded_channel();
@@ -9766,9 +9820,14 @@ async fn post_admission_descendant_registration_orders_with_ancestor_shutdown(
     let (harness, store, mut pending) =
         post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
     let (root_id, root) = harness.start_thread().await;
-    let sibling = idle_fresh_capacity_resident(&harness, &root, "independent_sibling").await;
-    let owner = idle_fresh_capacity_resident(&harness, &root, "subtree_owner").await;
-    let caller = idle_fresh_capacity_resident(&harness, &owner, "loaded_grandchild_caller").await;
+    let sibling =
+        post_admission_registered_idle_child(&harness, &root, "independent_sibling").await;
+    let owner = post_admission_registered_idle_child(&harness, &root, "subtree_owner").await;
+    let caller =
+        post_admission_registered_idle_child(&harness, &owner, "loaded_grandchild_caller").await;
+    for thread in [&sibling, &owner, &caller] {
+        residency_checkpoint_mark_idle(thread).await;
+    }
     let owner_id = owner.session.thread_id;
     let caller_id = caller.session.thread_id;
     if unloaded {
@@ -9946,6 +10005,9 @@ async fn post_admission_resume_target_revision_fences_outside_live_caller(stage:
     let (harness, store, mut pending) =
         post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
     let (root_id, root) = harness.start_thread().await;
+    let turn = root.session.new_default_turn().await;
+    assert_eq!(turn.multi_agent_version, MultiAgentVersion::V2);
+    assert_eq!(root.multi_agent_version(), Some(MultiAgentVersion::V2));
     let target = post_admission_registered_idle_child(&harness, &root, "resume_target").await;
     let target_id = target.session.thread_id;
     let source = target.session_source.clone();
@@ -9970,7 +10032,7 @@ async fn post_admission_resume_target_revision_fences_outside_live_caller(stage:
             .resume_agent_from_rollout(harness.config.clone(), target_id, source);
     tokio::pin!(resume);
     let blocked = tokio::select! {
-        result = &mut resume => panic!("must enter actual resume acquisition after admission: {}", result.is_ok()),
+        result = &mut resume => panic!("must enter actual resume acquisition after admission: {result:?}"),
         entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
     };
     assert_eq!(blocked.child, target_id);
@@ -10057,6 +10119,12 @@ async fn post_admission_v1_startup_cannot_escape_completed_subtree_shutdown(stag
     let (harness, store, mut pending) =
         post_admission_lifecycle_harness(MultiAgentVersion::V1).await;
     let (caller_id, caller) = harness.start_thread().await;
+    let turn = caller.session.new_default_turn().await;
+    assert_eq!(
+        turn.model_info().multi_agent_version,
+        Some(MultiAgentVersion::V1)
+    );
+    assert_eq!(turn.multi_agent_version, MultiAgentVersion::V1);
     caller.ensure_rollout_materialized().await;
     caller.session.flush_rollout().await.unwrap();
     let (prepared, source, permit) =
