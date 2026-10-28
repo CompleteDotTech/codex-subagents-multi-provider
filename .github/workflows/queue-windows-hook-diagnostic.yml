@@ -1,0 +1,64 @@
+name: One Windows queue hook diagnostic
+
+on:
+  push:
+    branches:
+      - diagnostic/18-windows-queue-hook-28a6d1e4
+
+permissions:
+  contents: read
+
+concurrency:
+  group: queue-hook-diagnostic-28a6d1e4-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  queue-hook-diagnostic:
+    if: ${{ github.event.created == true && github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && github.ref == 'refs/heads/diagnostic/18-windows-queue-hook-28a6d1e4' }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      CODEX_QUEUE_DIAGNOSTIC_NONCE: 28a6d1e4
+      # The user explicitly authorized the existing runtime-tools license declaration.
+      BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA: "1"
+    steps:
+      - name: Enable long paths for Windows checkout
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Prepare the existing Windows GNU Bazel route
+        uses: ./.github/actions/prepare-bazel-ci
+        with:
+          target: x86_64-pc-windows-gnullvm
+          native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && secrets.BUILDBUDDY_API_KEY == '' }}
+          cache-scope: bazel-test
+
+      - name: Execute the entire queue service target once
+        shell: bash
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          set -euo pipefail
+          ./.github/scripts/run-bazel-ci.sh \
+            --print-failed-action-summary \
+            --print-failed-test-logs \
+            --windows-cross-compile \
+            --remote-download-toplevel \
+            -- \
+            test \
+            --skip_incompatible_explicit_targets \
+            --test_tag_filters=-argument-comment-lint \
+            --test_verbose_timeout_warnings \
+            --nocache_test_results \
+            --runs_per_test=1 \
+            --flaky_test_attempts=1 \
+            --test_env=CODEX_QUEUE_DIAGNOSTIC_NONCE=28a6d1e4 \
+            --build_metadata=COMMIT_SHA=${GITHUB_SHA} \
+            --build_metadata=TAG_queue_hook_diagnostic=28a6d1e4 \
+            -- \
+            //codex-rs/ext/queue:queue-queue_service-test

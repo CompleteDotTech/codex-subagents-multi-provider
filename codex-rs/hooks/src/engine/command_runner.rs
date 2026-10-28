@@ -241,6 +241,9 @@ pub(crate) async fn run_command(
 
     let mut command = build_command(&runtime.shell, command_line, &runtime.environment, env);
     command.current_dir(cwd);
+    #[cfg(windows)]
+    let mut queue_diagnostic =
+        QueueHookDiagnostic::selected(&runtime.shell, command_line, env, &command, started);
 
     #[cfg(windows)]
     let (child, process_tree_job) = match JobObject::spawn_background(&mut command) {
@@ -253,6 +256,10 @@ pub(crate) async fn run_command(
     let mut child = match child {
         Ok(child) => child,
         Err(err) => {
+            #[cfg(windows)]
+            if let Some(diagnostic) = queue_diagnostic.as_mut() {
+                diagnostic.spawn_error(err.raw_os_error());
+            }
             return finish_command_run(
                 started_at,
                 started,
@@ -266,6 +273,10 @@ pub(crate) async fn run_command(
             );
         }
     };
+    #[cfg(windows)]
+    if let Some(diagnostic) = queue_diagnostic.as_mut() {
+        diagnostic.record(serde_json::json!({"stage":"spawned"}));
+    }
 
     let mut process_tree_guard = ProcessTreeGuard {
         process_id: child.id(),
@@ -292,7 +303,7 @@ pub(crate) async fn run_command(
 
     // Drain output while sending input so neither pipe can block the other, and
     // include stdin writes in the deadline even when the hook never reads them.
-    match timeout(
+    let result = match timeout(
         duration.saturating_sub(timeout_started.elapsed()),
         try_join(write_stdin, wait_with_output),
     )
@@ -339,6 +350,256 @@ pub(crate) async fn run_command(
                 outcome: "timeout",
             },
         ),
+    };
+    drop(process_tree_guard);
+    #[cfg(windows)]
+    if let Some(diagnostic) = queue_diagnostic.as_mut() {
+        diagnostic.completed(&result);
+    }
+    result
+}
+
+// Temporary, diagnostic-branch-only observer. Never merge into accepted product source.
+#[cfg(windows)]
+struct QueueHookDiagnostic {
+    path: std::path::PathBuf,
+    started: Instant,
+    finished: bool,
+}
+
+#[cfg(windows)]
+impl QueueHookDiagnostic {
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    fn selected(
+        shell: &CommandShell,
+        command_line: &str,
+        env: &HashMap<String, String>,
+        command: &Command,
+        started: Instant,
+    ) -> Option<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("28a6d1e4")
+            || env.get("CODEX_QUEUE_HOOK_DIAG_NONCE").map(String::as_str) != Some("28a6d1e4")
+        {
+            return None;
+        }
+        let script = std::path::PathBuf::from(env.get("CODEX_QUEUE_HOOK_DIAG_SCRIPT")?);
+        let log = std::path::PathBuf::from(env.get("CODEX_QUEUE_HOOK_DIAG_LOG")?);
+        let home = script.parent()?;
+        if script.file_name()? != "queue_prompt_hook.py"
+            || log != home.join("queue_prompt_hook.log")
+            || command_line != format!("python3 {}", script.display())
+            || !script.is_absolute()
+            || !std::fs::symlink_metadata(&script)
+                .ok()?
+                .file_type()
+                .is_file()
+            || script.canonicalize().ok()?.parent()? != home.canonicalize().ok()?
+        {
+            return None;
+        }
+        let source = std::fs::read_to_string(&script).ok()?;
+        let log_text = log.to_str()?;
+        if source.len() > 4096 || source.matches(log_text).count() != 1 {
+            return None;
+        }
+        let normalized = source.replace(log_text, "<TEST_LOG>");
+        if Self::digest(normalized.as_bytes())
+            != "e9a4daeacb568f3357da1eca872716ceb5db7aa12f28398ba91d8af8c35ae0c7"
+        {
+            return None;
+        }
+        if LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+            eprintln!("QUEUE_HOOK_DIAGNOSTIC launch_bound_exceeded");
+            return None;
+        }
+        let path = home.join("queue_hook_diagnostic_28a6d1e4.jsonl");
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+        {
+            return None;
+        }
+        let observer = Self {
+            path,
+            started,
+            finished: false,
+        };
+        let actual = command.as_std();
+        let program_bytes = actual
+            .get_program()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let basename = Path::new(actual.get_program())
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let program_kind = match basename.as_str() {
+            "cmd" | "cmd.exe" => "cmd",
+            "pwsh" | "pwsh.exe" => "pwsh",
+            "powershell" | "powershell.exe" => "powershell",
+            "sh" | "sh.exe" | "bash" | "bash.exe" => "sh",
+            _ => "other",
+        };
+        let mut flag_mask = 0_u32;
+        let mut unknown_args = 0_usize;
+        let mut command_arg = false;
+        let mut argc = 0_usize;
+        for argument in actual.get_args() {
+            argc += 1;
+            let value = argument.to_string_lossy();
+            let bit = match value.to_ascii_lowercase().as_str() {
+                "/c" => 1,
+                "/d" => 2,
+                "/s" => 4,
+                "-c" => 8,
+                "-command" => 16,
+                "-noprofile" => 32,
+                "-noninteractive" => 64,
+                _ => 0,
+            };
+            flag_mask |= bit;
+            if value == command_line || value == format!("\"{command_line}\"") {
+                command_arg = true;
+            } else if bit == 0 {
+                unknown_args += 1;
+            }
+        }
+        observer.record(serde_json::json!({
+            "stage":"built", "shell_source":if shell.program.is_empty() {"fallback"} else {"explicit"},
+            "program_kind":program_kind,"program_path_sha256":Self::digest(&program_bytes),
+            "argc":argc,"arg_flag_mask":flag_mask,"unknown_args":unknown_args,"exact_command_arg":command_arg,
+            "command_sha256":Self::digest(command_line.as_bytes()),"script_sha256":Self::digest(source.as_bytes()),
+            "normalized_script_sha256":Self::digest(normalized.as_bytes()),"script_has_space":script.to_string_lossy().contains(char::is_whitespace),
+            "script_arg_quoted":false,"script_regular":true
+        }));
+        Some(observer)
+    }
+
+    fn record(&self, mut value: serde_json::Value) {
+        use std::io::Write;
+        value["nonce"] = serde_json::json!("28a6d1e4");
+        value["elapsed_ms"] =
+            serde_json::json!(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+        let Ok(mut line) = serde_json::to_vec(&value) else {
+            return;
+        };
+        if line.len() > 2048 {
+            return;
+        }
+        line.push(b'\n');
+        let current = std::fs::symlink_metadata(&self.path);
+        if current
+            .as_ref()
+            .is_ok_and(|m| !m.is_file() || m.file_type().is_symlink() || m.len() > 30720)
+        {
+            eprintln!("QUEUE_HOOK_DIAGNOSTIC record_bound_or_identity_rejected");
+            return;
+        }
+        let file = if current.is_err() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)
+        } else {
+            std::fs::OpenOptions::new().append(true).open(&self.path)
+        };
+        if file.and_then(|mut f| f.write_all(&line)).is_err() {
+            eprintln!("QUEUE_HOOK_DIAGNOSTIC record_write_failed");
+        }
+    }
+
+    fn spawn_error(&mut self, os_error: Option<i32>) {
+        self.record(serde_json::json!({"stage":"spawn_error","raw_os_error":os_error}));
+        self.finished = true;
+    }
+
+    fn completed(&mut self, result: &HandlerRunResult) {
+        let lower = result
+            .stderr
+            .chars()
+            .take(4096)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let classification = if lower.contains("commandnotfoundexception") {
+            "powershell_command_not_found"
+        } else if lower.contains("not recognized") || lower.contains("not found") {
+            "command_not_found"
+        } else if lower.contains("can't open file") || lower.contains("cannot open file") {
+            "python_cannot_open_file"
+        } else if lower.contains("jsondecodeerror") {
+            "json_decode"
+        } else if lower.contains("permissionerror") || lower.contains("permission denied") {
+            "permission_denied"
+        } else if lower.is_empty() {
+            "empty"
+        } else {
+            "other"
+        };
+        let mut entry = false;
+        let mut decoded = false;
+        let mut appended = false;
+        let mut executable_hash = None;
+        let mut version = [None; 3];
+        for line in result.stderr.lines().take(64) {
+            let Some(json) = line.strip_prefix("QUEUE_HOOK_DIAG ") else {
+                continue;
+            };
+            if json.len() > 1024 {
+                continue;
+            }
+            let Ok(marker) = serde_json::from_str::<serde_json::Value>(json) else {
+                continue;
+            };
+            if marker["nonce"].as_str() != Some("28a6d1e4") {
+                continue;
+            }
+            match marker["phase"].as_str() {
+                Some("entry") => entry = true,
+                Some("decoded") => decoded = true,
+                Some("log_appended") => appended = true,
+                _ => continue,
+            }
+            if let Some(hash) = marker["executable_path_sha256"]
+                .as_str()
+                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                executable_hash = Some(hash.to_owned());
+            }
+            for (index, component) in version.iter_mut().enumerate() {
+                *component = marker["version"][index].as_u64().filter(|n| *n < 10000);
+            }
+        }
+        let error_kind = result.error.as_deref().map(|error| {
+            if error.starts_with("hook timed out after ") {
+                "timeout"
+            } else if error.starts_with("failed to write hook stdin:") {
+                "stdin_error"
+            } else {
+                "other"
+            }
+        });
+        self.record(serde_json::json!({"stage":"completed","exit_code":result.exit_code,"error_kind":error_kind,
+            "stdout_bytes":result.stdout.len(),"stdout_sha256":Self::digest(result.stdout.as_bytes()),
+            "stderr_bytes":result.stderr.len(),"stderr_sha256":Self::digest(result.stderr.as_bytes()),"stderr_class":classification,
+            "python_entry":entry,"python_decoded":decoded,"python_log_appended":appended,
+            "python_executable_path_sha256":executable_hash,"python_major":version[0],"python_minor":version[1],"python_micro":version[2]}));
+        self.finished = true;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for QueueHookDiagnostic {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record(serde_json::json!({"stage":"cancelled_before_completion"}));
+        }
     }
 }
 

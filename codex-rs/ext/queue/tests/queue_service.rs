@@ -153,7 +153,7 @@ fn install_registered_queue(
 fn write_rejecting_prompt_hook(home: &Path) {
     let script_path = home.join("queue_prompt_hook.py");
     let log_path = home.join("queue_prompt_hook.log");
-    let script = format!(
+    let mut script = format!(
         r#"import json
 from pathlib import Path
 import sys
@@ -166,9 +166,23 @@ if payload["prompt"] == "blocked":
 "#,
         log_path = log_path.display(),
     );
+    // Diagnostic branch only: the original interpreter/command and hook decision stay unchanged.
+    let diagnostic =
+        cfg!(windows) && std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() == Ok("28a6d1e4");
+    if diagnostic {
+        script = script
+            .replace("payload = json.load(sys.stdin)", concat!(r#"import hashlib
+
+def _queue_diag(phase):
+    print("QUEUE_HOOK_DIAG " + json.dumps({"nonce": "28a6d1e4", "phase": phase, "executable_path_sha256": hashlib.sha256(sys.executable.encode("utf-8", "surrogatepass")).hexdigest(), "version": list(sys.version_info[:3])}), file=sys.stderr, flush=True)
+
+_queue_diag("entry")
+"#, "\npayload = json.load(sys.stdin)\n_queue_diag(\"decoded\")"))
+            .replace("if payload[\"prompt\"] == \"blocked\":", "_queue_diag(\"log_appended\")\nif payload[\"prompt\"] == \"blocked\":");
+    }
     std::fs::write(&script_path, script)
         .unwrap_or_else(|error| panic!("write queue hook script: {error}"));
-    let hooks = serde_json::json!({
+    let mut hooks = serde_json::json!({
         "hooks": {
             "UserPromptSubmit": [{
                 "hooks": [{
@@ -178,8 +192,179 @@ if payload["prompt"] == "blocked":
             }]
         }
     });
+    if diagnostic {
+        hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["env"] = serde_json::json!({
+            "CODEX_QUEUE_HOOK_DIAG_NONCE": "28a6d1e4",
+            "CODEX_QUEUE_HOOK_DIAG_SCRIPT": script_path,
+            "CODEX_QUEUE_HOOK_DIAG_LOG": log_path,
+        });
+    }
     std::fs::write(home.join("hooks.json"), hooks.to_string())
         .unwrap_or_else(|error| panic!("write queue hooks: {error}"));
+}
+
+struct QueueHookDiagnostic {
+    home: std::path::PathBuf,
+    passed: bool,
+    events: Mutex<Vec<serde_json::Value>>,
+}
+
+impl QueueHookDiagnostic {
+    fn new(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            passed: false,
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn observe(&self, event: &EventMsg) {
+        if !cfg!(windows)
+            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("28a6d1e4")
+        {
+            return;
+        }
+        if let EventMsg::HookCompleted(completed) = event {
+            let mut events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if events.len() < 8 {
+                events.push(serde_json::json!({"kind":"hook_completed","status":format!("{:?}", completed.run.status),"entries":completed.run.entries.len(),"duration_ms":completed.run.duration_ms}));
+            }
+        }
+    }
+
+    fn safe_record(record: &serde_json::Value) -> bool {
+        let Some(fields) = record.as_object() else {
+            return false;
+        };
+        let allowed = [
+            "nonce",
+            "stage",
+            "elapsed_ms",
+            "shell_source",
+            "program_kind",
+            "program_path_sha256",
+            "argc",
+            "arg_flag_mask",
+            "unknown_args",
+            "exact_command_arg",
+            "command_sha256",
+            "script_sha256",
+            "normalized_script_sha256",
+            "script_has_space",
+            "script_arg_quoted",
+            "script_regular",
+            "raw_os_error",
+            "exit_code",
+            "error_kind",
+            "stdout_bytes",
+            "stdout_sha256",
+            "stderr_bytes",
+            "stderr_sha256",
+            "stderr_class",
+            "python_entry",
+            "python_decoded",
+            "python_log_appended",
+            "python_executable_path_sha256",
+            "python_major",
+            "python_minor",
+            "python_micro",
+        ];
+        let labels = [
+            "28a6d1e4",
+            "built",
+            "spawned",
+            "spawn_error",
+            "completed",
+            "cancelled_before_completion",
+            "explicit",
+            "fallback",
+            "cmd",
+            "pwsh",
+            "powershell",
+            "sh",
+            "other",
+            "timeout",
+            "stdin_error",
+            "powershell_command_not_found",
+            "command_not_found",
+            "python_cannot_open_file",
+            "json_decode",
+            "permission_denied",
+            "empty",
+        ];
+        fields.iter().all(|(key, value)| {
+            allowed.contains(&key.as_str())
+                && match value {
+                    serde_json::Value::Null
+                    | serde_json::Value::Bool(_)
+                    | serde_json::Value::Number(_) => true,
+                    serde_json::Value::String(value) => {
+                        labels.contains(&value.as_str())
+                            || (value.len() == 64
+                                && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    }
+                    _ => false,
+                }
+        })
+    }
+}
+
+impl Drop for QueueHookDiagnostic {
+    fn drop(&mut self) {
+        if self.passed
+            || !cfg!(windows)
+            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("28a6d1e4")
+        {
+            return;
+        }
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for event in events.iter() {
+            eprintln!("QUEUE_HOOK_DIAGNOSTIC {event}");
+        }
+        for name in [
+            "queue_prompt_hook.py",
+            "hooks.json",
+            "queue_prompt_hook.log",
+        ] {
+            let metadata = std::fs::symlink_metadata(self.home.join(name));
+            let record = match metadata {
+                Ok(m) => {
+                    serde_json::json!({"kind":"fixture_file","name":name,"exists":true,"regular":m.is_file(),"symlink":m.file_type().is_symlink(),"bytes":m.len()})
+                }
+                Err(e) => {
+                    serde_json::json!({"kind":"fixture_file","name":name,"exists":false,"error_kind":format!("{:?}",e.kind()),"raw_os_error":e.raw_os_error()})
+                }
+            };
+            eprintln!("QUEUE_HOOK_DIAGNOSTIC {record}");
+        }
+        let path = self.home.join("queue_hook_diagnostic_28a6d1e4.jsonl");
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            eprintln!("QUEUE_HOOK_DIAGNOSTIC {{\"kind\":\"records_absent\"}}");
+            return;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 32768 {
+            eprintln!("QUEUE_HOOK_DIAGNOSTIC {{\"kind\":\"records_rejected\"}}");
+            return;
+        }
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines().take(32) {
+                // The runtime emits only this bounded typed schema, never arbitrary hook text.
+                if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+                    if record.get("nonce").and_then(serde_json::Value::as_str) == Some("28a6d1e4")
+                        && Self::safe_record(&record)
+                    {
+                        eprintln!("QUEUE_HOOK_DIAGNOSTIC {record}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn test_queue() -> anyhow::Result<(Arc<dyn QueueStore>, TempDir)> {
@@ -743,6 +928,7 @@ async fn rejected_queue_messages_are_consumed_without_retrying_or_blocking_follo
         .with_config(|config| config.include_environment_context = false)
         .build_with_auto_env(&server)
         .await?;
+    let mut diagnostic = QueueHookDiagnostic::new(test.codex_home_path());
     let thread_id = test.session_configured.thread_id;
     let staging = QueuedItemService::new(
         loaded_thread_queue(&test)?,
@@ -758,6 +944,7 @@ async fn rejected_queue_messages_are_consumed_without_retrying_or_blocking_follo
         test.submit_text_turn("A").await?;
         for _ in 0..2 {
             wait_for_event_match(test.codex.as_ref(), |event| {
+                diagnostic.observe(event);
                 matches!(event, EventMsg::TurnComplete(_)).then_some(())
             })
             .await;
@@ -784,6 +971,7 @@ async fn rejected_queue_messages_are_consumed_without_retrying_or_blocking_follo
     );
     assert!(queue.list(thread_id).await?.is_empty());
     assert_eq!(2, responses.requests().len());
+    diagnostic.passed = true;
     Ok(())
 }
 
@@ -798,6 +986,7 @@ async fn explicitly_started_rejected_queue_messages_are_consumed() -> anyhow::Re
         .with_config(|config| config.include_environment_context = false)
         .build_with_auto_env(&server)
         .await?;
+    let mut diagnostic = QueueHookDiagnostic::new(test.codex_home_path());
     let thread_id = test.session_configured.thread_id;
     let queue = QueuedItemService::new(
         loaded_thread_queue(&test)?,
@@ -814,6 +1003,7 @@ async fn explicitly_started_rejected_queue_messages_are_consumed() -> anyhow::Re
     .expect("explicitly started input should be submitted");
     assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
     wait_for_event_match(test.codex.as_ref(), |event| {
+        diagnostic.observe(event);
         matches!(event, EventMsg::TurnComplete(_)).then_some(())
     })
     .await;
@@ -821,6 +1011,7 @@ async fn explicitly_started_rejected_queue_messages_are_consumed() -> anyhow::Re
     let hook_log = std::fs::read_to_string(test.codex_home_path().join("queue_prompt_hook.log"))?;
     assert_eq!(vec!["blocked"], hook_log.lines().collect::<Vec<_>>());
     assert!(responses.requests().is_empty());
+    diagnostic.passed = true;
     Ok(())
 }
 
