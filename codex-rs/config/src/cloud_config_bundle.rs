@@ -343,6 +343,49 @@ pub enum CloudConfigBundleBindingStatus {
 }
 
 impl CloudConfigBundleBinding {
+    /// Runs a pure synchronous decision while every supplied observation is
+    /// Current. Duplicate observations share one read lock, but EACH captured
+    /// revision is checked. The callback must not await, do I/O, or reenter a
+    /// managed policy. Empty inputs impose no managed restriction and run the
+    /// callback; this function does not establish any other authority.
+    pub fn with_current_bindings<T>(bindings: &[&Self], admit: impl FnOnce() -> T) -> Option<T> {
+        // A watch value occupies one fixed cell in its channel's shared
+        // allocation. Sender clones retained by every binding keep that cell
+        // alive throughout this call, so its address cannot be reused here.
+        // These local keys ONLY order/deduplicate locks: they never authorize,
+        // escape this function, appear in diagnostics, or enter serialized data.
+        let mut observations = bindings
+            .iter()
+            .map(|binding| {
+                let state = binding.policy.0.borrow();
+                let key = std::ptr::from_ref(&*state) as usize;
+                (key, *binding)
+            })
+            .collect::<Vec<_>>();
+        observations.sort_unstable_by_key(|(key, _)| *key);
+        let mut held = Vec::new();
+        for (key, binding) in &observations {
+            if held.last().is_some_and(|(held_key, _)| held_key == key) {
+                continue;
+            }
+            held.push((*key, binding.policy.0.borrow()));
+        }
+        for (key, binding) in &observations {
+            let index = held
+                .binary_search_by_key(key, |(held_key, _)| *held_key)
+                .ok()?;
+            let state = &held[index].1;
+            if state.phase != CloudConfigBundlePolicyPhase::Active
+                || binding.revision != Some(state.revision)
+            {
+                return None;
+            }
+        }
+        let result = admit();
+        drop(held);
+        Some(result)
+    }
+
     /// Wait until this delivered policy no longer authorizes its EMA owner.
     pub async fn invalidated(&self) {
         let mut changes = self.policy.0.subscribe();

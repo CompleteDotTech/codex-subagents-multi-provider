@@ -2204,6 +2204,20 @@ impl Session {
             // Save new environment defaults for future turns. The running turn keeps its own.
             windows_sandbox_changed =
                 state.session_configuration.windows_sandbox_level != updated.windows_sandbox_level;
+            let child_authority_changed = updated.thread_settings_snapshot(&updated.environments)
+                != state
+                    .session_configuration
+                    .thread_settings_snapshot(&state.session_configuration.environments)
+                || updated.environments != state.session_configuration.environments
+                || updated.inferred_environment_config()
+                    != state.session_configuration.inferred_environment_config();
+            // Settings and executor-scope publication must invalidate prepared
+            // child operations just like host config publication. Take the fence
+            // before publishing either the service view or the state snapshot.
+            let mut child_policy_revision = self
+                .child_policy_revision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.services
                 .turn_environments
                 .set_configured_thread_defaults(updated.inferred_environment_config());
@@ -2213,6 +2227,10 @@ impl Session {
                     .update_configured_selections(&updated.environments);
             }
             state.session_configuration = updated;
+            if child_authority_changed {
+                *child_policy_revision = child_policy_revision.wrapping_add(1);
+            }
+            drop(child_policy_revision);
             if root_service_tier_changed {
                 self.services.agent_control.propagate_config_update(
                     AgentConfigUpdate::ServiceTier(

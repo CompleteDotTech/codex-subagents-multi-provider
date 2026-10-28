@@ -328,3 +328,173 @@ allowed_sandbox_modes = ["read-only"]
         }
     );
 }
+
+fn aggregate_test_binding() -> (CloudConfigBundlePolicy, CloudConfigBundleBinding) {
+    let policy = CloudConfigBundlePolicy::default();
+    let mut snapshot = CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    (policy, snapshot.binding.expect("actual published binding"))
+}
+
+fn aggregate_changed_bundle() -> CloudConfigBundle {
+    let mut bundle = CloudConfigBundle::default();
+    bundle
+        .config_toml
+        .enterprise_managed
+        .push(CloudConfigFragment {
+            id: "aggregate-policy-change".into(),
+            name: "changed caller policy".into(),
+            contents: "[agents]\nallowed_model_providers=['openai']\n".into(),
+        });
+    bundle
+}
+
+#[test]
+fn aggregate_bindings_validate_distinct_and_every_duplicate_observation() {
+    let (a, a_old) = aggregate_test_binding();
+    let (b, b_old) = aggregate_test_binding();
+    let mut calls = 0;
+    assert_eq!(
+        CloudConfigBundleBinding::with_current_bindings(&[&a_old, &b_old, &a_old], || {
+            calls += 1;
+            7
+        }),
+        Some(7)
+    );
+    assert_eq!(
+        CloudConfigBundleBinding::with_current_bindings(&[&b_old, &a_old, &b_old], || {
+            calls += 1;
+            8
+        }),
+        Some(8)
+    );
+    assert_eq!(
+        calls, 2,
+        "reversed inputs and shared channels have the same authority"
+    );
+    let bundle = aggregate_changed_bundle();
+    b.observe_remote_bundle(&bundle).unwrap();
+    assert_eq!(a_old.read().status, CloudConfigBundleBindingStatus::Current);
+    assert_eq!(
+        CloudConfigBundleBinding::with_current_bindings(&[&a_old, &b_old], || {
+            calls += 1;
+        }),
+        None
+    );
+    assert_eq!(
+        calls, 2,
+        "an independent invalidated caller cannot run admission"
+    );
+    let mut snapshot = CloudConfigBundleSnapshot {
+        bundle: Ok(Some(bundle)),
+        binding: None,
+        config_server: None,
+    };
+    b.publish_snapshot(&mut snapshot);
+    let b_current = snapshot.binding.unwrap();
+    assert_eq!(
+        b_current.read().status,
+        CloudConfigBundleBindingStatus::Current
+    );
+    assert_eq!(b_old.read().status, CloudConfigBundleBindingStatus::Stale);
+    assert_eq!(
+        CloudConfigBundleBinding::with_current_bindings(&[&b_current, &b_old, &b_current], || {
+            calls += 1;
+        }),
+        None
+    );
+    assert_eq!(
+        calls, 2,
+        "deduplicating locks cannot discard a stale input revision"
+    );
+    assert_eq!(
+        CloudConfigBundleBinding::with_current_bindings(&[&b_current, &a_old], || 9),
+        Some(9)
+    );
+    assert_eq!(
+        CloudConfigBundleBinding::with_current_bindings(&[], || 10),
+        Some(10),
+        "empty inputs impose no managed restriction and grant no other authority"
+    );
+    drop(a);
+}
+
+#[test]
+fn aggregate_duplicate_channel_does_not_recursively_borrow_under_writer_pressure() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (policy, binding) = aggregate_test_binding();
+    let first = binding.clone();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (first_done_tx, first_done_rx) = mpsc::sync_channel(1);
+    let first_reader = std::thread::spawn(move || {
+        let result =
+            CloudConfigBundleBinding::with_current_bindings(&[&first, &first, &first], || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("bounded admission release");
+                11
+            });
+        first_done_tx.send(result).unwrap();
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("duplicate positive must enter admission");
+    let (writer_entered_tx, writer_entered_rx) = mpsc::sync_channel(1);
+    let (writer_done_tx, writer_done_rx) = mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        writer_entered_tx.send(()).unwrap();
+        policy
+            .observe_remote_bundle(&aggregate_changed_bundle())
+            .unwrap();
+        writer_done_tx.send(()).unwrap();
+    });
+    writer_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        matches!(
+            writer_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "managed publication must wait for the already admitted pure decision"
+    );
+    let after_publication = binding.clone();
+    let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+    let second_reader = std::thread::spawn(move || {
+        let result = CloudConfigBundleBinding::with_current_bindings(&[&binding, &binding], || 12);
+        second_done_tx.send(result).unwrap();
+    });
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        first_done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Some(11)
+    );
+    writer_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer must complete without recursive read deadlock");
+    let racing_reader = second_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("racing duplicate reader must finish");
+    assert!(
+        racing_reader.is_none_or(|value| value == 12),
+        "a reader admitted before publication may finish; an observation after publication denies"
+    );
+    assert_eq!(
+        CloudConfigBundleBinding::with_current_bindings(
+            &[&after_publication, &after_publication],
+            || 13
+        ),
+        None,
+        "a reader starting after completed publication must deny"
+    );
+    first_reader.join().unwrap();
+    writer.join().unwrap();
+    second_reader.join().unwrap();
+}

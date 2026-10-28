@@ -10381,10 +10381,13 @@ async fn legacy_custom_store_root_remains_supported_without_native_owned_writer_
 // Exercise the actual reserved-queue implementation with actual registered
 // sessions. A cloned SessionIo replaces only the queue with a bounded observed
 // queue, so no Core task can consume capacity before the publication barrier.
-#[test_case::test_case(false; "prepared operation queue unchanged positive")]
-#[test_case::test_case(true; "publication while queue capacity pending")]
+#[test_case::test_case(0; "prepared operation queue unchanged positive")]
+#[test_case::test_case(1; "publication while queue capacity pending")]
+#[test_case::test_case(2; "permission and environment publication while queue capacity pending")]
+#[test_case::test_case(3; "no-op settings preserves pending operation")]
 #[tokio::test]
-async fn loaded_operation_publication_between_check_and_enqueue(revoke: bool) {
+async fn loaded_operation_publication_between_check_and_enqueue(change: u8) {
+    let revoke = matches!(change, 1 | 2);
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let host_file = home.path().join("config.toml");
@@ -10481,7 +10484,31 @@ stream_idle_timeout_ms = 1000
         matches!(futures::poll!(submit.as_mut()), std::task::Poll::Pending),
         "the actual guarded queue must wait for capacity after the initial policy check"
     );
-    if revoke {
+    if change == 2 {
+        let environments = parent.session.inherited_environment_snapshot().await;
+        let ready = environments.primary().expect("actual invoking executor");
+        let mut owner = ready.config().clone();
+        owner.permission_profile =
+            codex_protocol::models::PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
+        let mut selection = ready.selection();
+        selection.config = EnvironmentConfigState::Ready(owner);
+        parent
+            .update_thread_settings(ThreadSettingsOverrides {
+                permission_profile: Some(PermissionProfile::Disabled),
+                environments: Some(TurnEnvironmentRequests::new(
+                    parent.thread_settings_snapshot().await.cwd,
+                    vec![selection.into_request()],
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    } else if change == 3 {
+        parent
+            .update_thread_settings(ThreadSettingsOverrides::default())
+            .await
+            .unwrap();
+    } else if revoke {
         let mut value: TomlValue =
             toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
         value["agents"]["allowed_model_providers"] =
@@ -10798,6 +10825,204 @@ stream_idle_timeout_ms = 1000
     harness.manager.remove_thread(&descendant_id).await;
     replacement.shutdown_and_wait().await.unwrap();
     harness.manager.remove_thread(&owner_id).await;
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
+}
+
+#[test_case::test_case(false; "actual sender shares managed channel")]
+#[test_case::test_case(true; "independent actual sender binding invalidates after precheck")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loaded_operation_pins_every_actual_policy_owner_binding(independent: bool) {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    let catalog_file = home.path().join("loaded-a.json");
+    std::fs::write(
+        &host_file,
+        r#"
+model = "gpt-5.5"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "loaded-a.json"
+[model_providers.a]
+name = "Loaded custom fixture"
+base_url = "http://127.0.0.1:9/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+    )
+    .unwrap();
+    let mut info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .expect("real bundled model metadata");
+    info.slug = "shared-loaded".into();
+    info.multi_agent_version = Some(MultiAgentVersion::V2);
+    info.supports_search_tool = false;
+    info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    info.used_fallback_model_metadata = false;
+    std::fs::write(
+        &catalog_file,
+        serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+    )
+    .unwrap();
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(snapshot.binding);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "openai");
+    let target = loaded_custom_provider_resident(&harness, &parent).await;
+    let target_id = target.session.thread_id;
+    assert!(target.is_running());
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+
+    let caller_policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut caller_config = harness.config.clone();
+    if independent {
+        let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+            bundle: Ok(None),
+            binding: None,
+            config_server: None,
+        };
+        caller_policy.publish_snapshot(&mut snapshot);
+        caller_config.config_layer_stack = caller_config
+            .config_layer_stack
+            .with_cloud_config_binding(snapshot.binding);
+    }
+    let caller = harness
+        .manager
+        .start_thread_with_control_for_tests(
+            StartThreadOptions::new(caller_config),
+            harness.control.clone(),
+        )
+        .await
+        .unwrap()
+        .thread;
+    let caller_id = caller.session.thread_id;
+    assert_ne!(caller_id, parent_id);
+    let mut operation = crate::agent::child_provider_authorization::current::prepare_loaded(
+        &harness.control.runtime,
+        target_id,
+        caller_id,
+    )
+    .await
+    .unwrap()
+    .expect("actual delegated operation with actual cross-origin sender");
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    operation.set_after_policy_validation(Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bounded post-validation admission barrier");
+    }));
+    let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let admitted = Arc::clone(&callbacks);
+    let task = tokio::task::spawn_blocking(move || {
+        operation.with_current(|| {
+            admitted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("actual operation passes ALL policy prechecks before invalidation");
+    let revision = *caller.session.child_policy_revision.lock().unwrap();
+    if independent {
+        let mut bundle = codex_config::CloudConfigBundle::default();
+        bundle
+            .config_toml
+            .enterprise_managed
+            .push(codex_config::CloudConfigFragment {
+                id: "independent-sender-policy".into(),
+                name: "sender revocation".into(),
+                contents: "[agents]\nallowed_model_providers=['openai']\n".into(),
+            });
+        caller_policy.observe_remote_bundle(&bundle).unwrap();
+        assert_ne!(
+            caller
+                .config()
+                .await
+                .config_layer_stack
+                .cloud_config_binding()
+                .unwrap()
+                .read()
+                .status,
+            codex_config::CloudConfigBundleBindingStatus::Current
+        );
+    }
+    assert_eq!(
+        parent
+            .config()
+            .await
+            .config_layer_stack
+            .cloud_config_binding()
+            .unwrap()
+            .read()
+            .status,
+        codex_config::CloudConfigBundleBindingStatus::Current,
+        "the target root binding stays current"
+    );
+    assert_eq!(
+        *caller.session.child_policy_revision.lock().unwrap(),
+        revision,
+        "independent managed invalidation does not change the Session config publication revision"
+    );
+    let before = harness.manager.captured_ops().len();
+    release_tx.send(()).unwrap();
+    let outcome = task.await.unwrap();
+    if independent {
+        let error = outcome
+            .expect_err("final managed admission must see the independent sender revocation");
+        assert!(loaded_fixture_policy_denial(&error.to_string()), "{error}");
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+    } else {
+        outcome.expect("one shared policy channel may appear repeatedly without recursive locking");
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(harness.manager.captured_ops().len(), before);
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+    caller.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&caller_id).await;
+    target.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&target_id).await;
     parent.shutdown_and_wait().await.unwrap();
     harness.manager.remove_thread(&parent_id).await;
 }

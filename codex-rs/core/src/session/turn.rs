@@ -35,7 +35,6 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
-use crate::responses_retry::handle_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
@@ -1809,6 +1808,7 @@ async fn run_sampling_request(
             &prompt,
             cancellation_token.child_token(),
             &mut draining_for_mailbox,
+            tool_operation.as_ref(),
         )
         .await
         {
@@ -1833,7 +1833,7 @@ async fn run_sampling_request(
 
         let original_input = original_input.get_or_insert(prompt.input);
 
-        let retry = handle_response_stream_error(
+        let retry = crate::responses_retry::handle_response_stream_error_guarded(
             &mut retry_state,
             max_retries,
             err,
@@ -1841,6 +1841,7 @@ async fn run_sampling_request(
             &sess,
             &step_context,
             ResponsesStreamRequest::Sampling,
+            tool_operation.as_ref(),
         )
         .or_cancel(&preempt)
         .or_cancel(&cancellation_token)
@@ -2657,6 +2658,9 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
+    current_operation: Option<
+        &crate::agent::child_provider_authorization::current::CurrentChildOperation,
+    >,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
@@ -2736,13 +2740,11 @@ async fn try_run_sampling_request(
     let mut request_token_usage = None;
     sess.set_server_reasoning_included(step_context.settings.model_info.use_responses_lite)
         .await;
-    // Hooks and other preparation awaits have completed. Capture one immutable
-    // operation fence; every lower retry/helper/fallback stage consults it.
-    let current_operation = crate::agent::child_provider_authorization::current::prepare_inference(
-        &sess,
-        &step_context,
-    )
-    .await?;
+    // Hooks and other preparation awaits have completed. Recheck the ORIGINAL
+    // operation fence; publication cannot be hidden by recapturing new authority.
+    if let Some(operation) = current_operation {
+        operation.check()?;
+    }
     let mut stream = match client_session
         .stream_guarded(
             prompt,
@@ -2753,7 +2755,7 @@ async fn try_run_sampling_request(
             step_context.settings.service_tier.clone(),
             responses_metadata,
             &inference_trace,
-            current_operation.as_ref(),
+            current_operation,
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)

@@ -198,6 +198,17 @@ impl Session {
                         environment.config = latest.config.clone();
                     }
                 }
+                // Publish the effective active scope and its revision together;
+                // snapshot_now is local state only and never waits for an executor.
+                let mut child_policy_revision = self
+                    .child_policy_revision
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let previous_scope =
+                    crate::agent::child_provider_authorization::ChildProviderScope::from_step(
+                        &configuration.original_config_do_not_use,
+                        &self.services.turn_environments.snapshot_now(),
+                    );
                 // Apply the saved defaults even if this turn selects the same environments.
                 self.services
                     .turn_environments
@@ -206,6 +217,14 @@ impl Session {
                     self.services
                         .turn_environments
                         .update_selections(&environments);
+                }
+                let next_scope =
+                    crate::agent::child_provider_authorization::ChildProviderScope::from_step(
+                        &configuration.original_config_do_not_use,
+                        &self.services.turn_environments.snapshot_now(),
+                    );
+                if previous_scope != next_scope {
+                    *child_policy_revision = child_policy_revision.wrapping_add(1);
                 }
             }
             self.services.turn_environments.snapshot()
@@ -350,6 +369,12 @@ impl Session {
             }
         }
 
+        let mut child_policy_revision = self
+            .child_policy_revision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scope_changed = future != state.session_configuration.environments
+            || current != self.services.turn_environments.selections();
         if update_future {
             self.services
                 .turn_environments
@@ -360,6 +385,9 @@ impl Session {
             // Invalidate MCP before installed configuration can wake a waiting turn.
             self.mark_mcp_runtime_dirty();
             self.services.turn_environments.update_selections(&current);
+        }
+        if scope_changed {
+            *child_policy_revision = child_policy_revision.wrapping_add(1);
         }
         Ok(())
     }

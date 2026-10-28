@@ -11,6 +11,8 @@ pub(crate) struct CurrentChildOperation {
     ceiling: Arc<RetainedAgentAuthority>,
     selected: Arc<RetainedAgentAuthority>,
     origin: VerifiedChildProviderOrigin,
+    #[cfg(test)]
+    after_policy_validation: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl CurrentChildOperation {
@@ -67,7 +69,12 @@ impl CurrentChildOperation {
             }
             threads.push(Arc::clone(caller));
         }
-        threads.sort_by_key(|thread| thread.session.thread_id.to_string());
+        threads.sort_by_key(|thread| {
+            (
+                thread.session.thread_id.to_string(),
+                thread.session.native_registration_id,
+            )
+        });
         threads.dedup_by(|left, right| Arc::ptr_eq(left, right));
         let mut owners = Vec::new();
         let mut snapshots = Vec::new();
@@ -164,6 +171,8 @@ impl CurrentChildOperation {
             ceiling,
             selected,
             origin,
+            #[cfg(test)]
+            after_policy_validation: None,
         };
         operation.with_current(|| Ok(()))?;
         Ok(Some(operation))
@@ -273,6 +282,10 @@ impl CurrentChildOperation {
     pub(crate) fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
         // File trust and resolution run outside all admission locks.
         self.validate_policy()?;
+        #[cfg(test)]
+        if let Some(barrier) = &self.after_policy_validation {
+            barrier();
+        }
         if self
             .target
             .session
@@ -306,21 +319,20 @@ impl CurrentChildOperation {
             &self.target.session,
             &callers,
             || {
-                // The root is the authenticated current host policy owner.
-                // Keep its managed publication stable through the pure decision.
-                let binding = self.policies[0]
-                    .0
-                    .config_layer_stack
-                    .cloud_config_binding()
-                    .map(|binding| binding.read());
-                if binding.as_ref().is_some_and(|guard| {
-                    guard.status != codex_config::CloudConfigBundleBindingStatus::Current
-                }) {
-                    return Err(invalid("managed operation policy changed before admission"));
-                }
-                admit()
+                let bindings = self
+                    .policies
+                    .iter()
+                    .filter_map(|(config, _, _)| config.config_layer_stack.cloud_config_binding())
+                    .collect::<Vec<_>>();
+                codex_config::CloudConfigBundleBinding::with_current_bindings(&bindings, admit)
+                    .ok_or_else(|| invalid("managed operation policy changed before admission"))?
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_policy_validation(&mut self, barrier: Arc<dyn Fn() + Send + Sync>) {
+        self.after_policy_validation = Some(barrier);
     }
 
     pub(crate) fn matches_target(&self, thread: &Arc<CodexThread>) -> bool {

@@ -6989,6 +6989,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
 
     let session = Session {
         fresh_child_admission_live: Arc::new(std::sync::Mutex::new(true)),
+        native_registration_id: uuid::Uuid::now_v7(),
         child_policy_revision: std::sync::Mutex::new(0),
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -9265,6 +9266,7 @@ where
 
     let session = Arc::new(Session {
         fresh_child_admission_live: Arc::new(std::sync::Mutex::new(true)),
+        native_registration_id: uuid::Uuid::now_v7(),
         child_policy_revision: std::sync::Mutex::new(0),
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),

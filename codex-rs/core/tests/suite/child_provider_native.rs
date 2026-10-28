@@ -1744,3 +1744,224 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     ));
     Ok(())
 }
+
+// A real host command hook pauses only the selected custom-provider request.
+// Unix is explicit because this fixture uses the existing Python command-hook
+// runtime; no Windows execution or setup-failure policy credit is claimed.
+#[cfg(unix)]
+fn native_request_barrier_setup(config: &mut codex_core::config::Config, attempt: u8) {
+    let home = config.codex_home.as_path();
+    let script = home.join("native-request-barrier.py");
+    let source = format!(
+        r#"import json, pathlib, sys, time
+home = pathlib.Path({home})
+payload = json.load(sys.stdin)
+if payload.get("model") == "shared":
+    counter = home / "native-request-attempts"
+    attempt = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(attempt))
+    if attempt == {attempt}:
+        (home / "native-request-hook-entered").write_text(json.dumps(payload))
+        deadline = time.monotonic() + 20
+        while not (home / "native-request-hook-release").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("native request barrier timed out: setup failure, not policy evidence")
+            time.sleep(0.01)
+print("{{}}")
+"#,
+        home = serde_json::to_string(&home.to_string_lossy()).unwrap(),
+    );
+    std::fs::write(&script, source).unwrap();
+    std::fs::write(
+        home.join("hooks.json"),
+        json!({"hooks":{"PreModelRequest":[{"hooks":[{
+            "type":"command", "command":format!("python3 -I -S '{}'", script.display())
+        }]}]}})
+        .to_string(),
+    )
+    .unwrap();
+    core_test_support::hooks::trust_discovered_hooks(config);
+}
+
+#[cfg(unix)]
+fn native_first_request_barrier_setup(config: &mut codex_core::config::Config) {
+    native_request_barrier_setup(config, 1);
+}
+
+#[cfg(unix)]
+fn native_retry_request_barrier_setup(config: &mut codex_core::config::Config) {
+    native_request_barrier_setup(config, 2);
+}
+
+#[cfg(unix)]
+#[test_case::test_case(false, false; "actual pre-model hook unchanged positive")]
+#[test_case::test_case(false, true; "actual pre-model hook host publication denies dispatch")]
+#[test_case::test_case(true, false; "actual HTTP stream retry unchanged positive")]
+#[test_case::test_case(true, true; "actual HTTP stream retry hook publication denies next dispatch")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_request_hook_and_http_retry_recheck_after_publication(
+    retry: bool,
+    revoke: bool,
+) -> Result<()> {
+    let setup: fn(&mut codex_core::config::Config) = if retry {
+        native_retry_request_barrier_setup
+    } else {
+        native_first_request_barrier_setup
+    };
+    let fixture = Fixture::with_host_setup(MultiAgentVersion::V2, None, setup).await?;
+    if retry {
+        // A real accepted HTTP/SSE attempt lacks response.completed. Core must
+        // observe this as a stream error and enter its actual normal retry loop.
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse(vec![ev_response_created(
+                        "incomplete-native-http-attempt",
+                    )])),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&fixture.a)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("custom-after-hook"))
+        .mount(&fixture.a)
+        .await;
+    scripted_spawn(
+        &fixture.root,
+        MultiAgentVersion::V2,
+        "hook_guard_worker",
+        json!({"prompt":"Complete the bounded hook request","model_provider":"a"}),
+    )
+    .await;
+    fixture.turn("spawn the hook barrier child").await?;
+    let entered = fixture.home.path().join("native-request-hook-entered");
+    let release = fixture.home.path().join("native-request-hook-release");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if entered.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual PreModelRequest command must enter the owned barrier");
+    let children = fixture.children(1).await?;
+    let child = &children[0];
+    let stored = child.read_thread(true, false).await?;
+    let child_id = stored.thread_id;
+    let hook_input: Value = serde_json::from_slice(&std::fs::read(&entered)?)?;
+    assert_eq!(hook_input["hook_event_name"], "PreModelRequest");
+    assert_eq!(hook_input["model"], "shared");
+    assert_eq!(
+        hook_input["agent_id"].as_str(),
+        Some(child_id.to_string().as_str()),
+        "the actual hook must belong to this registered custom-provider child"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.path().join("native-request-attempts"))?,
+        if retry { "2" } else { "1" }
+    );
+    let before = usize::from(retry);
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        before,
+        "the barrier is before the selected-provider dispatch, after any required real HTTP retry attempt"
+    );
+    assert_eq!(native_post_count(&fixture.b).await, 0);
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    if revoke {
+        revoke_native_fixture_a(fixture.home.path())?;
+        publish_native_fixture_host_config(&fixture, None).await?;
+        assert_native_fixture_published_revocation(&fixture.test.codex.config().await);
+    }
+    std::fs::write(&release, b"release actual request hook")?;
+    let status = native_terminal_status(child).await;
+    if revoke {
+        assert!(
+            matches!(&status, codex_protocol::protocol::AgentStatus::Errored(message)
+            if native_fixture_policy_denial(message)),
+            "{status:?}"
+        );
+    } else {
+        assert!(
+            matches!(status, codex_protocol::protocol::AgentStatus::Completed(_)),
+            "{status:?}"
+        );
+    }
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        before + usize::from(!revoke)
+    );
+    assert_eq!(native_post_count(&fixture.b).await, 0);
+    for request in fixture
+        .a
+        .received_requests()
+        .await
+        .expect("A request recording enabled")
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+    {
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer synthetic-a")
+        );
+        assert!(!String::from_utf8_lossy(&request.body).contains("synthetic-root"));
+    }
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    assert_eq!(child.config_snapshot().await.model_provider_id, "a");
+    assert!(Arc::ptr_eq(
+        child,
+        &fixture.test.thread_manager.get_thread(child_id).await?
+    ));
+    let root_before = native_post_count(&fixture.root).await;
+    fixture
+        .turn("ordinary OpenAI parent remains usable after the request boundary")
+        .await?;
+    assert!(native_post_count(&fixture.root).await > root_before);
+    assert_eq!(
+        fixture.test.codex.config_snapshot().await.model_provider_id,
+        "openai"
+    );
+    // A different authorized provider and its fresh child remain independent.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("independent-b-child"))
+        .mount(&fixture.b)
+        .await;
+    scripted_spawn(
+        &fixture.root,
+        MultiAgentVersion::V2,
+        "hook_guard_sibling",
+        json!({"prompt":"Complete the independent sibling","model_provider":"b"}),
+    )
+    .await;
+    fixture.turn("spawn the unaffected B sibling").await?;
+    let children = fixture.children(2).await?;
+    let mut found_b = false;
+    for sibling in children {
+        if sibling.config_snapshot().await.model_provider_id == "b" {
+            assert!(matches!(
+                native_terminal_status(&sibling).await,
+                codex_protocol::protocol::AgentStatus::Completed(_)
+            ));
+            found_b = true;
+        }
+    }
+    assert!(found_b);
+    assert_eq!(native_post_count(&fixture.b).await, 1);
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        before + usize::from(!revoke)
+    );
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    Ok(())
+}

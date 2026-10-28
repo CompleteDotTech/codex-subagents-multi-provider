@@ -63,6 +63,32 @@ pub(crate) async fn handle_response_stream_error(
     step_context: &StepContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
+    handle_response_stream_error_guarded(
+        retry_state,
+        max_retries,
+        err,
+        client_session,
+        sess,
+        step_context,
+        request,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_response_stream_error_guarded(
+    retry_state: &mut ResponsesStreamRetryState,
+    max_retries: u64,
+    err: CodexErr,
+    client_session: &mut ModelClientSession,
+    sess: &Session,
+    step_context: &StepContext,
+    request: ResponsesStreamRequest,
+    current_operation: Option<
+        &crate::agent::child_provider_authorization::current::CurrentChildOperation,
+    >,
+) -> Result<(), CodexErr> {
     let turn_context = &step_context.turn;
     if matches!(request, ResponsesStreamRequest::Sampling)
         && matches!(err.details(), CodexErrorDetails::ContentFilter)
@@ -117,6 +143,9 @@ pub(crate) async fn handle_response_stream_error(
         return Ok(());
     }
 
+    if let Some(operation) = current_operation {
+        operation.check()?;
+    }
     if retry_state.retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,

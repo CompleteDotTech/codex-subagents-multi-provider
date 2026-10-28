@@ -370,6 +370,16 @@ impl Session {
             return TurnSettingsUpdateOutcome::Rejected { reason };
         }
 
+        // Existing order is active_turn -> Session state -> publication fence.
+        // Nothing asynchronous or user supplied runs under this fence.
+        let mut child_policy_revision = self
+            .child_policy_revision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let authority_changed = updated_settings.is_some()
+            || environments
+                .as_ref()
+                .is_some_and(|_| proposed != current_environments.as_slice());
         // Save changed settings first. The manager then installs any new environment list before
         // waking waiting work. The next step cannot read either until we release this lock.
         if let Some(settings) = updated_settings {
@@ -379,6 +389,9 @@ impl Session {
         }
         if environments.is_some() {
             self.services.turn_environments.update_selections(proposed);
+        }
+        if authority_changed {
+            *child_policy_revision = child_policy_revision.wrapping_add(1);
         }
         TurnSettingsUpdateOutcome::Applied
     }
