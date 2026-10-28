@@ -2107,13 +2107,8 @@ impl ThreadManagerState {
         } else {
             None
         };
-        if let Some(ops_log) = &self.ops_log
-            && let Ok(mut log) = ops_log.lock()
-            && let Some(captured_op) = capture_test_op(&op)
-        {
-            log.push((thread_id, captured_op));
-        }
-        thread
+        let captured_op = self.ops_log.as_ref().and_then(|_| capture_test_op(&op));
+        let submitted = thread
             .io
             .submit_with_trace_guarded(
                 op,
@@ -2124,7 +2119,17 @@ impl ThreadManagerState {
                 message_delivery,
                 guard,
             )
-            .await
+            .await;
+        // This observer records admitted submissions, never an operation rejected
+        // by the final policy fence after a queue-capacity wait.
+        if submitted.is_ok()
+            && let Some(ops_log) = &self.ops_log
+            && let Ok(mut log) = ops_log.lock()
+            && let Some(captured_op) = captured_op
+        {
+            log.push((thread_id, captured_op));
+        }
+        submitted
     }
 
     /// Remove a thread from the manager by ID, returning it when present.
