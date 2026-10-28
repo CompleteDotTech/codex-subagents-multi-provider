@@ -870,6 +870,68 @@ impl AlternateGroupDiagnostics {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn mapped_alternate_group(
+    groups: &[u32],
+    original_group: u32,
+    gid_map: &str,
+) -> anyhow::Result<Option<u32>> {
+    // The first column is the namespace-visible ID range. In particular, an
+    // overflowgid reported by `id -G` is not necessarily a mapped member group.
+    let mut ranges = Vec::new();
+    for line in gid_map.lines() {
+        let values = line
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(values.len() == 3, "invalid gid_map column count");
+        let end = values[0].checked_add(values[2]);
+        let parent_end = values[1].checked_add(values[2]);
+        anyhow::ensure!(
+            values[2] > 0
+                && end.is_some_and(|end| end <= u64::from(u32::MAX))
+                && parent_end.is_some_and(|end| end <= u64::from(u32::MAX)),
+            "invalid gid_map range"
+        );
+        ranges.push((values[0], end.expect("validated range")));
+    }
+    Ok(groups.iter().copied().find(|group| {
+        *group != original_group
+            && ranges
+                .iter()
+                .any(|(start, end)| *start <= u64::from(*group) && u64::from(*group) < *end)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn alternate_group_selection_requires_a_namespace_mapping() -> anyhow::Result<()> {
+    assert_eq!(
+        mapped_alternate_group(&[65534, 1000, 65534], 1000, "1000 1000 1\n")?,
+        None,
+        "unmapped supplementary groups must not masquerade as overflowgid membership"
+    );
+    assert_eq!(
+        mapped_alternate_group(&[4, 1000], 1000, "0 0 4294967295\n")?,
+        Some(4)
+    );
+    assert_eq!(
+        mapped_alternate_group(&[65534, 1000], 1000, "1000 1000 1\n65534 65534 1\n")?,
+        Some(65534),
+        "a genuinely mapped 65534 is valid; do not blacklist the numeric overflow default"
+    );
+    assert_eq!(mapped_alternate_group(&[4, 1000], 1000, "")?, None);
+    for invalid in [
+        "1000 1000",
+        "1 1 0",
+        "4294967295 1 1",
+        "1 18446744073709551615 1",
+    ] {
+        assert!(mapped_alternate_group(&[4, 1000], 1000, invalid).is_err());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn worker_preserves_alternate_group_through_materialization() -> anyhow::Result<()> {
@@ -904,8 +966,37 @@ async fn worker_preserves_alternate_group_through_materialization() -> anyhow::R
             .map(str::parse::<u32>)
             .collect::<Result<Vec<_>, _>>(),
     )?;
-    let Some(group) = groups.into_iter().find(|group| *group != original_group) else {
-        eprintln!("skipping ownership regression: no alternate supplementary group");
+    #[cfg(target_os = "linux")]
+    let group = {
+        let gid_map =
+            diagnostics.stage("read_gid_map", fs::read_to_string("/proc/self/gid_map"))?;
+        diagnostics.stage(
+            "select_mapped_group",
+            mapped_alternate_group(&groups, original_group, &gid_map),
+        )?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let group = groups.into_iter().find(|group| *group != original_group);
+    let required = match std::env::var_os("CODEX_ROLLOUT_REQUIRE_ALTERNATE_GROUP") {
+        None => false,
+        Some(value) => {
+            anyhow::ensure!(
+                value == "1",
+                "invalid required alternate-group test setting"
+            );
+            true
+        }
+    };
+    let Some(group) = group else {
+        anyhow::ensure!(
+            !required,
+            "required ownership regression has no mapped alternate supplementary group"
+        );
+        diagnostics.emit("coverage=not_exercised reason=no_mapped_alternate_group");
+        eprintln!(
+            "ownership regression not exercised: no mapped alternate supplementary group; \
+             the required Linux host companion must exercise this case"
+        );
         return Ok(());
     };
     diagnostics.emit(&format!(
@@ -951,6 +1042,7 @@ async fn worker_preserves_alternate_group_through_materialization() -> anyhow::R
             .gid(),
         group
     );
+    diagnostics.emit("coverage=exercised stages=chown_worker_materialize");
     Ok(())
 }
 

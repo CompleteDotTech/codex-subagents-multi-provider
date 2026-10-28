@@ -1,6 +1,28 @@
-load("//:defs.bzl", "codex_rust_crate")
+load("//:defs.bzl", "codex_rust_crate", "workspace_root_test")
 
 codex_rust_crate(
     name = "rollout",
     crate_name = "codex_rollout",
+)
+
+# Linux sandbox user namespaces can expose unmapped supplementary groups as
+# overflowgid. Keep the ordinary unit suite sandboxed, and require this exact
+# ownership regression on a host where changing to a real member group works.
+workspace_root_test(
+    name = "rollout-alternate-group-host-test",
+    size = "small",
+    args = [
+        "compression::tests::worker_preserves_alternate_group_through_materialization",
+        "--exact",
+        "--test-threads=1",
+    ],
+    env = {"CODEX_ROLLOUT_REQUIRE_ALTERNATE_GROUP": "1"},
+    tags = [
+        "external",
+        "no-remote",
+        "no-sandbox",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    test_bin = ":rollout-unit-tests-bin",
+    workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
 )
