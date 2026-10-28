@@ -1,7 +1,6 @@
 --- a/opus/CMakeLists.txt
 +++ b/opus/CMakeLists.txt
-@@ -96,2 +96,14 @@
-+
+@@ -282,2 +282,14 @@
 +# Bazel source inputs may be symlinks into an action's input tree. CMake's
 +# install(FILES) preserves those links, which would escape the output tree.
 +# Stage regular files for installation without changing header contents.
@@ -13,5 +12,6 @@
 +  list(APPEND Opus_INSTALL_HEADER "${install_header}")
 +endforeach()
 +set(Opus_PUBLIC_HEADER ${Opus_INSTALL_HEADER})
++
  if(MSVC)
    if(OPUS_STATIC_RUNTIME)
