@@ -37,7 +37,7 @@ fn params(thread_id: ThreadId) -> CreateThreadParams {
 }
 
 #[tokio::test]
-async fn completed_shutdown_is_idempotent_without_reopening_retired_writer() {
+async fn completed_shutdown_receipt_is_idempotent_without_reopening_retired_writer() {
     let store = Arc::new(InMemoryThreadStore::default());
     let thread_id = ThreadId::new();
     let old = LiveThread::create_owned(store.clone(), params(thread_id))
@@ -48,7 +48,8 @@ async fn completed_shutdown_is_idempotent_without_reopening_retired_writer() {
     let completed_calls = store.calls().await;
     old.clone().prepare_shutdown().await.unwrap();
     old.completed_shutdown().await.unwrap();
-    old.shutdown().await.unwrap();
+    assert!(old.shutdown().await.is_err());
+    old.completed_shutdown().await.unwrap();
     assert_eq!(
         store.calls().await.shutdown_thread,
         completed_calls.shutdown_thread
@@ -75,7 +76,8 @@ async fn completed_shutdown_is_idempotent_without_reopening_retired_writer() {
     .unwrap();
     assert!(replacement.completed_shutdown().await.is_err());
     old.prepare_shutdown().await.unwrap();
-    old.shutdown().await.unwrap();
+    assert!(old.shutdown().await.is_err());
+    old.completed_shutdown().await.unwrap();
     replacement.prepare_shutdown().await.unwrap();
     replacement.flush().await.unwrap();
     replacement.shutdown().await.unwrap();

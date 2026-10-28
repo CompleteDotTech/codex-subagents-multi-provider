@@ -244,9 +244,8 @@ impl LiveThread {
 
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
         let mut completion = self.shutdown_completion.clone().lock_owned().await;
-        if matches!(completion.as_ref(), Some(Ok(()))) {
-            return Ok(());
-        }
+        // A completed receipt is historical evidence, not permission to mutate a retired writer.
+        // Every shutdown request still passes the acquisition's authoritative owner fence.
         let Some(owner) = &self.owner else {
             let result = self.shutdown_inner().await;
             if completion.is_none() || result.is_ok() {
