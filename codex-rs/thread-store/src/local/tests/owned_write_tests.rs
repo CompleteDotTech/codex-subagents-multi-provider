@@ -513,6 +513,8 @@ async fn retired_owned_handle_rejects_every_mutation_and_preserves_replacement()
         .unwrap();
     replacement.flush().await.unwrap();
     let before = state.get_thread(thread).await.unwrap().unwrap();
+    let memory_mode_before = state.get_thread_memory_mode(thread).await.unwrap();
+    assert!(memory_mode_before.is_some());
     let bytes = tokio::fs::read(&path).await.unwrap();
     assert!(
         old.append_items(&[owned_user_message(
@@ -566,7 +568,10 @@ async fn retired_owned_handle_rejects_every_mutation_and_preserves_replacement()
     replacement.flush().await.unwrap();
     let after = state.get_thread(thread).await.unwrap().unwrap();
     assert_eq!(after.preview, before.preview);
-    assert_eq!(after.memory_mode, before.memory_mode);
+    assert_eq!(
+        state.get_thread_memory_mode(thread).await.unwrap(),
+        memory_mode_before
+    );
     assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
     assert!(
         state
