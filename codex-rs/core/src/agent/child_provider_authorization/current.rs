@@ -3,6 +3,7 @@ use super::*;
 /// Private, one-operation fence. It cannot select a provider or refresh metadata.
 /// Each synchronous decision admits exactly one queue/helper/transport stage.
 /// That stage may finish after publication; later stages must be admitted again.
+#[derive(Clone)]
 pub(crate) struct CurrentChildOperation {
     root: Arc<CodexThread>,
     target: Arc<CodexThread>,

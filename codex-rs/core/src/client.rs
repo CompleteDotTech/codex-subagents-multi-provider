@@ -2033,14 +2033,36 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = input;
             }
             inference_trace_attempt.record_started(&request);
+            // Both adapters retain the original operation across EndpointSession's
+            // configured retries, including the await between auth and dispatch.
+            let operation = self.guard.cloned();
+            let denial = Arc::new(StdMutex::new(None));
             let client = ApiResponsesClient::new(
-                transport,
+                GuardedRequestTransport {
+                    inner: transport,
+                    operation: operation.clone(),
+                    denial: Arc::clone(&denial),
+                },
                 client_setup.api_provider,
-                client_setup.api_auth,
+                Arc::new(GuardedRequestAuth {
+                    inner: client_setup.api_auth,
+                    operation,
+                    denial: Arc::clone(&denial),
+                }),
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             admit_child_stage(self.guard)?;
             let stream_result = client.stream_request(request, options).await;
+            // The lower API preserves a nonretryable typed Policy sentinel. Restore
+            // the original child-policy error before generic mapping or recovery.
+            let denied = denial
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(error) = denied {
+                inference_trace_attempt.record_failed(&error, None, /*output_items*/ &[]);
+                return Err(error);
+            }
 
             match stream_result {
                 Ok(stream) => {
@@ -3322,4 +3344,251 @@ fn admit_child_stage(
         guard.check()?;
     }
     Ok(())
+}
+
+// Each check admits one immediately following stage. Delegated futures are
+// constructed/polled only after all admission locks have been released.
+struct GuardedRequestAuth {
+    inner: SharedAuthProvider,
+    operation: Option<crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    denial: Arc<StdMutex<Option<CodexErr>>>,
+}
+
+fn admit_request_stage(
+    operation: Option<&crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    denial: &StdMutex<Option<CodexErr>>,
+) -> std::result::Result<(), codex_http_client::NetworkPolicyDenied> {
+    admit_child_stage(operation).map_err(|error| {
+        let mut first = denial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first.is_none() {
+            *first = Some(error);
+        }
+        codex_http_client::NetworkPolicyDenied::Revoked
+    })
+}
+
+impl AuthProvider for GuardedRequestAuth {
+    fn add_auth_headers(
+        &self,
+        headers: &mut ApiHeaderMap,
+    ) -> std::result::Result<(), codex_api::AuthError> {
+        admit_request_stage(self.operation.as_ref(), &self.denial)?;
+        self.inner.add_auth_headers(headers)
+    }
+
+    fn resolve_auth_headers(&self) -> codex_api::AuthHeadersFuture<'_> {
+        Box::pin(async move {
+            admit_request_stage(self.operation.as_ref(), &self.denial)?;
+            self.inner.resolve_auth_headers().await
+        })
+    }
+
+    fn apply_auth(&self, request: codex_http_client::Request) -> codex_api::AuthProviderFuture<'_> {
+        Box::pin(async move {
+            admit_request_stage(self.operation.as_ref(), &self.denial)?;
+            self.inner.apply_auth(request).await
+        })
+    }
+
+    fn refresh_after_unauthorized(
+        &self,
+        rejected_headers: ApiHeaderMap,
+    ) -> codex_api::AuthRefreshFuture<'_> {
+        Box::pin(async move {
+            if admit_request_stage(self.operation.as_ref(), &self.denial).is_err() {
+                return false;
+            }
+            self.inner
+                .refresh_after_unauthorized(rejected_headers)
+                .await
+        })
+    }
+}
+
+struct GuardedRequestTransport<T> {
+    inner: T,
+    operation: Option<crate::agent::child_provider_authorization::current::CurrentChildOperation>,
+    denial: Arc<StdMutex<Option<CodexErr>>>,
+}
+
+impl<T: codex_http_client::HttpTransport> codex_http_client::HttpTransport
+    for GuardedRequestTransport<T>
+{
+    async fn execute(
+        &self,
+        request: codex_http_client::Request,
+    ) -> std::result::Result<codex_http_client::Response, TransportError> {
+        admit_request_stage(self.operation.as_ref(), &self.denial)?;
+        self.inner.execute(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: codex_http_client::Request,
+    ) -> std::result::Result<codex_http_client::StreamResponse, TransportError> {
+        admit_request_stage(self.operation.as_ref(), &self.denial)?;
+        self.inner.stream(request).await
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn exercise_current_http_boundary(
+    operation: crate::agent::child_provider_authorization::current::CurrentChildOperation,
+    hold_auth: bool,
+    publication: impl std::future::Future<Output = ()>,
+    revoke: bool,
+) {
+    use std::sync::atomic::AtomicUsize;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    struct HeldAuth {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+        hold: bool,
+    }
+    impl AuthProvider for HeldAuth {
+        fn add_auth_headers(
+            &self,
+            headers: &mut ApiHeaderMap,
+        ) -> std::result::Result<(), codex_api::AuthError> {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer boundary-test"),
+            );
+            Ok(())
+        }
+        fn apply_auth(
+            &self,
+            request: codex_http_client::Request,
+        ) -> codex_api::AuthProviderFuture<'_> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.hold {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                let mut request = request;
+                self.add_auth_headers(&mut request.headers)?;
+                Ok(request)
+            })
+        }
+    }
+    let response_started = Arc::new(StdMutex::new(None));
+    if !hold_auth {
+        let entered = Arc::clone(&entered);
+        let response_started = Arc::clone(&response_started);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |_: &wiremock::Request| {
+                *response_started.lock().unwrap() = Some(Instant::now());
+                entered.notify_one();
+                ResponseTemplate::new(500).set_delay(Duration::from_secs(10))
+            })
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST")).and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+            .set_body_string("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"boundary-complete\",\"output\":[]}}\n\n"))
+        .mount(&server).await;
+    let denial = Arc::new(StdMutex::new(None));
+    let transport = GuardedRequestTransport {
+        inner: ReqwestTransport::new(reqwest::Client::new()),
+        operation: Some(operation.clone()),
+        denial: Arc::clone(&denial),
+    };
+    let auth = GuardedRequestAuth {
+        inner: Arc::new(HeldAuth {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            calls: Arc::clone(&calls),
+            hold: hold_auth,
+        }),
+        operation: Some(operation),
+        denial: Arc::clone(&denial),
+    };
+    let provider = ApiProvider {
+        name: "actual-boundary-test".into(),
+        base_url: server.uri(),
+        query_params: None,
+        headers: ApiHeaderMap::new(),
+        stream_idle_timeout: Duration::from_secs(5),
+        retry: codex_client::RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            retry_429: true,
+            retry_5xx: true,
+            retry_transport: true,
+        },
+    };
+    let client = ApiResponsesClient::new(transport, provider, Arc::new(auth));
+    let request = client.stream(
+        serde_json::json!({"model":"shared-loaded","input":[]}),
+        ApiHeaderMap::new(),
+        Compression::default(),
+        None,
+    );
+    let change = async {
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("actual auth or first HTTP attempt must enter");
+        publication.await;
+        if hold_auth {
+            release.notify_one();
+        } else {
+            assert!(
+                response_started.lock().unwrap().unwrap().elapsed() < Duration::from_secs(10),
+                "publication must finish before the real retryable response is delivered; timeout is setup failure"
+            );
+        }
+    };
+    let (result, ()) = tokio::join!(request, change);
+    let original = denial.lock().unwrap().take();
+    if revoke {
+        assert!(matches!(
+            result,
+            Err(ApiError::Transport(TransportError::Policy(_)))
+        ));
+        let error = original
+            .expect("the original typed child denial must survive the lower-layer sentinel");
+        assert!(matches!(error, CodexErr::InvalidRequest(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("child_provider_policy_conflict"),
+            "{error}"
+        );
+    } else {
+        assert!(
+            result.is_ok(),
+            "unchanged actual lower HTTP request must succeed"
+        );
+        assert!(original.is_none());
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        if hold_auth {
+            usize::from(!revoke)
+        } else {
+            1 + usize::from(!revoke)
+        }
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        if hold_auth || revoke { 1 } else { 2 }
+    );
+    for request in requests {
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer boundary-test"
+        );
+    }
 }

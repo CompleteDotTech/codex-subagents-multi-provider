@@ -11026,3 +11026,468 @@ stream_idle_timeout_ms = 1000
     parent.shutdown_and_wait().await.unwrap();
     harness.manager.remove_thread(&parent_id).await;
 }
+#[test_case::test_case(false, false; "actual lower HTTP configured retry unchanged positive")]
+#[test_case::test_case(false, true; "actual lower HTTP configured retry publication denies second POST")]
+#[test_case::test_case(true, false; "actual held auth unchanged dispatch positive")]
+#[test_case::test_case(true, true; "actual held auth publication denies first POST")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_operation_reaches_actual_lower_auth_and_http_attempt(
+    hold_auth: bool,
+    revoke: bool,
+) {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    let catalog_file = home.path().join("loaded-a.json");
+    std::fs::write(
+        &host_file,
+        r#"
+model = "gpt-5.5"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "loaded-a.json"
+[model_providers.a]
+name = "Loaded custom fixture"
+base_url = "http://127.0.0.1:9/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+    )
+    .unwrap();
+    let mut info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .expect("real bundled model metadata");
+    info.slug = "shared-loaded".into();
+    info.multi_agent_version = Some(MultiAgentVersion::V2);
+    info.supports_search_tool = false;
+    info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    info.used_fallback_model_metadata = false;
+    std::fs::write(
+        &catalog_file,
+        serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+    )
+    .unwrap();
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(snapshot.binding);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "openai");
+    let target = loaded_custom_provider_resident(&harness, &parent).await;
+    let target_id = target.session.thread_id;
+    assert!(target.is_running());
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+
+    let guard = crate::agent::child_provider_authorization::current::prepare_loaded(
+        &harness.control.runtime,
+        target_id,
+        parent_id,
+    )
+    .await
+    .unwrap()
+    .expect("ordinary delegated target is guarded");
+    guard
+        .check()
+        .expect("prepared current helper stage is admitted");
+
+    crate::client::exercise_current_http_boundary(
+        guard,
+        hold_auth,
+        async {
+            if revoke {
+                let mut value: TomlValue =
+                    toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
+                value["agents"]["allowed_model_providers"] =
+                    TomlValue::Array(vec![TomlValue::String("openai".into())]);
+                std::fs::write(&host_file, toml::to_string(&value).unwrap()).unwrap();
+                let next = ConfigBuilder::without_managed_config_for_tests()
+                    .codex_home(harness.config.codex_home.to_path_buf())
+                    .harness_overrides(crate::config::ConfigOverrides {
+                        cwd: Some(project.path().to_path_buf()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    parent
+                        .refresh_runtime_config(parent.config().await, next)
+                        .await,
+                    crate::ConfigRefreshOutcome::Published
+                );
+            }
+        },
+        revoke,
+    )
+    .await;
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "openai");
+    target.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&target_id).await;
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
+}
+
+#[test_case::test_case(false, 0; "public HTTP native idle prewarm explicitly skipped while current")]
+#[test_case::test_case(false, 1; "public HTTP native idle prewarm skipped after publication")]
+#[test_case::test_case(true, 0; "public supported WS native idle prewarm explicitly skipped while current")]
+#[test_case::test_case(true, 1; "public supported WS native idle prewarm skipped after publication")]
+#[test_case::test_case(false, 2; "public HTTP native idle prewarm skipped after managed invalidation")]
+#[test_case::test_case(true, 2; "public supported WS native idle prewarm skipped after managed invalidation")]
+#[tokio::test]
+async fn public_native_idle_prewarm_has_no_optional_helper_worker_or_transport(
+    websockets: bool,
+    change: u8,
+) {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    let catalog_file = home.path().join("loaded-a.json");
+    std::fs::write(
+        &host_file,
+        r#"
+model = "gpt-5.5"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "loaded-a.json"
+[model_providers.a]
+name = "Loaded custom fixture"
+base_url = "http://127.0.0.1:9/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+    )
+    .unwrap();
+    let mut info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .expect("real bundled model metadata");
+    info.slug = "shared-loaded".into();
+    info.multi_agent_version = Some(MultiAgentVersion::V2);
+    info.supports_search_tool = false;
+    info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    info.used_fallback_model_metadata = false;
+    std::fs::write(
+        &catalog_file,
+        serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+    )
+    .unwrap();
+    let server = wiremock::MockServer::start().await;
+    let mut host: TomlValue =
+        toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
+    host["model_providers"]["a"]["base_url"] = TomlValue::String(format!("{}/v1", server.uri()));
+    host["model_providers"]["a"]["supports_websockets"] = TomlValue::Boolean(websockets);
+    let marker = home.path().join("idle-native-helper-marker");
+    let command = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+    let args = if cfg!(windows) {
+        vec![
+            "/D".to_owned(),
+            "/C".to_owned(),
+            format!("echo invoked>\"{}\"&echo synthetic-idle", marker.display()),
+        ]
+    } else {
+        vec![
+            "-c".to_owned(),
+            format!(
+                "printf invoked > '{}'; printf synthetic-idle",
+                marker.display()
+            ),
+        ]
+    };
+    host["model_providers"]["a"].as_table_mut().unwrap().insert(
+        "auth".into(),
+        TomlValue::Table(toml::Table::from_iter([
+            ("command".into(), TomlValue::String(command.into())),
+            (
+                "args".into(),
+                TomlValue::Array(args.into_iter().map(TomlValue::String).collect()),
+            ),
+            ("timeout_ms".into(), TomlValue::Integer(5000)),
+            ("refresh_interval_ms".into(), TomlValue::Integer(0)),
+        ])),
+    );
+    std::fs::write(&host_file, toml::to_string(&host).unwrap()).unwrap();
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(snapshot.binding);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "openai");
+    let target = loaded_custom_provider_resident(&harness, &parent).await;
+    let target_id = target.session.thread_id;
+    assert!(target.is_running());
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+
+    assert_eq!(
+        target
+            .session
+            .services
+            .model_client
+            .responses_websocket_enabled(),
+        websockets
+    );
+    assert!(target.session.state.lock().await.startup_prewarm.is_none());
+    assert!(
+        !marker.exists(),
+        "preregistration startup must also defer native helper prewarm"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    if change == 1 {
+        let mut value: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
+        value["agents"]["allowed_model_providers"] =
+            TomlValue::Array(vec![TomlValue::String("openai".into())]);
+        std::fs::write(&host_file, toml::to_string(&value).unwrap()).unwrap();
+        let next = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(harness.config.codex_home.to_path_buf())
+            .harness_overrides(crate::config::ConfigOverrides {
+                cwd: Some(project.path().to_path_buf()),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            parent
+                .refresh_runtime_config(parent.config().await, next)
+                .await,
+            crate::ConfigRefreshOutcome::Published
+        );
+    }
+    if change == 2 {
+        let mut bundle = codex_config::CloudConfigBundle::default();
+        bundle
+            .config_toml
+            .enterprise_managed
+            .push(codex_config::CloudConfigFragment {
+                id: "idle-native-revocation".into(),
+                name: "idle native revocation".into(),
+                contents: "[agents]\nallowed_model_providers=['openai']\n".into(),
+            });
+        policy.observe_remote_bundle(&bundle).unwrap();
+        assert_ne!(
+            parent
+                .config()
+                .await
+                .config_layer_stack
+                .cloud_config_binding()
+                .unwrap()
+                .read()
+                .status,
+            codex_config::CloudConfigBundleBindingStatus::Current
+        );
+    }
+    target.prewarm().await;
+    target.prewarm_with_history().await;
+    assert!(
+        target.session.state.lock().await.startup_prewarm.is_none(),
+        "no optional WS task may be scheduled"
+    );
+    assert!(
+        !marker.exists(),
+        "neither public call may start the concrete configured helper"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(Arc::ptr_eq(
+        &target,
+        &harness.manager.get_thread(target_id).await.unwrap()
+    ));
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "openai");
+    target.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&target_id).await;
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
+}
+
+#[tokio::test]
+async fn actual_host_owned_root_retains_optional_auth_prewarm() {
+    let websockets = false;
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let host_file = home.path().join("config.toml");
+    let catalog_file = home.path().join("loaded-a.json");
+    std::fs::write(
+        &host_file,
+        r#"
+model = "gpt-5.5"
+[agents]
+max_depth = 8
+allowed_model_providers = ["openai", "a"]
+[agents.provider_defaults.a]
+model = "shared-loaded"
+model_catalog_json = "loaded-a.json"
+[model_providers.a]
+name = "Loaded custom fixture"
+base_url = "http://127.0.0.1:9/v1"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 1000
+"#,
+    )
+    .unwrap();
+    let mut info = codex_models_manager::bundled_models_response()
+        .unwrap()
+        .models
+        .into_iter()
+        .find(|info| info.slug == "gpt-5.5")
+        .expect("real bundled model metadata");
+    info.slug = "shared-loaded".into();
+    info.multi_agent_version = Some(MultiAgentVersion::V2);
+    info.supports_search_tool = false;
+    info.tool_mode = Some(codex_protocol::openai_models::ToolMode::Direct);
+    info.used_fallback_model_metadata = false;
+    std::fs::write(
+        &catalog_file,
+        serde_json::to_vec(&serde_json::json!({"models":[info]})).unwrap(),
+    )
+    .unwrap();
+    let server = wiremock::MockServer::start().await;
+    let mut host: TomlValue =
+        toml::from_str(&std::fs::read_to_string(&host_file).unwrap()).unwrap();
+    host["model_providers"]["a"]["base_url"] = TomlValue::String(format!("{}/v1", server.uri()));
+    host["model_providers"]["a"]["supports_websockets"] = TomlValue::Boolean(websockets);
+    let marker = home.path().join("idle-native-helper-marker");
+    let command = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+    let args = if cfg!(windows) {
+        vec![
+            "/D".to_owned(),
+            "/C".to_owned(),
+            format!("echo invoked>\"{}\"&echo synthetic-idle", marker.display()),
+        ]
+    } else {
+        vec![
+            "-c".to_owned(),
+            format!(
+                "printf invoked > '{}'; printf synthetic-idle",
+                marker.display()
+            ),
+        ]
+    };
+    host["model_providers"]["a"].as_table_mut().unwrap().insert(
+        "auth".into(),
+        TomlValue::Table(toml::Table::from_iter([
+            ("command".into(), TomlValue::String(command.into())),
+            (
+                "args".into(),
+                TomlValue::Array(args.into_iter().map(TomlValue::String).collect()),
+            ),
+            ("timeout_ms".into(), TomlValue::Integer(5000)),
+            ("refresh_interval_ms".into(), TomlValue::Integer(0)),
+        ])),
+    );
+    std::fs::write(&host_file, toml::to_string(&host).unwrap()).unwrap();
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(crate::config::ConfigOverrides {
+            cwd: Some(project.path().to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .unwrap();
+    let policy = codex_config::CloudConfigBundlePolicy::default();
+    let mut snapshot = codex_config::CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_cloud_config_binding(snapshot.binding);
+    config.model_provider_id = "a".into();
+    config.model_provider = config.model_providers["a"].clone();
+    config.model = Some("shared-loaded".into());
+    config.model_catalog =
+        Some(serde_json::from_slice(&std::fs::read(&catalog_file).unwrap()).unwrap());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.config_snapshot().await.model_provider_id, "a");
+
+    assert!(parent.session_source.parent_thread_id().is_none());
+    parent.prewarm().await;
+    parent.prewarm_with_history().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual host-owned auth prewarm must still run the configured helper");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "invoked");
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "HTTP auth-only warmup sends no model request"
+    );
+    parent.shutdown_and_wait().await.unwrap();
+    harness.manager.remove_thread(&parent_id).await;
+}

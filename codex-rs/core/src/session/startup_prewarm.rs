@@ -207,6 +207,16 @@ impl SessionStartupPrewarmHandle {
 
 impl Session {
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, input: PrewarmInput) {
+        // Optional idle/startup work cannot borrow a turn's current-operation
+        // fence. Defer native children to their guarded regular turn instead.
+        // This restriction also applies before registry finalization; it creates
+        // no authority from a source label and never runs a helper/worker first.
+        if matches!(
+            self.state.lock().await.session_configuration.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) {
+            return;
+        }
         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let mut state = self.state.lock().await;
         if state.shutting_down {

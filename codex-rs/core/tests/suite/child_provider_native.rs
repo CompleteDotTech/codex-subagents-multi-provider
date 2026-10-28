@@ -1965,3 +1965,163 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
     assert!(!fixture.home.path().join("helper-marker").exists());
     Ok(())
 }
+
+fn native_lower_http_retry_setup(config: &mut codex_core::config::Config) {
+    let file = config.codex_home.join("config.toml");
+    let mut source: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    source["model_providers"]["a"]["request_max_retries"] = toml::Value::Integer(2);
+    std::fs::write(file, toml::to_string(&source).unwrap()).unwrap();
+    config
+        .model_providers
+        .get_mut("a")
+        .unwrap()
+        .request_max_retries = Some(2);
+}
+
+#[test_case::test_case(false; "actual native configured lower HTTP retry unchanged positive")]
+#[test_case::test_case(true; "actual native configured lower HTTP retry publication denies second POST")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -> Result<()> {
+    let fixture =
+        Fixture::with_host_setup(MultiAgentVersion::V2, None, native_lower_http_retry_setup)
+            .await?;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let response_started = Arc::new(std::sync::Mutex::new(None));
+    let response_clock = Arc::clone(&response_started);
+    let response_entered = Arc::clone(&entered);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |_: &wiremock::Request| {
+            *response_clock.lock().unwrap() = Some(std::time::Instant::now());
+            response_entered.notify_one();
+            ResponseTemplate::new(500).set_delay(Duration::from_secs(10))
+        })
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&fixture.a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("custom-after-hook"))
+        .mount(&fixture.a)
+        .await;
+    scripted_spawn(
+        &fixture.root,
+        MultiAgentVersion::V2,
+        "hook_guard_worker",
+        json!({"prompt":"Complete the bounded hook request","model_provider":"a"}),
+    )
+    .await;
+    fixture.turn("spawn the hook barrier child").await?;
+    tokio::time::timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("actual first lower HTTP attempt must reach the retryable response barrier");
+    let children = fixture.children(1).await?;
+    let child = &children[0];
+    let child_id = child.read_thread(true, false).await?.thread_id;
+    assert_eq!(
+        child.config().await.model_provider.request_max_retries,
+        Some(2),
+        "the actual selected child must retain configured lower HTTP retries"
+    );
+    let before = 1;
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        before,
+        "first actual POST is recorded before its retryable response is released"
+    );
+    assert_eq!(native_post_count(&fixture.b).await, 0);
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    if revoke {
+        revoke_native_fixture_a(fixture.home.path())?;
+        publish_native_fixture_host_config(&fixture, None).await?;
+        assert_native_fixture_published_revocation(&fixture.test.codex.config().await);
+    }
+    assert!(
+        response_started.lock().unwrap().unwrap().elapsed() < Duration::from_secs(10),
+        "completed policy publication must precede delivery of the actual first retryable HTTP response; timeout is setup failure"
+    );
+    let status = native_terminal_status(child).await;
+    if revoke {
+        assert!(
+            matches!(&status, codex_protocol::protocol::AgentStatus::Errored(message)
+            if native_fixture_policy_denial(message)),
+            "{status:?}"
+        );
+    } else {
+        assert!(
+            matches!(status, codex_protocol::protocol::AgentStatus::Completed(_)),
+            "{status:?}"
+        );
+    }
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        before + usize::from(!revoke)
+    );
+    assert_eq!(native_post_count(&fixture.b).await, 0);
+    for request in fixture
+        .a
+        .received_requests()
+        .await
+        .expect("A request recording enabled")
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+    {
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer synthetic-a")
+        );
+        assert!(!String::from_utf8_lossy(&request.body).contains("synthetic-root"));
+    }
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    assert_eq!(child.config_snapshot().await.model_provider_id, "a");
+    assert!(Arc::ptr_eq(
+        child,
+        &fixture.test.thread_manager.get_thread(child_id).await?
+    ));
+    let root_before = native_post_count(&fixture.root).await;
+    fixture
+        .turn("ordinary OpenAI parent remains usable after the request boundary")
+        .await?;
+    assert!(native_post_count(&fixture.root).await > root_before);
+    assert_eq!(
+        fixture.test.codex.config_snapshot().await.model_provider_id,
+        "openai"
+    );
+    // A different authorized provider and its fresh child remain independent.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(completion("independent-b-child"))
+        .mount(&fixture.b)
+        .await;
+    scripted_spawn(
+        &fixture.root,
+        MultiAgentVersion::V2,
+        "hook_guard_sibling",
+        json!({"prompt":"Complete the independent sibling","model_provider":"b"}),
+    )
+    .await;
+    fixture.turn("spawn the unaffected B sibling").await?;
+    let children = fixture.children(2).await?;
+    let mut found_b = false;
+    for sibling in children {
+        if sibling.config_snapshot().await.model_provider_id == "b" {
+            assert!(matches!(
+                native_terminal_status(&sibling).await,
+                codex_protocol::protocol::AgentStatus::Completed(_)
+            ));
+            found_b = true;
+        }
+    }
+    assert!(found_b);
+    assert_eq!(native_post_count(&fixture.b).await, 1);
+    assert_eq!(
+        native_post_count(&fixture.a).await,
+        before + usize::from(!revoke)
+    );
+    assert!(!fixture.home.path().join("helper-marker").exists());
+    Ok(())
+}
