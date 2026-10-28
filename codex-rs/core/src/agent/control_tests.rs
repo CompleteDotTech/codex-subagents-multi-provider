@@ -13395,7 +13395,7 @@ stream_idle_timeout_ms = 1000
         .captured_ops()
         .into_iter()
         .skip(before_ops)
-        .filter(|entry| captured_op_matches(entry, &(target_id, Op::Interrupt)))
+        .filter(|(thread_id, op)| *thread_id == target_id && matches!(op, Op::Interrupt))
         .count();
     let mut reloaded = false;
     if let Some(thread) = &loaded {
