@@ -15,7 +15,7 @@ struct MetadataFailureStore {
 macro_rules! delegate_owned_write_store {
     ($(fn $name:ident($arg:ident: $ty:ty) -> $output:ty;)*) => {
         $(fn $name(&self, $arg: $ty) -> ThreadStoreFuture<'_, $output> {
-            self.inner.$name($arg)
+            <LocalThreadStore as ThreadStore>::$name(&self.inner, $arg)
         })*
     };
 }
