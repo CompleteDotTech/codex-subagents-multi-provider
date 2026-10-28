@@ -549,7 +549,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
         session,
         &session.services.models_manager,
         config,
-        false,
+        /*strict_catalog*/ false,
     )
     .await
 }

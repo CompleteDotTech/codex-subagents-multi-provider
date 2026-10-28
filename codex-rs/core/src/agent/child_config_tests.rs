@@ -34,7 +34,7 @@ impl Fixture {
             .thread
     }
     async fn new() -> Self {
-        Self::with_fast_mode(None).await
+        Self::with_fast_mode(/*fast_mode*/ None).await
     }
 
     async fn with_fast_mode(fast_mode: Option<bool>) -> Self {
@@ -209,8 +209,8 @@ async fn selected_same_slug_catalog_reaches_startup_without_changing_parent_or_s
     let zai = fixture.resolved("zai").await;
     let ollama = fixture.resolved("ollama").await;
     let (zai, ollama) = tokio::join!(
-        fixture.prepared(&zai, None, None),
-        fixture.prepared(&ollama, None, None)
+        fixture.prepared(&zai, /*role*/ None, /*effort*/ None),
+        fixture.prepared(&ollama, /*role*/ None, /*effort*/ None)
     );
     let zai = zai.unwrap().config;
     let ollama = ollama.unwrap().config;
@@ -265,7 +265,7 @@ async fn prepared_scope_cannot_survive_provider_catalog_model_or_auth_changes() 
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
     let prepared = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -299,7 +299,7 @@ async fn unknown_model_and_unsupported_explicit_effort_fail_without_parent_fallb
     let fixture = Fixture::new().await;
     let mut resolved = fixture.resolved("zai").await;
     let result = fixture
-        .prepared(&resolved, None, Some(ReasoningEffort::High))
+        .prepared(&resolved, /*role*/ None, Some(ReasoningEffort::High))
         .await;
     assert!(
         result
@@ -308,7 +308,9 @@ async fn unknown_model_and_unsupported_explicit_effort_fail_without_parent_fallb
             .contains("child_provider_capability_unsupported")
     );
     resolved.model = "gpt-5.5".into();
-    let result = fixture.prepared(&resolved, None, None).await;
+    let result = fixture
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
+        .await;
     assert!(
         result
             .err()
@@ -321,7 +323,9 @@ async fn unknown_model_and_unsupported_explicit_effort_fail_without_parent_fallb
 async fn failed_target_catalog_discovery_cannot_validate_a_bundled_openai_slug() {
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("offline").await;
-    let result = fixture.prepared(&resolved, None, None).await;
+    let result = fixture
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
+        .await;
     assert!(
         result
             .err()
@@ -362,7 +366,9 @@ async fn prepared_provider_selection_cannot_be_reused_for_a_full_history_switch(
 async fn explicit_role_tier_is_validated_even_when_equal_to_inherited_value() {
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
-    let result = fixture.prepared(&resolved, Some("tier"), None).await;
+    let result = fixture
+        .prepared(&resolved, Some("tier"), /*effort*/ None)
+        .await;
     assert!(
         result
             .err()
@@ -370,7 +376,7 @@ async fn explicit_role_tier_is_validated_even_when_equal_to_inherited_value() {
             .contains("child_provider_capability_unsupported")
     );
     let mut config = fixture
-        .prepared(&resolved, None, None)
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
         .await
         .unwrap()
         .config;
@@ -386,7 +392,7 @@ async fn explicit_role_tier_is_validated_even_when_equal_to_inherited_value() {
         .unwrap();
     assert_eq!(explicit, Some("flex".into()));
     let default = fixture
-        .prepared(&resolved, Some("default_tier"), None)
+        .prepared(&resolved, Some("default_tier"), /*effort*/ None)
         .await
         .unwrap();
     assert_eq!(
@@ -416,7 +422,9 @@ async fn advertised_custom_role_tier_requires_the_same_feature_gate_as_runtime()
                 description: "fixture".into(),
             });
         std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
-        let result = fixture.prepared(&resolved, Some("tier"), None).await;
+        let result = fixture
+            .prepared(&resolved, Some("tier"), /*effort*/ None)
+            .await;
         if !enabled {
             assert!(
                 result
@@ -453,7 +461,7 @@ async fn unsupported_inherited_tier_is_omitted_and_default_sentinel_is_preserved
     let resolved = fixture.resolved("zai").await;
     assert_eq!(
         fixture
-            .prepared(&resolved, None, None)
+            .prepared(&resolved, /*role*/ None, /*effort*/ None)
             .await
             .unwrap()
             .config
@@ -470,7 +478,7 @@ async fn unsupported_inherited_tier_is_omitted_and_default_sentinel_is_preserved
         )));
     assert_eq!(
         fixture
-            .prepared(&resolved, None, None)
+            .prepared(&resolved, /*role*/ None, /*effort*/ None)
             .await
             .unwrap()
             .config
@@ -483,7 +491,10 @@ async fn unsupported_inherited_tier_is_omitted_and_default_sentinel_is_preserved
 async fn native_step_does_not_reintroduce_an_unsupported_root_flex_tier() {
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
-    let prepared = fixture.prepared(&resolved, None, None).await.unwrap();
+    let prepared = fixture
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
+        .await
+        .unwrap();
     let child = fixture.start_native_child(prepared.config).await;
     child
         .session
@@ -517,7 +528,7 @@ async fn native_explicit_role_tier_survives_root_updates_and_is_not_inherited_as
         });
     std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
     let prepared = fixture
-        .prepared(&resolved, Some("tier"), None)
+        .prepared(&resolved, Some("tier"), /*effort*/ None)
         .await
         .unwrap();
     assert!(prepared.config.child_role_service_tier_override);
@@ -549,9 +560,15 @@ async fn changed_provider_uses_target_reasoning_default_and_preserves_role_prece
     let resolved = fixture.resolved("zai").await;
     let mut config = fixture.config.clone();
     config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::High);
-    prepare_resolved_child_models(&fixture.parent.session, &mut config, &resolved, None, None)
-        .await
-        .unwrap();
+    prepare_resolved_child_models(
+        &fixture.parent.session,
+        &mut config,
+        &resolved,
+        /*requested_model*/ None,
+        /*requested_effort*/ None,
+    )
+    .await
+    .unwrap();
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Low));
     let prepared = fixture
         .prepared(&resolved, Some("reasoning"), Some(ReasoningEffort::High))
@@ -567,7 +584,10 @@ async fn changed_provider_uses_target_reasoning_default_and_preserves_role_prece
 async fn fresh_same_provider_reload_uses_changed_catalog_prompts_and_limits() {
     let fixture = Fixture::new().await;
     let resolved = fixture.resolved("zai").await;
-    let prepared = fixture.prepared(&resolved, None, None).await.unwrap();
+    let prepared = fixture
+        .prepared(&resolved, /*role*/ None, /*effort*/ None)
+        .await
+        .unwrap();
     let first = fixture
         .manager
         .start_thread(StartThreadOptions::new(prepared.config))
