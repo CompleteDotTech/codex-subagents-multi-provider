@@ -829,6 +829,7 @@ archive_override(
         "//patches:v8_array_sort_elements_kind.patch",
     ],
     strip_prefix = "v8-15.2.124.1",
+    type = "tar.gz",
     urls = ["https://github.com/v8/v8/archive/refs/tags/15.2.124.1.tar.gz"],
 )
 
