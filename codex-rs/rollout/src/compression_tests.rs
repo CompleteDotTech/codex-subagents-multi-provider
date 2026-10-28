@@ -743,38 +743,306 @@ async fn worker_preserves_inherited_acl_through_append() -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
+struct AlternateGroupDiagnostics {
+    remaining: usize,
+}
+
+#[cfg(unix)]
+impl AlternateGroupDiagnostics {
+    fn emit(&mut self, message: &str) {
+        use std::io::Write;
+        let line = format!("ROLLOUT_GID_DIAG {message}\n");
+        let bytes = line.as_bytes();
+        let count = bytes.len().min(self.remaining);
+        self.remaining -= count;
+        // Diagnostic output must never replace the original test result.
+        let _ = std::io::stderr().lock().write_all(&bytes[..count]);
+    }
+
+    fn stage<T, E: Into<anyhow::Error>>(
+        &mut self,
+        stage: &'static str,
+        result: Result<T, E>,
+    ) -> anyhow::Result<T> {
+        match result {
+            Ok(value) => {
+                self.emit(&format!("stage={stage} completed=1"));
+                Ok(value)
+            }
+            Err(error) => {
+                let error = error.into();
+                if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                    self.emit(&format!(
+                        "stage={stage} completed=0 errno={:?}",
+                        io.raw_os_error()
+                    ));
+                } else {
+                    self.emit(&format!("stage={stage} completed=0"));
+                }
+                Err(error.context(stage))
+            }
+        }
+    }
+
+    fn process(&mut self) {
+        use std::io::Read;
+        // Fixed files, bounded reads, selected numeric fields only; no environment,
+        // account names, arbitrary paths, or subprocesses are collected here.
+        for (role, path, limit) in [
+            ("uid_map", "/proc/self/uid_map", 16384),
+            ("gid_map", "/proc/self/gid_map", 16384),
+            ("status", "/proc/self/status", 16384),
+            ("setgroups", "/proc/self/setgroups", 64),
+        ] {
+            let result = (|| -> std::io::Result<Vec<u8>> {
+                let mut bytes = Vec::new();
+                fs::File::open(path)?
+                    .take(limit + 1)
+                    .read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })();
+            match result {
+                Ok(bytes) => {
+                    self.emit(&format!(
+                        "proc={role} truncated={}",
+                        bytes.len() as u64 > limit
+                    ));
+                    let bytes = &bytes[..bytes.len().min(limit as usize)];
+                    if role == "setgroups" {
+                        self.emit(&format!(
+                            "proc=setgroups allow={} deny={}",
+                            bytes == b"allow\n",
+                            bytes == b"deny\n"
+                        ));
+                        continue;
+                    }
+                    for line in String::from_utf8_lossy(bytes).lines().take(64) {
+                        let (field, values) = if role == "status" {
+                            let Some((field, values)) = line.split_once(':') else {
+                                continue;
+                            };
+                            if !["Uid", "Gid", "Groups", "NoNewPrivs", "Seccomp", "CapEff"]
+                                .contains(&field)
+                            {
+                                continue;
+                            }
+                            (field, values)
+                        } else {
+                            (role, line)
+                        };
+                        let numeric: Vec<_> = values
+                            .split_whitespace()
+                            .take(32)
+                            .filter(|value| value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                            .collect();
+                        self.emit(&format!(
+                            "proc={role} field={field} numeric={}",
+                            numeric.join(" ")
+                        ));
+                    }
+                }
+                Err(error) => self.emit(&format!(
+                    "proc={role} unavailable=1 errno={:?}",
+                    error.raw_os_error()
+                )),
+            }
+        }
+    }
+
+    fn file(&mut self, role: &'static str, path: &std::path::Path) {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(path) {
+            Ok(meta) => self.emit(&format!(
+                "file={role} uid={} gid={} dev={} ino={} mode={} mtime={} mtime_nsec={}",
+                meta.uid(),
+                meta.gid(),
+                meta.dev(),
+                meta.ino(),
+                meta.mode(),
+                meta.mtime(),
+                meta.mtime_nsec()
+            )),
+            Err(error) => self.emit(&format!(
+                "file={role} unavailable=1 errno={:?}",
+                error.raw_os_error()
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mapped_alternate_group(
+    groups: &[u32],
+    original_group: u32,
+    gid_map: &str,
+) -> anyhow::Result<Option<u32>> {
+    // The first column is the namespace-visible ID range. In particular, an
+    // overflowgid reported by `id -G` is not necessarily a mapped member group.
+    let mut ranges = Vec::new();
+    for line in gid_map.lines() {
+        let values = line
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(values.len() == 3, "invalid gid_map column count");
+        let end = values[0].checked_add(values[2]);
+        let parent_end = values[1].checked_add(values[2]);
+        anyhow::ensure!(
+            values[2] > 0
+                && end.is_some_and(|end| end <= u64::from(u32::MAX))
+                && parent_end.is_some_and(|end| end <= u64::from(u32::MAX)),
+            "invalid gid_map range"
+        );
+        ranges.push((values[0], end.expect("validated range")));
+    }
+    Ok(groups.iter().copied().find(|group| {
+        *group != original_group
+            && ranges
+                .iter()
+                .any(|(start, end)| *start <= u64::from(*group) && u64::from(*group) < *end)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn alternate_group_selection_requires_a_namespace_mapping() -> anyhow::Result<()> {
+    assert_eq!(
+        mapped_alternate_group(&[65534, 1000, 65534], 1000, "1000 1000 1\n")?,
+        None,
+        "unmapped supplementary groups must not masquerade as overflowgid membership"
+    );
+    assert_eq!(
+        mapped_alternate_group(&[4, 1000], 1000, "0 0 4294967295\n")?,
+        Some(4)
+    );
+    assert_eq!(
+        mapped_alternate_group(&[65534, 1000], 1000, "1000 1000 1\n65534 65534 1\n")?,
+        Some(65534),
+        "a genuinely mapped 65534 is valid; do not blacklist the numeric overflow default"
+    );
+    assert_eq!(mapped_alternate_group(&[4, 1000], 1000, "")?, None);
+    for invalid in [
+        "1000 1000",
+        "1 1 0",
+        "4294967295 1 1",
+        "1 18446744073709551615 1",
+    ] {
+        assert!(mapped_alternate_group(&[4, 1000], 1000, invalid).is_err());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn worker_preserves_alternate_group_through_materialization() -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
 
-    let home = TempDir::new()?;
+    let mut diagnostics = AlternateGroupDiagnostics {
+        remaining: 64 * 1024,
+    };
+    diagnostics.process();
+    let home = diagnostics.stage("create_home", TempDir::new())?;
     let uuid = Uuid::from_u128(62);
-    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let thread_id =
+        diagnostics.stage("parse_thread_id", ThreadId::from_string(&uuid.to_string()))?;
     let path = archived_rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
-    write_rollout(&path, thread_id, "different group")?;
-    set_old_mtime(&path)?;
-    let original_group = fs::metadata(&path)?.gid();
-    let groups = Command::new("id").arg("-G").output()?;
+    diagnostics.stage(
+        "write_fixture",
+        write_rollout(&path, thread_id, "different group"),
+    )?;
+    diagnostics.stage("age_fixture", set_old_mtime(&path))?;
+    let original_group = diagnostics
+        .stage("read_original_metadata", fs::metadata(&path))?
+        .gid();
+    let groups = diagnostics.stage("list_groups", Command::new("id").arg("-G").output())?;
     assert!(groups.status.success());
-    let Some(group) = std::str::from_utf8(&groups.stdout)?
-        .split_whitespace()
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .find(|group| *group != original_group)
-    else {
-        eprintln!("skipping ownership regression: no alternate supplementary group");
+    let groups_text =
+        diagnostics.stage("parse_groups_utf8", std::str::from_utf8(&groups.stdout))?;
+    let groups = diagnostics.stage(
+        "parse_groups",
+        groups_text
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>(),
+    )?;
+    #[cfg(target_os = "linux")]
+    let group = {
+        let gid_map =
+            diagnostics.stage("read_gid_map", fs::read_to_string("/proc/self/gid_map"))?;
+        diagnostics.stage(
+            "select_mapped_group",
+            mapped_alternate_group(&groups, original_group, &gid_map),
+        )?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let group = groups.into_iter().find(|group| *group != original_group);
+    let required = match std::env::var_os("CODEX_ROLLOUT_REQUIRE_ALTERNATE_GROUP") {
+        None => false,
+        Some(value) => {
+            anyhow::ensure!(
+                value == "1",
+                "invalid required alternate-group test setting"
+            );
+            true
+        }
+    };
+    let Some(group) = group else {
+        anyhow::ensure!(
+            !required,
+            "required ownership regression has no mapped alternate supplementary group"
+        );
+        diagnostics.emit("coverage=not_exercised reason=no_mapped_alternate_group");
+        eprintln!(
+            "ownership regression not exercised: no mapped alternate supplementary group; \
+             the required Linux host companion must exercise this case"
+        );
         return Ok(());
     };
-    std::os::unix::fs::chown(&path, /*uid*/ None, Some(group))?;
-    assert_eq!(fs::metadata(&path)?.gid(), group);
+    diagnostics.emit(&format!(
+        "selected_gid={group} original_gid={original_group}"
+    ));
+    diagnostics.file("before_chown", &path);
+    diagnostics.stage(
+        "set_alternate_group",
+        std::os::unix::fs::chown(&path, /*uid*/ None, Some(group)),
+    )?;
+    diagnostics.file("after_chown", &path);
+    assert_eq!(
+        diagnostics
+            .stage("verify_alternate_metadata", fs::metadata(&path))?
+            .gid(),
+        group
+    );
 
-    worker::run(home.path().to_path_buf(), Startup).await?;
+    diagnostics.emit("stage=run_worker begin=1");
+    diagnostics.stage(
+        "run_worker",
+        worker::run(home.path().to_path_buf(), Startup).await,
+    )?;
     assert!(!path.exists());
-    assert_eq!(fs::metadata(compressed_rollout_path(&path))?.gid(), group);
-    materialize_rollout_for_append(&path, /*writer_lock*/ None).await?;
-    assert_eq!(fs::metadata(&path)?.gid(), group);
+    assert_eq!(
+        diagnostics
+            .stage(
+                "read_compressed_metadata",
+                fs::metadata(compressed_rollout_path(&path))
+            )?
+            .gid(),
+        group
+    );
+    diagnostics.file("before_materialize", &compressed_rollout_path(&path));
+    diagnostics.emit("stage=materialize_append begin=1");
+    diagnostics.stage(
+        "materialize_append",
+        materialize_rollout_for_append(&path, /*writer_lock*/ None).await,
+    )?;
+    assert_eq!(
+        diagnostics
+            .stage("verify_restored_metadata", fs::metadata(&path))?
+            .gid(),
+        group
+    );
+    diagnostics.emit("coverage=exercised stages=chown_worker_materialize");
     Ok(())
 }
 

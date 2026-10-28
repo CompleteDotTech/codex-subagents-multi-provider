@@ -75,6 +75,8 @@ fn denied_dev_fd_starts_with_standard_devices_and_stdio_intact() {
             "test -L /dev/fd && test -d /dev/fd || exit 39"
         };
         let mut command = Command::new(&sandbox);
+        // These package controls must not discover Bazel's separate declared helper.
+        command.env_remove("CARGO_BIN_EXE_bwrap");
         if denied {
             command.env("PATH", &old_system_path);
         }
@@ -105,6 +107,7 @@ fn denied_dev_fd_starts_with_standard_devices_and_stdio_intact() {
     }
     std::fs::remove_file(resources.join("bwrap")).unwrap();
     let absent = Command::new(&sandbox)
+        .env_remove("CARGO_BIN_EXE_bwrap")
         .args([
             "--sandbox-policy-cwd",
             "/",

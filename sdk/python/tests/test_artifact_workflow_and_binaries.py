@@ -390,6 +390,31 @@ def test_generate_types_wires_all_generation_steps() -> None:
     ]
 
 
+def test_generate_types_preserves_optional_missing_public_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = _load_update_script_module()
+    monkeypatch.setattr(script, "sdk_root", lambda: tmp_path)
+    generated_dir = tmp_path / "src" / "openai_codex" / "generated"
+    generated_dir.mkdir(parents=True)
+    content = "# café\r\n".encode("utf-8")
+
+    def generate_v2_all(schema_dir: Path, *, format_output: bool) -> None:
+        (generated_dir / "v2_all.py").write_bytes(content)
+
+    def generate_notification_registry(schema_dir: Path) -> None:
+        (generated_dir / "notification_registry.py").write_bytes(content)
+
+    monkeypatch.setattr(script, "generate_v2_all", generate_v2_all)
+    monkeypatch.setattr(script, "generate_notification_registry", generate_notification_registry)
+
+    script.generate_types_from_schema_dir(tmp_path / "schema", format_output=False)
+
+    for name in ("v2_all.py", "notification_registry.py"):
+        assert (generated_dir / name).read_bytes() == "# café\n".encode("utf-8")
+    assert not (tmp_path / "src" / "openai_codex" / "api.py").exists()
+
+
 @pytest.mark.parametrize("schema_override", [None, "override-schema"])
 def test_generation_resolves_configured_schema_and_explicit_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema_override: str | None

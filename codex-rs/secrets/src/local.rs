@@ -464,7 +464,7 @@ mod tests {
             ]
         );
         assert!(decrypt_with_passphrase(&ciphertext, &"wrong-password".to_owned().into()).is_err());
-        let mut damaged = ciphertext.clone();
+        let mut damaged = ciphertext;
         *damaged.last_mut().expect("ciphertext payload") ^= 1;
         assert!(decrypt_with_passphrase(&damaged, &passphrase).is_err());
         let fresh =

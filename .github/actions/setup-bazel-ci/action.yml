@@ -8,6 +8,10 @@ inputs:
     description: Provision pinned job-local tools for this fork's native Windows fallback.
     required: false
     default: "false"
+  windows-resource-observation:
+    description: Observe bounded hosted Windows diagnostic resources.
+    required: false
+    default: "false"
 outputs:
   repository-cache-path:
     description: Filesystem path used for the Bazel repository cache.
@@ -18,6 +22,12 @@ runs:
   steps:
     - id: setup_ci
       uses: ./.github/actions/setup-ci
+
+    - name: Observe resources after build path provisioning
+      if: inputs.windows-resource-observation == 'true' && runner.os == 'Windows' && runner.environment == 'github-hosted' && github.repository == 'CompleteDotTech/codex-subagents-multi-provider'
+      continue-on-error: true
+      shell: pwsh
+      run: python .github/scripts/observe_windows_ci_resources.py after-provision
 
     - name: Set up Bazel
       uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
