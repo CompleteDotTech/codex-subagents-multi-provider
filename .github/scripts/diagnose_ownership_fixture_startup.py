@@ -57,7 +57,39 @@ def summary(module, mode, captures, error, digest):
             bytes(capture.stderr_tail) if capture else None
         ).split(" ", 1)[1]
     )
-    cleanup = getattr(error, "ownership_fixture_cleanup", None)
+    helper = getattr(error, "ownership_fixture_cleanup", None)
+    control = getattr(error, "ownership_startup_cleanup", None)
+    helper = helper if isinstance(helper, dict) else {}
+    control = control if isinstance(control, dict) else {}
+    allowed = {
+        "exit_observation",
+        "selector_close",
+        "stdout_close",
+        "stderr_close",
+        "group_cleanup",
+        "diagnostic_write",
+        "caller_diagnostic_write",
+        "fixture_temp_cleanup",
+        "summary",
+        "temporary_cleanup",
+    }
+    failed_phases = []
+    for facts in (helper, control):
+        phases = facts.get("failed_phases", [])
+        if isinstance(phases, list):
+            for phase in phases:
+                if (
+                    isinstance(phase, str)
+                    and phase in allowed
+                    and phase not in failed_phases
+                ):
+                    failed_phases.append(phase)
+    secondary_failure = bool(control) or bool(failed_phases)
+    complete = (
+        (error is None or helper.get("cleanup_complete") is True)
+        and helper.get("retain_workload_lease") is not True
+        and not secondary_failure
+    )
     return {
         "mode": mode,
         "control_only": mode == "minimal",
@@ -68,8 +100,9 @@ def summary(module, mode, captures, error, digest):
         "parent_observed_first_stage_ms": capture.stages if capture else {},
         "pwsh_version": known["pwsh_version"],
         "pwsh_binary_sha256_after_trial": digest,
-        "cleanup_complete": error is None
-        or bool(cleanup and cleanup.get("cleanup_complete")),
+        "cleanup_complete": complete,
+        "retain_workload_lease": not complete,
+        "failed_phases": failed_phases,
         "exit_category": "zero"
         if error is None
         else "timeout"

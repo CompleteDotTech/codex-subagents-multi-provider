@@ -178,6 +178,47 @@ class StartupTests(unittest.TestCase):
                 m.run("minimal", self.fixture)
         self.assertFalse(result.exception.ownership_startup_cleanup["cleanup_complete"])
 
+    def test_timeout_clean_group_and_failed_temp_emits_overall_incomplete(self):
+        primary = subprocess.TimeoutExpired(["SECRET"], 10)
+        primary.ownership_fixture_cleanup = {
+            "cleanup_complete": True,
+            "retain_workload_lease": False,
+            "failed_phases": ["SECRET /private/path"],
+        }
+        original_tail = []
+
+        def helper(argv):
+            try:
+                raise primary
+            except BaseException as error:
+                original_tail.append(error.__traceback__)
+                raise
+
+        temporary = types.SimpleNamespace(
+            name="unused", cleanup=Mock(side_effect=OSError("SECRET"))
+        )
+        output = io.StringIO()
+        with (
+            patch.object(m.tempfile, "TemporaryDirectory", return_value=temporary),
+            patch.object(m.Path, "write_text"),
+        ):
+            try:
+                self.invoke("minimal", helper, output)
+            except BaseException as error:
+                self.assertIs(error, primary)
+                tail = error.__traceback__
+                while tail.tb_next:
+                    tail = tail.tb_next
+                self.assertIs(tail, original_tail[0])
+            else:
+                self.fail("timeout lost")
+        facts = json.loads(output.getvalue().split(" ", 1)[1])
+        self.assertFalse(facts["cleanup_complete"])
+        self.assertTrue(facts["retain_workload_lease"])
+        self.assertEqual(facts["failed_phases"], ["temporary_cleanup"])
+        self.assertNotIn("SECRET", output.getvalue())
+        self.assertFalse(facts["qualified"])
+
     def test_unknown_mode_has_no_trial_or_metadata(self):
         with patch.object(m, "binary_digest") as digest:
             with self.assertRaises(ValueError):
