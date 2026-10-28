@@ -20,6 +20,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_all_normal_jobs_guarded_and_original_predicates_retained(self):
         ordinary = {
+            "plan-package-shards",
+            "linux-package-manifest",
             "test",
             "test-windows-shard",
             "test-windows",
@@ -30,6 +32,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(self.jobs), ordinary | {"voice-runtime-diagnostic"})
         for name in ordinary:
             gate = re.search(r"^    if: (.+)$", self.jobs[name], re.M).group(1)
+            if name == "linux-package-manifest":
+                # The manifest inherits the planner's diagnostic exclusion:
+                # without a successful planner it cannot receive a true output.
+                self.assertIn("    needs: plan-package-shards\n", self.jobs[name])
+                self.assertEqual(
+                    gate, "needs.plan-package-shards.outputs.package-shards == 'true'"
+                )
+                gate = re.search(
+                    r"^    if: (.+)$", self.jobs["plan-package-shards"], re.M
+                ).group(1)
             self.assertIn(
                 "!(github.event_name == 'workflow_dispatch' && inputs.voice_runtime_diagnostic)",
                 gate,
