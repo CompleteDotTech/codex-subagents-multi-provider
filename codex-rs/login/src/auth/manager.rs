@@ -689,7 +689,7 @@ impl CodexAuth {
     }
 
     /// Account-facing plan classification derived from the current auth.
-    /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦)
+    /// Returns a high-level `AccountPlanType` (e.g., Free/Plus/Pro/Team/…)
     /// for UI or product decisions based on the user's subscription.
     pub fn account_plan_type(&self) -> Option<AccountPlanType> {
         if matches!(self, Self::Headers(_)) {
@@ -2119,7 +2119,7 @@ impl UnauthorizedRecovery {
 ///
 /// External modifications to stored credentials will NOT be observed until
 /// `reload()` is called explicitly. This matches the design goal of avoiding
-/// different parts of the program seeing inconsistent auth data midÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Ëœrun.
+/// different parts of the program seeing inconsistent auth data mid‑run.
 pub struct AuthManager {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
