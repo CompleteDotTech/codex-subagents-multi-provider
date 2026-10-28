@@ -1406,6 +1406,12 @@ async fn native_loaded_followup_rechecks_policy_before_target_network(change: u8
 }
 
 fn native_continuation_exec_setup(config: &mut codex_core::config::Config) {
+    // TestCodex changes cwd after loading Config; bind both root projections to
+    // that owned workspace rather than retaining the loader's earlier cwd.
+    config.workspace_roots = vec![config.cwd.clone()];
+    config
+        .permissions
+        .set_workspace_roots(config.workspace_roots.clone());
     config
         .permissions
         .approval_policy
@@ -1430,6 +1436,58 @@ fn native_continuation_exec_setup(config: &mut codex_core::config::Config) {
         Feature::CodeModeToolSearch,
     ] {
         config.features.disable(feature).unwrap();
+    }
+}
+
+fn assert_native_continuation_workspace(
+    fixture: &Fixture,
+    config: &codex_core::config::Config,
+    selections: &[codex_protocol::protocol::TurnEnvironmentSelection],
+    require_ready: bool,
+) {
+    assert_eq!(config.cwd.as_path(), fixture.test.cwd.path());
+    assert_eq!(config.workspace_roots, vec![config.cwd.clone()]);
+    let expected = fixture.test.executor_environment().selection();
+    assert_eq!(selections.len(), 1, "one actual owned executor is required");
+    let selection = &selections[0];
+    assert_eq!(selection.environment_id, expected.environment_id);
+    assert_eq!(selection.cwd, expected.cwd);
+    assert_eq!(selection.workspace_roots, vec![expected.cwd.clone()]);
+    let owner = match &selection.config {
+        codex_protocol::protocol::EnvironmentConfigState::Ready(owner) => owner.clone(),
+        codex_protocol::protocol::EnvironmentConfigState::FromThread if !require_ready => {
+            core_test_support::test_codex::environment_config_for_selection(config, selection)
+        }
+        _ => panic!("actual active child executor configuration must be Ready"),
+    };
+    assert_eq!(owner.workspace_roots, selection.workspace_roots);
+    let filesystem = owner
+        .permission_profile
+        .permission_profile()
+        .clone()
+        .materialize_project_roots_with_path_uris(&owner.workspace_roots)
+        .file_system_sandbox_policy();
+    for name in [
+        "native-continuation-started",
+        "native-continuation-release",
+        "native-continuation-done",
+    ] {
+        assert!(
+            filesystem.can_write_local_path_with_cwd(
+                &fixture.test.cwd.path().join(name),
+                config.cwd.as_path()
+            ),
+            "actual selected executor roots must permit the owned continuation markers"
+        );
+    }
+    for path in [
+        fixture.home.path().join("config.toml"),
+        fixture.home.path().join("catalog.json"),
+    ] {
+        assert!(
+            !filesystem.can_write_local_path_with_cwd(&path, config.cwd.as_path()),
+            "the selected executor must not write host provider inputs"
+        );
     }
 }
 
@@ -1482,25 +1540,12 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
         assert!(!path.exists());
     }
     let config = fixture.test.codex.config().await;
-    let filesystem = config
-        .permissions
-        .permission_profile()
-        .file_system_sandbox_policy();
-    for path in [&started, &release, &done] {
-        assert!(
-            filesystem.can_write_local_path_with_cwd(path, config.cwd.as_path()),
-            "owned continuation markers must be writable inside the selected workspace"
-        );
-    }
-    for path in [
-        fixture.home.path().join("config.toml"),
-        fixture.home.path().join("catalog.json"),
-    ] {
-        assert!(
-            !filesystem.can_write_local_path_with_cwd(&path, config.cwd.as_path()),
-            "the owned tool must not gain write authority over host provider inputs"
-        );
-    }
+    assert_native_continuation_workspace(
+        &fixture,
+        &config,
+        &fixture.test.codex.environment_selections().await,
+        /*require_ready*/ false,
+    );
     let (cmd, shell) = native_owned_barrier_command(&started, &release, &done);
     let arguments = json!({"cmd":cmd,"shell":shell,"login":false,"tty":false,"yield_time_ms":10000,"timeout_ms":5000,"max_output_tokens":1000});
     Mock::given(method("POST"))
@@ -1583,6 +1628,25 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
         })
         .await
         .expect("actual exec_command reaches owned barrier")?;
+        let children = fixture.children(1).await?;
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        let child_config = child.config().await;
+        assert_native_continuation_workspace(
+            &fixture,
+            &child_config,
+            &child.environment_selections().await,
+            /*require_ready*/ false,
+        );
+        assert_native_continuation_workspace(
+            &fixture,
+            &child_config,
+            &child
+                .active_turn_environment_selections()
+                .await
+                .expect("actual owned tool keeps the child turn active"),
+            /*require_ready*/ true,
+        );
         if change != 0 {
             revoke_native_fixture_a(fixture.home.path())?;
             let children = fixture.children(1).await?;
