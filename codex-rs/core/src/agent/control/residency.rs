@@ -200,6 +200,18 @@ impl LocalAgentRuntime {
 }
 
 impl V2Residency {
+    #[cfg(test)]
+    pub(super) fn snapshot_for_test(&self) -> (Vec<ThreadId>, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.residents.iter().copied().collect(),
+            state.pending_slots,
+        )
+    }
+
     async fn reserve_slot(
         self: Arc<Self>,
         manager: &Arc<ThreadManagerState>,

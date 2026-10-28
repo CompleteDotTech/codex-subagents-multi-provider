@@ -13430,3 +13430,597 @@ stream_idle_timeout_ms = 1000
         "actual V1 interrupt dispatched once after reload"
     );
 }
+// These cases keep an ACTUAL explicit close paused after canonical revocation.
+// The manager allocation and residency count must remain real throughout admission.
+#[test_case::test_case(0; "same revoked allocation is busy")]
+#[test_case::test_case(1; "later idle candidate supplies capacity")]
+#[test_case::test_case(2; "only revoked candidate returns capacity error")]
+#[tokio::test]
+async fn revoked_counted_resident_never_reports_capacity_progress(case: u8) {
+    let (home, mut config, _server) = residency_checkpoint_config().await;
+    config.multi_agent_v2.max_concurrent_threads_per_session = if case == 1 { 3 } else { 2 };
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (root_id, root) = harness.start_thread().await;
+    let first =
+        post_admission_registered_idle_child(&harness, &root, "revoked_counted_first").await;
+    let first_id = first.session.thread_id;
+    residency_checkpoint_mark_idle(&first).await;
+    let second = if case == 1 {
+        let child =
+            post_admission_registered_idle_child(&harness, &root, "later_eligible_resident").await;
+        residency_checkpoint_mark_idle(&child).await;
+        Some(child)
+    } else {
+        None
+    };
+    let state = harness.control.runtime.upgrade().unwrap();
+    let membership = harness.control.runtime.admit_start().unwrap();
+    let expected_count = if second.is_some() { 2 } else { 1 };
+    assert_eq!(
+        harness
+            .control
+            .runtime
+            .residency
+            .snapshot_for_test()
+            .0
+            .len(),
+        expected_count
+    );
+    let pause = harness
+        .control
+        .runtime
+        .registry
+        .pause_graph_at(crate::agent::registry::GraphLifecycleTestPoint::BeforeExplicitCapture);
+    let close = harness.control.close_agent(first_id);
+    tokio::pin!(close);
+    tokio::select! {
+        result = &mut close => panic!("real close must reach its held revocation fence: {}", result.is_ok()),
+        entered = timeout(Duration::from_secs(10), pause.entered.notified()) => entered.expect("real close reached canonical revocation"),
+    }
+    let preconditions = first.is_running()
+        && first.multi_agent_version() == Some(MultiAgentVersion::V2)
+        && first.session.active_turn.lock().await.is_none()
+        && matches!(first.agent_status().await, AgentStatus::Completed(_))
+        && Arc::ptr_eq(&first, &harness.manager.get_thread(first_id).await.unwrap())
+        && !harness
+            .control
+            .runtime
+            .registry
+            .graph_open_is_current(&first.session)
+        && harness
+            .control
+            .runtime
+            .residency
+            .snapshot_for_test()
+            .0
+            .len()
+            == expected_count;
+    assert!(
+        preconditions,
+        "real revoked allocation must remain idle, registered and counted"
+    );
+    let mut direct_busy = false;
+    let mut timed_out = false;
+    let mut admitted = false;
+    let mut capacity_denied = false;
+    let mut reserved_slot = None;
+    if case == 0 {
+        direct_busy = timeout(
+            Duration::from_secs(5),
+            state.try_evict_v2_thread(Arc::clone(&first), &membership),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+            == ThreadEvictionOutcome::Busy;
+    } else {
+        match timeout(
+            Duration::from_secs(5),
+            harness.control.reserve_v2_residency_slot(
+                &state,
+                &harness.config,
+                &membership,
+                Some(root_id),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(slot)) => {
+                admitted = true;
+                reserved_slot = Some(slot);
+            }
+            Ok(Err(error)) => {
+                capacity_denied =
+                    matches!(error.details(), CodexErrorDetails::AgentLimitReached { .. })
+                        && error.agent_context() == Some(AgentErrorContext::ResidencyCapacity)
+            }
+            Err(_) => timed_out = true,
+        }
+    }
+    let (resident_ids, pending) = harness.control.runtime.residency.snapshot_for_test();
+    let first_still_exact =
+        Arc::ptr_eq(&first, &harness.manager.get_thread(first_id).await.unwrap())
+            && first.is_running()
+            && resident_ids.contains(&first_id);
+    let later_removed = if let Some(child) = &second {
+        harness
+            .manager
+            .get_thread(child.session.thread_id)
+            .await
+            .is_err()
+            && !resident_ids.contains(&child.session.thread_id)
+    } else {
+        true
+    };
+    drop(reserved_slot);
+    pause.release.notify_one();
+    timeout(Duration::from_secs(10), &mut close)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(close);
+    drop(membership);
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(
+        Duration::from_secs(10),
+        harness.control.runtime.request_shutdown().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        harness.manager.list_thread_ids().await.is_empty(),
+        "all real allocations cleaned up"
+    );
+    assert_eq!(
+        harness.control.runtime.residency.snapshot_for_test(),
+        (Vec::new(), 0)
+    );
+    eprintln!(
+        "RESIDENCY_CLOSE_FENCE_OBSERVED case={case} actual_preconditions={preconditions} first_still_exact={first_still_exact} direct_busy={direct_busy} timed_out={timed_out} admitted={admitted} capacity_denied={capacity_denied} later_removed={later_removed} pending={pending} cleanup=complete"
+    );
+    assert!(
+        first_still_exact,
+        "held real close must not release its still-live residency accounting"
+    );
+    match case {
+        0 => assert!(
+            direct_busy,
+            "same revoked resident must be Busy, never reported capacity progress"
+        ),
+        1 => {
+            assert!(
+                admitted && !timed_out && later_removed,
+                "later eligible resident must supply capacity while actual close stays held"
+            );
+            assert_eq!(pending, 1);
+        }
+        2 => {
+            assert!(
+                capacity_denied && !timed_out && !admitted,
+                "only revoked resident must return capacity denial while actual close stays held"
+            );
+            assert_eq!(pending, 0);
+        }
+        _ => unreachable!(),
+    }
+}
+
+async fn residency_checkpoint_mark_idle(thread: &Arc<CodexThread>) {
+    let turn = thread.session.new_default_turn().await;
+    assert_eq!(thread.multi_agent_version(), Some(MultiAgentVersion::V2));
+    thread
+        .session
+        .send_event(
+            &turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
+                turn_id: turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("idle registered fixture".into()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert!(thread.session.active_turn.lock().await.is_none());
+    assert!(matches!(
+        thread.agent_status().await,
+        AgentStatus::Completed(_)
+    ));
+}
+
+async fn residency_checkpoint_config() -> (TempDir, Config, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(core_test_support::responses::sse_response(
+            core_test_support::responses::sse_completed("fixture-complete"),
+        ))
+        .mount(&server)
+        .await;
+    let host = format!(
+        "openai_base_url = {}\n",
+        serde_json::to_string(&format!("{}/v1", server.uri())).unwrap()
+    );
+    let (home, mut config) = test_config_with_host_configuration(Vec::new(), Some(&host)).await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.model = Some("gpt-5.6-sol".into());
+    config.multi_agent_v2.max_concurrent_threads_per_session = 8;
+    (home, config, server)
+}
+
+struct PendingForkStandardCheckpoint {
+    child: ThreadId,
+    context: PersistContext,
+    copied_prefix_present: bool,
+    release: tokio::sync::oneshot::Sender<bool>,
+}
+
+struct ForkStandardCheckpointStore {
+    inner: InMemoryThreadStore,
+    armed_parent: std::sync::Mutex<Option<ThreadId>>,
+    armed_child: std::sync::Mutex<Option<ThreadId>>,
+    child_owner: std::sync::Mutex<Option<(ThreadId, codex_thread_store::ThreadWriterOwner)>>,
+    appends: std::sync::Mutex<Vec<(ThreadId, String)>>,
+    finished: std::sync::Mutex<Vec<(ThreadId, bool, bool)>>,
+    actual_io_errors: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::mpsc::UnboundedSender<PendingForkStandardCheckpoint>,
+    io_fault_path: std::path::PathBuf,
+}
+
+impl ThreadStore for ForkStandardCheckpointStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+        owner: codex_thread_store::ThreadWriterOwner,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.begin_native_authority_epoch_owned(epoch, owner)
+    }
+    fn create_thread_owned(
+        &self,
+        params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_thread_store::ThreadWriterOwner> {
+        Box::pin(async move {
+            let parent = *self.armed_parent.lock().unwrap();
+            let arm = parent.is_some()
+                && params.parent_thread_id == parent
+                && params.forked_from_id == parent;
+            if arm {
+                assert_eq!(params.history_mode, ThreadHistoryMode::Legacy);
+                *self.armed_parent.lock().unwrap() = None;
+            }
+            let child = params.thread_id;
+            let owner = self.inner.create_thread_owned(params).await?;
+            if arm {
+                *self.armed_child.lock().unwrap() = Some(child);
+                *self.child_owner.lock().unwrap() = Some((child, owner.clone()));
+            }
+            Ok(owner)
+        })
+    }
+    fn resume_thread_owned(
+        &self,
+        params: codex_thread_store::ResumeThreadParams,
+        preparation: Option<codex_thread_store::ThreadStoreResumePreparation>,
+    ) -> codex_thread_store::ThreadStoreFuture<
+        '_,
+        (Arc<Vec<RolloutItem>>, codex_thread_store::ThreadWriterOwner),
+    > {
+        self.inner.resume_thread_owned(params, preparation)
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: codex_thread_store::ThreadWriterOwner,
+        discard: bool,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let matches = self
+                .child_owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(child, expected)| *child == thread && expected.matches(&owner));
+            self.finished
+                .lock()
+                .unwrap()
+                .push((thread, discard, matches));
+            self.inner.finish_thread_owned(thread, owner, discard).await
+        })
+    }
+    fn append_items(
+        &self,
+        params: codex_thread_store::AppendThreadItemsParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.appends.lock().unwrap().push((
+                params.thread_id,
+                serde_json::to_string(&params.items).unwrap(),
+            ));
+            self.inner.append_items(params).await
+        })
+    }
+    fn persist_thread(
+        &self,
+        thread: ThreadId,
+        context: PersistContext,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let block = {
+                let mut armed = self.armed_child.lock().unwrap();
+                if *armed == Some(thread) && context == PersistContext::Standard {
+                    armed.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if block {
+                let prefix = self.appends.lock().unwrap().iter().any(|(child, text)| {
+                    *child == thread && text.contains("actual copied checkpoint parent prefix")
+                });
+                let (release, released) = tokio::sync::oneshot::channel();
+                self.entered
+                    .send(PendingForkStandardCheckpoint {
+                        child: thread,
+                        context,
+                        copied_prefix_present: prefix,
+                        release,
+                    })
+                    .unwrap();
+                if released
+                    .await
+                    .expect("release actual fork Standard checkpoint")
+                {
+                    // This performs a real owned-temp filesystem operation. Its parent is
+                    // a regular file, so the failed Standard checkpoint has a real I/O cause.
+                    let error = std::fs::File::create(&self.io_fault_path)
+                        .expect_err("checkpoint target parent is a real regular file");
+                    self.actual_io_errors.fetch_add(1, Ordering::SeqCst);
+                    return Err(codex_thread_store::ThreadStoreError::Internal {
+                        message: format!("required fork Standard checkpoint I/O: {error}"),
+                    });
+                }
+            }
+            self.inner.persist_thread(thread, context).await
+        })
+    }
+    delegate_fresh_revocation_store! {
+        fn create_thread(params: codex_thread_store::CreateThreadParams) -> ();
+        fn resume_thread(params: codex_thread_store::ResumeThreadParams) -> Arc<Vec<RolloutItem>>;
+        fn discard_thread(thread_id: ThreadId) -> ();
+        fn load_history(params: codex_thread_store::LoadThreadHistoryParams) -> codex_thread_store::StoredThreadHistory;
+        fn load_latest_model_context(params: codex_thread_store::LoadThreadHistoryParams) -> codex_thread_store::StoredModelContext;
+        fn read_thread(params: codex_thread_store::ReadThreadParams) -> codex_thread_store::StoredThread;
+        fn read_thread_by_rollout_path(params: codex_thread_store::ReadThreadByRolloutPathParams) -> codex_thread_store::StoredThread;
+        fn list_threads(params: codex_thread_store::ListThreadsParams) -> codex_thread_store::ThreadPage;
+        fn update_thread_metadata(params: codex_thread_store::UpdateThreadMetadataParams) -> Option<codex_thread_store::StoredThread>;
+        fn archive_thread(params: codex_thread_store::ArchiveThreadParams) -> ();
+        fn unarchive_thread(params: codex_thread_store::ArchiveThreadParams) -> codex_thread_store::StoredThread;
+        fn delete_thread(params: codex_thread_store::DeleteThreadParams) -> ();
+        fn flush_thread(thread_id: ThreadId) -> ();
+        fn shutdown_thread(thread_id: ThreadId) -> ();
+    }
+}
+
+#[test_case::test_case(false; "copied fork Standard checkpoint succeeds before input")]
+#[test_case::test_case(true; "copied fork Standard I/O failure denies input and acknowledgement")]
+#[tokio::test]
+async fn copied_fork_standard_checkpoint_precedes_input_and_ack(fail: bool) {
+    let (home, config, _server) = residency_checkpoint_config().await;
+    let blocked_parent = home.path().join("checkpoint-parent-is-file");
+    std::fs::write(&blocked_parent, b"not a directory").unwrap();
+    let (entered, mut pending) = tokio::sync::mpsc::unbounded_channel();
+    let store = Arc::new(ForkStandardCheckpointStore {
+        inner: InMemoryThreadStore::default(),
+        armed_parent: std::sync::Mutex::new(None),
+        armed_child: std::sync::Mutex::new(None),
+        child_owner: std::sync::Mutex::new(None),
+        appends: std::sync::Mutex::new(Vec::new()),
+        finished: std::sync::Mutex::new(Vec::new()),
+        actual_io_errors: std::sync::atomic::AtomicUsize::new(0),
+        entered,
+        io_fault_path: blocked_parent.join("checkpoint"),
+    });
+    crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        None,
+        crate::thread_manager::passthrough_image_store(),
+        store.clone(),
+        None,
+        uuid::Uuid::new_v4().to_string(),
+        None,
+        None,
+    )
+    .with_code_mode_session_provider(Arc::new(codex_code_mode::DisabledCodeModeSessionProvider));
+    let control = manager.agent_control();
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db: None,
+        manager,
+        control,
+    };
+    let (root_id, root) = harness.start_thread().await;
+    assert_eq!(
+        root.config_snapshot().await.history_mode,
+        ThreadHistoryMode::Legacy
+    );
+    root.inject_response_items(vec![user_message("actual copied checkpoint parent prefix")])
+        .await
+        .unwrap();
+    let turn = root.session.new_default_turn().await;
+    root.session
+        .record_conversation_items(
+            &turn,
+            turn.model_info(),
+            &[spawn_agent_call("required-checkpoint-fork")],
+        )
+        .await;
+    root.session
+        .try_ensure_rollout_materialized(PersistContext::Standard)
+        .await
+        .unwrap();
+    *store.armed_parent.lock().unwrap() = Some(root_id);
+    let spawn = harness.control.spawn_agent_with_metadata(
+        harness.config.clone(),
+        text_input("initial fork input after required checkpoint"),
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: root_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+        SpawnAgentOptions {
+            fork_mode: Some(SpawnAgentForkMode::FullHistory),
+            fork_parent_spawn_call_id: Some("required-checkpoint-fork".into()),
+            ..Default::default()
+        },
+    );
+    tokio::pin!(spawn);
+    let gate = tokio::select! {
+        outcome = &mut spawn => panic!("real copied fork must reach Standard checkpoint: {}", outcome.is_ok()),
+        event = timeout(Duration::from_secs(10), pending.recv()) => event.unwrap().unwrap(),
+    };
+    let child_id = gate.child;
+    let child = harness
+        .manager
+        .get_thread(child_id)
+        .await
+        .expect("actual child registered before acknowledgement checkpoint");
+    let before = child.session.clone_history().await;
+    let real_preconditions = gate.context == PersistContext::Standard
+        && gate.copied_prefix_present
+        && child.multi_agent_version() == Some(MultiAgentVersion::V2)
+        && history_contains_text(before.raw_items(), "actual copied checkpoint parent prefix")
+        && !history_contains_text(
+            before.raw_items(),
+            "initial fork input after required checkpoint",
+        )
+        && harness
+            .control
+            .runtime
+            .retained_authority(child_id)
+            .unwrap()
+            .matches_session(&child.session);
+    assert!(
+        real_preconditions,
+        "actual copied-history owned child must reach required Standard checkpoint before input"
+    );
+    gate.release.send(fail).unwrap();
+    let outcome = timeout(Duration::from_secs(10), &mut spawn).await.unwrap();
+    drop(spawn);
+    if outcome.is_ok() {
+        wait_for_recorded_user_message(&child, "initial fork input after required checkpoint")
+            .await;
+    }
+    if outcome.is_err() {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !child.is_running() && harness.manager.get_thread(child_id).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual PendingSpawn stops/removes exact failed child");
+    }
+    let acknowledged = outcome.is_ok();
+    let error_is_checkpoint = outcome.as_ref().err().is_some_and(|error| {
+        error
+            .to_string()
+            .contains("required fork Standard checkpoint I/O")
+    });
+    let final_child_history = child.session.clone_history().await;
+    let input_delivered = history_contains_text(
+        final_child_history.raw_items(),
+        "initial fork input after required checkpoint",
+    );
+    let prefix_preserved = history_contains_text(
+        final_child_history.raw_items(),
+        "actual copied checkpoint parent prefix",
+    );
+    let removed_before_root_cleanup = harness.manager.get_thread(child_id).await.is_err();
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(
+        Duration::from_secs(10),
+        harness.control.runtime.request_shutdown().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+    let exact_finishes = store
+        .finished
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(id, _, _)| *id == child_id)
+        .map(|(_, discard, matches)| (*discard, *matches))
+        .collect::<Vec<_>>();
+    let io_errors = store.actual_io_errors.load(Ordering::SeqCst);
+    eprintln!(
+        "FORK_STANDARD_CHECKPOINT_OBSERVED fail={fail} actual_preconditions={real_preconditions} actual_io_errors={io_errors} acknowledged={acknowledged} input_delivered={input_delivered} prefix_preserved={prefix_preserved} removed_before_root_cleanup={removed_before_root_cleanup} exact_finishes={exact_finishes:?} cleanup=complete"
+    );
+    assert!(
+        prefix_preserved,
+        "actual copied prefix remains in the retained Session history"
+    );
+    assert!(
+        !exact_finishes.is_empty() && exact_finishes.iter().all(|(_, matched)| *matched),
+        "all actual child cleanup uses its exact acquired writer identity"
+    );
+    if fail {
+        assert_eq!(io_errors, 1);
+        assert!(
+            !acknowledged && error_is_checkpoint,
+            "required copied-history Standard I/O failure must deny child acknowledgement"
+        );
+        assert!(
+            !input_delivered,
+            "required copied-history Standard I/O failure must deny initial input"
+        );
+        assert!(
+            removed_before_root_cleanup,
+            "PendingSpawn itself must remove the exact failed child"
+        );
+        assert!(
+            exact_finishes.iter().any(|(discard, _)| *discard),
+            "pending failure must execute its exact discard path"
+        );
+    } else {
+        assert_eq!(io_errors, 0);
+        assert!(
+            acknowledged && input_delivered && !removed_before_root_cleanup,
+            "successful actual copied checkpoint admits input and acknowledgement"
+        );
+    }
+}
