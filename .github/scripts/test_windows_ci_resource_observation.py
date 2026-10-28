@@ -4,9 +4,12 @@ import contextlib
 import importlib.util
 import io
 import json
+import locale
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import subprocess
 import tempfile
 import sys
@@ -108,7 +111,481 @@ def ownership_fixture_timeout_summary(stderr, stdout=None):
     )
 
 
+class OwnershipFixtureCapture:
+    """Bounded byte capture and parent-observed fixed-line arrival times."""
+
+    def __init__(self):
+        self.stdout = bytearray()
+        self.stderr = bytearray()
+        self.counts = {"stdout": 0, "stderr": 0}
+        self.line = bytearray()
+        self.long_line = False
+        self.entry_ms = None
+        self.stages = {}
+
+    def feed(self, role, block, elapsed_ms):
+        self.counts[role] = min(1024 * 1024 + 1, self.counts[role] + len(block))
+        if self.counts[role] > 1024 * 1024:
+            raise OverflowError("ownership fixture capture exceeded bound")
+        if role == "stdout":
+            if len(self.stdout) + len(block) > m.MAX_SAMPLE:
+                raise OverflowError("ownership fixture JSON exceeded bound")
+            self.stdout.extend(block)
+            return
+        self.stderr.extend(block)
+        del self.stderr[:-8192]
+        for part in block.splitlines(keepends=True):
+            self.line.extend(part[:513])
+            if len(self.line) > 512:
+                self.long_line = True
+                self.line.clear()
+            if part.endswith(b"\n"):
+                if not self.long_line:
+                    value = bytes(self.line).rstrip(b"\r\n")
+                    if value == b"OWNERSHIP_FIXTURE_ENTRY" and self.entry_ms is None:
+                        self.entry_ms = elapsed_ms
+                    parsed = json.loads(
+                        ownership_fixture_timeout_summary(value).split(" ", 1)[1]
+                    )
+                    for stage in parsed["stages"]:
+                        self.stages.setdefault(stage, elapsed_ms)
+                self.line.clear()
+                self.long_line = False
+
+
+def ownership_fixture_birth(pid):
+    # Linux only. This identity remains private; never emitted in diagnostics.
+    value = Path(f"/proc/{pid}/stat").read_text()
+    return int(value[value.rfind(")") + 2 :].split()[19])
+
+
+def cleanup_ownership_fixture(child, birth):
+    """Only the private child group; bounded failure cleanup, no pipe drain."""
+
+    def exists():
+        try:
+            os.killpg(child.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def stop(sig):
+        try:
+            current = ownership_fixture_birth(child.pid)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (birth is None or current != birth):
+            raise RuntimeError("ownership fixture leader identity unavailable")
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def settle(seconds):
+        cutoff = time.monotonic() + seconds
+        while True:
+            child.poll()  # Nonblocking reap, including a terminated group leader.
+            if not exists():
+                return True
+            if time.monotonic() >= cutoff:
+                return False
+            time.sleep(min(0.01, max(0, cutoff - time.monotonic())))
+
+    if child.pid <= 1 or child.pid == os.getpgrp():
+        raise RuntimeError("ownership fixture has no private process group")
+    if exists():
+        stop(signal.SIGTERM)
+        if not settle(1):
+            stop(signal.SIGKILL)
+            settle(2)
+    child.poll()
+    if child.returncode is None or exists():
+        raise RuntimeError("ownership fixture cleanup incomplete")
+
+
+def run_linux_ownership_fixture(argv):
+    """Same 10s qualification; at most 20s SAME-child failure-only observation.
+
+    Process creation may block in OS APIs. No hostile-host/escaped-process or
+    arbitrary scheduling bound is claimed. Windows keeps subprocess.run.
+    """
+    child = None
+    birth = None
+    selector = None
+    capture = OwnershipFixtureCapture()
+    timed_out = None
+    live_at_cutoff = None
+    exit_category = "unavailable"
+    cleanup_complete = False
+    try:
+        child = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+        )
+        started = time.monotonic()
+        deadline = started + 10
+        observation_deadline = deadline + 20
+        birth = ownership_fixture_birth(child.pid)
+        if os.getpgid(child.pid) != child.pid or os.getsid(child.pid) != child.pid:
+            raise RuntimeError("ownership fixture private session unavailable")
+        selector = selectors.DefaultSelector()
+        for role, pipe in (("stdout", child.stdout), ("stderr", child.stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, role)
+        while True:
+            now = time.monotonic()
+            if timed_out is None and now >= deadline:
+                timed_out = subprocess.TimeoutExpired(
+                    argv, 10, output=bytes(capture.stdout), stderr=bytes(capture.stderr)
+                )
+                live_at_cutoff = child.poll() is None
+            if timed_out is not None and now >= observation_deadline:
+                break
+            code = child.poll()
+            if not selector.get_map() and code is not None:
+                break
+            cutoff = deadline if timed_out is None else observation_deadline
+            for key, _ in selector.select(timeout=min(0.05, max(0, cutoff - now))):
+                # A read-ready wakeup can itself be scheduled after a cutoff.
+                # Freeze the original capture BEFORE consuming any late bytes.
+                observed_at = time.monotonic()
+                if timed_out is None and observed_at >= deadline:
+                    timed_out = subprocess.TimeoutExpired(
+                        argv,
+                        10,
+                        output=bytes(capture.stdout),
+                        stderr=bytes(capture.stderr),
+                    )
+                    live_at_cutoff = child.poll() is None
+                if timed_out is not None and observed_at >= observation_deadline:
+                    break
+                try:
+                    block = os.read(key.fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                elapsed = min(30000, max(0, int((time.monotonic() - started) * 1000)))
+                capture.feed(key.data, block, elapsed)
+        # Recheck clock even when child exit/EOF races the qualification cutoff.
+        if timed_out is None and time.monotonic() >= deadline:
+            timed_out = subprocess.TimeoutExpired(
+                argv, 10, output=bytes(capture.stdout), stderr=bytes(capture.stderr)
+            )
+            live_at_cutoff = child.poll() is None
+        if timed_out is not None:
+            raise timed_out
+        encoding = "utf-8" if sys.flags.utf8_mode else locale.getencoding()
+        stdout = (
+            bytes(capture.stdout)
+            .decode(encoding)
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
+        stderr = (
+            bytes(capture.stderr)
+            .decode(encoding)
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
+        if child.returncode:
+            raise subprocess.CalledProcessError(child.returncode, argv, stdout, stderr)
+        return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+    except Exception:
+        if timed_out is not None:
+            raise timed_out from None
+        raise
+    finally:
+        try:
+            # ExitStack invokes every callback even if an earlier close raises.
+            with contextlib.ExitStack() as release:
+                if child is not None:
+
+                    def cleanup():
+                        nonlocal cleanup_complete
+                        cleanup_ownership_fixture(child, birth)
+                        cleanup_complete = True
+
+                    release.callback(cleanup)
+                    for pipe in (child.stdout, child.stderr):
+                        if pipe is not None:
+                            release.callback(pipe.close)
+                if selector is not None:
+                    release.callback(selector.close)
+                if child is not None:
+                    observed_code = child.poll()
+                    exit_category = (
+                        "still_live"
+                        if observed_code is None
+                        else "zero"
+                        if observed_code == 0
+                        else "nonzero"
+                    )
+        finally:
+            if timed_out is not None:
+                print(
+                    "ownership-fixture-late-observation "
+                    + json.dumps(
+                        {
+                            "qualification_timeout_seconds": 10,
+                            "failure_only_observation_seconds": 20,
+                            "parent_observed_first_entry_ms": capture.entry_ms,
+                            "parent_observed_first_stage_ms": capture.stages,
+                            "child_live_at_qualification_cutoff": live_at_cutoff,
+                            "exit_category": exit_category,
+                            "cleanup_complete": cleanup_complete,
+                            "late_known_markers": json.loads(
+                                ownership_fixture_timeout_summary(
+                                    bytes(capture.stderr), bytes(capture.stdout)
+                                ).split(" ", 1)[1]
+                            ),
+                            "observed_stream_byte_counts_clamped_8192": {
+                                key: min(value, 8192)
+                                for key, value in capture.counts.items()
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                    file=sys.stderr,
+                )
+
+
 class ObservationTests(unittest.TestCase):
+    def linux_fixture_simulation(
+        self, events, exit_at, code=0, read_error=None, close_error=None
+    ):
+        """Exercise the Linux lifecycle with fake clock/fds; no child is started."""
+        clock = [0.0]
+        child = Mock(pid=12345, returncode=None)
+        pipes = {"stdout": Mock(), "stderr": Mock()}
+        child.stdout, child.stderr = pipes.values()
+        for number, pipe in enumerate(pipes.values(), 11):
+            pipe.fileno.return_value = number
+        active = {}
+        blocks = {}
+        pending = list(events)
+        selector = Mock()
+
+        def register(pipe, mask, role):
+            active[role] = Mock(fd=pipe.fileno(), fileobj=pipe, data=role)
+
+        def unregister(pipe):
+            del active[next(role for role in active if pipes[role] is pipe)]
+
+        def select(timeout):
+            until = clock[0] + timeout
+            if pending and pending[0][0] <= until:
+                when, role, block = pending.pop(0)
+                clock[0] = max(clock[0], when)
+                blocks[pipes[role].fileno()] = block
+                return [(active[role], 1)]
+            clock[0] = until
+            return []
+
+        def poll():
+            if clock[0] >= exit_at:
+                child.returncode = code
+            return child.returncode
+
+        child.poll.side_effect = poll
+        selector.register.side_effect = register
+        selector.unregister.side_effect = unregister
+        selector.select.side_effect = select
+        selector.get_map.side_effect = lambda: active
+        selector.close.side_effect = close_error
+        output = io.StringIO()
+        with (
+            patch.object(subprocess, "Popen", return_value=child) as launch,
+            patch.object(selectors, "DefaultSelector", return_value=selector),
+            patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(os, "set_blocking"),
+            patch.object(os, "getpgid", return_value=child.pid, create=True),
+            patch.object(os, "getsid", return_value=child.pid, create=True),
+            patch.object(
+                os, "read", side_effect=read_error or (lambda fd, size: blocks.pop(fd))
+            ),
+            patch(__name__ + ".ownership_fixture_birth", return_value=42),
+            patch(__name__ + ".cleanup_ownership_fixture") as cleanup,
+            contextlib.redirect_stderr(output),
+        ):
+            try:
+                result = run_linux_ownership_fixture(["pwsh", "FIXTURE"])
+                error = None
+            except BaseException as caught:
+                result, error = None, caught
+        self.assertEqual(cleanup.call_count, 1)
+        cleanup.assert_called_with(child, 42)
+        selector.close.assert_called_once()
+        for pipe in pipes.values():
+            pipe.close.assert_called_once()
+        launch.assert_called_once_with(
+            ["pwsh", "FIXTURE"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        return result, error, output.getvalue(), clock[0]
+
+    def test_linux_fixture_late_valid_json_is_same_irreversible_timeout(self):
+        original = subprocess.TimeoutExpired
+        errors = []
+
+        class RecordedTimeout(original):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                errors.append(self)
+
+        with patch.object(subprocess, "TimeoutExpired", RecordedTimeout):
+            result, error, output, elapsed = self.linux_fixture_simulation(
+                [
+                    (12, "stderr", b"OWNERSHIP_FIXTURE_EN"),
+                    (12.1, "stderr", b"TRY\nSECRET\n"),
+                    (
+                        12.2,
+                        "stderr",
+                        b"OWNERSHIP_FIXTURE stage=entered elapsed_ms=1 pwsh_major=7 pwsh_minor=4\n",
+                    ),
+                    (13, "stdout", b'{"valid":true}'),
+                    (13.1, "stdout", b""),
+                    (13.1, "stderr", b""),
+                ],
+                exit_at=13,
+            )
+        self.assertIsNone(result)
+        self.assertIs(error, errors[0])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(error.timeout, 10)
+        self.assertEqual(
+            error.stdout, b""
+        )  # Snapshot at10, never replaced by late JSON.
+        data = json.loads(output.split(" ", 1)[1])
+        self.assertEqual(data["exit_category"], "zero")
+        self.assertTrue(data["child_live_at_qualification_cutoff"])
+        self.assertEqual(data["parent_observed_first_entry_ms"], 12100)
+        self.assertEqual(data["parent_observed_first_stage_ms"], {"entered": 12200})
+        self.assertEqual(data["late_known_markers"]["pwsh_version"], [7, 4])
+        self.assertNotIn("SECRET", output)
+        self.assertNotIn("valid", output)
+        self.assertLess(elapsed, 30)
+
+    def test_linux_fixture_no_output_stops_observation_at_fixed_thirty(self):
+        result, error, output, elapsed = self.linux_fixture_simulation([], exit_at=100)
+        self.assertIsNone(result)
+        self.assertIsInstance(error, subprocess.TimeoutExpired)
+        self.assertLessEqual(elapsed, 30.001)
+        data = json.loads(output.split(" ", 1)[1])
+        self.assertIsNone(data["parent_observed_first_entry_ms"])
+        self.assertEqual(data["parent_observed_first_stage_ms"], {})
+        self.assertEqual(data["exit_category"], "still_live")
+
+    def test_linux_fixture_late_overflow_cannot_replace_frozen_timeout(self):
+        _, error, output, _ = self.linux_fixture_simulation(
+            [(11, "stdout", b"x" * (m.MAX_SAMPLE + 1))], exit_at=100
+        )
+        self.assertIsInstance(error, subprocess.TimeoutExpired)
+        self.assertEqual(error.timeout, 10)
+        self.assertEqual(error.stdout, b"")
+        self.assertTrue(json.loads(output.split(" ", 1)[1])["cleanup_complete"])
+
+    def test_linux_fixture_drains_both_pipes_and_preserves_early_check_errors(self):
+        for code in (0, 37):
+            result, error, output, _ = self.linux_fixture_simulation(
+                [
+                    (1, "stdout", b'{"ok":true}\r\n'),
+                    (1, "stderr", b"diagnostic\r\n"),
+                    (1.1, "stdout", b""),
+                    (1.1, "stderr", b""),
+                ],
+                exit_at=1,
+                code=code,
+            )
+            self.assertEqual(output, "")
+            observed = result if code == 0 else error
+            self.assertEqual(observed.stdout, '{"ok":true}\n')
+            self.assertEqual(observed.stderr, "diagnostic\n")
+            self.assertEqual(observed.returncode, code)
+            if code:
+                self.assertIsInstance(error, subprocess.CalledProcessError)
+
+    def test_linux_fixture_interrupt_and_read_error_close_all_owned_resources(self):
+        for failure in (KeyboardInterrupt(), OSError("SECRET")):
+            _, error, output, _ = self.linux_fixture_simulation(
+                [(1, "stdout", b"x")], exit_at=100, read_error=failure
+            )
+            self.assertIs(error, failure)
+            self.assertEqual(output, "")
+
+    def test_linux_fixture_selector_close_error_still_closes_pipes_and_reaps(self):
+        failure = OSError("SECRET close failure")
+        _, error, output, _ = self.linux_fixture_simulation(
+            [(1, "stdout", b""), (1, "stderr", b"")], exit_at=1, close_error=failure
+        )
+        self.assertIs(error, failure)
+        self.assertEqual(output, "")
+
+    def test_linux_fixture_capture_bounds_and_long_line_cannot_forge_marker(self):
+        capture = OwnershipFixtureCapture()
+        capture.feed("stderr", b"x" * 513, 1)
+        capture.feed("stderr", b"OWNERSHIP_FIXTURE_ENTRY\n", 2)
+        capture.feed("stderr", b"OWNERSHIP_FIXTURE_ENTRY\n", 3)
+        self.assertEqual(capture.entry_ms, 3)
+        capture.feed("stderr", b"SECRET\n" * 2000, 4)
+        self.assertLessEqual(len(capture.stderr), 8192)
+        with self.assertRaises(OverflowError):
+            capture.feed("stdout", b"x" * (m.MAX_SAMPLE + 1), 5)
+        with self.assertRaises(OverflowError):
+            capture.feed("stderr", b"x" * (1024 * 1024 + 1), 6)
+
+    def test_linux_fixture_cleanup_escalates_only_owned_group_and_rejects_reuse(self):
+        for reused in (False, True):
+            clock, alive = [0.0], [True]
+            child = Mock(pid=12345, returncode=None)
+
+            def poll():
+                if not alive[0]:
+                    child.returncode = -9
+
+            def kill(group, sig):
+                self.assertEqual(group, 12345)
+                if not alive[0]:
+                    raise ProcessLookupError
+                if sig == signal.SIGKILL:
+                    alive[0] = False
+
+            child.poll.side_effect = poll
+            with (
+                patch.object(signal, "SIGKILL", 9, create=True),
+                patch.object(os, "getpgrp", return_value=111, create=True),
+                patch.object(os, "killpg", side_effect=kill, create=True) as signals,
+                patch(
+                    __name__ + ".ownership_fixture_birth",
+                    return_value=43 if reused else 42,
+                ),
+                patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                patch.object(
+                    time,
+                    "sleep",
+                    side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay),
+                ),
+            ):
+                if reused:
+                    with self.assertRaises(RuntimeError):
+                        cleanup_ownership_fixture(child, 42)
+                    self.assertTrue(
+                        all(call.args[1] == 0 for call in signals.call_args_list)
+                    )
+                else:
+                    cleanup_ownership_fixture(child, 42)
+                    self.assertEqual(
+                        [
+                            call.args[1]
+                            for call in signals.call_args_list
+                            if call.args[1]
+                        ],
+                        [signal.SIGTERM, signal.SIGKILL],
+                    )
+                    self.assertLessEqual(clock[0], 3.01)
+
     def test_ownership_timeout_summary_retains_only_known_stage_and_numbers(self):
         summary = ownership_fixture_timeout_summary(
             b"SECRET endpoint/path\n"
@@ -205,6 +682,7 @@ class ObservationTests(unittest.TestCase):
             output = io.StringIO()
             with (
                 patch.object(subprocess, "run", side_effect=error),
+                patch(__name__ + ".run_linux_ownership_fixture", side_effect=error),
                 contextlib.redirect_stderr(output),
                 self.assertRaises(subprocess.TimeoutExpired) as raised,
             ):
@@ -649,13 +1127,13 @@ Write-OwnershipFixtureStage 'collector-return'
             runner = Path(temp) / "fixture.ps1"
             runner.write_text(fixture)
             try:
-                result = subprocess.run(
-                    ["pwsh", "-NoProfile", "-File", str(runner), str(script)],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=True,
-                )
+                argv = ["pwsh", "-NoProfile", "-File", str(runner), str(script)]
+                if sys.platform == "linux":
+                    result = run_linux_ownership_fixture(argv)
+                else:
+                    result = subprocess.run(
+                        argv, capture_output=True, text=True, timeout=10, check=True
+                    )
             except subprocess.TimeoutExpired as error:
                 print(
                     ownership_fixture_timeout_summary(error.stderr, error.stdout),
