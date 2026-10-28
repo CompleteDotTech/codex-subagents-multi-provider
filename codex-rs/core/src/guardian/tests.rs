@@ -1032,10 +1032,12 @@ fn collect_guardian_transcript_entries(
     history: &dyn codex_guardian_context::SectionHistory,
     node_repl_result_token_limit: usize,
 ) -> Vec<ConversationTranscriptEntry> {
+    let mut profile = codex_guardian_context::ContextProfile::synchronous();
+    profile.transcript.entry_limits.node_repl_output_tokens = node_repl_result_token_limit;
     prompt::collect_guardian_context(
         history,
-        node_repl_result_token_limit,
-        &[],
+        &profile,
+        /*root_conversation_candidates*/ None,
         &[],
         /*planned_action*/ None,
         /*permissions*/ None,
@@ -1186,16 +1188,14 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
                 kind: ConversationTranscriptEntryKind::NodeReplToolOutput(
                     "tool read_file result".to_string()
                 ),
-                content: codex_guardian_context::TranscriptContent::Text(
-                    guardian_truncate_text(&oversized_result, token_cap).0
-                ),
+                content: codex_guardian_context::TranscriptContent::Text(oversized_result.clone()),
                 original_bytes: oversized_result.len(),
                 retained_source: None,
             }
         );
         assert_eq!(entries.len(), 4);
         assert_eq!(
-            render_guardian_transcript_entries(&entries),
+            render_guardian_transcript_entries(&entries, token_cap),
             (
                 vec![
                     "[1] user: check the repo".to_string(),
@@ -1270,49 +1270,6 @@ async fn guardian_prompt_rejects_oversized_environment_ids() -> anyhow::Result<(
     Ok(())
 }
 
-#[test]
-fn guardian_approval_request_to_json_renders_mcp_tool_call_shape() -> serde_json::Result<()> {
-    let action = GuardianApprovalRequest::McpToolCall {
-        id: "call-1".to_string(),
-        server: "mcp_server".to_string(),
-        tool_name: "browser_navigate".to_string(),
-        arguments: Some(serde_json::json!({
-            "url": "https://example.com",
-        })),
-        connector_id: None,
-        connector_name: Some("Playwright".to_string()),
-        connector_description: None,
-        connected_account_email: Some("owner@example.com".to_string()),
-        tool_title: Some("Navigate".to_string()),
-        tool_description: None,
-        annotations: Some(GuardianMcpAnnotations {
-            destructive_hint: Some(true),
-            open_world_hint: None,
-            read_only_hint: Some(false),
-        }),
-    };
-
-    assert_eq!(
-        guardian_approval_request_to_json(&action)?,
-        serde_json::json!({
-            "tool": "mcp_tool_call",
-            "server": "mcp_server",
-            "tool_name": "browser_navigate",
-            "arguments": {
-                "url": "https://example.com",
-            },
-            "connector_name": "Playwright",
-            "connected_account_email": "owner@example.com",
-            "tool_title": "Navigate",
-            "annotations": {
-                "destructive_hint": true,
-                "read_only_hint": false,
-            },
-        })
-    );
-    Ok(())
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn build_guardian_prompt_items_keeps_required_node_repl_reviews_generic() -> anyhow::Result<()>
 {
@@ -1383,52 +1340,6 @@ async fn build_guardian_prompt_items_keeps_other_requests_generic() -> anyhow::R
         assert!(!text.contains("Node REPL action JSON:"));
         assert!(!text.contains("Distinguish preparation"));
     }
-
-    Ok(())
-}
-
-#[test]
-fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_json::Result<()> {
-    let cwd = PathUri::parse("file:///C:/repo").expect("valid Windows path URI");
-    let action = GuardianApprovalRequest::NetworkAccess {
-        id: "network-1".to_string(),
-        turn_id: "turn-1".to_string(),
-        environment_id: "local".to_string(),
-        target: "https://example.com:443".to_string(),
-        host: "example.com".to_string(),
-        protocol: NetworkApprovalProtocol::Https,
-        port: 443,
-        trigger: Some(GuardianNetworkAccessTrigger {
-            call_id: "call-1".to_string(),
-            tool_name: "shell".to_string(),
-            command: vec!["curl".to_string(), "https://example.com".to_string()],
-            cwd,
-            sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
-            additional_permissions: None,
-            justification: Some("Fetch the release metadata.".to_string()),
-            tty: None,
-        }),
-    };
-
-    assert_eq!(
-        guardian_approval_request_to_json(&action)?,
-        serde_json::json!({
-            "tool": "network_access",
-            "environment_id": "local",
-            "target": "https://example.com:443",
-            "host": "example.com",
-            "protocol": "https",
-            "port": 443,
-            "trigger": {
-                "callId": "call-1",
-                "toolName": "shell",
-                "command": ["curl", "https://example.com"],
-                "cwd": "C:\\repo",
-                "sandboxPermissions": "use_default",
-                "justification": "Fetch the release metadata.",
-            },
-        })
-    );
 
     Ok(())
 }
@@ -1545,7 +1456,7 @@ fn guardian_write_stdin_preserves_input_and_foreign_cwd(
     }
     assert_eq!(guardian_approval_request_to_json(&action)?, expected);
     assert_eq!(
-        guardian_assessment_action(&action),
+        guardian_assessment_action(&action).expect("reported approval action"),
         GuardianAssessmentAction::WriteStdin {
             approval_id: "terminal-write".to_string(),
             process_id: "1000".to_string(),
@@ -1567,12 +1478,22 @@ fn guardian_write_stdin_preserves_input_and_foreign_cwd(
     Ok(())
 }
 
-#[test_case::test_case(codex_utils_path_uri::PathConvention::Windows, r"C:\workspace"; "windows")]
-#[test_case::test_case(codex_utils_path_uri::PathConvention::Posix, "/C:/workspace"; "posix")]
-fn guardian_exec_command_uses_executor_cwd_convention(
-    cwd_convention: codex_utils_path_uri::PathConvention,
+#[test_case::test_case(Some("windows"), r"C:\workspace"; "windows")]
+#[test_case::test_case(Some("linux"), "/C:/workspace"; "posix")]
+#[test_case::test_case(None, r"C:\workspace"; "legacy")]
+#[tokio::test]
+async fn guardian_exec_command_uses_executor_cwd_convention(
+    platform_os: Option<&str>,
     expected_cwd: &str,
 ) -> serde_json::Result<()> {
+    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let mut executor = turn.initial_environments.primary().unwrap().clone();
+    executor.selection.environment_id = codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string();
+    executor.executor_platform_os = platform_os.map(str::to_owned);
+    turn.initial_environments
+        .environments
+        .push(TurnEnvironmentState::Ready(executor));
+    let context = GuardianReviewContext::from(Arc::new(turn));
     let cwd = PathUri::parse("file:///C:/workspace").expect("valid executor cwd");
     let action = crate::tools::sandboxing::ApprovalAction::ExecCommand {
         id: "command-1".to_string(),
@@ -1585,9 +1506,10 @@ fn guardian_exec_command_uses_executor_cwd_convention(
         justification: None,
         tty: false,
         proposed_execpolicy_amendment: None,
-    }
-    .into_guardian_request(Some(cwd_convention))
-    .expect("Guardian request should render executor cwd");
+    };
+    let action = ReviewAction::from_approval_action(action, &context)
+        .request
+        .expect("Guardian request should render executor cwd");
 
     assert_eq!(
         guardian_approval_request_to_json(&action)?,
@@ -1601,47 +1523,12 @@ fn guardian_exec_command_uses_executor_cwd_convention(
         }),
     );
     assert_eq!(
-        guardian_assessment_action(&action),
+        guardian_assessment_action(&action).expect("reported approval action"),
         GuardianAssessmentAction::Command {
             source: codex_protocol::approvals::GuardianCommandSource::UnifiedExec,
             command: "git status".to_string(),
             cwd: LegacyAppPathString::from_string(expected_cwd),
         },
-    );
-    Ok(())
-}
-
-#[test]
-fn guardian_apply_patch_preserves_foreign_paths_and_redacts_patch_text() -> serde_json::Result<()> {
-    let cwd = PathUri::parse("file:///C:/workspace").expect("valid executor cwd");
-    let file =
-        PathUri::parse("file:///C:/workspace/guardian.txt").expect("valid executor file path");
-    let patch = "*** Begin Patch\n*** Update File: guardian.txt\n@@\n+secret\n*** End Patch";
-    let action = GuardianApprovalRequest::ApplyPatch {
-        environment_id: "local".to_string(),
-        id: "patch-1".to_string(),
-        cwd,
-        files: vec![file],
-        patch: patch.to_string(),
-    };
-
-    assert_eq!(
-        guardian_approval_request_to_json(&action)?,
-        serde_json::json!({
-            "tool": "apply_patch",
-            "environment_id": "local",
-            "cwd": r"C:\workspace",
-            "files": [r"C:\workspace\guardian.txt"],
-            "patch": patch,
-        }),
-    );
-    assert_eq!(
-        serde_json::to_value(guardian_assessment_action(&action))?,
-        serde_json::json!({
-            "type": "apply_patch",
-            "cwd": r"C:\workspace",
-            "files": [r"C:\workspace\guardian.txt"],
-        }),
     );
     Ok(())
 }
@@ -1829,7 +1716,8 @@ fn build_guardian_transcript_reserves_separate_budget_for_tool_evidence() {
     }));
 
     let entries = collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
-    let (transcript, omission) = render_guardian_transcript_entries(&entries);
+    let (transcript, omission) =
+        render_guardian_transcript_entries(&entries, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
 
     assert!(
         transcript
@@ -1902,7 +1790,8 @@ fn build_guardian_transcript_preserves_recent_tool_context_when_user_history_is_
     ]);
 
     let entries = collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
-    let (transcript, omission) = render_guardian_transcript_entries(&entries);
+    let (transcript, omission) =
+        render_guardian_transcript_entries(&entries, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
 
     assert_eq!(
         transcript[..8],
@@ -3314,30 +3203,68 @@ async fn guardian_review_retries_two_parse_failures_then_approves() -> anyhow::R
         ],
     )
     .await;
-    let (session, turn) = guardian_test_session_and_turn(&server).await;
+    let (session, mut turn) = guardian_test_session_and_turn(&server).await;
+    let config = Arc::make_mut(&mut Arc::get_mut(&mut turn).unwrap().config);
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     seed_guardian_parent_history(&session, &turn).await;
-
-    let (outcome, metadata) = run_guardian_review_session_for_test(
-        Arc::clone(&session),
-        Arc::clone(&turn),
-        guardian_exec_command_request("shell-parse-retry"),
-        ApprovalRequestReasons::default(),
-        /*external_cancel*/ None,
-        /*max_attempts*/ 3,
-    )
-    .await;
-
-    let GuardianReviewOutcome::Completed(assessment) = outcome else {
-        panic!("expected guardian assessment");
+    let original = serde_json::json!({
+        "type": "function_call", "id": "fc_action", "call_id": "action",
+        "namespace": "team", "name": "send_message",
+        "arguments": r#"{"target":"worker","message":"opaque-message"}"#,
+        "encrypted_content": "opaque-replay", "encrypted_function_args": ["message"],
+    });
+    session
+        .record_conversation_items(
+            &turn,
+            turn.model_info(),
+            &[serde_json::from_value(original.clone())?],
+        )
+        .await;
+    let mut expected = original;
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("encrypted_content");
+    expected["arguments"] = serde_json::json!(r#"{"target":"/root","message":"opaque-message"}"#);
+    let invocation = crate::tools::context::ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: CancellationToken::new(),
+        tracker: Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        )),
+        call_id: "action".to_owned(),
+        tool_name: codex_tools::ToolName::namespaced("team", "send_message"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        environments: Default::default(),
+        payload: crate::tools::context::ToolPayload::Function {
+            arguments: expected["arguments"].as_str().unwrap().to_owned(),
+        },
     };
-    assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Allow);
-    assert_eq!(assessment.rationale, "retry succeeded");
-    assert_eq!(metadata.attempt_count, 3);
-    assert!(matches!(
-        metadata.guardian_session_kind,
-        Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
-    ));
-    assert_eq!(request_log.requests().len(), 3);
+    crate::tools::review_native_tool_call(&invocation).await?;
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let reviewer = requests[0].body_json()["client_metadata"]["thread_id"].clone();
+    for request in &requests {
+        assert_eq!(
+            request.body_json()["client_metadata"]["thread_id"],
+            reviewer
+        );
+        let calls = request
+            .inputs_of_type("function_call")
+            .into_iter()
+            .map(|mut item| {
+                item.as_object_mut()
+                    .unwrap()
+                    .remove("internal_chat_message_metadata_passthrough");
+                item
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec![expected.clone()]);
+        assert_eq!(request.inputs_of_type("function_call_output").len(), 1);
+    }
     Ok(())
 }
 

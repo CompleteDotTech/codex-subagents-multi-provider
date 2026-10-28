@@ -102,6 +102,7 @@ allowed_approval_policies = ["on-request"]
 allowed_sandbox_modes = ["workspace-write"]
 default_permissions = ":workspace"
 allow_remote_control = true
+unsafe_enforce_sqlite_journal_mode = false
 additional_developer_instructions = "Lower-priority instructions."
 
 [allowed_permission_profiles]
@@ -117,6 +118,7 @@ allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
 allow_remote_control = false
+unsafe_enforce_sqlite_journal_mode = true
 additional_developer_instructions = ""
 
 [allowed_permission_profiles]
@@ -136,6 +138,7 @@ allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
 allow_remote_control = false
+unsafe_enforce_sqlite_journal_mode = true
 additional_developer_instructions = ""
 
 [allowed_permission_profiles]
@@ -334,6 +337,104 @@ refresh_interval_ms = 12345
 "#,
             ))
         );
+    }
+}
+
+#[test]
+fn otel_requirements_compose_exact_values_and_atomic_exporters_with_relative_tls_paths() {
+    let low_dir = tempdir().expect("low-priority requirements directory");
+    let high_dir = tempdir().expect("high-priority requirements directory");
+    let low_base = AbsolutePathBuf::from_absolute_path(low_dir.path()).expect("absolute low base");
+    let high_base =
+        AbsolutePathBuf::from_absolute_path(high_dir.path()).expect("absolute high base");
+
+    let low = layer(
+        "req_low",
+        "Low",
+        r#"
+[otel]
+tool_result = { max_bytes = 1024 }
+log_user_prompt = true
+environment = "low"
+exporter = { otlp-http = { endpoint = "https://low.example", protocol = "json", headers = { stale = "low" }, tls = { ca-certificate = "low-ca.pem" } } }
+trace_exporter = { otlp-grpc = { endpoint = "https://low.example", tls = { client-certificate = "low-client.pem" } } }
+metrics_exporter = "statsig"
+"#,
+    )
+    .with_base_dir(low_base);
+    let high = layer(
+        "req_high",
+        "High",
+        r#"
+[otel]
+tool_result = { max_bytes = 4096 }
+log_user_prompt = false
+environment = "high"
+exporter = { otlp-http = { endpoint = "https://high.example", protocol = "binary", tls = { ca-certificate = "high-ca.pem" } } }
+metrics_exporter = "none"
+"#,
+    )
+    .with_base_dir(high_base);
+    let expected_source = RequirementSource::composite([high.source.clone(), low.source.clone()]);
+    let composed = compose_requirements_for_hostname(
+        vec![low, high, layer("empty", "Empty", "[otel]")],
+        /*hostname*/ None,
+    )
+    .expect("compose OTEL requirements")
+    .expect("requirements present")
+    .otel
+    .expect("OTEL requirements present");
+    assert_eq!(composed.source, expected_source);
+
+    let expected = r#"
+[otel]
+tool_result = { max_bytes = 4096 }
+log_user_prompt = false
+environment = "high"
+exporter = { otlp-http = { endpoint = "https://high.example", protocol = "binary", tls = { ca-certificate = '$HIGH_CA' } } }
+trace_exporter = { otlp-grpc = { endpoint = "https://low.example", tls = { client-certificate = '$LOW_CLIENT' } } }
+metrics_exporter = "none"
+"#
+    .replace(
+        "$HIGH_CA",
+        &high_dir.path().join("high-ca.pem").display().to_string(),
+    )
+    .replace(
+        "$LOW_CLIENT",
+        &low_dir.path().join("low-client.pem").display().to_string(),
+    );
+    assert_eq!(
+        composed.value,
+        *expected_requirements(expected).otel.unwrap()
+    );
+
+    assert_eq!(compose(vec![layer("empty", "Empty", "[otel]")]), Ok(None));
+}
+
+#[test]
+fn managed_otel_trace_metadata_is_rejected_with_its_requirements_source() {
+    for field in ["span_attributes", "tracestate"] {
+        let error = compose(vec![layer(
+            "req_metadata",
+            "Managed policy",
+            &format!("[otel]\n{field} = {{}}"),
+        )])
+        .expect_err("metadata is unsupported");
+        let RequirementsCompositionError::Parse {
+            layer_source,
+            message,
+        } = error
+        else {
+            panic!("expected a layer parse error: {error:?}");
+        };
+        assert_eq!(
+            layer_source,
+            RequirementSource::EnterpriseManaged {
+                id: "req_metadata".to_string(),
+                name: "Managed policy".to_string(),
+            },
+        );
+        assert!(message.contains(&format!("unknown field `{field}`")));
     }
 }
 
@@ -720,6 +821,48 @@ fn network_maps_use_regular_toml_merge() {
 "#
         )
     );
+}
+
+#[test]
+fn network_aliases_merge_with_layer_precedence_and_sources() {
+    for (low_key, high_key) in [
+        ("network_proxy", "experimental_network"),
+        ("experimental_network", "network_proxy"),
+    ] {
+        let low = layer(
+            "req_low",
+            "Low",
+            &format!(
+                "[{low_key}]\nenabled = true\nallow_local_binding = false\n\
+                 [{low_key}.domains]\n'low.example.com' = 'allow'\n'shared.example.com' = 'allow'"
+            ),
+        );
+        let high = layer(
+            "req_high",
+            "High",
+            &format!(
+                "[{high_key}]\nenabled = false\nallow_upstream_proxy = true\n\
+                 [{high_key}.domains]\n'high.example.com' = 'allow'\n'shared.example.com' = 'deny'"
+            ),
+        );
+        let expected_source =
+            RequirementSource::composite([high.source.clone(), low.source.clone()]);
+        let composed = compose_requirements_for_hostname(vec![low, high], /*hostname*/ None)
+            .expect("compose network aliases")
+            .expect("requirements present");
+        assert_eq!(
+            composed.network,
+            Some(Sourced::new(
+                expected_requirements(
+                    "[network_proxy]\nenabled = false\nallow_local_binding = false\nallow_upstream_proxy = true\n\
+                     [network_proxy.domains]\n'low.example.com' = 'allow'\n'high.example.com' = 'allow'\n'shared.example.com' = 'deny'"
+                )
+                .network
+                .expect("network requirements"),
+                expected_source,
+            ))
+        );
+    }
 }
 
 #[test]

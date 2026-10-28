@@ -271,6 +271,7 @@ pub(super) async fn ensure_listener_task_running(
             &conversation,
             watch_registration,
             thread_settings_baseline,
+            config_snapshot.history_mode,
         );
         let Some(listener_command_tx) = thread_state.listener_command_tx() else {
             tracing::warn!(
@@ -349,7 +350,7 @@ pub(super) async fn ensure_listener_task_running(
                     };
                     if matches!(
                         &event.msg,
-                        EventMsg::RawResponseItem(_) | EventMsg::RawResponseCompleted(_)
+                        EventMsg::RawResponseItem(_) | EventMsg::RawResponseCompleted(_) | EventMsg::PrivateSessionEvent(_)
                     ) && !raw_events_enabled
                     {
                         continue;

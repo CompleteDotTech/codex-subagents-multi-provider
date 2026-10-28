@@ -1,44 +1,37 @@
 use codex_extension_api::ConversationHistorySnapshot;
+use codex_features::Feature;
+#[cfg(test)]
 use codex_guardian_context::Budgeted;
 use codex_guardian_context::CollectedContext;
-use codex_guardian_context::ComposedContext;
-use codex_guardian_context::ContextPresentation;
 use codex_guardian_context::ContextProfile;
 #[cfg(test)]
 use codex_guardian_context::ConversationTranscriptEntry;
 use codex_guardian_context::GuardianRootMessage;
 use codex_guardian_context::PlannedAction;
-use codex_guardian_context::PlannedActionKind;
 use codex_guardian_context::SectionError;
 use codex_guardian_context::SectionHistory;
 use codex_guardian_context::SectionInput;
+#[cfg(test)]
 pub(crate) use codex_guardian_context::TranscriptCursor as GuardianTranscriptCursor;
 pub(crate) use codex_guardian_context::TranscriptMode as GuardianPromptMode;
-use codex_guardian_context::TranscriptSelection;
 use codex_guardian_context::default_registry;
+use codex_guardian_reviewer::GuardianPromptItems;
 use codex_protocol::models::ResponseItem;
 
-use crate::context::ContextualUserFragment;
 use crate::context::GuardianPermissionContext;
-use crate::context::GuardianReviewEvidence;
-use crate::context::GuardianToolDescriptions;
 use crate::context::NodeReplReviewEvidence;
 use crate::context::NodeReplReviewEvidenceMode;
 use crate::context::is_guardian_context_message;
 use crate::context::node_repl_review_evidence_mode;
 use crate::session::session::Session;
-use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
-use codex_utils_output_truncation::truncate_text;
 
 use super::ApprovalRequestReasons;
 use super::GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS;
 use super::GUARDIAN_MAX_TOOL_ENTRY_TOKENS;
 use super::GuardianApprovalRequest;
 use super::GuardianReviewContext;
-use super::approval_request::format_guardian_action_pretty;
 
-const GUARDIAN_MAX_APPROVAL_REASON_TOKENS: usize = 512;
 // Bound both JSON and permission evidence without restricting manual approvals.
 const MAX_GUARDIAN_ENVIRONMENT_ID_BYTES: usize = 256;
 pub(super) const GUARDIAN_TRANSCRIPT_START: &str = ">>> TRANSCRIPT START\n";
@@ -47,12 +40,6 @@ pub(super) const GUARDIAN_TRANSCRIPT_START: &str = ">>> TRANSCRIPT START\n";
 pub(crate) enum GuardianTranscriptHistory<'a> {
     Retained(&'a dyn ConversationHistorySnapshot),
     LoadedParentCheckpoint(&'a dyn ConversationHistorySnapshot),
-}
-
-pub(crate) struct GuardianPromptItems {
-    pub(crate) context: ComposedContext,
-    pub(crate) transcript_cursor: GuardianTranscriptCursor,
-    pub(crate) node_repl_evidence_sequence: u64,
 }
 
 /// Builds the guardian user content items from:
@@ -113,52 +100,21 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     } else {
         GUARDIAN_MAX_TOOL_ENTRY_TOKENS
     };
+    let config = session.get_config().await;
     let root_authorization = session
         .services
         .agent_control
         .get_guardian_package(session.thread_id)
         .await
-        .map(|snapshot| snapshot.messages);
-    let trusted_user_inputs = session
-        .services
-        .thread_extension_data
-        .get_or_init(GuardianReviewEvidence::default)
-        .user_input_snapshot(history)
-        .fragments;
-    let planned_action_json = format_guardian_action_pretty(&request)?;
-    let planned_action = PlannedAction {
-        json: planned_action_json,
-        tool_descriptions: if let GuardianApprovalRequest::McpToolCall {
-            tool_description,
-            connector_description,
-            ..
-        } = &request
-        {
-            GuardianToolDescriptions::new(
-                tool_description.as_deref(),
-                connector_description.as_deref(),
-            )
-            .map(|descriptions| descriptions.render().into_text().unwrap_or_default())
-        } else {
-            None
-        },
-        kind: match &request {
-            GuardianApprovalRequest::NetworkAccess { trigger, .. } => PlannedActionKind::Network {
-                has_trigger: trigger.is_some(),
-            },
-            GuardianApprovalRequest::WriteStdin { .. } => PlannedActionKind::TerminalInput,
-            GuardianApprovalRequest::ExecCommand { .. }
-            | GuardianApprovalRequest::ApplyPatch { .. }
-            | GuardianApprovalRequest::McpToolCall { .. }
-            | GuardianApprovalRequest::RequestPermissions { .. } => PlannedActionKind::Command,
-        },
-        reason: reasons.retry.or(reasons.approval).map(|reason| {
-            truncate_text(
-                &reason,
-                TruncationPolicy::Tokens(GUARDIAN_MAX_APPROVAL_REASON_TOKENS),
-            )
-        }),
-    };
+        .and_then(|snapshot| snapshot.request_candidates);
+    let trusted_user_inputs = history
+        .retained_context()
+        .map(codex_guardian_context::collect_verified_answer_candidates)
+        .unwrap_or_default();
+    let planned_action = codex_guardian_reviewer::build_guardian_planned_action(
+        &request,
+        reasons.retry.or(reasons.approval),
+    )?;
     let permissions = parent_context
         .map(|context| {
             super::permissions::for_environment(context, request.target_environment_id())
@@ -181,71 +137,63 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         .map_or(reviewed_node_repl_evidence_sequence, |snapshot| {
             snapshot.sequence
         });
+    let mut profile = ContextProfile::synchronous();
+    profile.transcript.entry_limits.node_repl_output_tokens = node_repl_result_token_limit;
+    profile.transcript.options.native_multi_agent_namespace = parent_context
+        .is_some_and(|context| {
+            let turn = context.turn();
+            turn.config
+                .features
+                .enabled(Feature::GuardianNativeMultiAgentHistory)
+                && turn.multi_agent_version == codex_protocol::protocol::MultiAgentVersion::V2
+        })
+        .then(|| {
+            config
+                .multi_agent_v2
+                .tool_namespace
+                .clone()
+                .filter(|namespace| !namespace.is_empty())
+                .unwrap_or_else(|| "functions".to_owned())
+        });
+    profile.transcript_format = match parent_context {
+        Some(context) => context.turn().config.guardian_transcript_mode,
+        None => config.guardian_transcript_mode,
+    };
     let sections = collect_guardian_context(
         &GuardianReviewHistory {
             history,
             use_parent_checkpoint,
         },
-        node_repl_result_token_limit,
-        root_authorization.as_deref().unwrap_or_default(),
+        &profile,
+        root_authorization.as_ref(),
         &trusted_user_inputs,
         Some(&planned_action),
         permissions.as_ref(),
         node_repl_context.as_ref(),
     )?;
-    let (selection, transcript_cursor) = mode.select(
-        sections.transcript_entries(),
+    codex_guardian_reviewer::compose_guardian_prompt(
+        sections,
+        &profile,
+        mode,
         if use_parent_checkpoint {
             history.history_version()
         } else {
             history.review_history_version()
         },
-    );
-    let session_id = session.thread_id.to_string();
-    let (transcript_entries, offset, placeholder, presentation) = match selection {
-        TranscriptSelection::Full(entries) => (
-            entries,
-            0,
-            "<no retained transcript entries>",
-            ContextPresentation::SyncFull {
-                session_id: &session_id,
-            },
-        ),
-        TranscriptSelection::Delta { entries, offset } => (
-            entries,
-            offset,
-            "<no retained transcript delta entries>",
-            ContextPresentation::SyncDelta {
-                session_id: &session_id,
-            },
-        ),
-    };
-    let mut profile = ContextProfile::synchronous();
-    profile.transcript_format = match parent_context {
-        Some(context) => context.turn().config.guardian_transcript_mode,
-        None => session.get_config().await.guardian_transcript_mode,
-    };
-    let mut transcript = profile.prepare_transcript(transcript_entries, offset);
-    if transcript_entries.is_empty() {
-        transcript.items.push(Budgeted::required(
-            codex_guardian_context::TranscriptContent::Text(placeholder.to_owned()),
-        ));
-    }
-    let context = sections.compose(presentation, transcript)?;
-    Ok(GuardianPromptItems {
-        context,
-        transcript_cursor,
+        &session.thread_id.to_string(),
         node_repl_evidence_sequence,
-    })
+    )
 }
 
 /// Exercises the sync profile through the host's existing transcript tests.
 #[cfg(test)]
 pub(crate) fn render_guardian_transcript_entries(
     entries: &[ConversationTranscriptEntry],
+    node_repl_result_token_limit: usize,
 ) -> (Vec<String>, Option<String>) {
-    let mut transcript =
-        ContextProfile::synchronous().prepare_transcript(entries, /*entry_number_offset*/ 0);
+    let mut profile = ContextProfile::synchronous();
+    profile.transcript.entry_limits.node_repl_output_tokens = node_repl_result_token_limit;
+    let mut transcript = profile.prepare_transcript(entries, /*entry_number_offset*/ 0);
     if entries.is_empty() {
         transcript.items.push(Budgeted::required(
             codex_guardian_context::TranscriptContent::Text(
@@ -260,7 +208,8 @@ pub(crate) fn render_guardian_transcript_entries(
             .map(|item| match item.content {
                 codex_guardian_context::TranscriptContent::Text(text) => text,
                 codex_guardian_context::TranscriptContent::Record(record) => record.to_string(),
-                codex_guardian_context::TranscriptContent::AgentMessage(_) => {
+                codex_guardian_context::TranscriptContent::ScheduledMessage(_)
+                | codex_guardian_context::TranscriptContent::NativeMessage(_) => {
                     panic!("expected text transcript")
                 }
             })
@@ -277,24 +226,23 @@ pub(crate) fn render_guardian_transcript_entries(
 /// Keep both tool calls and tool results here. The reviewer often needs the
 /// agent's exact queried path / arguments as well as the returned evidence to
 /// decide whether the pending approval is justified.
-/// Per-entry truncation happens during collection, using the current review's
-/// Node REPL cap; the cursor still counts every non-empty evidence entry.
+/// Per-entry truncation happens in sync preparation after cursor selection.
+/// The cursor counts every non-empty evidence entry.
 pub(super) fn collect_guardian_context(
     history: &dyn SectionHistory,
-    node_repl_result_token_limit: usize,
-    root_conversation: &[GuardianRootMessage],
-    trusted_user_answers: &[String],
+    profile: &ContextProfile,
+    root_conversation_candidates: Option<&codex_guardian_context::RootConversationInput>,
+    trusted_user_answers: &[codex_guardian_context::TrustedUserAnswer],
     planned_action: Option<&PlannedAction>,
     permissions: Option<&GuardianPermissionContext>,
     node_repl: Option<&codex_guardian_context::NodeReplContext<'_>>,
 ) -> Result<CollectedContext, SectionError> {
-    let mut profile = ContextProfile::synchronous();
-    profile.transcript.entry_limits.node_repl_output_tokens = node_repl_result_token_limit;
     default_registry().prepare(&SectionInput {
         target: profile.target,
         history: &FilteredGuardianHistory(history),
         transcript: &profile.transcript,
-        root_conversation,
+        root_conversation: &[],
+        root_conversation_candidates,
         trusted_user_answers,
         planned_action,
         permissions,
@@ -333,6 +281,14 @@ impl SectionHistory for GuardianReviewHistory<'_> {
         }
     }
 
+    fn render_original_assistant(
+        &self,
+        message: &codex_history::RetainedUserMessage,
+    ) -> Option<GuardianRootMessage> {
+        crate::context::render_original_assistant_context(message)
+            .map(GuardianRootMessage::Assistant)
+    }
+
     fn render_retained_assistant(
         &self,
         message: &codex_history::RetainedUserMessage,
@@ -362,6 +318,13 @@ impl SectionHistory for FilteredGuardianHistory<'_> {
 
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         Box::new(self.items_with_sources().map(|(item, _)| item))
+    }
+
+    fn render_original_assistant(
+        &self,
+        message: &codex_history::RetainedUserMessage,
+    ) -> Option<GuardianRootMessage> {
+        self.0.render_original_assistant(message)
     }
 
     fn render_retained_assistant(

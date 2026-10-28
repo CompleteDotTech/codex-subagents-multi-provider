@@ -21,6 +21,7 @@ pub use codex_protocol::config_types::AltScreenMode;
 pub use codex_protocol::config_types::ApprovalsReviewer;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 pub use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ToolExposureSurface;
 pub use codex_protocol::config_types::WebSearchMode;
@@ -320,7 +321,8 @@ pub use codex_protocol::MemoryVersion;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct MemoriesToml {
-    /// Selects the memory pipeline; v1 remains the default.
+    /// Selects the memory pipeline. Fresh profiles default to v2 when memories are enabled,
+    /// unless dual-write is explicitly disabled; existing v1 profiles default to v1.
     pub version: Option<MemoryVersion>,
     /// Generate both versions while v1 is selected; v2 runs alone after cutover.
     pub dual_write: Option<bool>,
@@ -352,6 +354,8 @@ pub struct MemoriesToml {
     pub extract_model: Option<String>,
     /// Model used for memory consolidation.
     pub consolidation_model: Option<String>,
+    /// Service tier for memory consolidation. Defaults to Standard (`"default"`).
+    pub consolidation_service_tier: Option<String>,
 }
 
 /// Effective memories settings after defaults are applied.
@@ -371,6 +375,7 @@ pub struct MemoriesConfig {
     pub min_rate_limit_remaining_percent: i64,
     pub extract_model: Option<String>,
     pub consolidation_model: Option<String>,
+    pub consolidation_service_tier: String,
 }
 
 impl Default for MemoriesConfig {
@@ -390,6 +395,7 @@ impl Default for MemoriesConfig {
             min_rate_limit_remaining_percent: DEFAULT_MEMORIES_MIN_RATE_LIMIT_REMAINING_PERCENT,
             extract_model: None,
             consolidation_model: None,
+            consolidation_service_tier: SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string(),
         }
     }
 }
@@ -438,6 +444,13 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .clamp(0, 100),
             extract_model: toml.extract_model,
             consolidation_model: toml.consolidation_model,
+            consolidation_service_tier: toml
+                .consolidation_service_tier
+                .map(|tier| {
+                    ServiceTier::from_request_value(&tier)
+                        .map_or(tier, |tier| tier.request_value().to_string())
+                })
+                .unwrap_or(defaults.consolidation_service_tier),
         }
     }
 }
@@ -622,8 +635,7 @@ pub enum OtelExporterKind {
 #[schemars(deny_unknown_fields)]
 pub struct OtelConfigToml {
     /// Byte limit for tool-result log output; independent of model-visible output.
-    #[serde(default)]
-    pub tool_result: codex_protocol::config_types::ToolResultLogConfig,
+    pub tool_result: Option<codex_protocol::config_types::ToolResultLogConfig>,
     /// Log user prompt in traces
     pub log_user_prompt: Option<bool>,
     /// Opt in to logging final main-agent and spawned-subagent responses to an OTLP log exporter.

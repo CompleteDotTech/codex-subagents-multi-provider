@@ -4,14 +4,13 @@ use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRun;
 use codex_agent_extension::AgentRunner;
 use codex_app_server_protocol::ImageReference as V2ImageReference;
+use codex_app_server_protocol::ThreadItem;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference as CoreImageReference;
-use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
-use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
@@ -103,18 +102,15 @@ fn map_additional_context(
         .unwrap_or_default()
         .into_iter()
         .map(|(key, entry)| {
-            (
-                key,
-                CoreAdditionalContextEntry {
-                    value: entry.value,
-                    kind: match entry.kind {
-                        AdditionalContextKind::Untrusted => CoreAdditionalContextKind::Untrusted,
-                        AdditionalContextKind::Application => {
-                            CoreAdditionalContextKind::Application
-                        }
-                    },
+            let entry = CoreAdditionalContextEntry {
+                value: entry.value,
+                kind: match entry.kind {
+                    AdditionalContextKind::Untrusted => CoreAdditionalContextKind::Untrusted,
+                    AdditionalContextKind::Application => CoreAdditionalContextKind::Application,
                 },
-            )
+                name: entry.name,
+            };
+            (key, entry)
         })
         .collect()
 }
@@ -355,7 +351,8 @@ impl TurnRequestProcessor {
                 )
                 .await;
         }
-        self.review_start_inner(request_id, params)
+        // Keep review setup from inflating the shared request dispatcher's stack frame.
+        Box::pin(self.review_start_inner(request_id, params))
             .await
             .map(|()| None)
     }
@@ -580,6 +577,15 @@ impl TurnRequestProcessor {
             );
             return Err(error);
         }
+        // Validate before changing the thread's live MCP policy.
+        let additional_context = map_additional_context(params.additional_context);
+        additional_context
+            .values()
+            .try_for_each(CoreAdditionalContextEntry::validate)
+            .map_err(invalid_request)
+            .inspect_err(|error| {
+                self.track_error_response(&request_id, error, /*error_type*/ None);
+            })?;
         Self::set_app_server_client_info(
             thread.as_ref(),
             app_server_client_name,
@@ -595,7 +601,6 @@ impl TurnRequestProcessor {
         let environment_requests =
             resolve_turn_environment_requests(self.thread_manager.as_ref(), params.environments)?;
 
-        let additional_context = map_additional_context(params.additional_context);
         let turn_has_input = !params.input.is_empty();
         let input = if let Some(tool_output) = params.tool_output {
             let item = ResponseItem::FunctionCallOutput {
@@ -678,7 +683,10 @@ impl TurnRequestProcessor {
             )
             .await
             .map_err(|err| {
-                let error = internal_error(format!("failed to submit turn input: {err}"));
+                let error = match err.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!("failed to submit turn input: {err}")),
+                };
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
                 error
             })?;
@@ -1095,7 +1103,10 @@ impl TurnRequestProcessor {
             )
             .await
             .map_err(|err| {
-                let error = internal_error(format!("failed to steer turn: {err}"));
+                let error = match err.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!("failed to steer turn: {err}")),
+                };
                 self.track_error_response(request_id, &error, /*error_type*/ None);
                 error
             })?;
@@ -1412,7 +1423,7 @@ impl TurnRequestProcessor {
         let items = if display_text.is_empty() {
             Vec::new()
         } else {
-            vec![ThreadItem::UserMessage {
+            vec![ThreadItem::untimed(ThreadItemPayload::UserMessage {
                 id: turn_id.clone(),
                 client_id: None,
                 content: vec![V2UserInput::Text {
@@ -1420,7 +1431,7 @@ impl TurnRequestProcessor {
                     // Review prompt display text is synthesized; no UI element ranges to preserve.
                     text_elements: Vec::new(),
                 }],
-            }]
+            })]
         };
 
         Turn {

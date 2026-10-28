@@ -10,6 +10,7 @@ pub(crate) use setup::run_guardian_review_session;
 
 #[path = "review_session_context.rs"]
 mod context_policy;
+use codex_guardian_reviewer::ReviewDeadline;
 use context_policy::ReviewContextPolicy;
 
 use std::borrow::Cow;
@@ -29,9 +30,9 @@ use codex_guardian_reviewer::ConversationState;
 use codex_guardian_reviewer::ReviewModel;
 use codex_guardian_reviewer::ReviewSessionResult;
 use codex_guardian_reviewer::SessionDisposition;
+use codex_guardian_reviewer::token_usage_delta;
 use codex_history::InitialHistory;
 use codex_history::RolloutItem;
-use codex_protocol::ThreadId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -46,9 +47,7 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol::protocol::TokenUsage;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -98,7 +97,6 @@ pub(crate) use super::reviewer_config::build_guardian_review_session_config;
 use codex_guardian_reviewer::run_before_review_deadline;
 use codex_guardian_reviewer::wait_for_guardian_review;
 
-const GUARDIAN_MAX_IMAGE_ITEM_TOKENS: i64 = 10_000;
 pub(crate) use codex_guardian_reviewer::GuardianReviewSessionOutcome;
 
 pub(crate) struct GuardianReviewSessionParams {
@@ -117,7 +115,7 @@ pub(crate) struct GuardianReviewSessionParams {
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
     pub(crate) personality: Option<Personality>,
     pub(crate) external_cancel: Option<CancellationToken>,
-    pub(crate) deadline: tokio::time::Instant,
+    pub(crate) deadline: ReviewDeadline,
 }
 
 pub(crate) type GuardianReviewSessionManager =
@@ -158,20 +156,6 @@ struct PendingNodeReplEvidenceAdmission {
 
 fn had_prior_review_context(prompt_mode: &GuardianPromptMode) -> bool {
     matches!(prompt_mode, GuardianPromptMode::Delta { .. })
-}
-
-fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage {
-    TokenUsage {
-        input_tokens: (end.input_tokens - start.input_tokens).max(0),
-        cached_input_tokens: (end.cached_input_tokens - start.cached_input_tokens).max(0),
-        cache_write_input_tokens: (end.cache_write_input_tokens - start.cache_write_input_tokens)
-            .max(0),
-        output_tokens: (end.output_tokens - start.output_tokens).max(0),
-        reasoning_output_tokens: (end.reasoning_output_tokens - start.reasoning_output_tokens)
-            .max(0),
-        total_tokens: (end.total_tokens - start.total_tokens).max(0),
-        codex_rollout_budget_units: None,
-    }
 }
 
 type GuardianReviewForkSnapshot = ConversationCheckpoint<GuardianReviewHistory>;
@@ -281,20 +265,6 @@ impl GuardianReviewSessionReuseKey {
     }
 }
 
-pub(crate) fn prompt_cache_key_override_for_review_session(
-    session_source: &SessionSource,
-    parent_thread_id: Option<ThreadId>,
-) -> Option<String> {
-    let SessionSource::SubAgent(SubAgentSource::Other(name)) = session_source else {
-        return None;
-    };
-    if name != GUARDIAN_REVIEWER_NAME {
-        return None;
-    }
-    let parent_thread_id = parent_thread_id?;
-    Some(format!("guardian:{parent_thread_id}"))
-}
-
 impl GuardianReviewSession {
     async fn admit_node_repl_evidence(&self, event: &Event) {
         // Annotated review inputs are recorded as response items without UI turn
@@ -331,7 +301,7 @@ async fn run_review_on_session(
     review_session: &GuardianReviewSession,
     params: &GuardianReviewSessionParams,
     guardian_session_kind: GuardianReviewSessionKind,
-    deadline: tokio::time::Instant,
+    deadline: ReviewDeadline,
 ) -> ReviewSessionResult {
     let review_model = &params.review_model;
     let model_info = params
@@ -589,18 +559,22 @@ async fn run_review_on_session(
                         .saturating_mul(model_info.effective_context_window_percent.clamp(0, 100))
                         / 100
                 });
-                let admit_images = if let Some(context_window) = context_window.filter(|limit| {
+                let context_window = context_window.filter(|limit| {
                     *limit > 0
                         && !model_info.used_fallback_model_metadata
                         && model_info.input_modalities.contains(&InputModality::Image)
-                }) {
-                    let features = &params.spawn_config.features;
-                    let mode = if unified_image_budget_enabled(features, &model_info) {
-                        ImagePreparationMode::UnifiedBudget
-                    } else {
-                        ImagePreparationMode::DetailBased
-                    };
-                    prompt_items.context.retain_new_images(reviewer_history.raw_items(), |image, detail| {
+                });
+                let features = &params.spawn_config.features;
+                let mode = if unified_image_budget_enabled(features, &model_info) {
+                    ImagePreparationMode::UnifiedBudget
+                } else {
+                    ImagePreparationMode::DetailBased
+                };
+                codex_guardian_context::prepare_sync_images(
+                    &mut prompt_items.context,
+                    reviewer_history.raw_items(),
+                    context_window,
+                    |image, detail| {
                         *detail = match normalize_output_image_detail(&model_info, *detail) {
                             _ if mode == ImagePreparationMode::UnifiedBudget => {
                                 Some(ImageDetail::Original)
@@ -611,9 +585,11 @@ async fn run_review_on_session(
                         match image {
                             ImageReference::Inline { image_url } => {
                                 match resize_image(image_url, detail, mode) {
-                                    Ok(Some(prepared)) => Some(Cow::Owned(ImageReference::Inline {
-                                        image_url: prepared.into_data_url(),
-                                    })),
+                                    Ok(Some(prepared)) => {
+                                        Some(Cow::Owned(ImageReference::Inline {
+                                            image_url: prepared.into_data_url(),
+                                        }))
+                                    }
                                     Ok(None) => Some(Cow::Borrowed(image)),
                                     Err(error) => {
                                         warn!(%error, "failed to prepare guardian review image");
@@ -623,36 +599,27 @@ async fn run_review_on_session(
                             }
                             ImageReference::File { .. } => Some(Cow::Borrowed(image)),
                         }
-                    });
-                    let prompt_tokens = prompt_items
-                        .context
-                        .clone()
-                        .into_messages()
-                        .iter()
-                        .map(crate::context_manager::estimate_item_token_count)
-                        .fold(0i64, i64::saturating_add);
-                    let base_instructions = review_session.session.get_base_instructions().await;
-                    let history_tokens = reviewer_history
-                        .estimate_token_count_with_base_instructions(&base_instructions)
-                        .unwrap_or(i64::MAX)
-                        .max(review_session.session.get_total_token_usage().await);
-                    prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
-                        && prompt_tokens.saturating_add(history_tokens) <= context_window
-                } else {
-                    false
-                };
-                if !admit_images {
-                    prompt_items.context.retain_images(|_, _| false);
-                }
+                    },
+                    crate::context_manager::estimate_item_token_count,
+                    || async {
+                        let base_instructions =
+                            review_session.session.get_base_instructions().await;
+                        reviewer_history
+                            .estimate_token_count_with_base_instructions(&base_instructions)
+                            .unwrap_or(i64::MAX)
+                            .max(review_session.session.get_total_token_usage().await)
+                    },
+                )
+                .await;
             }
 
             let items = match prompt_items.context.clone().into_user_inputs() {
                 Ok(items) => items,
                 Err(codex_guardian_context::SectionError::UnsupportedDelivery {
-                    section: "conversation_transcript",
+                    section: "conversation_transcript" | "planned_action",
                 }) => {
                     // Final admission replaces this turn-start marker with the complete,
-                    // budgeted context, including native encrypted agent-message evidence.
+                    // budgeted context, including native encrypted messages and tool calls.
                     vec![codex_protocol::user_input::UserInput::Text {
                         text: super::prompt::GUARDIAN_TRANSCRIPT_START.to_owned(),
                         text_elements: Vec::new(),

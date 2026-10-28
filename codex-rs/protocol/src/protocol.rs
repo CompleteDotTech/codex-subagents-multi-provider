@@ -69,6 +69,7 @@ use codex_extension_items::image_generation::GeneratedImageRef;
 use codex_extension_items::image_generation::ImageGenerationFailure;
 use codex_extension_items::image_generation::ImageGenerationInputImage;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -645,6 +646,45 @@ pub enum AdditionalContextKind {
 pub struct AdditionalContextEntry {
     pub value: String,
     pub kind: AdditionalContextKind,
+    /// Optional name for untrusted context, used to label its tool output.
+    pub name: Option<String>,
+}
+
+impl AdditionalContextEntry {
+    /// Creates an unnamed context entry.
+    pub fn new(value: String, kind: AdditionalContextKind) -> Self {
+        Self {
+            value,
+            kind,
+            name: None,
+        }
+    }
+
+    /// Sets the name for untrusted context.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Validates the optional untrusted-context name before input admission.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let Some(name) = &self.name else {
+            return Ok(());
+        };
+        if self.kind == AdditionalContextKind::Application {
+            return Err("additional context name is only supported for untrusted context");
+        }
+        if name.is_empty()
+            || name.len() > 64
+            || !name.as_bytes()[0].is_ascii_lowercase()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err("additional context name must match [a-z][a-z0-9_]{0,63}");
+        }
+        Ok(())
+    }
 }
 
 /// Submission operation
@@ -736,6 +776,13 @@ pub enum Op {
         /// When present, report validation errors here instead of emitting an error event.
         /// Successful updates still emit `ThreadSettingsApplied` for all callers.
         reply: Option<oneshot::Sender<CodexResult<()>>>,
+    },
+
+    /// Replace the dynamic tool catalog without starting a turn.
+    #[debug("ReplaceDynamicTools")]
+    ReplaceDynamicTools {
+        tools: Vec<DynamicToolSpec>,
+        reply: oneshot::Sender<CodexResult<()>>,
     },
 
     /// Update only the named running turn, without changing future settings.
@@ -1056,6 +1103,7 @@ impl Op {
             Self::RecoverTurn { .. } => "recover_turn",
             Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
             Self::ThreadSettings { .. } => "thread_settings",
+            Self::ReplaceDynamicTools { .. } => "replace_dynamic_tools",
             Self::TurnSettings { .. } => "turn_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",
@@ -1653,6 +1701,12 @@ pub enum EventMsg {
     RawResponseItem(RawResponseItemEvent),
     RawResponseCompleted(RawResponseCompletedEvent),
 
+    /// In-process delivery from a private reviewer through its parent's subscription.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    PrivateSessionEvent(PrivateSessionEvent),
+
     ItemStarted(ItemStartedEvent),
     ItemCompleted(ItemCompletedEvent),
     HookStarted(HookStartedEvent),
@@ -1686,6 +1740,34 @@ pub enum EventMsg {
 
     /// Path-based v2 sub-agent activity.
     SubAgentActivity(SubAgentActivityEvent),
+}
+
+impl EventMsg {
+    /// Returns the ID and start time of the command this approval opens.
+    /// Stdin and network reviews have their own prompts for an existing operation.
+    pub fn command_approval_start(&self) -> Option<(&str, i64)> {
+        match self {
+            Self::ExecApprovalRequest(request)
+                if request.approval_id.is_none() && request.network_approval_context.is_none() =>
+            {
+                Some((&request.call_id, request.started_at_ms))
+            }
+            Self::GuardianAssessment(assessment)
+                if assessment.status == GuardianAssessmentStatus::InProgress
+                    && matches!(
+                        assessment.action,
+                        GuardianAssessmentAction::Command { .. }
+                            | GuardianAssessmentAction::Execve { .. }
+                    ) =>
+            {
+                Some((
+                    assessment.target_item_id.as_deref()?,
+                    assessment.started_at_ms,
+                ))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS, EnumIter)]
@@ -1796,7 +1878,7 @@ pub struct HookRunSummary {
     pub handler_type: HookHandlerType,
     pub execution_mode: HookExecutionMode,
     pub scope: HookScope,
-    pub source_path: AbsolutePathBuf,
+    pub source_path: LegacyAppPathString,
     #[serde(default)]
     pub source: HookSource,
     pub display_order: i64,
@@ -1974,6 +2056,9 @@ pub enum CodexErrorInfo {
     RateLimitExceeded,
     FlexUnavailable,
     ServerOverloaded,
+    ModelNotFound,
+    /// Capacity is unavailable on a route restricted by server policy.
+    PolicyCapacityUnavailable,
     CyberPolicy,
     BioPolicy,
     MisalignmentPolicyViolation,
@@ -2019,6 +2104,8 @@ impl CodexErrorInfo {
             | Self::RateLimitExceeded
             | Self::FlexUnavailable
             | Self::ServerOverloaded
+            | Self::ModelNotFound
+            | Self::PolicyCapacityUnavailable
             | Self::CyberPolicy
             | Self::BioPolicy
             | Self::MisalignmentPolicyViolation
@@ -2040,6 +2127,20 @@ impl CodexErrorInfo {
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 pub struct RawResponseItemEvent {
     pub item: ResponseItem,
+}
+
+/// Observer events that a private session forwards without modifying its parent's history.
+#[derive(Debug, Clone)]
+pub struct PrivateSessionEvent {
+    pub thread_id: ThreadId,
+    pub event: PrivateSessionEventPayload,
+}
+
+/// Recorded state and cancellation needed by observers awaiting response acceptance.
+#[derive(Debug, Clone)]
+pub enum PrivateSessionEventPayload {
+    RecordedItem(RawResponseItemEvent),
+    TurnAborted(TurnAbortedEvent),
 }
 
 /// Exact usage and metadata reported by one upstream Responses API completion.
@@ -2942,6 +3043,9 @@ pub struct ImageGenerationEndEvent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<_>", optional)]
     pub input_images: Vec<ImageGenerationInputImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub generation_id: Option<String>,
 }
 
 // Conversation kept for backward compatibility.
@@ -3265,6 +3369,9 @@ pub struct SessionMeta {
     pub id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<ThreadId>,
+    /// Marks a persisted fork as attached to `forked_from_id`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attached_thread: bool,
     /// Exclusive ordinal inherited from the logical fork parent, independent of `history_base`.
     /// Revert may replace the physical history base while retaining this fork boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3339,6 +3446,7 @@ impl Default for SessionMeta {
             session_id: id.into(),
             id,
             forked_from_id: None,
+            attached_thread: false,
             forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             timestamp: String::new(),

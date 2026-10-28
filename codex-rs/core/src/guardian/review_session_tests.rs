@@ -261,7 +261,9 @@ async fn test_review_params() -> GuardianReviewSessionParams {
         reasoning_summary,
         personality,
         external_cancel: None,
-        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+        deadline: codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     }
 }
 
@@ -505,42 +507,6 @@ async fn encrypted_parent_compaction_requires_original_item_id(mode: GuardianCon
 }
 
 #[tokio::test]
-async fn guardian_prompt_cache_key_is_scoped_to_parent_thread() {
-    let session_source =
-        SessionSource::SubAgent(SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string()));
-    let parent_thread_id = ThreadId::new();
-    let key = prompt_cache_key_override_for_review_session(&session_source, Some(parent_thread_id))
-        .expect("guardian prompt cache key");
-
-    assert_eq!(key, format!("guardian:{parent_thread_id}"));
-    assert!(
-        key.len() <= 64,
-        "guardian prompt cache key should fit the Responses API limit"
-    );
-    assert_eq!(
-        key,
-        prompt_cache_key_override_for_review_session(&session_source, Some(parent_thread_id))
-            .expect("same guardian prompt cache key")
-    );
-    assert_ne!(
-        key,
-        prompt_cache_key_override_for_review_session(&session_source, Some(ThreadId::new()))
-            .expect("different parent guardian prompt cache key")
-    );
-    assert_eq!(
-        None,
-        prompt_cache_key_override_for_review_session(&SessionSource::Cli, Some(parent_thread_id))
-    );
-    assert_eq!(
-        None,
-        prompt_cache_key_override_for_review_session(
-            &session_source,
-            /*parent_thread_id*/ None
-        )
-    );
-}
-
-#[tokio::test]
 async fn guardian_review_session_compact_scope_change_invalidates_cached_session() {
     let parent_config = crate::config::test_config().await;
     let cached_spawn_config = build_guardian_review_session_config(
@@ -671,41 +637,6 @@ async fn guardian_review_session_config_resolves_policy_and_template(
     );
 }
 
-#[test]
-fn token_usage_delta_never_reports_negative_usage() {
-    let start = TokenUsage {
-        input_tokens: 10,
-        cached_input_tokens: 8,
-        cache_write_input_tokens: 8,
-        output_tokens: 6,
-        reasoning_output_tokens: 4,
-        total_tokens: 28,
-        codex_rollout_budget_units: None,
-    };
-    let end = TokenUsage {
-        input_tokens: 15,
-        cached_input_tokens: 7,
-        cache_write_input_tokens: 7,
-        output_tokens: 10,
-        reasoning_output_tokens: 2,
-        total_tokens: 34,
-        codex_rollout_budget_units: None,
-    };
-
-    assert_eq!(
-        token_usage_delta(&start, &end),
-        TokenUsage {
-            input_tokens: 5,
-            cached_input_tokens: 0,
-            cache_write_input_tokens: 0,
-            output_tokens: 4,
-            reasoning_output_tokens: 0,
-            total_tokens: 6,
-            codex_rollout_budget_units: None,
-        }
-    );
-}
-
 #[tokio::test]
 async fn run_review_on_reused_session_waits_for_submitted_turn() {
     let (review_session, tx_event, rx_sub) = test_review_session().await;
@@ -727,7 +658,9 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
             &review_session,
             &params,
             GuardianReviewSessionKind::TrunkReused,
-            tokio::time::Instant::now() + Duration::from_secs(1),
+            codex_guardian_reviewer::ReviewDeadline::At(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ),
         )
         .await
     });
@@ -849,7 +782,9 @@ async fn wait_for_guardian_review_ignores_prior_turn_errors() {
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -895,7 +830,9 @@ async fn wait_for_guardian_review_preserves_structured_session_error() {
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -933,7 +870,9 @@ async fn wait_for_guardian_review_ignores_prior_turn_aborts() {
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -973,7 +912,9 @@ async fn wait_for_guardian_review_timeout_drains_expected_turn_after_stale_termi
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_millis(10),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_millis(10),
+        ),
         /*external_cancel*/ None,
         &mut analytics_result,
     )
@@ -1014,7 +955,9 @@ async fn wait_for_guardian_review_cancel_drains_expected_turn_after_stale_termin
     } = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
+        codex_guardian_reviewer::ReviewDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
         Some(&external_cancel),
         &mut analytics_result,
     )
@@ -1045,7 +988,7 @@ async fn interrupt_and_drain_turn_ignores_prior_turn_completion() {
     let result = wait_for_guardian_review(
         &review_session,
         "current-turn",
-        tokio::time::Instant::now(),
+        codex_guardian_reviewer::ReviewDeadline::At(tokio::time::Instant::now()),
         Some(&cancellation),
         &mut GuardianReviewAnalyticsResult::without_session(),
     )

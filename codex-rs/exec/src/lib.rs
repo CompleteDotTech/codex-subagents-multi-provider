@@ -39,7 +39,6 @@ use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
-use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadReadParams;
@@ -59,7 +58,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_cloud_config::managed_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::ConfigLoadOptions;
@@ -408,9 +407,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             CloudConfigBundleLoader::default(),
         )
         .await;
-        let gate_cloud_config = cloud_config_bundle_loader_for_storage(
+        let gate_cloud_config = managed_config_bundle_loader_for_storage(
             embedded_network_policy
                 .bind_bootstrap_auth(bootstrap_auth_config(&codex_home, &gate_bootstrap)?),
+            gate_bootstrap.config_layer_stack.requirements_toml(),
             /*enable_codex_api_key_env*/ false,
         )
         .await?;
@@ -508,8 +508,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     // API keys cannot fetch workspace-managed configuration. Preserve the
     // existing ChatGPT bootstrap identity even when model requests allow
     // CODEX_API_KEY.
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
+    let cloud_config_bundle = managed_config_bundle_loader_for_storage(
         bootstrap_auth_config,
+        bootstrap_config.config_layer_stack.requirements_toml(),
         /*enable_codex_api_key_env*/ false,
     )
     .await?;
@@ -1793,7 +1794,7 @@ fn should_backfill_turn_completed_items(
 fn turn_items_for_thread(
     thread: &AppServerThread,
     turn_id: &str,
-) -> Option<Vec<AppServerThreadItem>> {
+) -> Option<Vec<codex_app_server_protocol::ThreadItem>> {
     thread
         .turns
         .iter()
@@ -1872,6 +1873,7 @@ async fn resolve_resume_thread_id(
                     request_id: RequestId::Integer(0),
                     params: ThreadListParams {
                         excluded_thread_ids: None,
+                        attached_to_thread_id: None,
                         originators: None,
                         cursor,
                         limit: Some(100),
@@ -1959,6 +1961,7 @@ async fn resolve_resume_thread_id(
                 request_id: RequestId::Integer(0),
                 params: ThreadListParams {
                     excluded_thread_ids: None,
+                    attached_to_thread_id: None,
                     originators: None,
                     cursor,
                     limit: Some(100),
@@ -2318,9 +2321,7 @@ fn decode_utf16(
     }
 
     let units: Vec<u16> = input
-        .as_chunks::<2>()
-        .0
-        .iter()
+        .chunks_exact(2)
         .map(|chunk| decode_unit([chunk[0], chunk[1]]))
         .collect();
 

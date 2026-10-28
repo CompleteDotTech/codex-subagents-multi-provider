@@ -1,3 +1,11 @@
+# Thread memory summary (experimental)
+
+`thread/memory/read` takes `{threadId}` for a loaded thread and returns
+`{summary}`. Start or resume the thread first. The summary uses that thread's
+resolved memory version, including thread-specific configuration overrides.
+It is `null` when memory use is disabled or the selected summary is missing,
+unreadable, or blank. It never falls back to the other memory version.
+
 # Thread list exclusions
 
 `thread/list` accepts `excludedThreadIds`, an optional array of up to 100
@@ -293,6 +301,23 @@ be loaded. This covers turn start/steer, review, compaction, manual queue start,
 updates. Realtime connections use separate routing configuration and are not checked here.
 Interrupt, realtime stop, and goal pause/clear remain available. User and project
 configuration changes alone do not invalidate existing threads.
+
+## Managed network requirements
+
+Use `[network_proxy]` in `requirements.toml` for shared managed network constraints.
+`[experimental_network]` remains a compatibility alias. A single requirements layer cannot
+contain both names; across layers, they merge with normal precedence. The
+`configRequirements/read.network` response exposes the resulting constraints.
+
+In `config.toml`, `[features.network_proxy]` configures the proxy, while
+`[permissions.<profile>.network]` configures a profile's network settings. Managed requirements
+remain separate and override conflicting profile settings. They can start the proxy without
+enabling the feature; feature settings apply only when the feature is enabled.
+
+Policy publishers must continue using `[experimental_network]` until every client and policy
+validation layer supports `[network_proxy]`. Older clients or intermediaries may ignore or strip
+the new spelling, or skip host-local validation. This reader change does not migrate or
+version-gate published policy bundles.
 
 # Amazon Bedrock authentication
 
@@ -603,6 +628,11 @@ execution and sandbox policies.
 
 # Item history anchors
 
+Live notifications and turn history return the same `ThreadItem`. Each item has
+`startedAtMs` and `completedAtMs` beside `type` and `id`. Each timestamp is in
+Unix milliseconds, or `null` when the producer has not recorded it. Clients
+reading older servers may also encounter items that omit these fields.
+
 `thread/items/list` accepts an optional nullable `cursor`: either an opaque string
 from a previous response or an item anchor such as
 `{"type":"item","itemId":"item-123"}`. An item anchor resumes exclusively after
@@ -616,3 +646,65 @@ and out-of-scope item IDs return invalid params (`-32602`) with
 Omitted or null cursors preserve normal first-page behavior. Continue anchored
 pages with the returned opaque string `nextCursor`; response fields and
 `backwardsCursor` semantics are unchanged.
+
+## Workspace switching (experimental)
+
+For a managed ChatGPT login, `accountSession/list` returns an opaque
+`sessionId` for that login and its selected workspace. Set
+`refreshWorkspaceMetadata` to fetch the user's memberships.
+
+Call `accountSession/switch` with that `sessionId` and the target workspace's
+`accountId`. Core checks the membership, stops loaded threads, exchanges the
+session token and validates the new workspace's routing. Clients receive
+`thread/closed` for unloaded threads and `account/updated` after a successful
+switch. Selecting the current workspace leaves its threads running.
+
+The server remembers the selected workspace on refresh. If routing validation
+fails, Core attempts to restore the previous workspace while the same credentials
+are still current.
+
+Clients that can open a browser may pass `allowBrowserLogin: true`. If the
+workspace requires SSO, the response contains `loginId` and `authUrl`. Open
+that URL and wait for `account/login/completed`. The browser can reuse an
+existing SSO session. Core accepts the callback only for the requesting login
+and target workspace. Cancel through `account/login/cancel` to keep the current
+workspace. Government workspaces require a separate sign-in.
+
+# GCP provider account
+
+The experimental `account/gcp/setup` method configures the built-in Vertex AI provider.
+
+- `projectId` (required) — Google Cloud project ID.
+- `location` (optional) — Defaults to `global`.
+- `credentialFile` (optional) — Absolute path to a credential file on the app-server
+  host. Omit it or pass `null` to clear the saved path in the active user
+  configuration and use Application Default Credentials (ADC), including
+  `GOOGLE_APPLICATION_CREDENTIALS`.
+
+If the active profile inherits `model_providers.gcp.credential_file` from the base
+`config.toml`, clearing the profile’s own setting would expose the base path again.
+Setup returns an error without saving changes. To use ADC, remove the inherited
+setting from the file named in the error and retry.
+
+Setup rejects a GCP `base_url` override or higher-priority settings that conflict
+with the request. It fetches an access token before saving the settings and
+selecting GCP, then returns `{}`. The next `model/list` reloads the catalog.
+`account/read` reports `{ "account": { "type": "gcp" }, "requiresOpenaiAuth": false }`.
+Use a model request to verify Vertex model access.
+
+Credential failures include `error.data.reason`.
+
+- `gcloudNotInstalled` — The app-server could not find `gcloud` on its PATH.
+- `credentialFileInvalid` — The path is invalid or the file is unreadable. For
+  default `gcloud` auth, setup also checks for a JSON object with a nonempty string `type`.
+- `authCommandFailed` — The token command failed, including when ADC is missing
+  or a token refresh fails.
+
+For personal sign-in, users can run `gcloud auth application-default login` on
+the app-server host and retry setup.
+
+## Managed OpenTelemetry configuration
+
+`configRequirements/read` exposes managed `otel` settings. `config/read` applies
+those settings to the effective configuration and omits ordinary origins for
+managed fields. Configuration writes that overlap managed settings are rejected.

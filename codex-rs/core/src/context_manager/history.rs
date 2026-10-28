@@ -8,6 +8,7 @@
 //! Token estimates charge item content rather than transport metadata.
 //! Oversized instructions keep an incomplete excerpt for bounded root review, including
 //! sources recovered from legacy Guardian checkpoints before their raw history is dropped.
+//! Prompt projections replace unavailable file images without changing retained history.
 
 #[path = "history_user_authorization.rs"]
 mod user_authorization;
@@ -21,8 +22,8 @@ use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context::world_state::WorldStateUpdate;
 use crate::context_manager::normalize;
-use crate::event_mapping::has_non_contextual_dev_message_content;
-use crate::event_mapping::is_contextual_dev_message_content;
+use crate::context_manager::replace_unresolvable_image_files;
+use crate::event_mapping::contextual_dev_fragments;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::event_mapping::parse_turn_item;
 use crate::guardian::GUARDIAN_MAX_ROOT_MESSAGE_TOKENS;
@@ -31,6 +32,7 @@ use crate::session::turn_context::TurnContext;
 use crate::utils::json::serialized_json_bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_attachment_store::AttachmentStore;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ConversationHistorySnapshot;
@@ -600,19 +602,33 @@ impl ContextManager {
     /// Returns the history prepared for sending to the model. This applies a proper
     /// normalization and drops un-suited items. Unsupported image and audio content
     /// is stripped from messages and tool outputs according to `input_modalities`.
-    pub(crate) fn for_prompt(self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
-        self.for_prompt_annotated(input_modalities)
+    /// Unavailable file images are replaced with text placeholders.
+    pub(crate) async fn for_prompt(
+        self,
+        input_modalities: &[InputModality],
+        image_store: &dyn AttachmentStore,
+    ) -> Vec<ResponseItem> {
+        self.for_prompt_annotated(input_modalities, image_store)
+            .await
             .into_iter()
             .map(ResponseItemEnvelope::into_item)
             .collect()
     }
 
     /// Returns normalized history envelopes for internal consumers that must retain metadata.
-    pub(crate) fn for_prompt_annotated(
+    pub(crate) async fn for_prompt_annotated(
         mut self,
         input_modalities: &[InputModality],
+        image_store: &dyn AttachmentStore,
     ) -> Vec<ResponseItemEnvelope> {
         self.normalize_history(input_modalities);
+        replace_unresolvable_image_files(
+            Arc::make_mut(&mut self.items)
+                .iter_mut()
+                .map(|envelope| &mut envelope.item),
+            image_store,
+        )
+        .await;
         Arc::unwrap_or_clone(self.items)
     }
 
@@ -965,7 +981,7 @@ impl ContextManager {
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry or names an external tool event
     /// 3. unsupported image and audio content is stripped from messages and tool outputs
-    fn normalize_history(&mut self, input_modalities: &[InputModality]) {
+    pub(crate) fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         let items = Arc::make_mut(&mut self.items);
 
         // all function/tool calls must have a corresponding output
@@ -1006,10 +1022,23 @@ impl ContextManager {
     ) -> usize {
         while cut_idx > first_instruction_turn_idx {
             match &snapshot[cut_idx - 1].item {
-                ResponseItem::Message { role, content, .. }
-                    if role == "developer" && is_contextual_dev_message_content(content) =>
-                {
-                    if has_non_contextual_dev_message_content(content) {
+                ResponseItem::Message {
+                    role,
+                    content,
+                    internal_chat_message_metadata_passthrough,
+                    ..
+                } if role == "developer" => {
+                    let kinds = internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|metadata| metadata.content_item_kinds.as_deref())
+                        .unwrap_or_default();
+                    let contextual_count = contextual_dev_fragments(content, kinds)
+                        .filter(|matched| *matched)
+                        .count();
+                    if contextual_count == 0 {
+                        break;
+                    }
+                    if contextual_count < content.len() {
                         // Mixed `build_initial_context` bundles are not reconstructible from
                         // steady-state diffs once trimmed, so the next real turn must fully
                         // reinject context instead of diffing against a stale baseline.

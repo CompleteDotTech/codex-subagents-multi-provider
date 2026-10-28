@@ -10,6 +10,7 @@ use codex_exec_server::ExecutorCapabilityDiscoveryV2Cache;
 use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_exec_server::MAX_SELECTED_CAPABILITY_ROOTS;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
+use codex_exec_server::supports_capability_discovery_v2;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ElicitationReviewRequest;
 use codex_mcp::ElicitationReviewer;
@@ -133,6 +134,7 @@ impl Session {
                 config,
                 &selected_capability_roots,
                 &environments,
+                executor_capability_discovery_v2.as_deref(),
             )
             .await;
         if inventory_changed || discovery_recovered {
@@ -173,7 +175,7 @@ impl Session {
         self.mcp_runtime_context(&environments, &host_fallback_cwd)
     }
 
-    fn mcp_runtime_context(
+    pub(super) fn mcp_runtime_context(
         &self,
         environments: &TurnEnvironmentSnapshot,
         host_fallback_cwd: &std::path::Path,
@@ -186,6 +188,7 @@ impl Session {
             self.services.turn_environments.environment_manager(),
             local_process_cwd,
         )
+        .with_connection_pool(self.services.mcp_manager.connection_pool())
         .with_selected_environments(
             environments.all_selections().into(),
             environments.ready_environment_handles(),
@@ -247,6 +250,7 @@ impl Session {
                     &desired.config,
                     &selected_capability_roots,
                     &desired.environments,
+                    executor_capability_discovery_v2.as_deref(),
                 )
                 .await;
             let mcp_projection = self
@@ -329,6 +333,7 @@ impl Session {
                 &desired.config,
                 &selected_capability_roots,
                 &desired.environments,
+                executor_capability_discovery_v2.as_deref(),
             )
             .await;
         let mcp_projection = self
@@ -481,11 +486,9 @@ impl Session {
         config: &Config,
         resolved_roots: &[ResolvedSelectedCapabilityRoot],
         environments: &TurnEnvironmentSnapshot,
+        v2_snapshots: Option<&[ExecutorCapabilityDiscoveryV2Snapshot]>,
     ) -> (Option<Arc<ExecutorCapabilityDiscoverySnapshot>>, bool) {
-        if config
-            .features
-            .enabled(Feature::ExecutorCapabilityDiscoveryV2)
-        {
+        if v2_snapshots.is_some() {
             return (None, false);
         }
         let restricted_file_system = environments.primary().map_or_else(
@@ -577,6 +580,7 @@ impl Session {
             .count();
         cache.ensure_capacity(remote_environment_count);
         let mut snapshots = Vec::new();
+        let mut skipped_incompatible_executor = false;
         for selected in environments.turn_environments() {
             if !selected.environment.is_remote() {
                 continue;
@@ -592,7 +596,8 @@ impl Session {
                     continue;
                 }
             };
-            if !info.capabilities.capability_discovery_v2 {
+            if !supports_capability_discovery_v2(&info) {
+                skipped_incompatible_executor = true;
                 continue;
             }
             let request = DiscoverV2CapabilitiesRequest {
@@ -606,6 +611,14 @@ impl Session {
                 environment_id: environment_id.clone(),
                 result,
             });
+        }
+        if snapshots.is_empty() && skipped_incompatible_executor {
+            let changed = self
+                .services
+                .thread_extension_data
+                .remove::<Vec<ExecutorCapabilityDiscoveryV2Snapshot>>()
+                .is_some();
+            return (None, changed);
         }
         let previous = self
             .services
@@ -720,6 +733,15 @@ impl Session {
             };
         }
 
+        // This callback carries a request ID, not a reliable tool invocation owner.
+        // Do not report its human wait as ordinary tool execution.
+        if turn_context
+            .config
+            .features
+            .enabled(Feature::CriticalPathTiming)
+        {
+            turn_context.turn_timing_state.invalidate_critical_path();
+        }
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {
@@ -870,6 +892,7 @@ impl Session {
                 &desired.config,
                 &selected_capability_roots,
                 &desired.environments,
+                executor_capability_discovery_v2.as_deref(),
             )
             .await;
         let mcp_projection = self
