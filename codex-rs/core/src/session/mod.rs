@@ -1679,6 +1679,27 @@ impl Session {
         }
     }
 
+    /// Prepare the exact writer acquisition for close, including a concurrent completed shutdown.
+    pub(crate) async fn prepare_rollout_shutdown(&self) -> std::io::Result<()> {
+        if let Some(live_thread) = self.live_thread() {
+            live_thread
+                .prepare_shutdown()
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn completed_rollout_shutdown(&self) -> std::io::Result<()> {
+        if let Some(live_thread) = self.live_thread() {
+            live_thread
+                .completed_shutdown()
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn try_ensure_rollout_materialized(
         &self,
         context: PersistContext,
