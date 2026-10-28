@@ -840,6 +840,192 @@ class BazeliskDownloadFramingTests(unittest.TestCase):
 
 
 class RejectedLineShapeTests(unittest.TestCase):
+    SOURCE_PREFIXES = (
+        ("Install base ('", "install-base-not-directory-prefix"),
+        ("Corrupt installation: file '", "corrupt-installation-file-prefix"),
+        ("The install_base directory '", "install-base-version-prefix"),
+        (
+            "Removing previous installation at '",
+            "removing-previous-installation-prefix",
+        ),
+        ("install base directory '", "install-base-rename-prefix"),
+        ("(00:00:00) INFO: ", "java-ui-time-event-prefix"),
+        ("[INFO 00:00:00.000 ", "cpp-client-time-level-prefix"),
+    )
+
+    def test_source_prefix_categories_are_finite_and_keep_bodies_private(self):
+        for prefix, kind in self.SOURCE_PREFIXES:
+            shapes = []
+            for body in ("PRIVATE_PATH?token=SECRET", "OTHER_PRIVATE_FILE:123] BODY"):
+                with self.subTest(prefix=prefix, body=body):
+                    error = m.RejectedWrapperLine(prefix + body)
+                    self.assertEqual(error.shape["public_source_prefix_shape"], kind)
+                    self.assertEqual(set(vars(error)), {"shape"})
+                    self.assertEqual(
+                        error.args, ("Unexpected wrapper output outside JSON",)
+                    )
+                    encoded = json.dumps(vars(error))
+                    for secret in ("PRIVATE", "SECRET", "OTHER", "123", "00:00:00"):
+                        self.assertNotIn(secret, encoded)
+                    shapes.append(error.shape)
+            self.assertEqual(shapes[0], shapes[1])
+
+    def test_timestamp_categories_use_distinct_source_level_vocabularies(self):
+        for clock in ("00:00:00", "23:59:59"):
+            for level in (
+                "FATAL",
+                "ERROR",
+                "FAIL",
+                "WARNING",
+                "CANCELLED",
+                "INFO",
+                "DEBUG",
+                "SUBCOMMAND",
+            ):
+                self.assertEqual(
+                    m.RejectedWrapperLine(f"({clock}) {level}: PRIVATE").shape[
+                        "public_source_prefix_shape"
+                    ],
+                    "java-ui-time-event-prefix",
+                )
+            for level in ("INFO", "USER", "WARNING", "ERROR", "FATAL"):
+                for milliseconds in ("000", "999"):
+                    self.assertEqual(
+                        m.RejectedWrapperLine(
+                            f"[{level} {clock}.{milliseconds} PRIVATE"
+                        ).shape["public_source_prefix_shape"],
+                        "cpp-client-time-level-prefix",
+                    )
+        self.assertEqual(
+            m.RejectedWrapperLine("(00:00:00) INFO: A").shape,
+            m.RejectedWrapperLine("(23:59:59) INFO: B").shape,
+        )
+        self.assertEqual(
+            m.RejectedWrapperLine("[INFO 00:00:00.000 A").shape,
+            m.RejectedWrapperLine("[FATAL 23:59:59.999 B").shape,
+        )
+
+    def test_source_prefix_near_misses_remain_none(self):
+        for prefix, _ in self.SOURCE_PREFIXES:
+            for altered in (
+                "x" + prefix,
+                " " + prefix,
+                "\t" + prefix,
+                "\ufeff" + prefix,
+                "\x1b" + prefix,
+                prefix.swapcase(),
+                prefix[:-1],
+            ):
+                with self.subTest(altered=altered):
+                    self.assertEqual(
+                        m.RejectedWrapperLine(altered).shape[
+                            "public_source_prefix_shape"
+                        ],
+                        "none",
+                    )
+        for line in (
+            "Install base (",
+            "Corrupt installation: file ",
+            "The install_base directory ",
+            "Removing previous installation at ",
+            "install base directory ",
+            "(24:00:00) INFO: ",
+            "(00:60:00) INFO: ",
+            "(00:00:60) INFO: ",
+            "(0:00:00) INFO: ",
+            "(００:00:00) INFO: ",
+            "(00:00:00) USER: ",
+            "(00:00:00) INFO:",
+            "(00:00:00) INFO:\t",
+            "(00:00:00)\tINFO: ",
+            "[DEBUG 00:00:00.000 ",
+            "[INFO 24:00:00.000 ",
+            "[INFO 00:60:00.000 ",
+            "[INFO 00:00:60.000 ",
+            "[INFO 00:00:00.00 ",
+            "[INFO 00:00:00.0000 ",
+            "[INFO 00:00:00.000\t",
+            "[INFO\t00:00:00.000 ",
+            "[INFO ００:00:00.000 ",
+            "Cannot read 'PRIVATE",
+            "unknown PRIVATE",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(
+                    m.RejectedWrapperLine(line).shape["public_source_prefix_shape"],
+                    "none",
+                )
+
+    def test_source_prefix_observation_uses_only_single_64_slice(self):
+        for prefix, kind in self.SOURCE_PREFIXES:
+            expected = m.RejectedWrapperLine(prefix + "x" * 64).shape
+            self.assertEqual(
+                expected,
+                m.RejectedWrapperLine(
+                    (prefix + "x" * 64)[:64] + "\x1b\ufeffSECRET"
+                ).shape,
+            )
+            self.assertEqual(
+                m.RejectedWrapperLine("x" * 64 + prefix).shape[
+                    "public_source_prefix_shape"
+                ],
+                "none",
+            )
+            accesses = []
+
+            class PrefixOnly(str):
+                def __getitem__(self, key):
+                    accesses.append(key)
+                    return (prefix + "x" * 64)[:64]
+
+            self.assertEqual(
+                m.RejectedWrapperLine(PrefixOnly("SECRET")).shape, expected
+            )
+            self.assertEqual(accesses, [slice(None, 64)])
+            self.assertEqual(expected["public_source_prefix_shape"], kind)
+
+    def test_source_prefixes_still_reject_all_provider_and_action_positions(self):
+        record = packages()[0][0]
+        for prefix, kind in self.SOURCE_PREFIXES:
+            for before in (True, False):
+                for provider in (True, False):
+                    payload = m.SENTINEL + json.dumps(record) if provider else "{}"
+                    line = prefix + "PRIVATE_SECRET"
+                    text = line + "\n" + payload if before else payload + "\n" + line
+                    with (
+                        self.subTest(prefix=prefix, before=before, provider=provider),
+                        self.assertRaises(m.RejectedWrapperLine) as raised,
+                    ):
+                        if provider:
+                            m.parse_provider(text, record["label"])
+                        else:
+                            m.parse_json(text)
+                    self.assertEqual(
+                        raised.exception.shape["public_source_prefix_shape"], kind
+                    )
+                    self.assertEqual(
+                        str(raised.exception), "Unexpected wrapper output outside JSON"
+                    )
+
+    def test_source_prefix_categories_propagate_through_real_main_and_still_fail(self):
+        for prefix, kind in self.SOURCE_PREFIXES:
+            for provider in (True, False):
+                with self.subTest(prefix=prefix, provider=provider):
+                    manifest = self.run_main_rejection(
+                        provider, line=prefix + "PRIVATE_SECRET"
+                    )
+                    self.assertEqual(manifest["status"], "failed")
+                    self.assertEqual(
+                        manifest["failure"], "Unexpected wrapper output outside JSON"
+                    )
+                    self.assertEqual(
+                        manifest["rejected_wrapper_line_shape"][
+                            "public_source_prefix_shape"
+                        ],
+                        kind,
+                    )
+                    self.assertNotIn("artifacts", manifest)
+
     def test_indented_progress_remains_rejected_for_provider_and_action(self):
         record = packages()[0][0]
         line = "    currently loading: PRIVATE_SYNTHETIC_PACKAGE"
@@ -876,7 +1062,8 @@ class RejectedLineShapeTests(unittest.TestCase):
                 self.assertEqual(
                     error.shape,
                     {
-                        "schema": "rejected-wrapper-line-shape-v2",
+                        "schema": "rejected-wrapper-line-shape-v3",
+                        "public_source_prefix_shape": "none",
                         "starts_with_four_ascii_spaces": four,
                         "other_ascii_leading_whitespace": whitespace,
                         "esc_control_in_prefix": esc,
@@ -906,7 +1093,8 @@ class RejectedLineShapeTests(unittest.TestCase):
                     prefix + "PRIVATE_https://private.invalid/C:/private?token=SECRET"
                 )
                 expected = {
-                    "schema": "rejected-wrapper-line-shape-v2",
+                    "schema": "rejected-wrapper-line-shape-v3",
+                    "public_source_prefix_shape": "none",
                     "starts_with_four_ascii_spaces": False,
                     "other_ascii_leading_whitespace": False,
                     "esc_control_in_prefix": False,
@@ -1215,7 +1403,7 @@ class RejectedLineShapeTests(unittest.TestCase):
                         provider, line=prefix + "PRIVATE_URL?token=SECRET"
                     )
                     shape = manifest["rejected_wrapper_line_shape"]
-                    self.assertEqual(shape["schema"], "rejected-wrapper-line-shape-v2")
+                    self.assertEqual(shape["schema"], "rejected-wrapper-line-shape-v3")
                     self.assertEqual(shape["public_emitter_prefix"], emitter)
                     self.assertEqual(shape["leading_unicode_bom"], bom)
                     self.assertEqual(
@@ -2805,6 +2993,25 @@ class ProvenanceStatusTests(unittest.TestCase):
                 [item.name for item in (root / "upload").iterdir()], ["manifest.json"]
             )
             return json.loads(raw)
+
+    def test_source_prefix_stderr_rejection_retains_zero_validated_providers(self):
+        for prefix, kind in RejectedLineShapeTests.SOURCE_PREFIXES:
+            with self.subTest(prefix=prefix):
+                manifest = self.main_fixture((prefix + "PRIVATE_SECRET").encode())
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(
+                    manifest["failure"], "Unexpected wrapper output outside JSON"
+                )
+                self.assertEqual(manifest["rejected_stage"], "query-stderr-validation")
+                self.assertEqual(manifest["rejected_stream"], "stderr")
+                self.assertEqual(
+                    manifest["rejected_wrapper_line_shape"][
+                        "public_source_prefix_shape"
+                    ],
+                    kind,
+                )
+                self.assertNotIn("providers", manifest)
+                self.assertNotIn("artifacts", manifest)
 
     def test_valid_stdout_never_hides_unknown_stderr_json_sentinel_or_encoding(self):
         for stderr in (

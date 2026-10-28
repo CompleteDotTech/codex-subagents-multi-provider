@@ -169,8 +169,40 @@ class RejectedWrapperLine(EvidenceError):
                 pass
             else:
                 emitter = "go-standard-datetime-header"
+        # Pinned Bazel 9.2.0 archive_utils.cc, UiEventHandler.java, and
+        # bazel_log_handler.cc/logging.cc ground only these public prefixes.
+        # The filename/body is not inspected. Spoofed prefixes can match; this
+        # never authenticates an emitter or permits an otherwise rejected line.
+        source_shape = "none"
+        for literal, kind in (
+            ("Install base ('", "install-base-not-directory-prefix"),
+            ("Corrupt installation: file '", "corrupt-installation-file-prefix"),
+            ("The install_base directory '", "install-base-version-prefix"),
+            (
+                "Removing previous installation at '",
+                "removing-previous-installation-prefix",
+            ),
+            ("install base directory '", "install-base-rename-prefix"),
+        ):
+            if prefix.startswith(literal):
+                source_shape = kind
+                break
+        if source_shape == "none":
+            clock = r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+            if re.match(
+                r"^\(" + clock + r"\) "
+                r"(?:FATAL|ERROR|FAIL|WARNING|CANCELLED|INFO|DEBUG|SUBCOMMAND): ",
+                prefix,
+            ):
+                source_shape = "java-ui-time-event-prefix"
+            elif re.match(
+                r"^\[(?:INFO|USER|WARNING|ERROR|FATAL) " + clock + r"\.[0-9]{3} ",
+                prefix,
+            ):
+                source_shape = "cpp-client-time-level-prefix"
         self.shape = {
-            "schema": "rejected-wrapper-line-shape-v2",
+            "schema": "rejected-wrapper-line-shape-v3",
+            "public_source_prefix_shape": source_shape,
             "starts_with_four_ascii_spaces": four_spaces,
             "other_ascii_leading_whitespace": bool(prefix)
             and prefix[0] in " \t\r\n\v\f"
