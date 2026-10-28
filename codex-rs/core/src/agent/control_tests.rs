@@ -13300,7 +13300,7 @@ stream_idle_timeout_ms = 1000
     config.config_layer_stack = config
         .config_layer_stack
         .with_cloud_config_binding(binding.binding);
-    // Use the config-aware production manager so the root's actual model is V1.
+    // Use actual V2 sessions for the protected eviction/reload path; invoke the V1 tool below.
     crate::thread_manager::set_thread_manager_test_mode_for_tests(true);
     let state_db = init_state_db(&config).await;
     let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
@@ -13338,6 +13338,7 @@ stream_idle_timeout_ms = 1000
         control,
     };
     let (parent_id, parent) = harness.start_thread().await;
+    assert_eq!(parent.multi_agent_version(), Some(MultiAgentVersion::V2));
     let original = public_v1_cold_compat_resident(&harness, &parent, selected).await;
     let target_id = original.session.thread_id;
     assert_eq!(
