@@ -135,7 +135,9 @@ impl LocalAgentControl {
         self.session_id
     }
 
-    /// Send rich user input items to an existing agent thread.
+    /// Test convenience for the private initial-input delivery helper.
+    /// Public followups use caller-aware `AgentControl::send` instead.
+    #[cfg(test)]
     pub(crate) async fn send_input(
         &self,
         agent_id: ThreadId,
@@ -147,6 +149,8 @@ impl LocalAgentControl {
             .await
     }
 
+    // Initial input after successful private child startup. Public followups
+    // must retain the current caller/target fence via AgentControl::send.
     async fn send_input_to_thread(
         &self,
         thread: &Arc<crate::CodexThread>,

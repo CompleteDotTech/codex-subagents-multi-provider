@@ -92,6 +92,8 @@ impl Handler {
                 }),
             )
             .await;
+        // Shared delivery retains the actual caller/target fence while waiting
+        // for execution or submission capacity, unlike initial-spawn delivery.
         let result = local_agent_control
             .send(SendRequest {
                 caller: session.thread_id,
