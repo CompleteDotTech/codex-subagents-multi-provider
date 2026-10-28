@@ -36,7 +36,9 @@ enum NativeAdmissionState {
     #[default]
     Unclassified,
     Pending(crate::agent::child_provider_authorization::NativeChildAdmission),
+    Checked(crate::agent::child_provider_authorization::NativeChildAdmission),
     Consumed,
+    HostCommitted,
 }
 
 #[derive(Default)]
@@ -48,6 +50,17 @@ enum ResumeFenceState {
 }
 
 impl SessionStartup {
+    pub(crate) fn requires_owned_writer(&self) -> bool {
+        matches!(
+            *self
+                .native_admission
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            NativeAdmissionState::Pending(_)
+                | NativeAdmissionState::Checked(_)
+                | NativeAdmissionState::Consumed
+        )
+    }
     pub(crate) fn defer_resume_fence(&self, target: ThreadId) -> codex_protocol::error::Result<()> {
         let mut state = self
             .resume_fence
@@ -109,8 +122,10 @@ impl SessionStartup {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         match &*state {
-            NativeAdmissionState::Pending(admission) => admission.check_current(),
-            NativeAdmissionState::Unclassified => Ok(()),
+            NativeAdmissionState::Pending(admission) | NativeAdmissionState::Checked(admission) => {
+                admission.check_current()
+            }
+            NativeAdmissionState::Unclassified | NativeAdmissionState::HostCommitted => Ok(()),
             NativeAdmissionState::Consumed => {
                 Err(crate::agent::child_provider_authorization::invalid(
                     "native startup admission was already consumed",
@@ -136,13 +151,55 @@ impl SessionStartup {
                 *state = NativeAdmissionState::Unclassified;
                 Ok(())
             }
-            NativeAdmissionState::Pending(admission) => admission.admit(),
-            NativeAdmissionState::Consumed => {
+            NativeAdmissionState::Pending(admission) => {
+                admission.admit()?;
+                *state = NativeAdmissionState::Checked(admission);
+                Ok(())
+            }
+            NativeAdmissionState::Checked(_)
+            | NativeAdmissionState::Consumed
+            | NativeAdmissionState::HostCommitted => {
                 Err(crate::agent::child_provider_authorization::invalid(
                     "native startup admission was already consumed",
                 ))
             }
         }
+    }
+
+    /// Manager map -> startup -> exact caller signal -> registry -> binding.
+    /// Registration consumes the original continuation, with no await in commit.
+    pub(crate) fn commit_registration<T>(
+        &self,
+        runtime: &crate::agent::control::LocalAgentRuntime,
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+        commit: impl FnOnce() -> codex_protocol::error::Result<T>,
+    ) -> codex_protocol::error::Result<T> {
+        let mut state = self
+            .native_admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let native = matches!(*state, NativeAdmissionState::Checked(_));
+        let result = match &*state {
+            NativeAdmissionState::Checked(admission) => {
+                admission.commit_registration(authority, commit)
+            }
+            NativeAdmissionState::Unclassified => {
+                let result = commit()?;
+                runtime.register_authority(authority);
+                Ok(result)
+            }
+            _ => Err(crate::agent::child_provider_authorization::invalid(
+                "native registration continuation is unavailable",
+            )),
+        };
+        if result.is_ok() {
+            *state = if native {
+                NativeAdmissionState::Consumed
+            } else {
+                NativeAdmissionState::HostCommitted
+            };
+        }
+        result
     }
 
     fn lock_teardown(&self) -> MutexGuard<'_, Option<AgentTreeTeardownGuard>> {
@@ -185,9 +242,15 @@ impl SessionStartup {
             teardown.set_thread_id(session.thread_id);
         }
         if let Some(io) = self.io.get() {
-            // The session loop owns persistence now. Preserve its shutdown semantics even
-            // if registration or the caller's handoff was interrupted after the loop started.
-            self.persistence.lock().await.commit();
+            if !self.requires_owned_writer() {
+                // Existing explicit host/inline lifetimes hand persistence to
+                // their loop as before; native provisional writers never fall
+                // back to the legacy ID-only cleanup contract.
+                self.persistence.lock().await.commit();
+            }
+            // Until map registration commits, LiveThread retains its exact
+            // provisional writer identity. Fresh cleanup discards only that
+            // acquisition; resumed cleanup always preserves saved history.
             let _ = io.submit(Op::Interrupt).await;
             if let Err(error) = io.shutdown_and_wait().await {
                 if let Some(teardown) = teardown.as_ref() {
@@ -202,7 +265,9 @@ impl SessionStartup {
             if let Some(session) = self.session.get() {
                 super::handlers::shutdown_session_runtime(session).await;
             }
-            let mut persistence = std::mem::take(&mut *self.persistence.lock().await);
+        }
+        {
+            let mut persistence = self.persistence.lock().await;
             if let Err(error) = persistence.discard().await {
                 if let Some(teardown) = teardown.as_ref() {
                     teardown.record_shutdown_failure(

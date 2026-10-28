@@ -8686,6 +8686,39 @@ macro_rules! delegate_fresh_revocation_store {
 }
 
 impl ThreadStore for FreshRevocationPersistenceGate {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+        owner: codex_thread_store::ThreadWriterOwner,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.begin_native_authority_epoch_owned(epoch, owner)
+    }
+
+    fn create_thread_owned(
+        &self,
+        params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_thread_store::ThreadWriterOwner> {
+        self.inner.create_thread_owned(params)
+    }
+    fn resume_thread_owned(
+        &self,
+        params: codex_thread_store::ResumeThreadParams,
+        preparation: Option<codex_thread_store::ThreadStoreResumePreparation>,
+    ) -> codex_thread_store::ThreadStoreFuture<
+        '_,
+        (Arc<Vec<RolloutItem>>, codex_thread_store::ThreadWriterOwner),
+    > {
+        self.inner.resume_thread_owned(params, preparation)
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: codex_thread_store::ThreadWriterOwner,
+        discard: bool,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.finish_thread_owned(thread, owner, discard)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -8983,10 +9016,90 @@ struct PendingPostAdmissionCreate {
 struct PostAdmissionCreateGate {
     inner: InMemoryThreadStore,
     armed_parent: std::sync::Mutex<Option<ThreadId>>,
+    armed_resume: std::sync::Mutex<Option<(ThreadId, ThreadId)>>,
     entered: tokio::sync::mpsc::UnboundedSender<PendingPostAdmissionCreate>,
 }
 
 impl ThreadStore for PostAdmissionCreateGate {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+        owner: codex_thread_store::ThreadWriterOwner,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.begin_native_authority_epoch_owned(epoch, owner)
+    }
+
+    fn create_thread_owned(
+        &self,
+        params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_thread_store::ThreadWriterOwner> {
+        Box::pin(async move {
+            let armed = *self.armed_parent.lock().unwrap();
+            if params.parent_thread_id.is_some() && params.parent_thread_id == armed {
+                let parent = armed.expect("armed actual parent");
+                assert_eq!(params.source.parent_thread_id(), Some(parent));
+                assert!(matches!(
+                    &params.source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                ));
+                *self.armed_parent.lock().unwrap() = None;
+                let (release, released) = tokio::sync::oneshot::channel();
+                self.entered
+                    .send(PendingPostAdmissionCreate {
+                        child: params.thread_id,
+                        parent,
+                        release,
+                    })
+                    .expect("actual store gate receiver");
+                released
+                    .await
+                    .expect("release actual post-admission create");
+            }
+            self.inner.create_thread_owned(params).await
+        })
+    }
+    fn resume_thread_owned(
+        &self,
+        params: codex_thread_store::ResumeThreadParams,
+        preparation: Option<codex_thread_store::ThreadStoreResumePreparation>,
+    ) -> codex_thread_store::ThreadStoreFuture<
+        '_,
+        (Arc<Vec<RolloutItem>>, codex_thread_store::ThreadWriterOwner),
+    > {
+        Box::pin(async move {
+            let armed = *self.armed_resume.lock().unwrap();
+            if let Some((target, parent)) = armed.filter(|(target, _)| *target == params.thread_id)
+            {
+                *self.armed_resume.lock().unwrap() = None;
+                let history = params
+                    .history
+                    .as_ref()
+                    .expect("actual host-read resume history");
+                assert!(history.iter().any(|item| matches!(item, RolloutItem::SessionMeta(line) if line.meta.id == target && line.meta.parent_thread_id == Some(parent))));
+                let (release, released) = tokio::sync::oneshot::channel();
+                self.entered
+                    .send(PendingPostAdmissionCreate {
+                        child: target,
+                        parent,
+                        release,
+                    })
+                    .unwrap();
+                released
+                    .await
+                    .expect("release actual post-admission resume writer");
+            }
+            self.inner.resume_thread_owned(params, preparation).await
+        })
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: codex_thread_store::ThreadWriterOwner,
+        discard: bool,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.finish_thread_owned(thread, owner, discard)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -9059,6 +9172,7 @@ async fn post_admission_startup_cannot_escape_completed_subtree_shutdown(stage: 
     let store = Arc::new(PostAdmissionCreateGate {
         inner: InMemoryThreadStore::default(),
         armed_parent: std::sync::Mutex::new(None),
+        armed_resume: std::sync::Mutex::new(None),
         entered,
     });
     let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
@@ -9575,4 +9689,688 @@ stream_idle_timeout_ms = 1000
             "revocation must precede actual target submission"
         );
     }
+}
+
+async fn post_admission_lifecycle_harness(
+    version: MultiAgentVersion,
+) -> (
+    AgentControlHarness,
+    Arc<PostAdmissionCreateGate>,
+    tokio::sync::mpsc::UnboundedReceiver<PendingPostAdmissionCreate>,
+) {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    if version == MultiAgentVersion::V1 {
+        config.features.disable(Feature::MultiAgentV2);
+    }
+    config.model = Some("gpt-5.6-sol".into());
+    config.multi_agent_v2.max_concurrent_threads_per_session = 8;
+    config.agent_max_depth = 8;
+    let (entered, pending) = tokio::sync::mpsc::unbounded_channel();
+    let store = Arc::new(PostAdmissionCreateGate {
+        inner: InMemoryThreadStore::default(),
+        armed_parent: std::sync::Mutex::new(None),
+        armed_resume: std::sync::Mutex::new(None),
+        entered,
+    });
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        store.clone(),
+        /*agent_graph_store*/ None,
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let control = manager.agent_control();
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db: None,
+        manager,
+        control,
+    };
+    (harness, store, pending)
+}
+
+#[test_case::test_case(false, false; "loaded owner teardown wins late grandchild")]
+#[test_case::test_case(false, true; "loaded owner registration wins and joins teardown")]
+#[test_case::test_case(true, false; "unloaded owner teardown fences loaded grandchild caller")]
+#[test_case::test_case(true, true; "unloaded owner includes registered great grandchild")]
+#[tokio::test]
+async fn post_admission_descendant_registration_orders_with_ancestor_shutdown(
+    unloaded: bool,
+    registration_wins: bool,
+) {
+    let (harness, store, mut pending) =
+        post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
+    let (root_id, root) = harness.start_thread().await;
+    let sibling = idle_fresh_capacity_resident(&harness, &root, "independent_sibling").await;
+    let owner = idle_fresh_capacity_resident(&harness, &root, "subtree_owner").await;
+    let caller = idle_fresh_capacity_resident(&harness, &owner, "loaded_grandchild_caller").await;
+    let owner_id = owner.session.thread_id;
+    let caller_id = caller.session.thread_id;
+    if unloaded {
+        assert_eq!(
+            harness
+                .manager
+                .try_evict_v2_thread(Arc::clone(&owner))
+                .await
+                .unwrap(),
+            ThreadEvictionOutcome::Evicted
+        );
+        assert!(!owner.is_running());
+        assert!(harness.manager.get_thread(owner_id).await.is_err());
+        assert!(caller.is_running());
+    }
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &caller, "late_descendant").await;
+    *store.armed_parent.lock().unwrap() = Some(caller_id);
+    let start = fresh_lifetime_lower_start(&harness, &caller, prepared, source, permit);
+    tokio::pin!(start);
+    let blocked = tokio::select! {
+        result = &mut start => panic!("must enter actual post-admission descendant writer create: {}", result.is_ok()),
+        entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
+    };
+    assert_eq!(blocked.parent, caller_id);
+    let mut release = Some(blocked.release);
+    let early_child = if registration_wins {
+        release.take().unwrap().send(()).unwrap();
+        Some(
+            timeout(Duration::from_secs(10), &mut start)
+                .await
+                .unwrap()
+                .unwrap()
+                .thread,
+        )
+    } else {
+        None
+    };
+    let teardown = timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(owner_id),
+    )
+    .await
+    .unwrap();
+    if unloaded {
+        assert!(matches!(
+            teardown.unwrap_err().details(),
+            CodexErrorDetails::ThreadNotFound(_)
+        ));
+    } else {
+        teardown.unwrap();
+    }
+    assert!(!caller.is_running());
+    assert!(harness.manager.get_thread(caller_id).await.is_err());
+    if let Some(child) = early_child {
+        assert!(
+            !child.is_running(),
+            "registration winning the shared map ordering must be included in teardown"
+        );
+    } else {
+        release.take().unwrap().send(()).unwrap();
+        assert!(
+            timeout(Duration::from_secs(10), &mut start)
+                .await
+                .unwrap()
+                .is_err(),
+            "teardown winning the shared map ordering must reject late registration"
+        );
+    }
+    assert!(harness.manager.get_thread(blocked.child).await.is_err());
+    if !registration_wins {
+        assert!(
+            matches!(store.inner.load_history(codex_thread_store::LoadThreadHistoryParams { thread_id: blocked.child, include_archived: true }).await,
+            Err(codex_thread_store::ThreadStoreError::ThreadNotFound { thread_id }) if thread_id == blocked.child),
+            "denied fresh acquisition must leave no provisional history"
+        );
+    }
+    assert!(
+        root.is_running(),
+        "subtree closure must not stop the outside root"
+    );
+    assert!(
+        sibling.is_running(),
+        "subtree closure must not stop a sibling"
+    );
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+async fn post_admission_registered_idle_child(
+    harness: &AgentControlHarness,
+    parent: &Arc<CodexThread>,
+    name: &str,
+) -> Arc<CodexThread> {
+    let parent_id = parent.session.thread_id;
+    let source = thread_spawn_source(
+        parent_id,
+        &parent.session_source,
+        next_thread_spawn_depth(&parent.session_source),
+        None,
+        Some(name.into()),
+    )
+    .unwrap();
+    let mut prepared = harness
+        .control
+        .prepare_spawn_fixture(&harness.config, &source, false)
+        .await
+        .unwrap();
+    let mut reservation = harness
+        .control
+        .runtime
+        .registry
+        .reserve_spawn_slot(None)
+        .unwrap();
+    let role = prepared
+        .prepared_child_authorization
+        .as_ref()
+        .unwrap()
+        .role_name();
+    let (source, mut metadata) = harness
+        .control
+        .prepare_thread_spawn(
+            &mut reservation,
+            &prepared,
+            parent_id,
+            next_thread_spawn_depth(&parent.session_source),
+            source.get_agent_path(),
+            role,
+            None,
+        )
+        .unwrap();
+    let permit = prepared
+        .prepared_child_authorization
+        .take()
+        .unwrap()
+        .consume(
+            &harness.control.runtime,
+            parent_id,
+            &prepared,
+            false,
+            &source,
+        )
+        .await
+        .unwrap();
+    let state = harness.control.runtime.upgrade().unwrap();
+    let membership = harness.control.runtime.admit_start().unwrap();
+    let slot = harness
+        .control
+        .reserve_v2_residency_slot(&state, &prepared, &membership, Some(parent_id))
+        .await
+        .unwrap();
+    let child = fresh_lifetime_lower_start(harness, parent, prepared, source, permit)
+        .await
+        .unwrap();
+    metadata.agent_id = Some(child.thread_id);
+    reservation.commit(metadata);
+    slot.commit(child.thread_id);
+    child.thread.ensure_rollout_materialized().await;
+    child.thread.session.flush_rollout().await.unwrap();
+    assert!(child.thread.session.active_turn.lock().await.is_none());
+    child.thread
+}
+
+#[test_case::test_case(0; "outside caller current owned resume positive")]
+#[test_case::test_case(1; "outside caller cannot resume target closed after admission")]
+#[test_case::test_case(2; "second explicit close invalidates new resume of already closed target")]
+#[tokio::test]
+async fn post_admission_resume_target_revision_fences_outside_live_caller(stage: u8) {
+    let (harness, store, mut pending) =
+        post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
+    let (root_id, root) = harness.start_thread().await;
+    let target = post_admission_registered_idle_child(&harness, &root, "resume_target").await;
+    let target_id = target.session.thread_id;
+    let source = target.session_source.clone();
+    if stage == 2 {
+        harness.control.close_agent(target_id).await.unwrap();
+    } else {
+        assert_eq!(
+            harness
+                .manager
+                .try_evict_v2_thread(Arc::clone(&target))
+                .await
+                .unwrap(),
+            ThreadEvictionOutcome::Evicted
+        );
+    }
+    assert!(!target.is_running());
+    assert!(harness.manager.get_thread(target_id).await.is_err());
+    *store.armed_resume.lock().unwrap() = Some((target_id, root_id));
+    let resume =
+        harness
+            .control
+            .resume_agent_from_rollout(harness.config.clone(), target_id, source);
+    tokio::pin!(resume);
+    let blocked = tokio::select! {
+        result = &mut resume => panic!("must enter actual resume acquisition after admission: {}", result.is_ok()),
+        entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
+    };
+    assert_eq!(blocked.child, target_id);
+    assert_eq!(blocked.parent, root_id);
+    if stage != 0 {
+        let closed = harness.control.close_agent(target_id).await;
+        if stage == 1 {
+            closed.unwrap();
+        } else {
+            assert!(matches!(
+                closed.unwrap_err().details(),
+                CodexErrorDetails::ThreadNotFound(_)
+            ));
+        }
+    }
+    assert!(
+        root.is_running(),
+        "actual caller outside the target subtree stays current"
+    );
+    blocked.release.send(()).unwrap();
+    let result = timeout(Duration::from_secs(10), resume).await.unwrap();
+    if stage == 0 {
+        assert_eq!(result.unwrap(), target_id);
+        assert!(
+            harness
+                .manager
+                .get_thread(target_id)
+                .await
+                .unwrap()
+                .is_running()
+        );
+    } else {
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("child_provider_policy_conflict")),
+            "target teardown revision must invalidate an admitted resume even when its actual outside caller remains live"
+        );
+        assert!(harness.manager.get_thread(target_id).await.is_err());
+        assert!(
+            !store
+                .inner
+                .load_history(codex_thread_store::LoadThreadHistoryParams {
+                    thread_id: target_id,
+                    include_archived: true
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "denied resume must retain existing history"
+        );
+        // A deliberate new operation after the completed close captures the new
+        // revision and remains supported; the previous failed operation grants nothing.
+        let reopened = timeout(
+            Duration::from_secs(10),
+            harness.control.resume_agent_from_rollout(
+                harness.config.clone(),
+                target_id,
+                target.session_source.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reopened, target_id);
+    }
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+#[test_case::test_case(0; "v1 current post admission startup registers")]
+#[test_case::test_case(1; "v1 explicit close fences admitted unregistered child")]
+#[test_case::test_case(2; "v1 tree shutdown fences admitted unregistered child")]
+#[tokio::test]
+async fn post_admission_v1_startup_cannot_escape_completed_subtree_shutdown(stage: u8) {
+    let (harness, store, mut pending) =
+        post_admission_lifecycle_harness(MultiAgentVersion::V1).await;
+    let (caller_id, caller) = harness.start_thread().await;
+    caller.ensure_rollout_materialized().await;
+    caller.session.flush_rollout().await.unwrap();
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &caller, "post_admission_child").await;
+    assert_eq!(caller.multi_agent_version(), Some(MultiAgentVersion::V1));
+    *store.armed_parent.lock().unwrap() = Some(caller_id);
+    let start = fresh_lifetime_lower_start(&harness, &caller, prepared, source, permit);
+    tokio::pin!(start);
+    let blocked = tokio::select! {
+        result = &mut start => panic!("must reach real post-admission store create: {}", result.is_ok()),
+        reached = timeout(Duration::from_secs(/*secs*/ 10), pending.recv()) => reached.unwrap().expect("actual child store create"),
+    };
+    assert_eq!(blocked.parent, caller_id);
+    assert_ne!(blocked.child, caller_id);
+    assert!(caller.is_running());
+    assert_eq!(harness.manager.list_thread_ids().await, vec![caller_id]);
+    if stage == 0 {
+        blocked.release.send(()).unwrap();
+        let child = timeout(Duration::from_secs(/*secs*/ 10), start)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.thread_id, blocked.child);
+        assert!(child.thread.is_running());
+        assert!(Arc::ptr_eq(
+            &child.thread,
+            &harness.manager.get_thread(blocked.child).await.unwrap()
+        ));
+        timeout(
+            Duration::from_secs(/*secs*/ 10),
+            child.thread.shutdown_and_wait(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            harness
+                .manager
+                .remove_thread(&blocked.child)
+                .await
+                .is_some()
+        );
+        timeout(Duration::from_secs(/*secs*/ 10), caller.shutdown_and_wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(harness.manager.remove_thread(&caller_id).await.is_some());
+        return;
+    }
+    let shutdown = async {
+        if stage == 1 {
+            harness.control.close_agent(caller_id).await.map(|_| ())
+        } else {
+            harness
+                .control
+                .shutdown_agent_tree(caller_id)
+                .await
+                .map(|_| ())
+        }
+    };
+    tokio::pin!(shutdown);
+    // Keep polling the independent startup as teardown runs: a repaired owner
+    // may cancel and drain it instead of only rejecting its final registration.
+    // The store gate itself remains closed until teardown has completed.
+    let early = timeout(Duration::from_secs(/*secs*/ 10), async {
+        tokio::select! {
+            result = &mut shutdown => {
+                result.unwrap();
+                None
+            },
+            outcome = &mut start => {
+                assert!(outcome.is_err(), "held real store creation cannot publish a successful child");
+                shutdown.await.unwrap();
+                Some(outcome)
+            },
+        }
+    }).await.expect("actual subtree teardown completes while the admitted store gate is held");
+    assert!(!caller.is_running());
+    assert!(harness.manager.get_thread(caller_id).await.is_err());
+    assert!(harness.manager.get_thread(blocked.child).await.is_err());
+    let released = blocked.release.send(());
+    let outcome = if let Some(outcome) = early {
+        outcome
+    } else {
+        released.expect("independent unfinished startup still owns its store gate");
+        timeout(Duration::from_secs(/*secs*/ 10), start)
+            .await
+            .unwrap()
+    };
+    let registered = harness.manager.get_thread(blocked.child).await.ok();
+    let survivor_present = registered.is_some();
+    let survivor =
+        registered.or_else(|| outcome.as_ref().ok().map(|child| Arc::clone(&child.thread)));
+    let survivor_running = survivor.as_ref().is_some_and(|child| child.is_running());
+    tracing::info!(
+        "POST_ADMISSION_SUBTREE_OBSERVED stage={stage} returned_success={} survivor_present={survivor_present} survivor_running={survivor_running}",
+        outcome.is_ok()
+    );
+    if let Some(child) = survivor {
+        timeout(Duration::from_secs(/*secs*/ 10), child.shutdown_and_wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = harness.manager.remove_thread(&blocked.child).await;
+    }
+    assert!(
+        outcome.is_err(),
+        "completed subtree teardown must reject independently awaited in-flight native startup: returned_success={} survivor_present={survivor_present} survivor_running={survivor_running}",
+        outcome.is_ok()
+    );
+    assert!(
+        !survivor_present && !survivor_running,
+        "no admitted child may register or run after completed subtree teardown: survivor_present={survivor_present} survivor_running={survivor_running}"
+    );
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn post_admission_stale_caller_cannot_register_or_retire_same_id_replacement() {
+    let (harness, store, mut pending) =
+        post_admission_lifecycle_harness(MultiAgentVersion::V2).await;
+    let (root_id, root) = harness.start_thread().await;
+    root.ensure_rollout_materialized().await;
+    root.session.flush_rollout().await.unwrap();
+    let state = harness.control.runtime.upgrade().unwrap();
+    let stored = state
+        .read_stored_thread(codex_thread_store::ReadThreadParams {
+            thread_id: root_id,
+            include_archived: true,
+            include_history: true,
+        })
+        .await
+        .unwrap();
+    let initial = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: root_id,
+        history: Arc::new(stored.history.unwrap().items),
+        rollout_path: stored.rollout_path,
+    });
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &root, "replacement_race_child").await;
+    *store.armed_parent.lock().unwrap() = Some(root_id);
+    let start = fresh_lifetime_lower_start(&harness, &root, prepared, source, permit);
+    tokio::pin!(start);
+    let blocked = tokio::select! {
+        result = &mut start => panic!("must reach admitted real writer acquisition: {}", result.is_ok()),
+        entered = timeout(Duration::from_secs(10), pending.recv()) => entered.unwrap().unwrap(),
+    };
+    timeout(Duration::from_secs(10), root.shutdown_and_wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        harness
+            .manager
+            .remove_thread_if_matches(&root_id, &root)
+            .await
+            .is_some()
+    );
+    let replacement = timeout(
+        Duration::from_secs(10),
+        harness.manager.start_thread_with_control_for_tests(
+            StartThreadOptions {
+                initial_history: initial,
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                session_source: Some(root.session_source.clone()),
+                ..StartThreadOptions::new(harness.config.clone())
+            },
+            harness.control.clone(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .thread;
+    assert_eq!(replacement.session.thread_id, root_id);
+    assert!(!Arc::ptr_eq(&root, &replacement));
+    let epoch = harness.control.runtime.retained_authority(root_id).unwrap();
+    assert!(replacement.is_running());
+    blocked.release.send(()).unwrap();
+    assert!(
+        timeout(Duration::from_secs(10), start)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(harness.manager.get_thread(blocked.child).await.is_err());
+    assert!(
+        matches!(store.inner.load_history(codex_thread_store::LoadThreadHistoryParams { thread_id: blocked.child, include_archived: true }).await,
+        Err(codex_thread_store::ThreadStoreError::ThreadNotFound { thread_id }) if thread_id == blocked.child),
+        "stale native startup must clean only its own fresh history"
+    );
+    assert!(Arc::ptr_eq(
+        &harness.manager.get_thread(root_id).await.unwrap(),
+        &replacement
+    ));
+    assert!(replacement.is_running());
+    assert!(
+        harness
+            .control
+            .runtime
+            .retained_authority(root_id)
+            .unwrap()
+            .same_registration(&epoch)
+    );
+    assert!(
+        harness
+            .manager
+            .remove_thread_if_matches(&root_id, &root)
+            .await
+            .is_none()
+    );
+    assert!(replacement.is_running());
+    timeout(
+        Duration::from_secs(10),
+        harness.control.shutdown_agent_tree(root_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(harness.manager.list_thread_ids().await.is_empty());
+}
+
+struct LegacyRootOnlyThreadStore {
+    inner: InMemoryThreadStore,
+}
+impl ThreadStore for LegacyRootOnlyThreadStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    delegate_fresh_revocation_store! {
+        fn create_thread(params: codex_thread_store::CreateThreadParams) -> ();
+        fn resume_thread(params: codex_thread_store::ResumeThreadParams) -> Arc<Vec<RolloutItem>>;
+        fn append_items(params: codex_thread_store::AppendThreadItemsParams) -> ();
+        fn discard_thread(thread_id: ThreadId) -> ();
+        fn load_history(params: codex_thread_store::LoadThreadHistoryParams) -> codex_thread_store::StoredThreadHistory;
+        fn read_thread(params: codex_thread_store::ReadThreadParams) -> codex_thread_store::StoredThread;
+        fn read_thread_by_rollout_path(params: codex_thread_store::ReadThreadByRolloutPathParams) -> codex_thread_store::StoredThread;
+        fn list_threads(params: codex_thread_store::ListThreadsParams) -> codex_thread_store::ThreadPage;
+        fn update_thread_metadata(params: codex_thread_store::UpdateThreadMetadataParams) -> Option<codex_thread_store::StoredThread>;
+        fn archive_thread(params: codex_thread_store::ArchiveThreadParams) -> ();
+        fn unarchive_thread(params: codex_thread_store::ArchiveThreadParams) -> codex_thread_store::StoredThread;
+        fn delete_thread(params: codex_thread_store::DeleteThreadParams) -> ();
+        fn flush_thread(thread_id: ThreadId) -> ();
+        fn shutdown_thread(thread_id: ThreadId) -> ();
+    }
+    fn persist_thread(
+        &self,
+        id: ThreadId,
+        context: codex_thread_store::PersistContext,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.persist_thread(id, context)
+    }
+}
+
+#[tokio::test]
+async fn legacy_custom_store_root_remains_supported_without_native_owned_writer_fallback() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.model = Some("gpt-5.6-sol".into());
+    let store = Arc::new(LegacyRootOnlyThreadStore {
+        inner: InMemoryThreadStore::default(),
+    });
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth.clone(),
+        crate::thread_manager::build_models_manager(&config, auth),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        store.clone(),
+        /*agent_graph_store*/ None,
+        uuid::Uuid::new_v4().to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let control = manager.agent_control();
+    let harness = AgentControlHarness {
+        _home: home,
+        config,
+        state_db: None,
+        manager,
+        control,
+    };
+    let (root_id, root) = harness.start_thread().await;
+    root.ensure_rollout_materialized().await;
+    root.session.flush_rollout().await.unwrap();
+    assert!(root.is_running());
+    assert_eq!(store.inner.calls().await.create_thread, 1);
+    let (prepared, source, permit) =
+        fresh_lifetime_permit(&harness, &root, "unsupported_native_owner").await;
+    let denied = timeout(
+        Duration::from_secs(10),
+        fresh_lifetime_lower_start(&harness, &root, prepared, source, permit),
+    )
+    .await
+    .unwrap();
+    assert!(
+        denied
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.to_string().contains("owned_writer")),
+        "unknown native store must fail before acquisition, with no ID-only fallback"
+    );
+    assert_eq!(
+        store.inner.calls().await.create_thread,
+        1,
+        "native rejection must never invoke legacy create"
+    );
+    assert!(root.is_running(), "ordinary existing root remains usable");
+    timeout(Duration::from_secs(10), root.shutdown_and_wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        harness
+            .manager
+            .remove_thread_if_matches(&root_id, &root)
+            .await
+            .is_some()
+    );
+    assert!(store.inner.calls().await.shutdown_thread >= 1);
+    assert!(harness.manager.list_thread_ids().await.is_empty());
 }

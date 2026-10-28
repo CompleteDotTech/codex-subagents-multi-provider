@@ -138,7 +138,82 @@ pub enum NativeAuthorityStorage {
 }
 
 /// Storage-neutral thread persistence boundary.
+/// Store-generated identity only; it grants no native provider authority and
+/// does not retain the operating system writer lock.
+#[derive(Clone, Debug)]
+pub struct ThreadWriterOwner(Arc<()>, Arc<std::sync::atomic::AtomicBool>);
+
+impl ThreadWriterOwner {
+    pub fn new() -> Self {
+        Self(
+            Arc::new(()),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+    }
+    pub fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(crate) fn provisional(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.1)
+    }
+    pub fn is_provisional(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for ThreadWriterOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub trait ThreadStore: Any + Send + Sync {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        _epoch: crate::NativeAuthorityEpoch,
+        _owner: ThreadWriterOwner,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "native_authority",
+            })
+        })
+    }
+    /// Ownership of one exact writer acquisition, returned atomically by the
+    /// store. Unknown stores fail before acquiring a writer.
+    fn create_thread_owned(
+        &self,
+        _params: CreateThreadParams,
+    ) -> ThreadStoreFuture<'_, ThreadWriterOwner> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "owned_writer",
+            })
+        })
+    }
+    fn resume_thread_owned(
+        &self,
+        _params: ResumeThreadParams,
+        _preparation: Option<ThreadStoreResumePreparation>,
+    ) -> ThreadStoreFuture<'_, (Arc<Vec<RolloutItem>>, ThreadWriterOwner)> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "owned_writer",
+            })
+        })
+    }
+    fn finish_thread_owned(
+        &self,
+        _thread: ThreadId,
+        _owner: ThreadWriterOwner,
+        _discard: bool,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "owned_writer",
+            })
+        })
+    }
     /// Unknown stores cannot provide native cold authority proof.
     fn native_authority_storage(&self) -> Option<NativeAuthorityStorage> {
         None

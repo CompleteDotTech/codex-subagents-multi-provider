@@ -526,6 +526,9 @@ pub struct InMemoryThreadStore {
 
 #[derive(Default)]
 struct InMemoryThreadStoreState {
+    writer_owners: HashMap<ThreadId, crate::ThreadWriterOwner>,
+    fresh_writers: std::collections::HashSet<ThreadId>,
+    writer_authority_generations: HashMap<ThreadId, uuid::Uuid>,
     calls: InMemoryThreadStoreCalls,
     repeated_list_threads_cursor: Option<String>,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
@@ -546,6 +549,21 @@ struct InMemoryThreadStoreState {
 }
 
 impl InMemoryThreadStore {
+    #[cfg(test)]
+    async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
+        self.create_thread_owned_impl(params, false)
+            .await
+            .map(|_| ())
+    }
+    #[cfg(test)]
+    async fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
+        self.resume_thread_owned_impl(params, false)
+            .await
+            .map(|(history, _)| history)
+    }
     /// Returns the store associated with `id`, creating it if needed.
     pub fn for_id(id: impl Into<String>) -> Arc<Self> {
         let id = id.into();
@@ -586,8 +604,25 @@ impl InMemoryThreadStore {
             .store(true, Ordering::Relaxed);
     }
 
-    async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
+    async fn create_thread_owned_impl(
+        &self,
+        params: CreateThreadParams,
+        exclusive: bool,
+    ) -> ThreadStoreResult<crate::ThreadWriterOwner> {
         let mut state = self.state.lock().await;
+        if exclusive && state.writer_owners.contains_key(&params.thread_id) {
+            return Err(ThreadStoreError::Conflict {
+                message: "thread already has a live owned writer".into(),
+            });
+        }
+        if exclusive
+            && (state.histories.contains_key(&params.thread_id)
+                || state.native_authority.contains_key(&params.thread_id))
+        {
+            return Err(ThreadStoreError::Conflict {
+                message: "fresh thread identity already has saved history".into(),
+            });
+        }
         state.calls.create_thread += 1;
         let session_meta = SessionMeta {
             session_id: params.session_id,
@@ -628,15 +663,24 @@ impl InMemoryThreadStore {
                 meta: session_meta,
                 git: None,
             })));
+        let owner = crate::ThreadWriterOwner::new();
+        state.writer_owners.insert(params.thread_id, owner.clone());
+        state.fresh_writers.insert(params.thread_id);
         state.created_threads.insert(params.thread_id, params);
-        Ok(())
+        Ok(owner)
     }
 
-    async fn resume_thread(
+    async fn resume_thread_owned_impl(
         &self,
         params: ResumeThreadParams,
-    ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
+        exclusive: bool,
+    ) -> ThreadStoreResult<(Arc<Vec<RolloutItem>>, crate::ThreadWriterOwner)> {
         let mut state = self.state.lock().await;
+        if exclusive && state.writer_owners.contains_key(&params.thread_id) {
+            return Err(ThreadStoreError::Conflict {
+                message: "thread already has a live owned writer".into(),
+            });
+        }
         state.calls.resume_thread += 1;
         if let Some(history) = params.history {
             if matches!(
@@ -658,7 +702,10 @@ impl InMemoryThreadStore {
         if let Some(rollout_path) = params.rollout_path {
             state.rollout_paths.insert(rollout_path, params.thread_id);
         }
-        Ok(Arc::new(state.histories[&params.thread_id].clone()))
+        let owner = crate::ThreadWriterOwner::new();
+        state.writer_owners.insert(params.thread_id, owner.clone());
+        state.fresh_writers.remove(&params.thread_id);
+        Ok((Arc::new(state.histories[&params.thread_id].clone()), owner))
     }
 
     async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()> {
@@ -924,6 +971,111 @@ impl InMemoryThreadStore {
 }
 
 impl ThreadStore for InMemoryThreadStore {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: crate::NativeAuthorityEpoch,
+        owner: crate::ThreadWriterOwner,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            epoch
+                .validate()
+                .map_err(|_| ThreadStoreError::InvalidRequest {
+                    message: "invalid native authority epoch".into(),
+                })?;
+            let mut state = self.state.lock().await;
+            if !state
+                .writer_owners
+                .get(&epoch.thread_id)
+                .is_some_and(|current| current.matches(&owner))
+            {
+                return Err(ThreadStoreError::Conflict {
+                    message: "native authority writer was replaced".into(),
+                });
+            }
+            if let Some((old, _)) = state.native_authority.get(&epoch.thread_id) {
+                if old.root_thread_id != epoch.root_thread_id
+                    || old.parent_thread_id != epoch.parent_thread_id
+                {
+                    return Err(ThreadStoreError::Conflict {
+                        message: "native authority host ownership changed".into(),
+                    });
+                }
+            }
+            state
+                .writer_authority_generations
+                .insert(epoch.thread_id, epoch.generation);
+            state
+                .native_authority
+                .insert(epoch.thread_id, (epoch, None));
+            Ok(())
+        })
+    }
+    fn create_thread_owned(
+        &self,
+        params: CreateThreadParams,
+    ) -> ThreadStoreFuture<'_, crate::ThreadWriterOwner> {
+        Box::pin(InMemoryThreadStore::create_thread_owned_impl(
+            self, params, true,
+        ))
+    }
+    fn resume_thread_owned(
+        &self,
+        params: ResumeThreadParams,
+        preparation: Option<crate::ThreadStoreResumePreparation>,
+    ) -> ThreadStoreFuture<'_, (Arc<Vec<RolloutItem>>, crate::ThreadWriterOwner)> {
+        Box::pin(async move {
+            if preparation.is_some() {
+                return Err(ThreadStoreError::Unsupported {
+                    operation: "resume_thread_with_preparation",
+                });
+            }
+            InMemoryThreadStore::resume_thread_owned_impl(self, params, true).await
+        })
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: crate::ThreadWriterOwner,
+        discard: bool,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+            if !state
+                .writer_owners
+                .get(&thread)
+                .is_some_and(|current| current.matches(&owner))
+            {
+                return Ok(());
+            }
+            if discard
+                && owner.is_provisional()
+                && state.fresh_writers.contains(&thread)
+                && state
+                    .native_authority
+                    .get(&thread)
+                    .is_some_and(|(epoch, _)| {
+                        state.writer_authority_generations.get(&thread) != Some(&epoch.generation)
+                    })
+            {
+                return Err(ThreadStoreError::Conflict {
+                    message: "provisional native authority ownership changed".into(),
+                });
+            }
+            state.writer_owners.remove(&thread);
+            state.writer_authority_generations.remove(&thread);
+            let fresh = state.fresh_writers.remove(&thread);
+            if discard && fresh && owner.is_provisional() {
+                state.calls.discard_thread += 1;
+                state.created_threads.remove(&thread);
+                state.histories.remove(&thread);
+                state.metadata_updates.remove(&thread);
+                state.native_authority.remove(&thread);
+            } else {
+                state.calls.shutdown_thread += 1;
+            }
+            Ok(())
+        })
+    }
     fn native_authority_storage(&self) -> Option<crate::NativeAuthorityStorage> {
         Some(crate::NativeAuthorityStorage::InMemory {
             allocation: Arc::as_ptr(&self.state) as usize,
@@ -1025,14 +1177,22 @@ impl ThreadStore for InMemoryThreadStore {
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(InMemoryThreadStore::create_thread(self, params))
+        Box::pin(async move {
+            InMemoryThreadStore::create_thread_owned_impl(self, params, false)
+                .await
+                .map(|_| ())
+        })
     }
 
     fn resume_thread(
         &self,
         params: ResumeThreadParams,
     ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
-        Box::pin(InMemoryThreadStore::resume_thread(self, params))
+        Box::pin(async move {
+            InMemoryThreadStore::resume_thread_owned_impl(self, params, false)
+                .await
+                .map(|(history, _)| history)
+        })
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
@@ -1057,16 +1217,22 @@ impl ThreadStore for InMemoryThreadStore {
         })
     }
 
-    fn shutdown_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+    fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            self.state.lock().await.calls.shutdown_thread += 1;
+            let mut state = self.state.lock().await;
+            state.calls.shutdown_thread += 1;
+            state.writer_owners.remove(&thread_id);
+            state.fresh_writers.remove(&thread_id);
             Ok(())
         })
     }
 
-    fn discard_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+    fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            self.state.lock().await.calls.discard_thread += 1;
+            let mut state = self.state.lock().await;
+            state.calls.discard_thread += 1;
+            state.writer_owners.remove(&thread_id);
+            state.fresh_writers.remove(&thread_id);
             Ok(())
         })
     }

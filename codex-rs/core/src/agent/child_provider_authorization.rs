@@ -49,6 +49,15 @@ struct OriginState {
 }
 
 impl ChildProviderOrigins {
+    pub(crate) fn ownership_edges(&self) -> Vec<(ThreadId, ThreadId)> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .parents
+            .iter()
+            .map(|(child, parent)| (*child, *parent))
+            .collect()
+    }
     pub(crate) fn parent(&self, thread: ThreadId) -> Option<ThreadId> {
         self.0
             .lock()
@@ -278,6 +287,7 @@ impl RetainedAgentAuthority {
 
     pub(crate) fn matches_session(&self, session: &Session) -> bool {
         self.thread_id == session.thread_id
+            && self.registration_id == session.native_registration_id
             && self.session_allocation == session as *const Session as usize
     }
 
@@ -285,13 +295,7 @@ impl RetainedAgentAuthority {
         let (config, settings, environments) = session.native_agent_authority_snapshot().await;
         let scope = ChildProviderScope::from_current(&config, &settings, &environments);
         let session_allocation = session as *const Session as usize;
-        let registration_id = session
-            .services
-            .local_agent_runtime
-            .retained_authority(session.thread_id)
-            .filter(|old| old.session_allocation == session_allocation)
-            .map(|old| old.registration_id)
-            .unwrap_or_else(Uuid::now_v7);
+        let registration_id = session.native_registration_id;
         let model_authority = session
             .services
             .models_manager
@@ -333,7 +337,7 @@ impl FreshChildCaller {
         }
         let authority = runtime
             .retained_authority(session.thread_id)
-            .filter(|authority| authority.session_allocation == session as *const Session as usize)
+            .filter(|authority| authority.matches_session(session))
             .ok_or_else(|| invalid("fresh child caller registration is unavailable"))?;
         let fence = Self {
             caller: Arc::downgrade(&caller),
@@ -634,6 +638,7 @@ pub(crate) struct NativeChildAdmission {
     caller_fence: Option<FreshChildCaller>,
     resume_caller: Option<ResumeChildCaller>,
     binding: Option<codex_config::CloudConfigBundleBinding>,
+    teardown_revisions: Vec<(ThreadId, u64)>,
 }
 
 impl NativeChildAdmission {
@@ -642,6 +647,7 @@ impl NativeChildAdmission {
             caller_fence: None,
             resume_caller: None,
             binding: config.config_layer_stack.cloud_config_binding().cloned(),
+            teardown_revisions: Vec::new(),
         }
     }
 
@@ -652,14 +658,38 @@ impl NativeChildAdmission {
         }
     }
 
-    fn for_resume(config: &Config, resume_caller: ResumeChildCaller) -> Self {
+    fn for_resume(
+        config: &Config,
+        resume_caller: ResumeChildCaller,
+        teardown_revisions: Vec<(ThreadId, u64)>,
+    ) -> Self {
         Self {
             resume_caller: Some(resume_caller),
+            teardown_revisions,
             ..Self::new(config)
         }
     }
 
     pub(crate) fn check_current(&self) -> Result<()> {
+        let runtime = self
+            .caller_fence
+            .as_ref()
+            .and_then(|fence| fence.caller.upgrade())
+            .or_else(|| {
+                self.resume_caller
+                    .as_ref()
+                    .map(|fence| Arc::clone(&fence.caller))
+            });
+        if let Some(caller) = runtime {
+            let registry = &caller.session.services.local_agent_runtime;
+            if self
+                .teardown_revisions
+                .iter()
+                .any(|(id, revision)| registry.teardown_revision(*id) != *revision)
+            {
+                return Err(invalid("native target was closed during startup"));
+            }
+        }
         match &self.caller_fence {
             Some(caller) => caller.with_current(|| self.check_binding()),
             None => match &self.resume_caller {
@@ -681,13 +711,71 @@ impl NativeChildAdmission {
         Ok(())
     }
 
-    pub(crate) fn admit(self) -> Result<()> {
+    pub(crate) fn admit(&self) -> Result<()> {
         // For fresh launches the caller signal lock spans the epoch/liveness
         // checks and managed binding read. Admission and exact-caller revocation
         // therefore have a shared synchronous ordering after all startup awaits.
         // Private resume carries its original caller epoch and allows only a
         // registry-authenticated completed residency eviction of that same epoch.
         self.check_current()
+    }
+
+    pub(crate) fn commit_registration<T>(
+        &self,
+        authority: Arc<RetainedAgentAuthority>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let (caller, epoch, allow_evicted) = if let Some(fence) = &self.caller_fence {
+            let caller = fence
+                .caller
+                .upgrade()
+                .ok_or_else(|| invalid("native startup caller is unavailable"))?;
+            let epoch = caller
+                .session
+                .services
+                .local_agent_runtime
+                .retained_authority(caller.session.thread_id)
+                .filter(|epoch| {
+                    epoch.registration_id() == fence.registration_id
+                        && epoch.matches_session(&caller.session)
+                })
+                .ok_or_else(|| invalid("native startup caller registration changed"))?;
+            (caller, epoch, false)
+        } else if let Some(fence) = &self.resume_caller {
+            (Arc::clone(&fence.caller), Arc::clone(&fence.epoch), true)
+        } else {
+            return Err(invalid("native startup has no caller continuation"));
+        };
+        let live = caller
+            .session
+            .fresh_child_admission_live
+            .lock()
+            .map_err(|_| invalid("native startup caller signal is unavailable"))?;
+        let runtime = &caller.session.services.local_agent_runtime;
+        if runtime.shutdown.is_cancelled() {
+            return Err(invalid("native runtime shut down during startup"));
+        }
+        runtime.commit_native_registration(
+            &epoch,
+            *live && caller.is_running(),
+            allow_evicted,
+            &self.teardown_revisions,
+            authority,
+            || {
+                let binding = self.binding.as_ref().map(|binding| binding.read());
+                if binding.as_ref().is_some_and(|guard| {
+                    guard.status != codex_config::CloudConfigBundleBindingStatus::Current
+                }) {
+                    return Err(invalid(
+                        "managed native child policy was revoked before registration",
+                    ));
+                }
+                let result = commit()?;
+                // The registry retains this guard through installation of the
+                // new epoch, not merely through the earlier status check.
+                Ok((result, binding))
+            },
+        )
     }
 }
 
@@ -698,6 +786,7 @@ pub(crate) struct ChildResumePermit {
     caller_epoch: Arc<RetainedAgentAuthority>,
     origins: Arc<ChildProviderOrigins>,
     target: ThreadId,
+    teardown_revisions: Vec<(ThreadId, u64)>,
     parent: Option<ThreadId>,
     source: SessionSource,
     history: Arc<Vec<RolloutItem>>,
@@ -743,6 +832,16 @@ impl ChildResumePermit {
         selections: &mut Option<Vec<TurnEnvironmentSelection>>,
         inherited: Option<&TurnEnvironmentSnapshot>,
     ) -> Result<Self> {
+        let InitialHistory::Resumed(prepared_history) = history else {
+            return Err(invalid("private reload requires host-read resumed history"));
+        };
+        let mut teardown_revisions = vec![(
+            prepared_history.conversation_id,
+            runtime.teardown_revision(prepared_history.conversation_id),
+        )];
+        if let Some(parent) = parent {
+            teardown_revisions.push((parent, runtime.teardown_revision(parent)));
+        }
         let manager = runtime.upgrade()?;
         let registered = manager.get_thread(caller.session.thread_id).await?;
         if !Arc::ptr_eq(&registered, &caller)
@@ -1125,6 +1224,7 @@ impl ChildResumePermit {
             caller_epoch,
             origins: Arc::clone(&runtime.child_provider_origins),
             target,
+            teardown_revisions,
             parent,
             source: source.clone(),
             history: Arc::clone(&saved.history),
@@ -1240,7 +1340,11 @@ impl ChildResumePermit {
             .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
         Ok((
             self.origin,
-            NativeChildAdmission::for_resume(&current.config, caller_fence),
+            NativeChildAdmission::for_resume(
+                &current.config,
+                caller_fence,
+                self.teardown_revisions,
+            ),
         ))
     }
 }

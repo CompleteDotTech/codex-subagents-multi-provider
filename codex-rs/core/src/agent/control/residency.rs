@@ -59,6 +59,11 @@ impl ThreadManagerState {
         // Once shutdown is submitted, cancellation cannot release delivery or capacity early.
         tokio::spawn(async move {
             let _residency_guard = residency_guard;
+            let authority = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(&thread.session, &thread.session_source).await;
+            if !thread.session.services.local_agent_runtime.registry.begin_residency_eviction(&authority) {
+                teardown.complete();
+                return Ok(ThreadEvictionOutcome::NotCurrent);
+            }
             thread.ensure_rollout_materialized().await;
             if let Err(err) = thread.shutdown_and_wait().await {
                 teardown.record_shutdown_failure("stop_resident", CodexErrKind::from(&err).into());
@@ -182,7 +187,11 @@ impl LocalAgentRuntime {
         }
         let guard = Arc::clone(&thread.residency_gate).read_owned().await;
         let thread_id = thread.session.thread_id;
-        if !Arc::ptr_eq(thread, &state.get_thread(thread_id).await?) {
+        let threads = state.threads.read().await;
+        if !threads
+            .get(&thread_id)
+            .is_some_and(|registered| Arc::ptr_eq(thread, registered))
+        {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
         self.residency.touch(thread_id);

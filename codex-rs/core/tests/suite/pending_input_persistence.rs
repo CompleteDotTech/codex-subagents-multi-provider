@@ -104,6 +104,39 @@ macro_rules! delegate_store_methods {
 }
 
 impl ThreadStore for GatedCheckpointStore {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+        owner: codex_thread_store::ThreadWriterOwner,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.begin_native_authority_epoch_owned(epoch, owner)
+    }
+
+    fn create_thread_owned(
+        &self,
+        params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_thread_store::ThreadWriterOwner> {
+        self.inner.create_thread_owned(params)
+    }
+    fn resume_thread_owned(
+        &self,
+        params: codex_thread_store::ResumeThreadParams,
+        preparation: Option<codex_thread_store::ThreadStoreResumePreparation>,
+    ) -> codex_thread_store::ThreadStoreFuture<
+        '_,
+        (Arc<Vec<RolloutItem>>, codex_thread_store::ThreadWriterOwner),
+    > {
+        self.inner.resume_thread_owned(params, preparation)
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: codex_thread_store::ThreadWriterOwner,
+        discard: bool,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.finish_thread_owned(thread, owner, discard)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

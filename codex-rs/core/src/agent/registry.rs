@@ -38,6 +38,7 @@ struct ActiveAgents {
     // Actual finalized/unloaded Session ceilings only; never serialized, printed,
     // or sufficient by themselves to authorize provider use.
     retained_authority: HashMap<ThreadId, RetainedAuthorityEntry>,
+    teardown_revisions: HashMap<ThreadId, u64>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
 }
@@ -45,6 +46,7 @@ struct ActiveAgents {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CallerPhase {
     Current,
+    ResidencyEvictionInProgress,
     CompletedResidencyEviction,
     Revoked,
 }
@@ -111,6 +113,110 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 }
 
 impl AgentRegistry {
+    pub(crate) fn teardown_revision(&self, thread: ThreadId) -> u64 {
+        *self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .teardown_revisions
+            .get(&thread)
+            .unwrap_or(&0)
+    }
+
+    /// Called with the manager map write guard held. Ownership edges remain
+    /// authoritative after residency eviction and explicit close.
+    pub(crate) fn revoke_subtree(
+        &self,
+        root: ThreadId,
+        edges: impl IntoIterator<Item = (ThreadId, ThreadId)>,
+    ) -> HashSet<ThreadId> {
+        let mut state = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut edges: Vec<_> = edges.into_iter().collect();
+        edges.extend(state.retained_authority.iter().filter_map(|(id, entry)| {
+            entry
+                .authority
+                .source
+                .parent_thread_id()
+                .map(|parent| (*id, parent))
+        }));
+        let mut closed = HashSet::from([root]);
+        loop {
+            let before = closed.len();
+            for (child, parent) in &edges {
+                if closed.contains(parent) {
+                    closed.insert(*child);
+                }
+            }
+            if before == closed.len() {
+                break;
+            }
+        }
+        for id in &closed {
+            *state.teardown_revisions.entry(*id).or_default() += 1;
+            if let Some(entry) = state.retained_authority.get_mut(id) {
+                entry.phase = CallerPhase::Revoked;
+            }
+            if let Some(agent) = state.thread_paths.get_mut(id) {
+                agent.evicted_environments = None;
+            }
+        }
+        closed
+    }
+
+    /// The caller signal and manager map are held by the private startup owner.
+    /// No callback may reenter this registry or await.
+    pub(crate) fn commit_native_registration<T, G>(
+        &self,
+        caller: &RetainedAgentAuthority,
+        live: bool,
+        allow_completed_eviction: bool,
+        revisions: &[(ThreadId, u64)],
+        authority: Arc<RetainedAgentAuthority>,
+        commit: impl FnOnce() -> Result<(T, G)>,
+    ) -> Result<T> {
+        let mut state = self.active_agents.lock().map_err(|_| {
+            crate::agent::child_provider_authorization::invalid(
+                "native registration registry is unavailable",
+            )
+        })?;
+        let valid = state
+            .retained_authority
+            .get(&caller.thread_id)
+            .is_some_and(|entry| {
+                entry.authority.same_registration(caller)
+                    && match entry.phase {
+                        CallerPhase::Current => live,
+                        CallerPhase::CompletedResidencyEviction => allow_completed_eviction,
+                        CallerPhase::Revoked | CallerPhase::ResidencyEvictionInProgress => false,
+                    }
+            });
+        if !valid
+            || revisions.iter().any(|(id, revision)| {
+                state.teardown_revisions.get(id).copied().unwrap_or(0) != *revision
+            })
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "native caller or target was closed or replaced during startup",
+            ));
+        }
+        let (result, policy_guard) = commit()?;
+        *state
+            .teardown_revisions
+            .entry(authority.thread_id)
+            .or_default() += 1;
+        state.retained_authority.insert(
+            authority.thread_id,
+            RetainedAuthorityEntry {
+                authority,
+                phase: CallerPhase::Current,
+            },
+        );
+        drop(policy_guard);
+        Ok(result)
+    }
     /// Only successful actual registration installs a NEW Current epoch.
     /// Same-registration snapshot refresh preserves eviction/revocation phase.
     pub(crate) fn register_authority(&self, authority: Arc<RetainedAgentAuthority>) {
@@ -125,6 +231,7 @@ impl AgentRegistry {
             entry.authority = authority;
             return;
         }
+        *state.teardown_revisions.entry(thread_id).or_default() += 1;
         state.retained_authority.insert(
             thread_id,
             RetainedAuthorityEntry {
@@ -150,12 +257,54 @@ impl AgentRegistry {
         }
     }
 
+    pub(crate) fn begin_residency_eviction(&self, authority: &RetainedAgentAuthority) -> bool {
+        let mut state = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = state
+            .retained_authority
+            .get_mut(&authority.thread_id)
+            .filter(|entry| {
+                entry.authority.same_registration(authority) && entry.phase == CallerPhase::Current
+            })
+        else {
+            return false;
+        };
+        entry.phase = CallerPhase::ResidencyEvictionInProgress;
+        true
+    }
+
+    /// A real explicit Session stop changes target lifetime before its first
+    /// shutdown await. The private eviction owner alone preserves its revision.
+    pub(crate) fn note_session_stopped(&self, session: &crate::session::session::Session) {
+        let mut state = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = state
+            .retained_authority
+            .get_mut(&session.thread_id)
+            .filter(|entry| entry.authority.matches_session(session))
+        else {
+            return;
+        };
+        if entry.phase == CallerPhase::Current {
+            entry.phase = CallerPhase::Revoked;
+            *state
+                .teardown_revisions
+                .entry(session.thread_id)
+                .or_default() += 1;
+        }
+    }
+
     /// Explicit loaded or unloaded close sets a tombstone before its first await.
     pub(crate) fn revoke_caller(&self, thread_id: ThreadId) {
         let mut state = self
             .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state.teardown_revisions.entry(thread_id).or_default() += 1;
         if let Some(entry) = state.retained_authority.get_mut(&thread_id) {
             entry.phase = CallerPhase::Revoked;
         }
@@ -179,7 +328,9 @@ impl AgentRegistry {
         let Some(entry) = state.retained_authority.get_mut(&thread_id) else {
             return;
         };
-        if !entry.authority.same_registration(&authority) || entry.phase != CallerPhase::Current {
+        if !entry.authority.same_registration(&authority)
+            || entry.phase != CallerPhase::ResidencyEvictionInProgress
+        {
             return;
         }
         entry.authority = authority;
@@ -242,7 +393,7 @@ impl AgentRegistry {
                     && match entry.phase {
                         CallerPhase::Current => live,
                         CallerPhase::CompletedResidencyEviction => true,
-                        CallerPhase::Revoked => false,
+                        CallerPhase::Revoked | CallerPhase::ResidencyEvictionInProgress => false,
                     }
             });
         if !valid {
@@ -387,13 +538,20 @@ impl AgentRegistry {
     }
 
     fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
-        let Some(thread_id) = agent_metadata.agent_id else {
-            return;
-        };
-        let mut active_agents = self
+        let mut state = self
             .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::register_spawned_thread_locked(&mut state, agent_metadata);
+    }
+
+    fn register_spawned_thread_locked(
+        active_agents: &mut ActiveAgents,
+        agent_metadata: AgentMetadata,
+    ) {
+        let Some(thread_id) = agent_metadata.agent_id else {
+            return;
+        };
         let key = agent_metadata
             .agent_path
             .as_ref()
@@ -539,6 +697,36 @@ impl SpawnReservation {
     pub(crate) fn reserve_agent_path(&mut self, agent_path: &AgentPath) -> Result<()> {
         self.state.reserve_agent_path(agent_path)?;
         self.reserved_agent_path = Some(agent_path.clone());
+        Ok(())
+    }
+
+    pub(crate) fn commit_if_current(
+        mut self,
+        agent_metadata: AgentMetadata,
+        authority: &RetainedAgentAuthority,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if agent_metadata.agent_id != Some(authority.thread_id)
+            || !state
+                .retained_authority
+                .get(&authority.thread_id)
+                .is_some_and(|entry| {
+                    entry.phase == CallerPhase::Current
+                        && entry.authority.same_registration(authority)
+                })
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "spawned runtime was closed or replaced before metadata commit",
+            ));
+        }
+        AgentRegistry::register_spawned_thread_locked(&mut state, agent_metadata);
+        self.reserved_agent_nickname = None;
+        self.reserved_agent_path = None;
+        self.active = false;
         Ok(())
     }
 

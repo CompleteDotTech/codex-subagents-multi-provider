@@ -76,6 +76,69 @@ macro_rules! delegate_store_methods {
 }
 
 impl ThreadStore for GatedChildMetadataStore {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+        owner: codex_thread_store::ThreadWriterOwner,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.begin_native_authority_epoch_owned(epoch, owner)
+    }
+
+    fn create_thread_owned(
+        &self,
+        params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_thread_store::ThreadWriterOwner> {
+        self.inner.create_thread_owned(params)
+    }
+    fn resume_thread_owned(
+        &self,
+        params: ResumeThreadParams,
+        preparation: Option<codex_thread_store::ThreadStoreResumePreparation>,
+    ) -> ThreadStoreFuture<'_, (Arc<Vec<RolloutItem>>, codex_thread_store::ThreadWriterOwner)> {
+        Box::pin(async move {
+            assert!(
+                params.history_revision.is_some(),
+                "core must forward the revision"
+            );
+            let supplied = params.history.as_ref().expect("preloaded history");
+            let (unchanged, owner) = self
+                .inner
+                .resume_thread_owned(params.clone(), preparation)
+                .await?;
+            assert!(Arc::ptr_eq(supplied, &unchanged));
+            if params.thread_id != self.edited_child {
+                return Ok((unchanged, owner));
+            }
+
+            // Commit an edit after core preloads history, before its writer acquisition finishes.
+            let edit: ResponseItem = serde_json::from_value(json!({
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": LATE_EDIT}],
+            }))
+            .expect("late user message");
+            self.inner
+                .append_items(AppendThreadItemsParams {
+                    thread_id: params.thread_id,
+                    items: vec![RolloutItem::ResponseItem(edit.into())],
+                })
+                .await?;
+            self.inner
+                .finish_thread_owned(params.thread_id, owner, false)
+                .await?;
+            let (refreshed, owner) = self.inner.resume_thread_owned(params, None).await?;
+            assert!(!Arc::ptr_eq(&unchanged, &refreshed));
+            Ok((refreshed, owner))
+        })
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: codex_thread_store::ThreadWriterOwner,
+        discard: bool,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.finish_thread_owned(thread, owner, discard)
+    }
+
     fn native_authority_storage(&self) -> Option<codex_thread_store::NativeAuthorityStorage> {
         self.inner.native_authority_storage()
     }

@@ -15,6 +15,7 @@ use crate::agent::LocalAgentControl;
 use crate::agent::api::AgentConfigUpdate;
 use crate::agent::api::AgentControl;
 use crate::agent::control::AgentControlInit;
+use crate::agent::control::LocalAgentRuntime;
 use crate::agents_md_manager::SessionInstructions;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
@@ -1951,14 +1952,18 @@ impl ThreadManagerState {
             })
     }
 
-    pub(crate) async fn begin_native_authority_epoch(
+    async fn begin_session_authority_epoch(
         &self,
+        session: &Session,
         epoch: codex_thread_store::NativeAuthorityEpoch,
     ) -> CodexResult<()> {
-        match self.thread_store.begin_native_authority_epoch(epoch).await {
+        let Some(writer) = session.live_thread() else {
+            return Ok(());
+        };
+        match writer.begin_native_authority_epoch(epoch).await {
             Ok(()) | Err(ThreadStoreError::Unsupported { .. }) => Ok(()),
             Err(_) => Err(crate::agent::child_provider_authorization::invalid(
-                "host authority epoch could not be fenced",
+                "owned host authority epoch could not be fenced",
             )),
         }
     }
@@ -2033,6 +2038,37 @@ impl ThreadManagerState {
         message_delivery: Option<crate::agent_communication::MessageDelivery>,
     ) -> CodexResult<String> {
         let thread = self.get_thread(thread_id).await?;
+        self.send_op_to_thread(&thread, op, parent_turn_id, root_turn_id, message_delivery)
+            .await
+    }
+
+    pub(crate) async fn send_op_if_matches(
+        &self,
+        expected: &Arc<CodexThread>,
+        op: Op,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+        message_delivery: Option<crate::agent_communication::MessageDelivery>,
+    ) -> CodexResult<String> {
+        let registered = self.get_thread(expected.session.thread_id).await?;
+        if !Arc::ptr_eq(&registered, expected) {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "native recipient allocation was replaced",
+            ));
+        }
+        self.send_op_to_thread(expected, op, parent_turn_id, root_turn_id, message_delivery)
+            .await
+    }
+
+    async fn send_op_to_thread(
+        &self,
+        thread: &Arc<CodexThread>,
+        op: Op,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+        message_delivery: Option<crate::agent_communication::MessageDelivery>,
+    ) -> CodexResult<String> {
+        let thread_id = thread.session.thread_id;
         let residency_guard = if matches!(op, Op::InterAgentCommunication { .. }) {
             thread
                 .session
@@ -2065,6 +2101,47 @@ impl ThreadManagerState {
     /// Remove a thread from the manager by ID, returning it when present.
     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
         let current = self.threads.read().await.get(thread_id).cloned()?;
+        self.remove_thread_if_matches(thread_id, &current, || {})
+            .await
+    }
+
+    pub(crate) async fn fence_native_subtree(
+        &self,
+        runtime: &LocalAgentRuntime,
+        root: ThreadId,
+        descendants: bool,
+        mut unloaded: impl FnMut(ThreadId),
+    ) -> Vec<(ThreadId, Arc<CodexThread>)> {
+        let threads = self.threads.write().await;
+        let mut edges = runtime.child_provider_origins.ownership_edges();
+        edges.extend(threads.iter().filter_map(|(id, thread)| {
+            thread
+                .session_source
+                .parent_thread_id()
+                .map(|parent| (*id, parent))
+        }));
+        let closed = if descendants {
+            runtime.revoke_subtree_with_edges(root, edges)
+        } else {
+            runtime.revoke_single_caller(root);
+            std::collections::HashSet::from([root])
+        };
+        for id in closed.iter().filter(|id| !threads.contains_key(id)) {
+            unloaded(*id);
+        }
+        threads
+            .iter()
+            .filter(|(id, _)| closed.contains(id))
+            .map(|(id, thread)| (*id, Arc::clone(thread)))
+            .collect()
+    }
+
+    pub(crate) async fn remove_thread_if_matches(
+        &self,
+        thread_id: &ThreadId,
+        current: &Arc<CodexThread>,
+        removed: impl FnOnce(),
+    ) -> Option<Arc<CodexThread>> {
         let authority =
             crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
                 &current.session,
@@ -2072,7 +2149,7 @@ impl ThreadManagerState {
             )
             .await;
         if let Err(error) = crate::agent::child_provider_authorization::durable::seal_stopped(
-            self, &current, &authority,
+            self, current, &authority,
         )
         .await
         {
@@ -2081,7 +2158,7 @@ impl ThreadManagerState {
         let mut threads = self.threads.write().await;
         if !threads
             .get(thread_id)
-            .is_some_and(|thread| Arc::ptr_eq(thread, &current))
+            .is_some_and(|thread| Arc::ptr_eq(thread, current))
         {
             return None;
         }
@@ -2091,6 +2168,7 @@ impl ThreadManagerState {
             .services
             .local_agent_runtime
             .retire_authority(authority);
+        removed();
         threads
             .remove(thread_id)
             .inspect(|thread| thread.session.services.mcp_runtime.revoke_ema())
@@ -2898,6 +2976,7 @@ impl ThreadManagerState {
                 initial_host_config,
                 delegated_launch.then_some(parent_thread_id).flatten(),
                 provider_origin,
+                &startup_state,
             )
             .await;
         let new_thread = match finalize_result {
@@ -2909,16 +2988,16 @@ impl ThreadManagerState {
                 return Err(error);
             }
         };
+        startup_state.release_membership();
+        if let Some(startup_guard) = startup_guard {
+            startup_guard.disarm();
+        }
         new_thread.thread.emit_thread_ready_lifecycle().await;
         if source_changed_during_startup.load(Ordering::Acquire) {
             new_thread.thread.session.request_mcp_runtime_refresh();
         }
         if is_resumed_thread {
             new_thread.thread.emit_thread_resume_lifecycle().await;
-        }
-        startup_state.release_membership();
-        if let Some(startup_guard) = startup_guard {
-            startup_guard.disarm();
         }
         Ok(new_thread)
     }
@@ -2931,6 +3010,7 @@ impl ThreadManagerState {
         initial_host_config: Option<AgentConfigUpdate>,
         delegated_parent: Option<ThreadId>,
         provider_origin: Option<codex_config::child_provider::VerifiedChildProviderOrigin>,
+        startup: &SessionStartup,
     ) -> CodexResult<NewThread> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -2950,13 +3030,14 @@ impl ThreadManagerState {
                 &session_source,
             )
             .await;
+        startup.check_native_current()?;
         if (!session_source.is_non_root_agent()
             || matches!(
                 session_source,
                 SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
             ))
             && let Err(error) = self
-                .begin_native_authority_epoch(retained_authority.epoch())
+                .begin_session_authority_epoch(&session, retained_authority.epoch())
                 .await
         {
             if let Err(shutdown_error) = io.shutdown_and_wait().await {
@@ -2970,38 +3051,39 @@ impl ThreadManagerState {
             .config_layer_stack
             .mcp_ema_cancellation()
             .clone();
+        let runtime = session.services.local_agent_runtime.clone();
+        let mut persistence = startup.persistence.lock().await;
         {
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
-                let origins = &session.services.local_agent_runtime.child_provider_origins;
-                if let Some(parent) = delegated_parent {
-                    origins.publish_child(thread_id, parent, provider_origin);
-                } else if !session_source.is_non_root_agent() {
-                    origins.publish_root(thread_id, &session_configured.model_provider_id);
-                }
-                if let Some(update) = initial_host_config {
-                    session
-                        .services
-                        .agent_control
-                        .propagate_config_update(update);
-                }
-                session
-                    .services
-                    .local_agent_runtime
-                    .register_authority(retained_authority);
-                ema_cancellation.publish();
-                let thread = Arc::new(CodexThread::new(
-                    session,
-                    io,
-                    ThreadStartupMetadata::from(&session_configured),
-                    session_configured.rollout_path.clone(),
-                    session_source,
-                ));
-                e.insert(thread.clone());
-                return Ok(NewThread {
-                    thread_id,
-                    thread,
-                    session_configured,
+                return startup.commit_registration(&runtime, retained_authority, || {
+                    let origins = &session.services.local_agent_runtime.child_provider_origins;
+                    if let Some(parent) = delegated_parent {
+                        origins.publish_child(thread_id, parent, provider_origin);
+                    } else if !session_source.is_non_root_agent() {
+                        origins.publish_root(thread_id, &session_configured.model_provider_id);
+                    }
+                    if let Some(update) = initial_host_config {
+                        session
+                            .services
+                            .agent_control
+                            .propagate_config_update(update);
+                    }
+                    ema_cancellation.publish();
+                    let thread = Arc::new(CodexThread::new(
+                        session,
+                        io,
+                        ThreadStartupMetadata::from(&session_configured),
+                        session_configured.rollout_path.clone(),
+                        session_source,
+                    ));
+                    e.insert(thread.clone());
+                    persistence.commit();
+                    Ok(NewThread {
+                        thread_id,
+                        thread,
+                        session_configured,
+                    })
                 });
             }
         }

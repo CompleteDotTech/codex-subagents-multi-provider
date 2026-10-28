@@ -214,6 +214,45 @@ impl LocalAgentRuntime {
         self.registry.register_authority(authority);
     }
 
+    pub(crate) fn revoke_subtree_with_edges(
+        &self,
+        root: ThreadId,
+        edges: Vec<(ThreadId, ThreadId)>,
+    ) -> std::collections::HashSet<ThreadId> {
+        self.registry.revoke_subtree(root, edges)
+    }
+
+    pub(crate) fn revoke_single_caller(&self, thread: ThreadId) {
+        self.registry.revoke_caller(thread);
+    }
+
+    pub(crate) fn teardown_revision(&self, thread: ThreadId) -> u64 {
+        self.registry.teardown_revision(thread)
+    }
+
+    pub(crate) fn note_session_stopped(&self, session: &crate::session::session::Session) {
+        self.registry.note_session_stopped(session);
+    }
+
+    pub(crate) fn commit_native_registration<T, G>(
+        &self,
+        caller: &crate::agent::child_provider_authorization::RetainedAgentAuthority,
+        live: bool,
+        allow_completed_eviction: bool,
+        revisions: &[(ThreadId, u64)],
+        authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,
+        commit: impl FnOnce() -> CodexResult<(T, G)>,
+    ) -> CodexResult<T> {
+        self.registry.commit_native_registration(
+            caller,
+            live,
+            allow_completed_eviction,
+            revisions,
+            authority,
+            commit,
+        )
+    }
+
     pub(crate) fn retire_authority(
         &self,
         authority: Arc<crate::agent::child_provider_authorization::RetainedAgentAuthority>,

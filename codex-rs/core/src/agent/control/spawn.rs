@@ -760,8 +760,19 @@ impl LocalAgentControl {
                     let residency_pin = runtime
                         .pin_v2_residency(&state, &reloaded_thread.thread)
                         .await?;
+                    let threads = state.threads.write().await;
+                    if !threads
+                        .get(&thread_id)
+                        .is_some_and(|registered| Arc::ptr_eq(registered, &reloaded_thread.thread))
+                        || !reloaded_thread.thread.is_running()
+                    {
+                        return Err(crate::agent::child_provider_authorization::invalid(
+                            "resumed residency changed before commit",
+                        ));
+                    }
                     runtime.registry.clear_evicted_environments(thread_id);
                     residency_slot.commit(reloaded_thread.thread_id);
+                    drop(threads);
                     // Register before listeners can forward events from the resumed thread.
                     if let Some((client_metadata, source)) = subagent_analytics {
                         let thread_config = reloaded_thread.thread.config_snapshot().await;
@@ -1013,8 +1024,11 @@ impl LocalAgentControl {
             .map_err(|err| err.with_agent_context(AgentErrorContext::ChildStartup))?;
         let child_create = child_create_started_at.elapsed();
         agent_metadata.agent_id = Some(new_thread.thread_id);
-        let mut pending_spawn =
-            PendingSpawn::new(Arc::clone(&state), new_thread.thread_id, membership);
+        let mut pending_spawn = PendingSpawn::new(
+            Arc::clone(&state),
+            Arc::clone(&new_thread.thread),
+            membership,
+        );
 
         if let Some(SessionSource::SubAgent(
             subagent_source @ SubAgentSource::ThreadSpawn {
@@ -1106,17 +1120,18 @@ impl LocalAgentControl {
         let input_admission_started_at = Instant::now();
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input(new_thread.thread_id, input, start_options)
+                self.send_input_to_thread(&new_thread.thread, input, start_options)
                     .await
                     .map_err(|err| err.with_agent_context(AgentErrorContext::InputAdmission))?;
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
-                self.send_inter_agent_communication_after_capacity_check(
+                self.submit_inter_agent_communication(
                     new_thread.thread_id,
                     &state,
                     communication,
                     context,
                     start_options,
+                    Some(&new_thread.thread),
                 )
                 .await
                 .map_err(|err| err.with_agent_context(AgentErrorContext::InputAdmission))?;
@@ -1130,11 +1145,31 @@ impl LocalAgentControl {
             Some(config) => config,
             None => new_thread.thread.config_snapshot().await,
         };
-        reservation.commit(agent_metadata.clone());
+        let authority = self
+            .runtime
+            .retained_authority(new_thread.thread_id)
+            .filter(|authority| authority.matches_session(&new_thread.thread.session))
+            .ok_or_else(|| {
+                crate::agent::child_provider_authorization::invalid(
+                    "spawned runtime registration was replaced",
+                )
+            })?;
+        let threads = state.threads.write().await;
+        if !threads
+            .get(&new_thread.thread_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &new_thread.thread))
+            || !new_thread.thread.is_running()
+        {
+            return Err(crate::agent::child_provider_authorization::invalid(
+                "spawned runtime stopped or changed before return",
+            ));
+        }
+        reservation.commit_if_current(agent_metadata.clone(), &authority)?;
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
         }
         let _membership = pending_spawn.disarm();
+        drop(threads);
 
         // Notify a new thread has been created. This notification will be processed by clients
         // to subscribe or drain this newly created thread.
@@ -1719,10 +1754,42 @@ impl LocalAgentControl {
             .await?;
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
-        reservation.commit(agent_metadata.clone());
+        let state_for_commit = Arc::clone(&state);
+        let thread_for_commit = Arc::clone(&resumed_thread.thread);
+        let metadata_for_commit = agent_metadata.clone();
+        // Once the resumed manager registration wins, cancellation must not
+        // abandon its metadata reservation. The exact epoch still fences close
+        // and replacement while this owned handoff waits for the map ordering.
+        tokio::spawn(async move {
+            let threads = state_for_commit.threads.write().await;
+            let id = thread_for_commit.session.thread_id;
+            if !threads
+                .get(&id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &thread_for_commit))
+                || !thread_for_commit.is_running()
+            {
+                return Err(crate::agent::child_provider_authorization::invalid(
+                    "resumed runtime changed before metadata commit",
+                ));
+            }
+            let authority = thread_for_commit
+                .session
+                .services
+                .local_agent_runtime
+                .retained_authority(id)
+                .filter(|authority| authority.matches_session(&thread_for_commit.session))
+                .ok_or_else(|| {
+                    crate::agent::child_provider_authorization::invalid(
+                        "resumed registration authority changed",
+                    )
+                })?;
+            reservation.commit_if_current(metadata_for_commit, &authority)?;
+            state_for_commit.notify_thread_created(id);
+            Ok::<_, CodexErr>(())
+        })
+        .await??;
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
-        state.notify_thread_created(resumed_thread.thread_id);
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path

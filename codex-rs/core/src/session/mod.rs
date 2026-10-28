@@ -697,6 +697,9 @@ impl Session {
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
         } = args;
+        if let Some(startup) = &startup {
+            startup.check_native_current()?;
+        }
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
@@ -800,6 +803,9 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
+        if let Some(startup) = &startup {
+            startup.check_native_current()?;
+        }
         if model.trim().is_empty() {
             return Err(CodexErr::InvalidRequest(
                 "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
@@ -1063,6 +1069,9 @@ impl Session {
                 Err(error) => map_session_init_error(&error, &config.codex_home),
             }
         })?;
+        if let Some(startup) = &startup {
+            startup.check_native_current()?;
+        }
         if let Some(message) = initial_service_tier_warning {
             session
                 .send_event_raw(Event {
@@ -1095,7 +1104,9 @@ impl Session {
 
         if let Some(startup) = startup {
             let _ = startup.io.set(io.clone());
-            startup.persistence.lock().await.commit();
+            if !startup.requires_owned_writer() {
+                startup.persistence.lock().await.commit();
+            }
         }
         Ok((session, io))
     }

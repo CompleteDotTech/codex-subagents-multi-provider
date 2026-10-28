@@ -73,6 +73,44 @@ macro_rules! delegate_store_methods {
 }
 
 impl ThreadStore for GatedReviewerStore {
+    fn begin_native_authority_epoch_owned(
+        &self,
+        epoch: codex_thread_store::NativeAuthorityEpoch,
+        owner: codex_thread_store::ThreadWriterOwner,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.begin_native_authority_epoch_owned(epoch, owner)
+    }
+
+    fn create_thread_owned(
+        &self,
+        params: CreateThreadParams,
+    ) -> ThreadStoreFuture<'_, codex_thread_store::ThreadWriterOwner> {
+        Box::pin(async move {
+            if params.thread_source == Some(ThreadSource::GuardianReview) {
+                self.reviewer.lock().await.thread_id = Some(params.thread_id);
+            }
+            ThreadStore::create_thread_owned(&self.inner, params).await
+        })
+    }
+    fn resume_thread_owned(
+        &self,
+        params: codex_thread_store::ResumeThreadParams,
+        preparation: Option<codex_thread_store::ThreadStoreResumePreparation>,
+    ) -> codex_thread_store::ThreadStoreFuture<
+        '_,
+        (Arc<Vec<RolloutItem>>, codex_thread_store::ThreadWriterOwner),
+    > {
+        self.inner.resume_thread_owned(params, preparation)
+    }
+    fn finish_thread_owned(
+        &self,
+        thread: ThreadId,
+        owner: codex_thread_store::ThreadWriterOwner,
+        discard: bool,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.finish_thread_owned(thread, owner, discard)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

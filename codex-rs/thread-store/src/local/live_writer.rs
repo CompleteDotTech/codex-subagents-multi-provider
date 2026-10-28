@@ -26,22 +26,59 @@ const ROLLOUT_SIZE_BYTES_METRIC: &str = "codex.rollout.size_bytes";
 pub(super) async fn create_thread(
     store: &LocalThreadStore,
     params: CreateThreadParams,
-) -> ThreadStoreResult<()> {
+    exclusive: bool,
+) -> ThreadStoreResult<crate::ThreadWriterOwner> {
     let thread_id = params.thread_id;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let history_mode = params.history_mode;
     store.ensure_live_recorder_absent(thread_id).await?;
     let writer_lock = store.acquire_writer_lock(thread_id)?;
+    // Fresh acquisition must not claim a saved runtime. Holding both writer
+    // locks makes exact provisional removal safe without an ID-only delete.
+    if exclusive
+        && (super::thread_rollout_resolver::resolve_current_including_archived(store, thread_id)
+            .await?
+            .is_some()
+            || if let Some(state) = &store.state_db {
+                state
+                    .get_thread(thread_id)
+                    .await
+                    .map_err(|error| ThreadStoreError::Internal {
+                        message: error.to_string(),
+                    })?
+                    .is_some()
+                    || state
+                        .read_native_authority_epoch(thread_id)
+                        .await
+                        .map_err(|error| ThreadStoreError::Internal {
+                            message: error.to_string(),
+                        })?
+                        .is_some()
+            } else {
+                false
+            })
+    {
+        return Err(ThreadStoreError::Conflict {
+            message: "fresh thread identity already has saved history".into(),
+        });
+    }
     let recorder = create_thread::create_thread(store, params, writer_lock.clone()).await?;
     store
-        .insert_live_recorder(thread_id, recorder, thread_id, history_mode, writer_lock)
+        .insert_live_recorder(
+            thread_id,
+            recorder,
+            thread_id,
+            history_mode,
+            writer_lock,
+            exclusive,
+        )
         .await
 }
 
 pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
-) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
+) -> ThreadStoreResult<(Arc<Vec<RolloutItem>>, crate::ThreadWriterOwner)> {
     let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
     let writer_lock = store.acquire_writer_lock(params.thread_id)?;
@@ -124,18 +161,97 @@ pub(super) async fn resume_thread(
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to resume local thread recorder: {err}"),
     })?;
-    store
+    let owner = store
         .insert_live_recorder(
             params.thread_id,
             recorder,
             rollout_id,
             history_mode,
             writer_lock,
+            false,
         )
         .await?;
-    Ok(history)
+    Ok((history, owner))
 }
 
+/// Exact acquisition identity is compared before touching pending metadata or
+/// the current writer. The lock remains held until the old writer has exited.
+pub(super) async fn finish_thread_owned(
+    store: &LocalThreadStore,
+    thread: ThreadId,
+    owner: crate::ThreadWriterOwner,
+    discard: bool,
+) -> ThreadStoreResult<()> {
+    let mut pending = store.pending_thread_metadata.lock(thread).await;
+    let _writer = store.live_writer_locks.lock(thread).await;
+    let (recorder, rollout_id, mode, fresh, stopped, generation, _os_writer) = {
+        let recorders = store.live_recorders.lock().await;
+        let Some(entry) = recorders
+            .get(&thread)
+            .filter(|entry| entry.owner.matches(&owner))
+        else {
+            return Ok(());
+        };
+        (
+            entry.recorder.clone(),
+            entry.rollout_id,
+            entry.history_mode,
+            entry.fresh,
+            entry.stopped,
+            entry.authority_generation,
+            entry.writer_lock.clone(),
+        )
+    };
+    let delete_fresh = discard && fresh && owner.is_provisional();
+    let path = recorder.rollout_path().to_path_buf();
+    if !stopped {
+        if discard {
+            recorder.discard().await.map_err(thread_store_io_error)?;
+        } else {
+            recorder.shutdown().await.map_err(thread_store_io_error)?;
+        }
+        if let Some(entry) = store.live_recorders.lock().await.get_mut(&thread) {
+            entry.stopped = true;
+        }
+    }
+    if delete_fresh {
+        if let Some(state) = &store.state_db {
+            let removed = state
+                .discard_provisional_thread_if_current(thread, &path, generation)
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: error.to_string(),
+                })?;
+            if !removed {
+                return Err(ThreadStoreError::Conflict {
+                    message: "provisional metadata ownership changed".into(),
+                });
+            }
+        }
+        super::thread_history::delete_thread(store, rollout_id).await?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(thread_store_io_error(error)),
+        }
+        if pending.take().is_some() {
+            store.pending_thread_metadata.remove(thread).await;
+        }
+    } else if !discard {
+        if mode == ThreadHistoryMode::Paginated {
+            super::thread_history_materialization::materialize_to_sqlite(store, rollout_id, &path)
+                .await?;
+        }
+        sync_materialized_rollout_path(store, thread, &path).await?;
+    }
+    if discard && fresh && !delete_fresh && pending.take().is_some() {
+        store.pending_thread_metadata.remove(thread).await;
+    }
+    // Leave the stopped owned entry in place on any failure so exact cleanup is
+    // retryable and no replacement can acquire the writer while cleanup is partial.
+    store.live_recorders.lock().await.remove(&thread);
+    Ok(())
+}
 #[tracing::instrument(
     level = "trace",
     skip_all,
