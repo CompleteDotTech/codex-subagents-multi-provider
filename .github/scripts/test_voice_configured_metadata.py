@@ -142,10 +142,21 @@ def packages():
                 "outputs": [exe, receipt] + dlls,
             }
         )
-    records[m.LABELS[0]]["default"]["executable"] = records[m.LABELS[2]][
-        "voice_package"
-    ]["executable"]
+    # Native alias delegates the complete actual package provider payload.
+    records[m.LABELS[0]] = copy.deepcopy(records[m.LABELS[2]])
     return list(records.values()), actions
+
+
+def configured_packages():
+    records, actions = packages()
+    return [
+        dict(record, requested_label=requested)
+        for requested, record in zip(m.LABELS, records)
+    ], actions
+
+
+def parsed_record(record):
+    return dict(record, requested_label=record["label"])
 
 
 class ParsingTests(unittest.TestCase):
@@ -170,7 +181,7 @@ class ParsingTests(unittest.TestCase):
     def test_provider_sentinel_exactly_once_and_correct_identity(self):
         record = packages()[0][0]
         text = m.SENTINEL + json.dumps(record) + "\nINFO: done"
-        self.assertEqual(m.parse_provider(text, record["label"]), record)
+        self.assertEqual(m.parse_provider(text, record["label"]), parsed_record(record))
         for wrong in (
             text + "\n" + text,
             "ERROR: failed\n" + text,
@@ -190,7 +201,9 @@ class ParsingTests(unittest.TestCase):
                     "INFO: done",
                 )
             )
-            self.assertEqual(m.parse_provider(text, record["label"]), record)
+            self.assertEqual(
+                m.parse_provider(text, record["label"]), parsed_record(record)
+            )
 
     def test_exact_extraction_line_frames_action_json(self):
         value = graph()
@@ -261,24 +274,24 @@ class ProviderLabelMismatchTests(unittest.TestCase):
         self.assertEqual(vars(caught.exception), {"kind": kind})
         self.assertEqual(caught.exception.args, ("Provider label mismatch",))
 
-    def test_all_requested_apparent_positive_and_canonical_still_rejected(self):
-        for label in m.LABELS:
-            with self.subTest(label=label):
-                self.assertEqual(
-                    m.provider_label_mismatch_kind(label, label), "expected-apparent"
-                )
-                record = copy.deepcopy(packages()[0][0])
-                record["label"] = label
-                self.assertEqual(
-                    m.parse_provider(m.SENTINEL + json.dumps(record), label), record
-                )
-                self.assert_mismatch("@@" + label, label, "requested-canonical")
+    def test_all_requested_queries_accept_only_selected_apparent_and_canonical(self):
+        for requested in m.LABELS:
+            selected = m.LABELS[2] if requested == m.LABELS[0] else requested
+            for observed in (selected, "@@" + selected):
+                with self.subTest(requested=requested, observed=observed):
+                    record = copy.deepcopy(packages()[0][0])
+                    record["label"] = observed
+                    parsed = m.parse_provider(
+                        m.SENTINEL + json.dumps(record), requested
+                    )
+                    self.assertEqual(parsed, dict(record, requested_label=requested))
+                    self.assertEqual(
+                        m.configured_main_identity(requested, observed), selected
+                    )
 
-    def test_only_source_fixed_native_alias_forms_are_classified_and_rejected(self):
-        self.assert_mismatch(m.LABELS[2], m.LABELS[0], "approved-alias-apparent")
-        self.assert_mismatch(
-            "@@" + m.LABELS[2], m.LABELS[0], "approved-alias-canonical"
-        )
+    def test_alias_requested_spelling_and_raw_fallback_stay_rejected(self):
+        self.assert_mismatch(m.LABELS[0], m.LABELS[0], "expected-apparent")
+        self.assert_mismatch("@@" + m.LABELS[0], m.LABELS[0], "requested-canonical")
         self.assert_mismatch(m.LABELS[1], m.LABELS[0], "unrecognized")
         for expected in m.LABELS[1:]:
             for observed in (m.LABELS[0], "@@" + m.LABELS[0]):
@@ -331,6 +344,196 @@ class ProviderLabelMismatchTests(unittest.TestCase):
                 self.assertEqual(str(error), "Provider label mismatch")
 
 
+class ConfiguredProviderIdentityTests(unittest.TestCase):
+    def test_formatter_cannot_supply_driver_requested_identity(self):
+        record = copy.deepcopy(packages()[0][2])
+        for spoof in (m.LABELS[2], m.LABELS[0], None):
+            record["requested_label"] = spoof
+            with (
+                self.subTest(spoof=spoof),
+                self.assertRaisesRegex(
+                    m.EvidenceError, "^Reserved provider query identity$"
+                ),
+            ):
+                m.parse_provider(m.SENTINEL + json.dumps(record), m.LABELS[2])
+
+    def test_identity_helper_rejects_unknown_requests_and_exact_type_spoofs(self):
+        class StringSubclass(str):
+            pass
+
+        for requested, observed in (
+            ("//PRIVATE:unknown", "//PRIVATE:unknown"),
+            (None, m.LABELS[2]),
+            (StringSubclass(m.LABELS[0]), m.LABELS[2]),
+            (m.LABELS[0], StringSubclass(m.LABELS[2])),
+            (m.LABELS[0], "@@" + m.LABELS[1]),
+        ):
+            with (
+                self.subTest(requested_type=type(requested)),
+                self.assertRaises(m.ProviderLabelMismatch),
+            ):
+                m.configured_main_identity(requested, observed)
+
+    def test_sanitized_records_preserve_distinct_requests_and_observed_labels(self):
+        records, actions = configured_packages()
+        for record in records:
+            record["label"] = "@@" + record["label"]
+        self.assertEqual(records[0]["label"], records[2]["label"])
+        self.assertNotEqual(
+            records[0]["requested_label"], records[2]["requested_label"]
+        )
+        self.assertEqual(len(m.package_proof(records, actions)), 2)
+        sanitized = [m.sanitize_provider(record) for record in records]
+        self.assertEqual([r["requested_label"] for r in sanitized], list(m.LABELS))
+        self.assertEqual([r["label"] for r in sanitized], [r["label"] for r in records])
+        self.assertEqual(
+            m.PROVIDER_IDENTITY_SCHEMA, "voice-configured-provider-identities-v1"
+        )
+        for field, value in (
+            ("requested_label", "//PRIVATE:unknown"),
+            ("label", "@@external+" + m.LABELS[2]),
+        ):
+            invalid = dict(records[0], **{field: value})
+            with self.subTest(field=field), self.assertRaises(m.ProviderLabelMismatch):
+                m.sanitize_provider(invalid)
+
+    def test_provider_query_set_cannot_collapse_duplicate_missing_or_extra_requests(
+        self,
+    ):
+        records, actions = configured_packages()
+        for invalid in (
+            records[:-1],
+            records + [copy.deepcopy(records[0])],
+            records[:-1] + [copy.deepcopy(records[0])],
+        ):
+            with self.subTest(count=len(invalid)), self.assertRaises(m.EvidenceError):
+                m.package_proof(invalid, actions)
+        for field, value in (
+            ("requested_label", "//PRIVATE:unknown"),
+            ("label", "@@external+" + m.LABELS[2]),
+            ("label", m.LABELS[0]),
+            ("label", m.LABELS[1]),
+        ):
+            invalid = copy.deepcopy(records)
+            invalid[0][field] = value
+            with (
+                self.subTest(field=field, value=value),
+                self.assertRaises(m.EvidenceError),
+            ):
+                m.package_proof(invalid, actions)
+
+    def test_alias_full_raw_provider_payload_must_match_before_redaction(self):
+        records, actions = configured_packages()
+        for mutate in (
+            lambda r: r[0]["provider_keys"].append("OtherProvider"),
+            lambda r: r[0]["default"].update(executable="other.exe"),
+            lambda r: r[0].update(output_groups={"other": ["private"]}),
+            lambda r: r[0].update(run_environment={"environment": {"PATH": "private"}}),
+            lambda r: r[0].update(
+                crate_info={
+                    "fields": [],
+                    "selected": {"rustc_env": {"PRIVATE": "different"}},
+                }
+            ),
+        ):
+            invalid = copy.deepcopy(records)
+            mutate(invalid)
+            with (
+                self.subTest(mutation=mutate),
+                self.assertRaisesRegex(
+                    m.EvidenceError, "^Public alias provider payload mismatch$"
+                ),
+            ):
+                m.package_proof(invalid, actions)
+
+    def test_alias_private_nested_field_types_cannot_compare_equal_by_coercion(self):
+        for left, right in ((True, 1), (1, 1.0), ({"x": [False]}, {"x": [0]})):
+            records, actions = configured_packages()
+            for index, value in ((0, left), (2, right)):
+                records[index]["crate_info"] = {
+                    "fields": ["selected"],
+                    "selected": {"private_nested": value},
+                }
+            with self.subTest(left_type=type(left), right_type=type(right)):
+                self.assertFalse(m.same_json_types_and_values(left, right))
+                with self.assertRaisesRegex(
+                    m.EvidenceError, "^Public alias provider payload mismatch$"
+                ):
+                    m.package_proof(records, actions)
+        records, actions = configured_packages()
+        for index in (0, 2):
+            records[index]["crate_info"] = {
+                "fields": ["rustc_env"],
+                "selected": {"rustc_env": {"PATH": "private-value"}},
+            }
+        self.assertEqual(len(m.package_proof(records, actions)), 2)
+        self.assertNotIn("private-value", json.dumps(m.sanitize_provider(records[0])))
+        records[0]["crate_info"]["selected"]["rustc_env"]["PATH"] = (
+            "other-private-value"
+        )
+        with self.assertRaisesRegex(
+            m.EvidenceError, "^Public alias provider payload mismatch$"
+        ):
+            m.package_proof(records, actions)
+
+    def test_canonical_provider_labels_join_only_exact_apparent_package_owners(self):
+        records, actions = configured_packages()
+        for record in records:
+            record["label"] = "@@" + record["label"]
+        proof = m.package_proof(records, actions)
+        self.assertEqual([p["package"] for p in proof], [m.LABELS[2], m.LABELS[4]])
+        self.assertEqual([p["raw"] for p in proof], [m.LABELS[1], m.LABELS[3]])
+        for owner in ("@@" + m.LABELS[2], "@@external+" + m.LABELS[2], m.LABELS[1]):
+            invalid = copy.deepcopy(actions)
+            invalid[0]["owner"] = owner
+            with (
+                self.subTest(owner=owner),
+                self.assertRaisesRegex(
+                    m.EvidenceError, "^Package action owner mismatch$"
+                ),
+            ):
+                m.package_proof(records, invalid)
+
+    def test_graph_resolves_apparent_action_owners_without_global_label_rewrite(self):
+        records, actions = configured_packages()
+        raw = {
+            "artifacts": [],
+            "actions": [],
+            "targets": [],
+            "ruleClasses": [{"id": 1, "name": "fixture"}],
+            "pathFragments": [],
+            "depSetOfFiles": [],
+        }
+        for index, action in enumerate(actions, 1):
+            raw["targets"].append(
+                {"id": index, "label": action["owner"], "ruleClassId": 1}
+            )
+            ids = []
+            for path in action["inputs"] + action["outputs"]:
+                key = len(raw["artifacts"]) + 1
+                raw["pathFragments"].append({"id": key, "label": path})
+                raw["artifacts"].append({"id": key, "pathFragmentId": key})
+                ids.append(key)
+            raw["depSetOfFiles"].append({"id": index, "directArtifactIds": ids[:1]})
+            raw["actions"].append(
+                {
+                    "targetId": index,
+                    "mnemonic": "VoiceExecutablePackage",
+                    "inputDepSetIds": [index],
+                    "outputIds": ids[1:],
+                }
+            )
+        raw["targets"].append(
+            {"id": 99, "label": "@@external+//fixture:dependency", "ruleClassId": 1}
+        )
+        sanitized, resolved = m.graph_metadata(raw)
+        self.assertEqual(sanitized["targets"], raw["targets"])
+        self.assertEqual(resolved, actions)
+        for record in records:
+            record["label"] = "@@" + record["label"]
+        self.assertEqual(len(m.package_proof(records, resolved)), 2)
+
+
 class ActualWrapperFramingTests(unittest.TestCase):
     def keyless_wrapper_stderr(self, query):
         env = {"CODEX_BAZEL_BIN": "fixture-bazel"}
@@ -368,7 +571,7 @@ class ActualWrapperFramingTests(unittest.TestCase):
     def test_real_keyless_wrapper_line_frames_provider_record(self):
         record = packages()[0][0]
         text = self.keyless_wrapper_stderr("cquery") + m.SENTINEL + json.dumps(record)
-        self.assertEqual(m.parse_provider(text, record["label"]), record)
+        self.assertEqual(m.parse_provider(text, record["label"]), parsed_record(record))
 
     def test_real_keyless_wrapper_line_frames_action_json(self):
         value = graph()
@@ -444,7 +647,9 @@ class JVMWarningFramingTests(unittest.TestCase):
         for separator in ("\n", "\r\n"):
             with self.subTest(separator=separator):
                 text = self.frame(m.SENTINEL + json.dumps(record), separator)
-                self.assertEqual(m.parse_provider(text, record["label"]), record)
+                self.assertEqual(
+                    m.parse_provider(text, record["label"]), parsed_record(record)
+                )
 
     def test_observed_fixed_jvm_warning_frames_action_json(self):
         value = graph()
@@ -521,7 +726,8 @@ class BazeliskDownloadFramingTests(unittest.TestCase):
                             (line, payload) if before else (payload, line)
                         )
                         self.assertEqual(
-                            m.parse_provider(text, record["label"]), record
+                            m.parse_provider(text, record["label"]),
+                            parsed_record(record),
                         )
 
     def test_known_official_download_frames_action_json(self):
@@ -895,7 +1101,7 @@ class RejectedLineShapeTests(unittest.TestCase):
     def run_main_rejection(
         self, provider, *, source_changed=False, deadline_expired=False, line=None
     ):
-        records = {p["label"]: p for p in packages()[0]}
+        records = dict(zip(m.LABELS, packages()[0]))
         captured, statuses, rejected = [], [], []
         secret_line = (
             "    Fetching https://PRIVATE.invalid/?token=SECRET"
@@ -1111,8 +1317,8 @@ class GraphTests(unittest.TestCase):
     def test_provider_environment_values_are_private_and_equalities_use_raw_values(
         self,
     ):
-        records, actions = packages()
-        for record in records[1:3]:
+        records, actions = configured_packages()
+        for record in records[:3]:
             record["run_environment"] = {
                 "environment": {"PATH": "private-path"},
                 "inherited_environment_names": [],
@@ -1148,7 +1354,7 @@ class GraphTests(unittest.TestCase):
                 m.graph_metadata(value)
 
     def test_package_counts_bind_to_actual_provider_paths(self):
-        records, actions = packages()
+        records, actions = configured_packages()
         self.assertEqual(len(m.package_proof(records, actions)), 2)
         for mutate in (
             lambda r, a: a.append(copy.deepcopy(a[0])),
@@ -1597,7 +1803,7 @@ class QueryBudgetTests(unittest.TestCase):
         self.assertEqual(m.OWNED_CLEANUP_RESERVE_SECONDS, 15)
 
     def run_deadline_failure(self, clock, expected, expected_captures):
-        records = {p["label"]: p for p in packages()[0]}
+        records = dict(zip(m.LABELS, packages()[0]))
 
         def capture(
             command,
@@ -2005,7 +2211,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(list((root / "private").iterdir()), [])
 
     def test_main_emits_batch_queries_with_absolute_shell_and_unique_private_root(self):
-        records = {p["label"]: p for p in packages()[0]}
+        records = dict(zip(m.LABELS, packages()[0]))
         seen = []
 
         def capture(
@@ -2509,7 +2715,7 @@ class ProvenanceStatusTests(unittest.TestCase):
     def main_fixture(
         self, stderr, *, both_fail=False, status_failure=None, reader_closed=True
     ):
-        records = {record["label"]: record for record in packages()[0]}
+        records = dict(zip(m.LABELS, packages()[0]))
 
         def capture(
             command,
@@ -2617,6 +2823,15 @@ class ProvenanceStatusTests(unittest.TestCase):
         manifest = self.main_fixture(b"SECOND_PRIVATE_UNKNOWN", both_fail=True)
         self.assertEqual(manifest["rejected_stage"], "query-stdout-validation")
         self.assertEqual(manifest["rejected_stream"], "stdout")
+
+    def test_main_declares_additive_provider_identity_schema_even_on_failure(self):
+        manifest = self.main_fixture(b"PRIVATE_UNKNOWN_STDERR")
+        self.assertEqual(
+            manifest["provider_identity_schema"],
+            "voice-configured-provider-identities-v1",
+        )
+        self.assertEqual(manifest["status"], "failed")
+        self.assertNotIn("artifacts", manifest)
 
     def test_main_emits_only_finite_label_mismatch_kind_and_still_fails(self):
         for observed, kind in (

@@ -5,6 +5,11 @@ JSON goes in upload/. Environment values are removed, including PATH/MSVC paths;
 artifact paths, action arguments, param-file arguments and depsets remain intact.
 Unknown schema/environment names fail closed. Bazel schema: 9.2.0
 src/main/protobuf/analysis_v2.proto. This is not compiler/lint/runtime proof.
+
+Provider identity schema voice-configured-provider-identities-v1 adds driver-owned
+requested_label to providers.json records; label retains the exact observed
+configured label. Package-proof package/raw use checked apparent main identities.
+Alias and direct-package requests remain separate even when labels coincide.
 """
 
 from __future__ import annotations
@@ -49,6 +54,11 @@ NAMES = (
     "voice-host-installed_client-test",
 )
 LABELS = tuple(PREFIX + x for x in NAMES)
+# Driver query identities remain distinct when the native alias selects row2.
+SELECTED_MAIN_LABELS = {
+    label: LABELS[2] if i == 0 else label for i, label in enumerate(LABELS)
+}
+PROVIDER_IDENTITY_SCHEMA = "voice-configured-provider-identities-v1"
 QUERY = (
     "deps(set("
     + " ".join(
@@ -107,6 +117,30 @@ class ProviderLabelMismatch(EvidenceError):
     def __init__(self, observed, expected):
         super().__init__("Provider label mismatch")
         self.kind = provider_label_mismatch_kind(observed, expected)
+
+
+def configured_main_identity(requested, observed):
+    """Join only the closed source-proven native-MSVC main-repository pairs."""
+    if type(requested) is str and type(observed) is str and requested in LABELS:
+        selected = SELECTED_MAIN_LABELS[requested]
+        if observed in (selected, "@@" + selected):
+            return selected
+    raise ProviderLabelMismatch(observed, requested)
+
+
+def same_json_types_and_values(left, right):
+    """Compare raw provider payloads without bool/int or int/float coercion."""
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return left.keys() == right.keys() and all(
+            same_json_types_and_values(left[key], right[key]) for key in left
+        )
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            same_json_types_and_values(a, b) for a, b in zip(left, right)
+        )
+    return type(left) in (str, int, float, bool, type(None)) and left == right
 
 
 class RejectedWrapperLine(EvidenceError):
@@ -250,8 +284,8 @@ def parse_provider(text, label):
         record = json.loads(records[0], object_pairs_hook=unique_object)
     except ValueError:
         raise EvidenceError("Malformed provider record") from None
-    if record.get("label") != label:
-        raise ProviderLabelMismatch(record.get("label"), label)
+    require("requested_label" not in record, "Reserved provider query identity")
+    configured_main_identity(label, record.get("label"))
     require(isinstance(record.get("provider_keys"), list), "Missing provider keys")
     require("default" in record, "Missing DefaultInfo")
     require(
@@ -259,7 +293,7 @@ def parse_provider(text, label):
         == {"files", "executable", "default_runfiles", "data_runfiles"},
         "Unknown DefaultInfo shape",
     )
-    return record
+    return {**record, "requested_label": label}
 
 
 def env_allowed(name):
@@ -298,9 +332,11 @@ def safe_arguments(args):
 
 
 def sanitize_provider(raw):
+    configured_main_identity(raw.get("requested_label"), raw.get("label"))
     result = copy.deepcopy(raw)
     known = {
         "label",
+        "requested_label",
         "provider_keys",
         "default",
         "run_environment",
@@ -486,7 +522,38 @@ def graph_metadata(raw):
 
 
 def package_proof(providers, actions):
-    by_label = {p["label"]: p for p in providers}
+    require(
+        type(providers) is list and len(providers) == len(LABELS),
+        "Expected seven provider queries",
+    )
+    by_label, identities = {}, {}
+    for provider in providers:
+        require(type(provider) is dict, "Unknown provider query shape")
+        requested = provider.get("requested_label")
+        identity = configured_main_identity(requested, provider.get("label"))
+        require(requested not in by_label, "Duplicate provider query identity")
+        by_label[requested] = provider
+        identities[requested] = identity
+    require(set(by_label) == set(LABELS), "Missing provider query identity")
+    public_provider, package_provider = by_label[LABELS[0]], by_label[LABELS[2]]
+    require(
+        identities[LABELS[0]] == identities[LABELS[2]], "Public alias target mismatch"
+    )
+    require(
+        same_json_types_and_values(
+            {
+                k: v
+                for k, v in public_provider.items()
+                if k not in ("label", "requested_label")
+            },
+            {
+                k: v
+                for k, v in package_provider.items()
+                if k not in ("label", "requested_label")
+            },
+        ),
+        "Public alias provider payload mismatch",
+    )
     copies = [a for a in actions if a["mnemonic"] == "VoiceExecutablePackage"]
     require(len(copies) == 2, "Expected exactly two package actions")
     proofs = []
@@ -518,7 +585,7 @@ def package_proof(providers, actions):
                 "Missing packaged runfiles",
             )
             require(set(raw["default"][kind]) <= set(d[kind]), "Lost upstream runfiles")
-        owned = [a for a in copies if a["owner"] == package["label"]]
+        owned = [a for a in copies if a["owner"] == identities[PREFIX + package_name]]
         require(len(owned) == 1, "Package action owner mismatch")
         require(
             len(owned[0]["outputs"]) == 27
@@ -539,8 +606,8 @@ def package_proof(providers, actions):
         )
         proofs.append(
             {
-                "package": package["label"],
-                "raw": raw["label"],
+                "package": identities[PREFIX + package_name],
+                "raw": identities[PREFIX + raw_name],
                 "output_count": 27,
                 "output_groups_equal": True,
                 "run_environment_equal_including_private_values": True,
@@ -1279,6 +1346,9 @@ def main():
         "phases": [],
         "source_sha256": hashes,
         "status": "failed",
+        # providers.json adds driver-owned requested_label; label is unmodified
+        # configured output. Proof/action identities use Java's apparent form.
+        "provider_identity_schema": PROVIDER_IDENTITY_SCHEMA,
         "provider_semantics": "unknown until actual hosted provider keys and fields are reviewed",
         "unexecuted_gates": [
             "compiler identity",
