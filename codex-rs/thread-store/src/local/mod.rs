@@ -1049,6 +1049,8 @@ mod tests {
     mod acquisition_tests;
     #[path = "delegated_preview_tests.rs"]
     mod delegated_preview_tests;
+    #[path = "owned_write_tests.rs"]
+    mod owned_write_tests;
     use std::sync::Arc;
 
     use codex_protocol::ThreadId;
