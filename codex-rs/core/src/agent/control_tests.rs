@@ -11631,6 +11631,7 @@ stream_idle_timeout_ms = 1000
     assert_eq!(parent.config_snapshot().await.model_provider_id, "a");
 
     assert!(parent.session_source.parent_thread_id().is_none());
+    let requests_before_prewarm = server.received_requests().await.unwrap().len();
     parent.prewarm().await;
     parent.prewarm_with_history().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -11641,9 +11642,25 @@ stream_idle_timeout_ms = 1000
     .await
     .expect("actual host-owned auth prewarm must still run the configured helper");
     assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "invoked");
+    let requests = server.received_requests().await.unwrap();
     assert!(
-        server.received_requests().await.unwrap().is_empty(),
-        "HTTP auth-only warmup sends no model request"
+        requests.is_empty(),
+        "HTTP auth-only warmup sends no model request; before_prewarm_count={}, final_count={}, first_method_paths={:?}",
+        requests_before_prewarm,
+        requests.len(),
+        requests
+            .iter()
+            .take(8)
+            .map(|request| (
+                request
+                    .method
+                    .to_string()
+                    .chars()
+                    .take(16)
+                    .collect::<String>(),
+                request.url.path().chars().take(128).collect::<String>(),
+            ))
+            .collect::<Vec<_>>()
     );
     parent.shutdown_and_wait().await.unwrap();
     harness.manager.remove_thread(&parent_id).await;
