@@ -503,6 +503,54 @@ impl Default for AppServerRuntimeOptions {
     }
 }
 
+// Explicit worktree-test opt-in only; never configuration, paths or identifiers.
+const DAEMON_READINESS_DIAGNOSTIC_ENV: &str = "CODEX_INTERNAL_TEST_DAEMON_READINESS_STAGES";
+
+#[derive(Clone, Copy)]
+enum DaemonReadinessStage {
+    InstallationIdBefore,
+    InstallationIdAfter,
+    TransportBindBefore,
+    TransportBindAfter,
+}
+
+impl DaemonReadinessStage {
+    fn line(self) -> &'static [u8] {
+        match self {
+            Self::InstallationIdBefore => b"CODEX_DAEMON_READINESS stage=installation-id-before\n",
+            Self::InstallationIdAfter => b"CODEX_DAEMON_READINESS stage=installation-id-after\n",
+            Self::TransportBindBefore => b"CODEX_DAEMON_READINESS stage=transport-bind-before\n",
+            Self::TransportBindAfter => b"CODEX_DAEMON_READINESS stage=transport-bind-after\n",
+        }
+    }
+}
+
+fn daemon_readiness_diagnostic_enabled(value: Option<&std::ffi::OsStr>, managed: bool) -> bool {
+    managed && value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn write_daemon_readiness_stage(
+    writer: &mut impl Write,
+    enabled: bool,
+    stage: DaemonReadinessStage,
+) {
+    if enabled {
+        // One bounded fixed line; diagnostic write errors never affect startup.
+        let _ = writer.write(stage.line());
+    }
+}
+
+fn emit_daemon_readiness_stage(managed: bool, stage: DaemonReadinessStage) {
+    let enabled = daemon_readiness_diagnostic_enabled(
+        std::env::var_os(DAEMON_READINESS_DIAGNOSTIC_ENV).as_deref(),
+        managed,
+    );
+    if !enabled {
+        return;
+    }
+    write_daemon_readiness_stage(&mut std::io::stderr(), enabled, stage);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_main_with_transport_options(
     arg0_paths: Arg0DispatchPaths,
@@ -798,7 +846,9 @@ pub async fn run_main_with_transport_options(
             "remote control is disabled by managed requirements",
         ));
     }
+    emit_daemon_readiness_stage(managed_daemon, DaemonReadinessStage::InstallationIdBefore);
     let installation_id = resolve_installation_id(&config.codex_home).await?;
+    emit_daemon_readiness_stage(managed_daemon, DaemonReadinessStage::InstallationIdAfter);
     let transport_shutdown_token = CancellationToken::new();
     // Remote enrollment must cancel before RPC drain without shutting down telemetry.
     let remote_control_shutdown_token = transport_shutdown_token.child_token();
@@ -830,6 +880,7 @@ pub async fn run_main_with_transport_options(
             transport_accept_handles.push(handle);
         }
         AppServerTransport::UnixSocket { socket_path } => {
+            emit_daemon_readiness_stage(managed_daemon, DaemonReadinessStage::TransportBindBefore);
             let accept_handle = start_control_socket_acceptor(
                 socket_path.clone(),
                 transport_event_tx.clone(),
@@ -845,6 +896,7 @@ pub async fn run_main_with_transport_options(
                 websocket_compression,
             )
             .await?;
+            emit_daemon_readiness_stage(managed_daemon, DaemonReadinessStage::TransportBindAfter);
             transport_accept_handles.push(accept_handle);
         }
         AppServerTransport::WebSocket { bind_address } => {
@@ -1656,5 +1708,77 @@ mod tests {
             loader_overrides.user_config_path,
             Some(AbsolutePathBuf::from_absolute_path(path).expect("absolute test path"))
         );
+    }
+}
+
+#[cfg(test)]
+mod daemon_readiness_diagnostic_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn gate_requires_exact_opt_in_without_echoing_values() {
+        for value in [
+            None,
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+            Some(OsStr::new("SECRET")),
+        ] {
+            assert!(!daemon_readiness_diagnostic_enabled(
+                value, /*managed*/ true
+            ));
+        }
+        let value = Some(OsStr::new("1"));
+        assert!(daemon_readiness_diagnostic_enabled(
+            value, /*managed*/ true
+        ));
+        assert!(!daemon_readiness_diagnostic_enabled(
+            value, /*managed*/ false
+        ));
+    }
+
+    #[test]
+    fn fixed_marker_is_bounded_and_write_failure_is_ignored_without_retry() {
+        struct RefusingWriter {
+            calls: usize,
+        }
+        impl std::io::Write for RefusingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                assert!(bytes.len() < 96);
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("diagnostics must not flush or wait")
+            }
+        }
+        let stages = [
+            DaemonReadinessStage::InstallationIdBefore,
+            DaemonReadinessStage::InstallationIdAfter,
+            DaemonReadinessStage::TransportBindBefore,
+            DaemonReadinessStage::TransportBindAfter,
+        ];
+        for stage in stages {
+            let mut output = Vec::new();
+            write_daemon_readiness_stage(&mut output, /*enabled*/ true, stage);
+            assert_eq!(output, stage.line());
+            assert!(output.is_ascii());
+            assert!(output.len() < 96);
+            assert!(output.starts_with(b"CODEX_DAEMON_READINESS stage="));
+            assert!(!output.contains(&b'/') && !output.contains(&b'\\'));
+        }
+        let mut writer = RefusingWriter { calls: 0 };
+        write_daemon_readiness_stage(
+            &mut writer,
+            /*enabled*/ false,
+            DaemonReadinessStage::InstallationIdBefore,
+        );
+        assert_eq!(writer.calls, 0);
+        write_daemon_readiness_stage(
+            &mut writer,
+            /*enabled*/ true,
+            DaemonReadinessStage::InstallationIdBefore,
+        );
+        assert_eq!(writer.calls, 1);
     }
 }

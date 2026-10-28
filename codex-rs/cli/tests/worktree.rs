@@ -268,6 +268,7 @@ trust_level = "trusted"
         "ZELLIJ",
         "ZELLIJ_SESSION_NAME",
         "ZELLIJ_VERSION",
+        "CODEX_INTERNAL_TEST_DAEMON_READINESS_STAGES",
     ] {
         env.remove(key);
     }
@@ -279,6 +280,10 @@ trust_level = "trusted"
         }
     }
     let _daemon = if backend == "daemon" {
+        env.insert(
+            "CODEX_INTERNAL_TEST_DAEMON_READINESS_STAGES".into(),
+            "1".into(),
+        );
         let bin = home.join("packages/app-server-daemon/current/bin");
         fs::create_dir_all(&bin)?;
         let managed = bin.join(if cfg!(windows) { "codex.exe" } else { "codex" });

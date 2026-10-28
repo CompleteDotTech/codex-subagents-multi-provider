@@ -37,6 +37,64 @@ const CONTROL_SOCKET_MODE: u32 = 0o600;
 const MAX_UNFRAGMENTED_MESSAGE_BYTES_HEADER: &str =
     "x-codex-websocket-max-unfragmented-message-bytes";
 
+const DAEMON_READINESS_DIAGNOSTIC_ENV: &str = "CODEX_INTERNAL_TEST_DAEMON_READINESS_STAGES";
+
+#[derive(Clone, Copy)]
+enum DaemonSocketReadinessStage {
+    #[cfg(unix)]
+    PhysicalLockBefore,
+    #[cfg(unix)]
+    PhysicalLockAfter,
+    SocketBindBefore,
+    SocketBindAfter,
+    #[cfg(unix)]
+    HomeAliasBefore,
+    #[cfg(unix)]
+    HomeAliasAfter,
+}
+
+impl DaemonSocketReadinessStage {
+    fn line(self) -> &'static [u8] {
+        match self {
+            #[cfg(unix)]
+            Self::PhysicalLockBefore => b"CODEX_DAEMON_READINESS stage=physical-lock-before\n",
+            #[cfg(unix)]
+            Self::PhysicalLockAfter => b"CODEX_DAEMON_READINESS stage=physical-lock-after\n",
+            Self::SocketBindBefore => b"CODEX_DAEMON_READINESS stage=socket-bind-before\n",
+            Self::SocketBindAfter => b"CODEX_DAEMON_READINESS stage=socket-bind-after\n",
+            #[cfg(unix)]
+            Self::HomeAliasBefore => b"CODEX_DAEMON_READINESS stage=home-alias-before\n",
+            #[cfg(unix)]
+            Self::HomeAliasAfter => b"CODEX_DAEMON_READINESS stage=home-alias-after\n",
+        }
+    }
+}
+
+fn daemon_readiness_diagnostic_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn write_daemon_socket_readiness_stage(
+    writer: &mut impl std::io::Write,
+    enabled: bool,
+    stage: DaemonSocketReadinessStage,
+) {
+    if enabled {
+        // One bounded fixed line; diagnostic write errors never affect binding.
+        let _ = writer.write(stage.line());
+    }
+}
+
+fn emit_daemon_socket_readiness_stage(stage: DaemonSocketReadinessStage) {
+    let enabled = daemon_readiness_diagnostic_enabled(
+        std::env::var_os(DAEMON_READINESS_DIAGNOSTIC_ENV).as_deref(),
+    );
+    if !enabled {
+        return;
+    }
+    write_daemon_socket_readiness_stage(&mut std::io::stderr(), enabled, stage);
+}
+
 #[derive(Clone, Copy)]
 pub enum DaemonShutdownAccess {
     Disabled,
@@ -100,10 +158,12 @@ pub async fn bind_private_daemon_socket(
         }
         codex_uds::prepare_shared_daemon_socket_directory()?;
         let physical_path = protected_socket_path(socket_path.as_path())?;
+        emit_daemon_socket_readiness_stage(DaemonSocketReadinessStage::PhysicalLockBefore);
         let lock = acquire_removable_app_server_startup_lock(
             AbsolutePathBuf::from_absolute_path_checked(physical_path.with_extension("lock"))?,
         )
         .await?;
+        emit_daemon_socket_readiness_stage(DaemonSocketReadinessStage::PhysicalLockAfter);
         prepare_control_socket_path(socket_path.as_path()).await?;
         (
             AbsolutePathBuf::from_absolute_path_checked(physical_path)?,
@@ -120,7 +180,9 @@ pub async fn bind_private_daemon_socket(
         (AbsolutePathBuf::from_absolute_path_checked(path)?, guard)
     };
     prepare_control_socket_path(socket_path.as_path()).await?;
+    emit_daemon_socket_readiness_stage(DaemonSocketReadinessStage::SocketBindBefore);
     let listener = UnixListener::bind(socket_path.as_path()).await?;
+    emit_daemon_socket_readiness_stage(DaemonSocketReadinessStage::SocketBindAfter);
     #[cfg(unix)]
     {
         startup_lock.remove_on_drop = true;
@@ -136,10 +198,14 @@ pub async fn bind_private_daemon_socket(
     };
     set_control_socket_permissions(socket_guard.socket_path.as_path()).await?;
     #[cfg(unix)]
-    std::os::unix::fs::symlink(
-        socket_guard.socket_path.as_path(),
-        socket_guard.rendezvous_path.as_path(),
-    )?;
+    {
+        emit_daemon_socket_readiness_stage(DaemonSocketReadinessStage::HomeAliasBefore);
+        std::os::unix::fs::symlink(
+            socket_guard.socket_path.as_path(),
+            socket_guard.rendezvous_path.as_path(),
+        )?;
+        emit_daemon_socket_readiness_stage(DaemonSocketReadinessStage::HomeAliasAfter);
+    }
     #[cfg(unix)]
     socket_guard._startup_lock._file.unlock()?;
     Ok((listener, socket_guard))
@@ -540,5 +606,76 @@ impl Drop for DaemonSocketFileGuard {
                 "failed to remove app-server control socket file"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_readiness_diagnostic_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn gate_requires_exact_opt_in_without_echoing_values() {
+        for value in [
+            None,
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+            Some(OsStr::new("SECRET")),
+        ] {
+            assert!(!daemon_readiness_diagnostic_enabled(value));
+        }
+        let value = Some(OsStr::new("1"));
+        assert!(daemon_readiness_diagnostic_enabled(value));
+    }
+
+    #[test]
+    fn fixed_marker_is_bounded_and_write_failure_is_ignored_without_retry() {
+        struct RefusingWriter {
+            calls: usize,
+        }
+        impl std::io::Write for RefusingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                assert!(bytes.len() < 96);
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("diagnostics must not flush or wait")
+            }
+        }
+        let stages = [
+            #[cfg(unix)]
+            DaemonSocketReadinessStage::PhysicalLockBefore,
+            #[cfg(unix)]
+            DaemonSocketReadinessStage::PhysicalLockAfter,
+            DaemonSocketReadinessStage::SocketBindBefore,
+            DaemonSocketReadinessStage::SocketBindAfter,
+            #[cfg(unix)]
+            DaemonSocketReadinessStage::HomeAliasBefore,
+            #[cfg(unix)]
+            DaemonSocketReadinessStage::HomeAliasAfter,
+        ];
+        for stage in stages {
+            let mut output = Vec::new();
+            write_daemon_socket_readiness_stage(&mut output, /*enabled*/ true, stage);
+            assert_eq!(output, stage.line());
+            assert!(output.is_ascii());
+            assert!(output.len() < 96);
+            assert!(output.starts_with(b"CODEX_DAEMON_READINESS stage="));
+            assert!(!output.contains(&b'/') && !output.contains(&b'\\'));
+        }
+        let mut writer = RefusingWriter { calls: 0 };
+        write_daemon_socket_readiness_stage(
+            &mut writer,
+            /*enabled*/ false,
+            DaemonSocketReadinessStage::SocketBindBefore,
+        );
+        assert_eq!(writer.calls, 0);
+        write_daemon_socket_readiness_stage(
+            &mut writer,
+            /*enabled*/ true,
+            DaemonSocketReadinessStage::SocketBindBefore,
+        );
+        assert_eq!(writer.calls, 1);
     }
 }
