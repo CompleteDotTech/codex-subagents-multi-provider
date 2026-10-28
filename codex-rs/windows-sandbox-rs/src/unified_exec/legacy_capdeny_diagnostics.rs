@@ -18,15 +18,11 @@ struct BDirectories {
 impl Drop for BDirectories {
     fn drop(&mut self) {
         if !self.cleanup_safe {
-            if let Some(root) = self.root.take() {
-                let _ = root.keep();
-            }
-            if let Some(home) = self.home.take() {
-                let _ = home.keep();
-            }
+            let retained_root = self.root.take().map(|directory| directory.keep());
+            let retained_home = self.home.take().map(|directory| directory.keep());
             let _ = writeln!(
                 std::io::stderr().lock(),
-                "LEGACY_CAPDENY incomplete_phase=true fixture_and_home_preserved=true no_further_arm=true"
+                "LEGACY_CAPDENY incomplete_phase=true fixture_and_home_preserved=true no_further_arm=true retained_root={retained_root:?} retained_home={retained_home:?}"
             );
         }
     }
