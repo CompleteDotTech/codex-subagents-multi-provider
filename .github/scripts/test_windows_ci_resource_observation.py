@@ -23,7 +23,98 @@ m = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(m)
 
 
+def ownership_fixture_timeout_summary(stderr):
+    """Retain only bounded fixed-stage/numeric observations, never raw errors."""
+    stages = {
+        "entered",
+        "mocks-ready",
+        "collector-call",
+        "collector-return",
+        "query-memory",
+        "query-pagefiles",
+        "query-settings",
+        "query-volume",
+        "query-process",
+        "vhd-test",
+        "vhd-item",
+    }
+    if isinstance(stderr, bytes):
+        stderr = stderr[-8192:].decode("utf-8", errors="replace")
+    elif isinstance(stderr, str):
+        stderr = stderr[-8192:]
+    else:
+        stderr = ""
+    observed = []
+    elapsed = None
+    version = None
+    for line in stderr.splitlines()[-64:]:
+        match = re.fullmatch(
+            r"OWNERSHIP_FIXTURE stage=([a-z-]+) elapsed_ms=([0-9]{1,5}) "
+            r"pwsh_major=([0-9]{1,3}) pwsh_minor=([0-9]{1,3})",
+            line,
+        )
+        if not match or match[1] not in stages:
+            continue
+        milliseconds, major, minor = map(int, match.group(2, 3, 4))
+        if milliseconds > 60000 or major > 100 or minor > 100:
+            continue
+        if not observed or observed[-1] != match[1]:
+            observed.append(match[1])
+        elapsed, version = milliseconds, [major, minor]
+    return "ownership-fixture-timeout " + json.dumps(
+        {"stages": observed[-16:], "elapsed_ms": elapsed, "pwsh_version": version},
+        separators=(",", ":"),
+    )
+
+
 class ObservationTests(unittest.TestCase):
+    def test_ownership_timeout_summary_retains_only_known_stage_and_numbers(self):
+        summary = ownership_fixture_timeout_summary(
+            b"SECRET endpoint/path\n"
+            b"OWNERSHIP_FIXTURE stage=entered elapsed_ms=0 pwsh_major=7 pwsh_minor=4\n"
+            b"OWNERSHIP_FIXTURE stage=collector-call elapsed_ms=120 pwsh_major=7 pwsh_minor=4\n"
+            b"SECRET token\n"
+        )
+        data = json.loads(summary.split(" ", 1)[1])
+        self.assertEqual(data["stages"], ["entered", "collector-call"])
+        self.assertEqual(data["elapsed_ms"], 120)
+        self.assertEqual(data["pwsh_version"], [7, 4])
+        self.assertNotIn("SECRET", summary)
+
+    def test_ownership_timeout_summary_missing_or_unrecognized_is_unknown(self):
+        for value in (
+            None,
+            "SECRET",
+            b"SECRET",
+            "OWNERSHIP_FIXTURE stage=secret-path elapsed_ms=1 pwsh_major=7 pwsh_minor=4",
+            "OWNERSHIP_FIXTURE stage=entered elapsed_ms=99999 pwsh_major=7 pwsh_minor=4",
+            "OWNERSHIP_FIXTURE stage=entered elapsed_ms=1 pwsh_major=999 pwsh_minor=4",
+        ):
+            with self.subTest(value=type(value).__name__):
+                self.assertEqual(
+                    json.loads(
+                        ownership_fixture_timeout_summary(value).split(" ", 1)[1]
+                    ),
+                    {"stages": [], "elapsed_ms": None, "pwsh_version": None},
+                )
+
+    def test_ownership_timeout_diagnostics_never_turn_timeout_into_success(self):
+        for stderr in (
+            b"SECRET\nOWNERSHIP_FIXTURE stage=entered elapsed_ms=0 pwsh_major=7 pwsh_minor=4\n",
+            b"SECRET unrecognized failure",
+        ):
+            error = subprocess.TimeoutExpired(["SECRET"], 10, stderr=stderr)
+            output = io.StringIO()
+            with (
+                patch.object(subprocess, "run", side_effect=error),
+                contextlib.redirect_stderr(output),
+                self.assertRaises(subprocess.TimeoutExpired) as raised,
+            ):
+                self.run_ownership_fixture()
+            self.assertIs(raised.exception, error)
+            self.assertIn("ownership-fixture-timeout ", output.getvalue())
+            self.assertNotIn("SECRET", output.getvalue())
+
     def test_scope_requires_every_gate_and_actual_windows(self):
         env = dict(
             GITHUB_REPOSITORY="CompleteDotTech/codex-subagents-multi-provider",
@@ -373,10 +464,27 @@ class ObservationTests(unittest.TestCase):
     ):
         script = Path(__file__).with_name("observe_windows_ci_resources.ps1").resolve()
         fixture = r"""
+$global:ownershipFixtureClock = [Diagnostics.Stopwatch]::StartNew()
+$global:ownershipFixtureStageCount = 0
+function global:Write-OwnershipFixtureStage {
+    param([string]$Stage)
+    if ($global:ownershipFixtureStageCount -ge 64 -and $Stage -ne 'collector-return') { return }
+    $global:ownershipFixtureStageCount++
+    $elapsed = [Math]::Min(60000, $global:ownershipFixtureClock.ElapsedMilliseconds)
+    [Console]::Error.WriteLine("OWNERSHIP_FIXTURE stage=$Stage elapsed_ms=$elapsed pwsh_major=$($PSVersionTable.PSVersion.Major) pwsh_minor=$($PSVersionTable.PSVersion.Minor)")
+}
+Write-OwnershipFixtureStage 'entered'
 $global:fixtureQueries = 0
 $global:fixtureCreated = [datetime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
 function global:Get-CimInstance {
     param($ClassName, $Filter, $OperationTimeoutSec, $ErrorAction)
+    switch ($ClassName) {
+        'Win32_PerfFormattedData_PerfOS_Memory' { Write-OwnershipFixtureStage 'query-memory' }
+        'Win32_PageFileUsage' { Write-OwnershipFixtureStage 'query-pagefiles' }
+        'Win32_PageFileSetting' { Write-OwnershipFixtureStage 'query-settings' }
+        'Win32_LogicalDisk' { Write-OwnershipFixtureStage 'query-volume' }
+        'Win32_Process' { Write-OwnershipFixtureStage 'query-process' }
+    }
     switch ($ClassName) {
         'Win32_PerfFormattedData_PerfOS_Memory' { [pscustomobject]@{ AvailableBytes=$null; CommittedBytes=200; CommitLimit=400; PercentCommittedBytesInUse=50 } }
         'Win32_PageFileUsage' { [pscustomobject]@{ Name='C:\pagefile.sys'; AllocatedBaseSize=$null; CurrentUsage=1; PeakUsage=2 } }
@@ -406,11 +514,13 @@ function global:Get-CimInstance {
 }
 function global:Test-Path {
     param($LiteralPath, $PathType)
+    Write-OwnershipFixtureStage 'vhd-test'
     if ($LiteralPath -ne $global:fixtureVhd) { throw 'unexpected VHD path' }
     return $true
 }
 function global:Get-Item {
     param($LiteralPath)
+    Write-OwnershipFixtureStage 'vhd-item'
     if ($LiteralPath -ne $global:fixtureVhd) { throw 'unexpected VHD path' }
     [pscustomobject]@{ Length=4096 }
 }
@@ -418,7 +528,10 @@ $env:RUNNER_TEMP = 'FIXTURE_ROOT'
 $global:fixtureVhd = Join-Path $env:RUNNER_TEMP 'codex-dev-drive.vhdx'
 $epoch = [datetime]::new(1601, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).Ticks
 $micro = [long](($global:fixtureCreated.Ticks - $epoch) / 10D) + OFFSET
+Write-OwnershipFixtureStage 'mocks-ready'
+Write-OwnershipFixtureStage 'collector-call'
 & $args[0] -OwnedPid 101 -CreationMicroseconds $micro
+Write-OwnershipFixtureStage 'collector-return'
 """
         # Keep Windows C: semantics there; Linux PowerShell needs a native
         # filesystem root for Join-Path and System.IO.Path root interpretation.
@@ -436,13 +549,17 @@ $micro = [long](($global:fixtureCreated.Ticks - $epoch) / 10D) + OFFSET
         with tempfile.TemporaryDirectory() as temp:
             runner = Path(temp) / "fixture.ps1"
             runner.write_text(fixture)
-            result = subprocess.run(
-                ["pwsh", "-NoProfile", "-File", str(runner), str(script)],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
+            try:
+                result = subprocess.run(
+                    ["pwsh", "-NoProfile", "-File", str(runner), str(script)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+            except subprocess.TimeoutExpired as error:
+                print(ownership_fixture_timeout_summary(error.stderr), file=sys.stderr)
+                raise
         return json.loads(result.stdout)
 
     def test_powershell_exact_root_identity_and_numeric_vhd_fixture(self):
