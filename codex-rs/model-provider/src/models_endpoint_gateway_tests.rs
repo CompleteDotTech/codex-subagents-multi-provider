@@ -82,12 +82,16 @@ async fn gateway_only_catalog_scope_observes_external_accounts_legacy_grants_and
     );
     let endpoint = Arc::new(OpenAiModelsEndpoint::new(
         info.clone(),
-        None,
+        /*auth_manager*/ None,
         Some(Ok(gateway.clone())),
     ));
-    let manager = OpenAiModelsManager::new(home.path().to_path_buf(), endpoint.clone(), None)
-        .with_provider_catalog();
-    mount(&server, "legacy", 1000, Duration::ZERO).await;
+    let manager = OpenAiModelsManager::new(
+        home.path().to_path_buf(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+    )
+    .with_provider_catalog();
+    mount(&server, "legacy", /*window*/ 1000, Duration::ZERO).await;
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::OnlineIfUncached, HTTP)
@@ -111,7 +115,7 @@ async fn gateway_only_catalog_scope_observes_external_accounts_legacy_grants_and
     );
     assert_ne!(endpoint.identity().unwrap(), legacy_scope);
     assert!(manager.try_get_remote_models().unwrap().is_empty());
-    mount(&server, "account-b", 2000, Duration::ZERO).await;
+    mount(&server, "account-b", /*window*/ 2000, Duration::ZERO).await;
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::OnlineIfUncached, HTTP)
@@ -134,7 +138,7 @@ async fn gateway_only_catalog_scope_observes_external_accounts_legacy_grants_and
         .expect(1)
         .mount(&server)
         .await;
-    mount(&server, "rotated-b", 3000, Duration::ZERO).await;
+    mount(&server, "rotated-b", /*window*/ 3000, Duration::ZERO).await;
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::OnlineIfUncached, HTTP)
@@ -176,13 +180,24 @@ async fn changed_gateway_grant_during_catalog_response_cannot_publish_or_cache_o
     );
     let endpoint = Arc::new(OpenAiModelsEndpoint::new(
         info.clone(),
-        None,
+        /*auth_manager*/ None,
         Some(Ok(gateway)),
     ));
     let manager = Arc::new(
-        OpenAiModelsManager::new(home.path().to_path_buf(), endpoint, None).with_provider_catalog(),
+        OpenAiModelsManager::new(
+            home.path().to_path_buf(),
+            endpoint,
+            /*auth_manager*/ None,
+        )
+        .with_provider_catalog(),
     );
-    mount(&server, "old", 1111, Duration::from_millis(300)).await;
+    mount(
+        &server,
+        "old",
+        /*window*/ 1111,
+        Duration::from_millis(300),
+    )
+    .await;
     let pending = tokio::spawn({
         let manager = manager.clone();
         async move {
@@ -206,7 +221,7 @@ async fn changed_gateway_grant_during_catalog_response_cannot_publish_or_cache_o
     assert!(pending.await.unwrap().models.is_empty());
     assert!(manager.get_remote_models().await.is_empty());
     assert!(!home.path().join("models_cache.d").exists());
-    mount(&server, "new", 2222, Duration::ZERO).await;
+    mount(&server, "new", /*window*/ 2222, Duration::ZERO).await;
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::OnlineIfUncached, HTTP)
@@ -224,12 +239,17 @@ async fn trusted_unauthenticated_catalog_url_is_discovered_through_the_models_ma
     info.gateway_oauth = None;
     Mock::given(method("GET"))
         .and(path("/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": [model(1234)]})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"models": [model(/*window*/ 1234)]})),
+        )
         .expect(1)
         .mount(&server)
         .await;
-    let endpoint = Arc::new(OpenAiModelsEndpoint::new(info, None, None));
-    let manager = OpenAiModelsManager::new_without_cache(endpoint, None).with_provider_catalog();
+    let endpoint = Arc::new(OpenAiModelsEndpoint::new(
+        info, /*auth_manager*/ None, /*gateway_auth_manager*/ None,
+    ));
+    let manager = OpenAiModelsManager::new_without_cache(endpoint, /*auth_manager*/ None)
+        .with_provider_catalog();
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::OnlineIfUncached, HTTP)
@@ -260,10 +280,18 @@ async fn catalog_metadata_fails_closed_promptly_when_the_real_store_lock_is_busy
         &primary,
         json!({"access_token":"lock-test", "expires_at":i64::MAX}),
     );
-    let endpoint = Arc::new(OpenAiModelsEndpoint::new(info, None, Some(Ok(gateway))));
-    let manager =
-        OpenAiModelsManager::new(home.path().to_path_buf(), endpoint, None).with_provider_catalog();
-    mount(&server, "lock-test", 1234, Duration::ZERO).await;
+    let endpoint = Arc::new(OpenAiModelsEndpoint::new(
+        info,
+        /*auth_manager*/ None,
+        Some(Ok(gateway)),
+    ));
+    let manager = OpenAiModelsManager::new(
+        home.path().to_path_buf(),
+        endpoint,
+        /*auth_manager*/ None,
+    )
+    .with_provider_catalog();
+    mount(&server, "lock-test", /*window*/ 1234, Duration::ZERO).await;
     assert_eq!(
         manager
             .raw_model_catalog(RefreshStrategy::Online, HTTP)
@@ -362,7 +390,7 @@ async fn rejected_catalog_invalidates_the_sent_grant_after_a_preflight_account_s
         let endpoint = Arc::new(PausedGatewayEndpoint {
             inner: Arc::new(OpenAiModelsEndpoint::new(
                 info.clone(),
-                None,
+                /*auth_manager*/ None,
                 Some(Ok(gateway)),
             )),
             pause: std::sync::atomic::AtomicBool::new(false),
@@ -370,10 +398,14 @@ async fn rejected_catalog_invalidates_the_sent_grant_after_a_preflight_account_s
             release: Default::default(),
         });
         let manager = Arc::new(
-            OpenAiModelsManager::new(home.path().to_path_buf(), endpoint.clone(), None)
-                .with_provider_catalog(),
+            OpenAiModelsManager::new(
+                home.path().to_path_buf(),
+                endpoint.clone(),
+                /*auth_manager*/ None,
+            )
+            .with_provider_catalog(),
         );
-        mount(&server, "account-a", 1000, Duration::ZERO).await;
+        mount(&server, "account-a", /*window*/ 1000, Duration::ZERO).await;
         assert_eq!(
             manager
                 .raw_model_catalog(RefreshStrategy::Online, HTTP)
@@ -383,7 +415,7 @@ async fn rejected_catalog_invalidates_the_sent_grant_after_a_preflight_account_s
             Some(1000)
         );
         let _b = seed_gateway_auth(&info, &primary, grant("account-b"));
-        mount(&server, "account-b", 2000, Duration::ZERO).await;
+        mount(&server, "account-b", /*window*/ 2000, Duration::ZERO).await;
         assert_eq!(
             manager
                 .raw_model_catalog(RefreshStrategy::Online, HTTP)
@@ -452,7 +484,7 @@ async fn rejected_catalog_invalidates_the_sent_grant_after_a_preflight_account_s
         let _b = seed_gateway_auth(&info, &primary, grant("account-b"));
         server.verify().await;
         server.reset().await;
-        mount(&server, "account-b", 3000, Duration::ZERO).await;
+        mount(&server, "account-b", /*window*/ 3000, Duration::ZERO).await;
         assert_eq!(
             manager
                 .raw_model_catalog(RefreshStrategy::OnlineIfUncached, HTTP)
