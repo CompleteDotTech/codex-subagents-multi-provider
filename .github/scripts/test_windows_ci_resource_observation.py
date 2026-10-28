@@ -161,6 +161,30 @@ def ownership_fixture_birth(pid):
     return int(value[value.rfind(")") + 2 :].split()[19])
 
 
+def record_ownership_fixture_secondary_failure(primary, phase):
+    """Fixed failure facts only; preserve the existing primary and owned lease."""
+    allowed = {
+        "exit_observation",
+        "selector_close",
+        "stdout_close",
+        "stderr_close",
+        "group_cleanup",
+        "diagnostic_write",
+        "caller_diagnostic_write",
+        "fixture_temp_cleanup",
+    }
+    previous = getattr(primary, "ownership_fixture_cleanup", None)
+    phases = previous.get("failed_phases", []) if isinstance(previous, dict) else []
+    phases = [value for value in phases if isinstance(value, str) and value in allowed]
+    if phase in allowed and phase not in phases:
+        phases.append(phase)
+    primary.ownership_fixture_cleanup = {
+        "cleanup_complete": False,
+        "failed_phases": phases,
+        "retain_workload_lease": True,
+    }
+
+
 def cleanup_ownership_fixture(child, birth):
     """Only the private child group; bounded failure cleanup, no pipe drain."""
 
@@ -881,6 +905,115 @@ class ObservationTests(unittest.TestCase):
             self.assertIn("ownership-fixture-timeout ", output.getvalue())
             self.assertNotIn("SECRET", output.getvalue())
 
+    def test_actual_fixture_caller_preserves_timeout_through_broken_diagnostic(self):
+        class BrokenStderr(io.StringIO):
+            def write(self, value):
+                raise OSError("SECRET stderr unavailable")
+
+        for platform in ("linux", "win32"):
+            for mode in ("stderr", "summary"):
+                error = subprocess.TimeoutExpired(["SECRET"], 10)
+                error.ownership_fixture_cleanup = {
+                    "cleanup_complete": False,
+                    "failed_phases": ["group_cleanup"],
+                    "retain_workload_lease": True,
+                }
+                try:
+                    raise error
+                except subprocess.TimeoutExpired:
+                    original_traceback = error.__traceback__
+                caught = None
+                with (
+                    patch.object(sys, "platform", platform),
+                    patch(
+                        __name__ + ".run_linux_ownership_fixture", side_effect=error
+                    ) as linux,
+                    patch.object(subprocess, "run", side_effect=error) as windows,
+                    patch(
+                        __name__ + ".ownership_fixture_timeout_summary",
+                        side_effect=ValueError("SECRET summary")
+                        if mode == "summary"
+                        else None,
+                        wraps=ownership_fixture_timeout_summary,
+                    ),
+                    contextlib.redirect_stderr(BrokenStderr()),
+                ):
+                    try:
+                        self.run_ownership_fixture()
+                    except BaseException as failure:
+                        caught = failure
+                self.assertIs(caught, error)
+                facts = error.ownership_fixture_cleanup
+                self.assertEqual(
+                    facts["failed_phases"], ["group_cleanup", "caller_diagnostic_write"]
+                )
+                self.assertFalse(facts["cleanup_complete"])
+                self.assertTrue(facts["retain_workload_lease"])
+                self.assertNotIn("SECRET", json.dumps(facts))
+                tb = error.__traceback__
+                while tb is not None and tb is not original_traceback:
+                    tb = tb.tb_next
+                self.assertIs(tb, original_traceback)
+                if platform == "linux":
+                    linux.assert_called_once()
+                    windows.assert_not_called()
+                else:
+                    windows.assert_called_once()
+                    linux.assert_not_called()
+                    self.assertEqual(
+                        windows.call_args.kwargs,
+                        {
+                            "capture_output": True,
+                            "text": True,
+                            "timeout": 10,
+                            "check": True,
+                        },
+                    )
+
+    def test_actual_fixture_caller_preserves_primary_through_temp_cleanup_failure(self):
+        for platform in ("linux", "win32"):
+            error = subprocess.TimeoutExpired(["fixture"], 10)
+            with tempfile.TemporaryDirectory() as temp:
+                temporary = Mock(name=temp)
+                temporary.name = temp
+                temporary.cleanup.side_effect = OSError("SECRET temp cleanup")
+                with (
+                    patch.object(sys, "platform", platform),
+                    patch(__name__ + ".run_linux_ownership_fixture", side_effect=error),
+                    patch.object(subprocess, "run", side_effect=error),
+                    patch.object(
+                        tempfile, "TemporaryDirectory", return_value=temporary
+                    ),
+                    contextlib.redirect_stderr(io.StringIO()) as output,
+                    self.assertRaises(subprocess.TimeoutExpired) as raised,
+                ):
+                    self.run_ownership_fixture()
+            self.assertIs(raised.exception, error)
+            self.assertEqual(
+                error.ownership_fixture_cleanup["failed_phases"],
+                ["fixture_temp_cleanup"],
+            )
+            self.assertTrue(error.ownership_fixture_cleanup["retain_workload_lease"])
+            self.assertNotIn("SECRET", output.getvalue())
+
+    def test_actual_fixture_temp_cleanup_failure_without_primary_stays_failure(self):
+        failure = OSError("SECRET temp cleanup")
+        with tempfile.TemporaryDirectory() as temp:
+            temporary = Mock()
+            temporary.name = temp
+            temporary.cleanup.side_effect = failure
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch(
+                    __name__ + ".run_linux_ownership_fixture",
+                    return_value=subprocess.CompletedProcess(["fixture"], 0, "{}", ""),
+                ),
+                patch.object(tempfile, "TemporaryDirectory", return_value=temporary),
+                self.assertRaises(OSError) as raised,
+            ):
+                self.run_ownership_fixture()
+        self.assertIs(raised.exception, failure)
+
     def test_scope_requires_every_gate_and_actual_windows(self):
         env = dict(
             GITHUB_REPOSITORY="CompleteDotTech/codex-subagents-multi-provider",
@@ -1313,8 +1446,11 @@ Write-OwnershipFixtureStage 'collector-return'
             fixture = fixture.replace(
                 "-CreationMicroseconds $micro", "-CreationMicroseconds 0"
             )
-        with tempfile.TemporaryDirectory() as temp:
-            runner = Path(temp) / "fixture.ps1"
+        temporary = tempfile.TemporaryDirectory()
+        primary = None
+        primary_traceback = None
+        try:
+            runner = Path(temporary.name) / "fixture.ps1"
             runner.write_text(fixture)
             try:
                 argv = ["pwsh", "-NoProfile", "-File", str(runner), str(script)]
@@ -1325,11 +1461,32 @@ Write-OwnershipFixtureStage 'collector-return'
                         argv, capture_output=True, text=True, timeout=10, check=True
                     )
             except subprocess.TimeoutExpired as error:
-                print(
-                    ownership_fixture_timeout_summary(error.stderr, error.stdout),
-                    file=sys.stderr,
-                )
+                try:
+                    print(
+                        ownership_fixture_timeout_summary(error.stderr, error.stdout),
+                        file=sys.stderr,
+                    )
+                except BaseException:
+                    record_ownership_fixture_secondary_failure(
+                        error, "caller_diagnostic_write"
+                    )
                 raise
+        except BaseException as error:
+            primary, primary_traceback = error, error.__traceback__
+        finally:
+            try:
+                temporary.cleanup()
+            except BaseException as error:
+                if primary is None:
+                    record_ownership_fixture_secondary_failure(
+                        error, "fixture_temp_cleanup"
+                    )
+                    raise
+                record_ownership_fixture_secondary_failure(
+                    primary, "fixture_temp_cleanup"
+                )
+        if primary is not None:
+            raise primary.with_traceback(primary_traceback)
         return json.loads(result.stdout)
 
     def test_powershell_exact_root_identity_and_numeric_vhd_fixture(self):
