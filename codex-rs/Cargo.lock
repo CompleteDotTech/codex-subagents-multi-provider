@@ -4965,6 +4965,8 @@ dependencies = [
  "clap",
  "codex-core-api",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
