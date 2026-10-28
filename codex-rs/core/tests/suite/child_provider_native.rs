@@ -1845,7 +1845,7 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
         &fixture.root,
         MultiAgentVersion::V2,
         "hook_guard_worker",
-        json!({"prompt":"Complete the bounded hook request","model_provider":"a"}),
+        json!({"message":"Complete the bounded hook request","model_provider":"a"}),
     )
     .await;
     fixture.turn("spawn the hook barrier child").await?;
@@ -1951,7 +1951,7 @@ async fn native_request_hook_and_http_retry_recheck_after_publication(
         &fixture.root,
         MultiAgentVersion::V2,
         "hook_guard_sibling",
-        json!({"prompt":"Complete the independent sibling","model_provider":"b"}),
+        json!({"message":"Complete the independent sibling","model_provider":"b"}),
     )
     .await;
     fixture.turn("spawn the unaffected B sibling").await?;
@@ -2049,7 +2049,7 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
         &fixture.root,
         MultiAgentVersion::V2,
         "hook_guard_worker",
-        json!({"prompt":"Complete the bounded hook request","model_provider":"a"}),
+        json!({"message":"Complete the bounded hook request","model_provider":"a"}),
     )
     .await;
     fixture.turn("spawn the hook barrier child").await?;
@@ -2197,7 +2197,7 @@ async fn native_actual_configured_http_retry_uses_original_fence(revoke: bool) -
         &fixture.root,
         MultiAgentVersion::V2,
         "hook_guard_sibling",
-        json!({"prompt":"Complete the independent sibling","model_provider":"b"}),
+        json!({"message":"Complete the independent sibling","model_provider":"b"}),
     )
     .await;
     fixture.turn("spawn the unaffected B sibling").await?;
