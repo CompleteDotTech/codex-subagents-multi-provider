@@ -70,7 +70,7 @@ async fn completed_shutdown_receipt_is_idempotent_without_reopening_retired_writ
             include_archived: true,
             metadata: params(thread_id).metadata,
         },
-        None,
+        /*preparation*/ None,
     )
     .await
     .unwrap();

@@ -10078,7 +10078,12 @@ async fn post_admission_resume_target_revision_fences_outside_live_caller(stage:
             .await
     );
     target.session.flush_rollout().await.unwrap();
-    let stored = target.read_thread(false, false).await.unwrap();
+    let stored = target
+        .read_thread(
+            /*include_archived*/ false, /*include_history*/ false,
+        )
+        .await
+        .unwrap();
     assert_eq!(stored.approval_mode, caller_context.approval_policy);
     assert_eq!(
         stored.permission_profile,
