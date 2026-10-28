@@ -1413,7 +1413,14 @@ fn native_continuation_exec_setup(config: &mut codex_core::config::Config) {
         .unwrap();
     config
         .permissions
-        .set_permission_profile(codex_protocol::models::PermissionProfile::workspace_write())
+        .set_permission_profile(
+            codex_protocol::models::PermissionProfile::workspace_write_with(
+                &[],
+                codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                /*exclude_tmpdir_env_var*/ true,
+                /*exclude_slash_tmp*/ true,
+            ),
+        )
         .unwrap();
     config.features.enable(Feature::ShellTool).unwrap();
     for feature in [
@@ -1474,6 +1481,26 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     for path in [&started, &release, &done] {
         assert!(!path.exists());
     }
+    let config = fixture.test.codex.config().await;
+    let filesystem = config
+        .permissions
+        .permission_profile()
+        .file_system_sandbox_policy();
+    for path in [&started, &release, &done] {
+        assert!(
+            filesystem.can_write_local_path_with_cwd(path, config.cwd.as_path()),
+            "owned continuation markers must be writable inside the selected workspace"
+        );
+    }
+    for path in [
+        fixture.home.path().join("config.toml"),
+        fixture.home.path().join("catalog.json"),
+    ] {
+        assert!(
+            !filesystem.can_write_local_path_with_cwd(&path, config.cwd.as_path()),
+            "the owned tool must not gain write authority over host provider inputs"
+        );
+    }
     let (cmd, shell) = native_owned_barrier_command(&started, &release, &done);
     let arguments = json!({"cmd":cmd,"shell":shell,"login":false,"tty":false,"yield_time_ms":10000,"timeout_ms":5000,"max_output_tokens":1000});
     Mock::given(method("POST"))
@@ -1507,6 +1534,33 @@ async fn native_existing_turn_rechecks_policy_after_successful_owned_tool(
     let change_policy = async {
         tokio::time::timeout(Duration::from_secs(30), async {
             while !started.exists() {
+                let root_requests = fixture.root.received_requests().await.expect("root recording enabled");
+                for request in root_requests.iter().filter(|request| request.method.as_str() == "POST") {
+                    if let Some(output) = body(request)["input"].as_array().and_then(|items| items.iter().find(|item| {
+                        item["type"].as_str() == Some("function_call_output")
+                            && item["call_id"].as_str() == Some("continuation_worker")
+                    })) {
+                        let ids = fixture.test.thread_manager.list_thread_ids().await;
+                        if ids.iter().all(|id| *id == fixture.test.session_configured.thread_id) {
+                            anyhow::bail!("actual root spawn returned without a registered child; setup failure, not policy RED: {output}");
+                        }
+                    }
+                }
+                for id in fixture.test.thread_manager.list_thread_ids().await {
+                    if id == fixture.test.session_configured.thread_id {
+                        continue;
+                    }
+                    if let Ok(child) = fixture.test.thread_manager.get_thread(id).await {
+                        let status = child.agent_status().await;
+                        if matches!(
+                            status,
+                            codex_protocol::protocol::AgentStatus::Completed(_)
+                                | codex_protocol::protocol::AgentStatus::Errored(_)
+                        ) && !started.exists() {
+                            anyhow::bail!("registered child became terminal before the owned tool barrier; setup failure, not policy RED: {status:?}");
+                        }
+                    }
+                }
                 let requests = fixture.a.received_requests().await.expect("recording enabled");
                 if let Some(first) = requests.iter().find(|request| request.method.as_str() == "POST") {
                     let tools = body(first)["tools"].clone();
