@@ -39,6 +39,7 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -119,6 +120,46 @@ async fn wait_for_thread_idle(thread: &CodexThread) {
         .expect("thread should become idle");
 }
 
+async fn wait_for_guardian_event<F>(
+    thread: &CodexThread,
+    stage: &str,
+    matches: F,
+) -> Result<EventMsg>
+where
+    F: Fn(&EventMsg) -> bool,
+{
+    let thread_id = thread.startup_metadata().thread_id;
+    loop {
+        // Preserve the common event wait's ten-second per-event bound. A stage
+        // label distinguishes fixture ordering from an unqualified generic timeout.
+        let event = tokio::time::timeout(Duration::from_secs(10), thread.next_event())
+            .await
+            .with_context(|| format!("Guardian {stage}: timeout for thread {thread_id}"))?
+            .with_context(|| format!("Guardian {stage}: event stream for thread {thread_id}"))?;
+        if matches(&event.msg) {
+            return Ok(event.msg);
+        }
+        match event.msg {
+            EventMsg::Error(_) | EventMsg::TurnAborted(_) => {
+                let details = format!("{:?}", event.msg)
+                    .chars()
+                    .take(2_048)
+                    .collect::<String>();
+                anyhow::bail!("Guardian {stage}: thread {thread_id}: {details}");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn wait_for_guardian_turn(thread: &CodexThread, stage: &str) -> Result<()> {
+    wait_for_guardian_event(thread, stage, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await?;
+    Ok(())
+}
+
 async fn record_answer(
     thread: &CodexThread,
     server: &MockServer,
@@ -154,11 +195,13 @@ async fn record_answer(
             text_elements: Vec::new(),
         }]))
         .await?;
-    let request = wait_for_event_match(thread, |event| match event {
-        EventMsg::RequestUserInput(request) => Some(request.clone()),
-        _ => None,
+    let event = wait_for_guardian_event(thread, &format!("answer {call_id}: question"), |event| {
+        matches!(event, EventMsg::RequestUserInput(_))
     })
-    .await;
+    .await?;
+    let EventMsg::RequestUserInput(request) = event else {
+        unreachable!("matched request_user_input event")
+    };
     thread
         .submit(Op::UserInputAnswer {
             id: request.turn_id.clone(),
@@ -172,7 +215,7 @@ async fn record_answer(
             },
         })
         .await?;
-    wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_guardian_turn(thread, &format!("answer {call_id}: completion")).await?;
     let retained = VerifiedAnswer {
         turn_id: request.turn_id,
         call_id: call_id.to_owned(),
@@ -218,10 +261,56 @@ async fn load_context(test: &TestCodex, thread: &CodexThread) -> Result<Vec<Roll
 
 async fn resume(test: &TestCodex, thread: &CodexThread) -> Result<Arc<CodexThread>> {
     let thread_id = thread.startup_metadata().thread_id;
+    let source = thread.config_snapshot().await.session_source;
+    let parent_id = source.parent_thread_id();
+    let stored = thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await?;
+    assert_eq!(stored.parent_thread_id, parent_id);
+    let parent = if let Some(parent_id) = parent_id {
+        // Legacy here is a history mode, not the native protocol version. These
+        // children were created by the actual V2 spawn tool, under this owner.
+        assert_eq!(thread.multi_agent_version(), Some(MultiAgentVersion::V2));
+        Some(test.thread_manager.get_thread(parent_id).await?)
+    } else {
+        None
+    };
     thread.shutdown_and_wait().await?;
     test.thread_manager.remove_thread(&thread_id).await;
     let saved = load_context(test, thread).await?;
-    let items: Vec<RolloutItem> = serde_json::from_value(serde_json::to_value(saved)?)?;
+    let items: Vec<RolloutItem> = serde_json::from_value(serde_json::to_value(&saved)?)?;
+    if let Some(parent) = parent {
+        assert_eq!(serde_json::to_value(&items)?, serde_json::to_value(&saved)?);
+        // Reload persisted delegated history through its recorded, current owner.
+        // No caller-supplied source label or serialized history can mint a permit.
+        test.thread_manager
+            .ensure_multi_agent_v2_child_loaded(thread_id)
+            .await
+            .context("Guardian owner-native child resume")?;
+        assert!(Arc::ptr_eq(
+            &parent,
+            &test
+                .thread_manager
+                .get_thread(parent.startup_metadata().thread_id)
+                .await?
+        ));
+        let resumed = test.thread_manager.get_thread(thread_id).await?;
+        assert!(!std::ptr::eq(thread, resumed.as_ref()));
+        assert_eq!(resumed.config_snapshot().await.session_source, source);
+        assert_eq!(
+            resumed
+                .read_thread(
+                    /*include_archived*/ true, /*include_history*/ false
+                )
+                .await?
+                .parent_thread_id,
+            parent_id
+        );
+        return Ok(resumed);
+    }
+    // Independent roots still exercise the real serialized-history resume API.
     Ok(test
         .thread_manager
         .resume_thread_with_history(
@@ -390,7 +479,7 @@ async fn compact_and_assert_answers(
     // Inspect live state by persisting a real compaction checkpoint, not a private getter.
     // Repeating this after legacy rollback replay also catches checkpoint resurrection.
     thread.submit(Op::Compact).await?;
-    wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_guardian_turn(thread, "retained-context compaction").await?;
     thread.flush_rollout().await?;
     let history = load_context(test, thread).await?;
     let checkpoint = history
@@ -845,16 +934,12 @@ async fn standalone_fork_retains_inherited_user_instructions(
             text_elements: Vec::new(),
         }]))
         .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    wait_for_guardian_turn(&test.codex, "standalone root spawn").await?;
     let worker = test
         .thread_manager
         .get_thread(created.recv().await?)
         .await?;
-    wait_for_event(&worker, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    test.codex.shutdown_and_wait().await?;
+    wait_for_guardian_turn(&worker, "standalone initial worker turn").await?;
     let local_instruction = if compacted {
         // Leave less than Guardian's 900-token budget for the inherited source
         // within local compaction's 20K user-message budget.
@@ -869,7 +954,7 @@ async fn standalone_fork_retains_inherited_user_instructions(
             text_elements: Vec::new(),
         }]))
         .await?;
-    wait_for_event(&worker, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_guardian_turn(&worker, "standalone worker local instruction").await?;
     if compacted {
         // Local compaction keeps the inherited source message in replacement history.
         mount_sse_sequence(
@@ -882,6 +967,9 @@ async fn standalone_fork_retains_inherited_user_instructions(
         .await;
         compact_and_assert_answers(&test, &worker, &[]).await?;
     }
+    // Native model work above requires the original current policy owner.
+    // Stop it before purely local orphan-history inspection and root adoption.
+    test.codex.shutdown_and_wait().await?;
     let worker_context = worker.conversation_history_snapshot().await;
     let inherited_text = worker_context
         .items()
