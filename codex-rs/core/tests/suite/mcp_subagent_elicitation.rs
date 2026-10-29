@@ -24,8 +24,163 @@ use test_case::test_case;
 use wiremock::matchers::body_partial_json;
 
 const SERVER: &str = r#"
+import time
+CUSTODY_STARTED = time.monotonic()
 import json
 import sys
+import os
+import stat
+import hashlib
+
+def custody_ready():
+    nonce = os.environ.get("CODEX_TEST_MCP_CUSTODY_NONCE")
+    directory = os.environ.get("CODEX_TEST_MCP_CUSTODY_DIR")
+    if nonce is None and directory is None:
+        return
+    deadline = CUSTODY_STARTED + 10.0
+    def clock():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("MCP custody original startup deadline")
+    def hex64(value):
+        return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+    if sys.platform != "linux" or not hex64(nonce) or directory is None:
+        raise RuntimeError("MCP custody requires complete local Linux opt-in")
+    temp = os.environ.get("TMPDIR")
+    case = os.environ.get("CODEX_TEST_MCP_CUSTODY_CASE_SHA256")
+    owner = os.environ.get("CODEX_TEST_MCP_CUSTODY_OWNER_PID", "")
+    if temp is None or not hex64(case) or not owner.isascii() or not owner.isdecimal() or str(int(owner)) != owner or int(owner) <= 0:
+        raise RuntimeError("MCP custody missing phase/case/owner")
+    for name in (temp, directory):
+        if len(os.fsencode(name)) > 4096:
+            raise RuntimeError("MCP custody directory path bound")
+        if not os.path.isabs(name) or os.path.realpath(name) != name:
+            raise RuntimeError("MCP custody path is not canonical")
+        cursor = name
+        while True:
+            if stat.S_ISLNK(os.lstat(cursor).st_mode):
+                raise RuntimeError("MCP custody symlink directory")
+            parent = os.path.dirname(cursor)
+            if parent == cursor:
+                break
+            cursor = parent
+    if directory == temp or os.path.commonpath((temp, directory)) != temp:
+        raise RuntimeError("MCP custody directory outside phase TMPDIR")
+    def private(fd):
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise RuntimeError("MCP custody requires owned0700 directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root = os.open(temp, flags)
+    try:
+        private(root)
+        for component in os.path.relpath(directory, temp).split(os.sep):
+            if component in ("", ".", ".."):
+                raise RuntimeError("MCP custody directory component")
+            child = os.open(component, flags, dir_fd=root)
+            os.close(root)
+            root = child
+            private(root)
+        def small(path):
+            with open(path, "rb") as stream:
+                value = stream.read(4097)
+            if len(value) > 4096:
+                raise RuntimeError("MCP custody proc bound")
+            return value
+        pid = os.getpid()
+        def birth():
+            text = small("/proc/self/stat").decode("utf-8")
+            if text.split("(", 1)[0].strip() != str(pid):
+                raise RuntimeError("MCP custody PID mismatch")
+            fields = text.rsplit(")", 1)[1].split()
+            if len(fields) < 20 or fields[0] in ("Z", "X", "x"):
+                raise RuntimeError("MCP custody process not live")
+            value = (int(fields[19]), int(fields[1]), os.stat("/proc/self").st_uid)
+            if value[0] <= 0 or value[1] <= 0 or value[2] != os.geteuid():
+                raise RuntimeError("MCP custody birth/owner mismatch")
+            return value
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        before = birth()
+        clock()
+        exe = os.open("/proc/self/exe", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            info = os.fstat(exe)
+            original = identity(info)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 1073741824:
+                raise RuntimeError("MCP custody executable bound")
+            digest = hashlib.sha256()
+            count = 0
+            while True:
+                clock()
+                block = os.read(exe, 65536)
+                if not block:
+                    break
+                count += len(block)
+                if count > 1073741824:
+                    raise RuntimeError("MCP custody executable read bound")
+                digest.update(block)
+            exe_hash = digest.hexdigest()
+            if identity(os.fstat(exe)) != original or identity(os.stat("/proc/self/exe")) != original or birth() != before:
+                raise RuntimeError("MCP custody identity changed while hashing")
+            boot = hashlib.sha256(small("/proc/sys/kernel/random/boot_id").strip()).hexdigest()
+            receipt = {"schema": 1, "nonce": nonce, "kind": "python", "role": "initialize",
+                       "case_sha256": case, "owner_pid": int(owner), "pid": pid,
+                       "starttime": before[0], "ppid": before[1], "uid": before[2], "boot_sha256": boot,
+                       "exe": {"dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
+                               "mtime_sec": info.st_mtime_ns // 1000000000, "mtime_nsec": info.st_mtime_ns % 1000000000,
+                               "ctime_sec": info.st_ctime_ns // 1000000000, "ctime_nsec": info.st_ctime_ns % 1000000000,
+                               "sha256": exe_hash, "path_sha256": hashlib.sha256(os.fsencode(os.readlink("/proc/self/exe"))).hexdigest()}}
+            payload = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if len(payload) > 4096:
+                raise RuntimeError("MCP custody receipt bound")
+            stem = nonce + "-python-" + str(pid) + "-" + str(before[0])
+            clock()
+            record = os.open(stem + ".json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=root)
+            try:
+                state = os.fstat(record)
+                if not stat.S_ISREG(state.st_mode) or state.st_uid != os.geteuid() or state.st_nlink != 1 or stat.S_IMODE(state.st_mode) != 0o600:
+                    raise RuntimeError("MCP custody receipt identity")
+                if os.write(record, payload) != len(payload):
+                    raise RuntimeError("MCP custody incomplete receipt write")
+                os.fsync(record)
+            finally:
+                os.close(record)
+            os.fsync(root)
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate MCP custody ACK field")
+                    result[key] = value
+                return result
+            while True:
+                clock()
+                try:
+                    ack = os.open(stem + ".ack.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=root)
+                except FileNotFoundError:
+                    time.sleep(0.005)
+                    continue
+                try:
+                    state = os.fstat(ack)
+                    if not stat.S_ISREG(state.st_mode) or state.st_uid != os.geteuid() or state.st_nlink != 1 or stat.S_IMODE(state.st_mode) != 0o600 or state.st_size > 4096:
+                        raise RuntimeError("MCP custody ACK identity")
+                    value = os.read(ack, 4097)
+                    if len(value) > 4096 or identity(os.fstat(ack)) != identity(state):
+                        raise RuntimeError("MCP custody ACK changed")
+                    value = json.loads(value.decode("utf-8"), object_pairs_hook=unique)
+                    expected = {"schema": 1, "nonce": nonce, "pid": pid, "starttime": before[0], "exe_sha256": exe_hash, "case_sha256": case}
+                    if value != expected or any(type(value.get(key)) is not int for key in ("schema", "pid", "starttime")):
+                        raise RuntimeError("MCP custody ACK mismatch")
+                finally:
+                    os.close(ack)
+                if birth() != before or identity(os.stat("/proc/self/exe")) != original or hashlib.sha256(small("/proc/sys/kernel/random/boot_id").strip()).hexdigest() != boot:
+                    raise RuntimeError("MCP custody process changed before ACK admission")
+                clock()
+                break
+        finally:
+            os.close(exe)
+    finally:
+        os.close(root)
 
 def send(message):
     print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
@@ -36,6 +191,10 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     if method == "initialize":
+        try:
+            custody_ready()
+        except Exception:
+            raise RuntimeError("MCP custody initialization UNQUALIFIED") from None
         result = {"protocolVersion": request["params"]["protocolVersion"],
                   "capabilities": {"tools": {}},
                   "serverInfo": {"name": "elicitation-test", "version": "1"}}
@@ -60,6 +219,57 @@ for line in sys.stdin:
         result = {}
     send({"id": request["id"], "result": result})
 "#;
+
+fn custody_environment() -> Result<Option<std::collections::HashMap<String, String>>> {
+    let nonce = std::env::var_os("CODEX_TEST_MCP_CUSTODY_NONCE");
+    let directory = std::env::var_os("CODEX_TEST_MCP_CUSTODY_DIR");
+    if nonce.is_none() && directory.is_none() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        nonce.is_some() && directory.is_some(),
+        "partial MCP custody opt-in"
+    );
+    anyhow::ensure!(
+        cfg!(target_os = "linux") && !core_test_support::is_remote_test_environment(),
+        "MCP custody opt-in requires local Linux, never remote/Wine/Windows"
+    );
+    let nonce = nonce
+        .unwrap()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("invalid custody nonce"))?;
+    anyhow::ensure!(
+        nonce.len() == 64
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid custody nonce"
+    );
+    let directory = directory
+        .unwrap()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("invalid custody directory"))?;
+    use sha2::Digest;
+    let case = format!(
+        "{:x}",
+        sha2::Sha256::digest(
+            std::thread::current()
+                .name()
+                .ok_or_else(|| anyhow::anyhow!("actual libtest thread name required"))?
+                .as_bytes()
+        )
+    );
+    Ok(Some(std::collections::HashMap::from([
+        ("CODEX_TEST_MCP_CUSTODY_NONCE".into(), nonce),
+        ("CODEX_TEST_MCP_CUSTODY_DIR".into(), directory),
+        ("TMPDIR".into(), std::env::var("TMPDIR")?),
+        ("CODEX_TEST_MCP_CUSTODY_CASE_SHA256".into(), case),
+        (
+            "CODEX_TEST_MCP_CUSTODY_OWNER_PID".into(),
+            std::process::id().to_string(),
+        ),
+    ])))
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Caller {
@@ -89,6 +299,7 @@ async fn mcp_server_elicitations_follow_approval_policy(
     caller: Caller,
     request_kind: RequestKind,
 ) -> Result<()> {
+    custody_environment()?;
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
     mcp_server_elicitation_scenario(caller, request_kind).await?;
@@ -99,6 +310,7 @@ pub(super) async fn mcp_server_elicitation_scenario(
     caller: Caller,
     request_kind: RequestKind,
 ) -> Result<Vec<ResponsesRequest>> {
+    let custody = custody_environment()?;
     let server = responses::start_mock_server().await;
     let mut elicitation = json!({
         "mode": "form",
@@ -136,7 +348,7 @@ pub(super) async fn mcp_server_elicitation_scenario(
         config.approvals_reviewer = ApprovalsReviewer::User;
         config.mcp_servers.set(serde_json::from_value(json!({
             "elicitation": { "command": if cfg!(windows) { "python" } else { "python3" },
-                "args": ["-u", "-c", SERVER, elicitation.to_string()], "default_tools_approval_mode": "approve" }
+                "args": ["-u", "-c", SERVER, elicitation.to_string()], "default_tools_approval_mode": "approve", "env": custody }
         })).expect("MCP fixture configuration")).expect("MCP fixture constraints");
     }).build_with_auto_env(&server).await?;
     let mut owned_child = None;

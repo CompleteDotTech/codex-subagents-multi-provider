@@ -17,6 +17,7 @@ mod native_mcp_cache_tests {
     #[derive(Default)]
     struct OwnedMcpCase {
         fixtures: Vec<Arc<NativeMcpFixture>>,
+        custody_receipts: Vec<Value>,
         threads: Vec<Arc<CodexThread>>,
         http_gates: Vec<std::sync::mpsc::Sender<()>>,
         file_gates: Vec<(Arc<dyn ExecutorFileSystem>, PathUri)>,
@@ -72,6 +73,7 @@ mod native_mcp_cache_tests {
     async fn run_native_mcp_case(
         body: impl Future<Output = anyhow::Result<()>>,
     ) -> anyhow::Result<()> {
+        custody_opt_in()?;
         let owned = Arc::new(Mutex::new(OwnedMcpCase::default()));
         let outcome = OWNED_MCP_CASE
             .scope(
@@ -81,6 +83,9 @@ mod native_mcp_cache_tests {
             .await;
         let body_failed = !matches!(&outcome, Ok(Ok(())));
         let mut resources = std::mem::take(&mut *owned.lock().unwrap());
+        for receipt in &resources.custody_receipts {
+            eprintln!("MCP_CUSTODY_RETAINED {}", receipt);
+        }
         // Release every test-owned startup gate before asking a live client to stop.
         // This also covers assertion/Err paths preceding the body's normal release.
         for gate in resources.http_gates.drain(..) {
@@ -691,12 +696,374 @@ mod native_mcp_cache_tests {
         );
     }
 
+    fn custody_opt_in() -> anyhow::Result<bool> {
+        let nonce = std::env::var_os("CODEX_TEST_MCP_CUSTODY_NONCE");
+        let directory = std::env::var_os("CODEX_TEST_MCP_CUSTODY_DIR");
+        if nonce.is_none() && directory.is_none() {
+            return Ok(false);
+        }
+        ensure!(
+            nonce.is_some() && directory.is_some(),
+            "partial MCP custody opt-in"
+        );
+        ensure!(
+            cfg!(target_os = "linux") && !is_remote_test_environment(),
+            "MCP custody opt-in requires local Linux, never remote/Wine/Windows"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            linux_mcp_custody::Root::open()?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux_mcp_custody {
+        use super::*;
+        use anyhow::Context as _;
+        use sha2::Digest;
+        use std::fs::File;
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::path::Path;
+        use tokio::time::Instant;
+
+        const LIMIT: usize = 4096;
+        const MAX_EXE: u64 = 1024 * 1024 * 1024;
+        fn digest(bytes: &[u8]) -> String {
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        }
+        fn hex_nonce(value: &str) -> bool {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        fn check_clock(deadline: Instant) -> anyhow::Result<()> {
+            ensure!(
+                Instant::now() < deadline,
+                "MCP custody original five-second deadline"
+            );
+            Ok(())
+        }
+        fn private_directory(file: &File) -> anyhow::Result<()> {
+            let meta = file.metadata()?;
+            ensure!(
+                meta.is_dir()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && meta.mode() & 0o7777 == 0o700,
+                "MCP custody requires owned0700 directory"
+            );
+            Ok(())
+        }
+        fn canonical(path: &Path) -> anyhow::Result<()> {
+            ensure!(
+                path.is_absolute() && std::fs::canonicalize(path)? == path,
+                "MCP custody path must already be absolute/canonical"
+            );
+            for ancestor in path.ancestors() {
+                ensure!(
+                    !std::fs::symlink_metadata(ancestor)?
+                        .file_type()
+                        .is_symlink(),
+                    "MCP custody directory path cannot contain symlinks"
+                );
+            }
+            Ok(())
+        }
+        pub(super) struct Root {
+            directory: File,
+            nonce: String,
+        }
+        impl Root {
+            pub(super) fn open() -> anyhow::Result<Self> {
+                let nonce = std::env::var("CODEX_TEST_MCP_CUSTODY_NONCE")?;
+                ensure!(
+                    hex_nonce(&nonce),
+                    "MCP custody nonce must be64 lowercase hex bytes"
+                );
+                let root = std::path::PathBuf::from(
+                    std::env::var_os("CODEX_TEST_MCP_CUSTODY_DIR").context("custody DIR")?,
+                );
+                let temp = std::path::PathBuf::from(
+                    std::env::var_os("TMPDIR").context("explicit phase TMPDIR")?,
+                );
+                ensure!(
+                    root.as_os_str().as_bytes().len() <= LIMIT
+                        && temp.as_os_str().as_bytes().len() <= LIMIT,
+                    "MCP custody directory path bound"
+                );
+                canonical(&root)?;
+                canonical(&temp)?;
+                let relative = root
+                    .strip_prefix(&temp)
+                    .context("custody DIR outside phase TMPDIR")?;
+                ensure!(
+                    !relative.as_os_str().is_empty(),
+                    "custody DIR must be child of TMPDIR"
+                );
+                let mut directory = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&temp)?;
+                private_directory(&directory)?;
+                for component in relative.components() {
+                    let std::path::Component::Normal(name) = component else {
+                        anyhow::bail!("invalid custody directory component")
+                    };
+                    let name = std::ffi::CString::new(name.as_bytes())?;
+                    let fd = unsafe {
+                        libc::openat(
+                            directory.as_raw_fd(),
+                            name.as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    directory = unsafe { File::from_raw_fd(fd) };
+                    private_directory(&directory)?;
+                }
+                Ok(Self { directory, nonce })
+            }
+            fn create(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                ensure!(bytes.len() <= LIMIT, "MCP custody record exceeds bound");
+                let name = std::ffi::CString::new(name)?;
+                let fd = unsafe {
+                    libc::openat(
+                        self.directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        0o600,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                let mut file = unsafe { File::from_raw_fd(fd) };
+                let meta = file.metadata()?;
+                ensure!(
+                    meta.is_file()
+                        && meta.uid() == unsafe { libc::geteuid() }
+                        && meta.nlink() == 1
+                        && meta.mode() & 0o7777 == 0o600,
+                    "MCP custody receipt must be regular owned0600 single-link"
+                );
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                self.directory.sync_all()?;
+                Ok(())
+            }
+            fn ack(&self, name: &str) -> anyhow::Result<Option<Ack>> {
+                let name = std::ffi::CString::new(name)?;
+                let fd = unsafe {
+                    libc::openat(
+                        self.directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        return Ok(None);
+                    }
+                    return Err(error.into());
+                }
+                let mut file = unsafe { File::from_raw_fd(fd) };
+                let before = file.metadata()?;
+                ensure!(
+                    before.is_file()
+                        && before.uid() == unsafe { libc::geteuid() }
+                        && before.nlink() == 1
+                        && before.mode() & 0o7777 == 0o600
+                        && before.len() <= LIMIT as u64,
+                    "MCP custody ACK must be bounded regular owned0600 single-link"
+                );
+                let mut bytes = Vec::new();
+                Read::by_ref(&mut file)
+                    .take((LIMIT + 1) as u64)
+                    .read_to_end(&mut bytes)?;
+                let after = file.metadata()?;
+                ensure!(
+                    bytes.len() <= LIMIT && file_identity(&before) == file_identity(&after),
+                    "MCP custody ACK changed during read"
+                );
+                Ok(Some(serde_json::from_slice(&bytes)?))
+            }
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ack {
+            schema: u8,
+            nonce: String,
+            pid: u32,
+            starttime: u64,
+            exe_sha256: String,
+            case_sha256: String,
+        }
+        fn file_identity(meta: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+            (
+                meta.dev(),
+                meta.ino(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+            )
+        }
+        fn small(path: &Path) -> anyhow::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            File::open(path)?
+                .take((LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= LIMIT,
+                "MCP custody proc record exceeds bound"
+            );
+            Ok(bytes)
+        }
+        fn stat(pid: u32) -> anyhow::Result<(u64, u32, u32)> {
+            let path = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
+            let bytes = small(&path)?;
+            let text = std::str::from_utf8(&bytes)?;
+            ensure!(
+                text.split_once('(').context("proc stat header")?.0.trim() == pid.to_string(),
+                "proc PID mismatch"
+            );
+            let tail = text.rsplit_once(')').context("proc comm boundary")?.1;
+            let fields = tail.split_whitespace().collect::<Vec<_>>();
+            ensure!(
+                fields.len() >= 20 && !matches!(fields[0], "Z" | "X" | "x"),
+                "MCP process is not live"
+            );
+            let birth = fields[19].parse::<u64>()?;
+            let ppid = fields[1].parse::<u32>()?;
+            let uid = std::fs::metadata(format!("/proc/{pid}"))?.uid();
+            ensure!(
+                birth > 0 && ppid > 0 && uid == unsafe { libc::geteuid() },
+                "invalid MCP birth/owner"
+            );
+            Ok((birth, ppid, uid))
+        }
+        pub(super) async fn publish(
+            pid_text: &str,
+            role: &str,
+            deadline: Instant,
+        ) -> anyhow::Result<()> {
+            check_clock(deadline)?;
+            let pid = pid_text.parse::<u32>()?;
+            ensure!(
+                pid > 0 && pid.to_string() == pid_text,
+                "noncanonical MCP PID"
+            );
+            ensure!(
+                ["first", "eager", "second", "filtered", "interrupted"].contains(&role),
+                "unknown MCP role"
+            );
+            let root = Root::open()?;
+            let before = stat(pid)?;
+            let exe_path = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
+            let mut exe = File::open(&exe_path)?;
+            let meta = exe.metadata()?;
+            ensure!(
+                meta.is_file() && meta.len() <= MAX_EXE,
+                "MCP exe exceeds identity bound"
+            );
+            let identity = file_identity(&meta);
+            let mut hash = sha2::Sha256::new();
+            let mut buffer = [0_u8; 65536];
+            let mut total = 0_u64;
+            loop {
+                check_clock(deadline)?;
+                let count = exe.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                total += count as u64;
+                ensure!(total <= MAX_EXE, "MCP exe read exceeds bound");
+                hash.update(&buffer[..count]);
+            }
+            let exe_hash = format!("{:x}", hash.finalize());
+            ensure!(
+                file_identity(&exe.metadata()?) == identity
+                    && std::fs::metadata(&exe_path).map(|m| file_identity(&m))? == identity
+                    && stat(pid)? == before,
+                "MCP process identity changed during hashing"
+            );
+            let boot = digest(small(Path::new("/proc/sys/kernel/random/boot_id"))?.trim_ascii());
+            let path_hash = digest(std::fs::read_link(&exe_path)?.as_os_str().as_bytes());
+            let case = digest(
+                std::thread::current()
+                    .name()
+                    .context("actual libtest thread name")?
+                    .as_bytes(),
+            );
+            let receipt = json!({"schema":1,"nonce":root.nonce.clone(),"kind":"stdio","role":role,"case_sha256":case.clone(),
+                "owner_pid":std::process::id(),"pid":pid,"starttime":before.0,"ppid":before.1,"uid":before.2,"boot_sha256":boot.clone(),
+                "exe":{"dev":identity.0,"ino":identity.1,"size":identity.2,"mtime_sec":identity.3,"mtime_nsec":identity.4,
+                    "ctime_sec":identity.5,"ctime_nsec":identity.6,"sha256":exe_hash.clone(),"path_sha256":path_hash}});
+            check_clock(deadline)?;
+            let stem = format!("{}-stdio-{pid}-{}", root.nonce, before.0);
+            root.create(&format!("{stem}.json"), &serde_json::to_vec(&receipt)?)?;
+            OWNED_MCP_CASE.with(|owned| {
+                let mut owned = owned.lock().unwrap();
+                ensure!(
+                    owned.custody_receipts.len() < 16,
+                    "too many owned MCP identities"
+                );
+                owned.custody_receipts.push(receipt);
+                anyhow::Ok(())
+            })?;
+            loop {
+                check_clock(deadline)?;
+                if let Some(ack) = root.ack(&format!("{stem}.ack.json"))? {
+                    ensure!(
+                        ack.schema == 1
+                            && ack.nonce == root.nonce
+                            && ack.pid == pid
+                            && ack.starttime == before.0
+                            && ack.exe_sha256 == exe_hash
+                            && ack.case_sha256 == case,
+                        "MCP custody ACK identity mismatch"
+                    );
+                    ensure!(
+                        stat(pid)? == before
+                            && std::fs::metadata(&exe_path).map(|m| file_identity(&m))? == identity
+                            && digest(
+                                small(Path::new("/proc/sys/kernel/random/boot_id"))?.trim_ascii()
+                            ) == boot,
+                        "MCP process changed before ACK admission"
+                    );
+                    check_clock(deadline)?;
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
     async fn wait_for_new_pid(
         fs: &dyn ExecutorFileSystem,
         path: &PathUri,
         previous_pid: Option<&str>,
+        role: &str,
     ) -> anyhow::Result<String> {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        #[cfg(not(target_os = "linux"))]
+        let _ = role;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tokio::time::timeout_at(deadline, async {
             loop {
                 if let Ok(contents) = fs
                     .read_file_text(path, Default::default(), /*sandbox*/ None)
@@ -704,14 +1071,18 @@ mod native_mcp_cache_tests {
                 {
                     let pid = contents.trim();
                     if !pid.is_empty() && Some(pid) != previous_pid {
-                        return pid.to_string();
+                        if custody_opt_in()? {
+                            #[cfg(target_os = "linux")]
+                            linux_mcp_custody::publish(pid, role, deadline).await?;
+                        }
+                        return anyhow::Ok(pid.to_string());
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .context("timed out waiting for a new MCP server process")
+        .context("timed out waiting for a new MCP server process")?
     }
 
     use core_test_support::stdio_server_bin;
@@ -1211,7 +1582,8 @@ mod native_mcp_cache_tests {
             .codex
             .start_or_steer_turn(user_turn("use the echo tool"))
             .await?;
-        let first_pid = wait_for_new_pid(fs.as_ref(), &pid_file, /*previous_pid*/ None).await?;
+        let first_pid =
+            wait_for_new_pid(fs.as_ref(), &pid_file, /*previous_pid*/ None, "first").await?;
         fs.write_file(
             &barrier_file,
             b"ready".to_vec(),
@@ -1238,7 +1610,7 @@ mod native_mcp_cache_tests {
             .start_thread(StartThreadOptions::new(fixture.config.clone()))
             .await?;
         retain_thread(&eager_thread);
-        let eager_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&first_pid)).await?;
+        let eager_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&first_pid), "eager").await?;
         wait_for_mcp_server(&eager_thread, SERVER_NAME).await?;
         eager_thread.shutdown_and_wait().await?;
         let cached_process = process_label(&eager_pid);
@@ -1463,7 +1835,8 @@ mod native_mcp_cache_tests {
             &format!("Use the tools from {cached_process}."),
             &format!("Echo from {cached_process}."),
         );
-        let second_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&eager_pid)).await?;
+        let second_pid =
+            wait_for_new_pid(fs.as_ref(), &pid_file, Some(&eager_pid), "second").await?;
         let second_process = process_label(&second_pid);
         tokio::time::timeout(Duration::from_secs(2), unrelated_finished_rx)
             .await
@@ -1652,7 +2025,8 @@ mod native_mcp_cache_tests {
             .call_mcp_tool(SERVER_NAME, "cwd", Some(json!({})), /*meta*/ None)
             .await?;
         assert_ne!(result.is_error, Some(true));
-        let filtered_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&second_pid)).await?;
+        let filtered_pid =
+            wait_for_new_pid(fs.as_ref(), &pid_file, Some(&second_pid), "filtered").await?;
         filtered_thread.shutdown_and_wait().await?;
         fs.remove(
             &barrier_file,
@@ -1694,7 +2068,8 @@ mod native_mcp_cache_tests {
         interrupted_thread
             .start_or_steer_turn(user_turn("Start the cached MCP tool."))
             .await?;
-        let interrupted_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&filtered_pid)).await?;
+        let interrupted_pid =
+            wait_for_new_pid(fs.as_ref(), &pid_file, Some(&filtered_pid), "interrupted").await?;
         wait_for_event(&interrupted_thread, |event| {
             matches!(
                 event,
