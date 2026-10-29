@@ -1212,7 +1212,7 @@ async fn queued_text_limit_is_enforced_across_all_input_items() -> anyhow::Resul
 async fn queued_text_limit_counts_characters_and_ignores_non_text_items() -> anyhow::Result<()> {
     let (queue, _home) = test_queue().await?;
     let service = QueuedItemService::new(queue, Weak::new(), Arc::new(NoopExtensionEventSink));
-    let mut input = structured_user_input(&"ÃƒÂ©".repeat(MAX_USER_INPUT_TEXT_CHARS));
+    let mut input = structured_user_input(&"é".repeat(MAX_USER_INPUT_TEXT_CHARS));
     if let TurnInput::UserInput { content, .. } = &mut input {
         content.push(UserInput::Mention {
             name: "Demo App".to_string(),
