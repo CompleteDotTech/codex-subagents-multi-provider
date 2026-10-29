@@ -382,7 +382,7 @@ impl QueueHookDiagnostic {
     ) -> Option<Self> {
         use std::os::windows::ffi::OsStrExt;
         static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("8d7b2c61") {
+        if std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("6c4e9a72") {
             return None;
         }
         // hooks.json has no per-command env field. Recognize only this exact
@@ -409,7 +409,7 @@ impl QueueHookDiagnostic {
         }
         let normalized = source.replace(log_text, "<TEST_LOG>");
         if Self::digest(normalized.as_bytes())
-            != "0ed1acf40344f9128b8ce00f54cc87de715e89ebf3b1b8631e78188025423581"
+            != "55b7d7d5a6a4827d7b8475920bc813779b5197b1318430468df4fda7f5e76e18"
         {
             return None;
         }
@@ -417,7 +417,7 @@ impl QueueHookDiagnostic {
             eprintln!("QUEUE_HOOK_DIAGNOSTIC launch_bound_exceeded");
             return None;
         }
-        let path = home.join("queue_hook_diagnostic_8d7b2c61.jsonl");
+        let path = home.join("queue_hook_diagnostic_6c4e9a72.jsonl");
         if std::fs::symlink_metadata(&path)
             .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
         {
@@ -470,7 +470,39 @@ impl QueueHookDiagnostic {
                 unknown_args += 1;
             }
         }
+        // Observe only the exact configured child environment after env_clear.
+        // Values and paths are never recorded; Windows keys are case-insensitive.
+        let path_present = actual.get_envs().any(|(key, value)| {
+            key.to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case("PATH"))
+                && value.is_some()
+        });
+        let pathext = actual.get_envs().find_map(|(key, value)| {
+            key.to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case("PATHEXT"))
+                .then_some(value)
+                .flatten()
+        });
+        let extensions = pathext
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let contains_extension = |expected: &str| {
+            extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case(expected))
+        };
         observer.record(serde_json::json!({
+            "path_present":path_present,"pathext_present":pathext.is_some(),
+            "pathext_empty":pathext.is_some_and(|value| value.is_empty()),
+            "pathext_extension_count":extensions.iter().filter(|extension| !extension.is_empty()).count(),
+            "pathext_has_exe":contains_extension(".EXE"),"pathext_has_com":contains_extension(".COM"),
+            "pathext_has_bat":contains_extension(".BAT"),"pathext_has_cmd":contains_extension(".CMD"),
             "stage":"built", "shell_source":if shell.program.is_empty() {"fallback"} else {"explicit"},
             "program_kind":program_kind,"program_path_sha256":Self::digest(&program_bytes),
             "argc":argc,"arg_flag_mask":flag_mask,"unknown_args":unknown_args,"exact_command_arg":command_arg,
@@ -483,7 +515,7 @@ impl QueueHookDiagnostic {
 
     fn record(&self, mut value: serde_json::Value) {
         use std::io::Write;
-        value["nonce"] = serde_json::json!("8d7b2c61");
+        value["nonce"] = serde_json::json!("6c4e9a72");
         value["elapsed_ms"] =
             serde_json::json!(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         let Ok(mut line) = serde_json::to_vec(&value) else {
@@ -556,7 +588,7 @@ impl QueueHookDiagnostic {
             let Ok(marker) = serde_json::from_str::<serde_json::Value>(json) else {
                 continue;
             };
-            if marker["nonce"].as_str() != Some("8d7b2c61") {
+            if marker["nonce"].as_str() != Some("6c4e9a72") {
                 continue;
             }
             match marker["phase"].as_str() {

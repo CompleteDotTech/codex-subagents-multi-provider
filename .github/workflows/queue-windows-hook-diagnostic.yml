@@ -1,24 +1,24 @@
-name: One Windows queue hook diagnostic
+name: One Windows queue PATHEXT comparison
 
 on:
   push:
     branches:
-      - diagnostic/18-windows-queue-hook-selector-8d7b2c61
+      - diagnostic/18-windows-queue-pathext-6c4e9a72
 
 permissions:
   contents: read
 
 concurrency:
-  group: queue-hook-diagnostic-8d7b2c61-${{ github.run_id }}
+  group: queue-hook-diagnostic-6c4e9a72-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   queue-hook-diagnostic:
-    if: ${{ github.event.created == true && github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && github.ref == 'refs/heads/diagnostic/18-windows-queue-hook-selector-8d7b2c61' }}
+    if: ${{ github.event.created == true && github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && github.ref == 'refs/heads/diagnostic/18-windows-queue-pathext-6c4e9a72' }}
     runs-on: windows-2025
     timeout-minutes: 90
     env:
-      CODEX_QUEUE_DIAGNOSTIC_NONCE: 8d7b2c61
+      CODEX_QUEUE_DIAGNOSTIC_NONCE: 6c4e9a72
       # The user explicitly authorized the existing runtime-tools license declaration.
       BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA: "1"
     steps:
@@ -38,27 +38,60 @@ jobs:
           native-windows-voice: ${{ github.repository == 'CompleteDotTech/codex-subagents-multi-provider' && secrets.BUILDBUDDY_API_KEY == '' }}
           cache-scope: bazel-test
 
-      - name: Execute the entire queue service target once
+      - name: Compare the entire queue target in two predetermined arms
         shell: bash
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
           set -euo pipefail
-          ./.github/scripts/run-bazel-ci.sh \
-            --print-failed-action-summary \
-            --print-failed-test-logs \
-            --windows-cross-compile \
-            --remote-download-toplevel \
-            -- \
-            test \
-            --skip_incompatible_explicit_targets \
-            --test_tag_filters=-argument-comment-lint \
-            --test_verbose_timeout_warnings \
-            --nocache_test_results \
-            --runs_per_test=1 \
-            --flaky_test_attempts=1 \
-            --test_env=CODEX_QUEUE_DIAGNOSTIC_NONCE=8d7b2c61 \
-            --build_metadata=COMMIT_SHA=${GITHUB_SHA} \
-            --build_metadata=TAG_queue_hook_diagnostic=8d7b2c61 \
-            -- \
-            //codex-rs/ext/queue:queue-queue_service-test
+          results="${RUNNER_TEMP}/queue-pathext-6c4e9a72-results.tsv"
+          : > "$results"
+          run_arm() {
+            local arm="$1"
+            shift
+            local raw="${RUNNER_TEMP}/queue-pathext-6c4e9a72-${arm}.log"
+            local status
+            printf 'QUEUE_PATHEXT_ARM_BEGIN arm=%s head=%s\n' "$arm" "$GITHUB_SHA"
+            if ./.github/scripts/run-bazel-ci.sh \
+              --print-failed-action-summary \
+              --print-failed-test-logs \
+              --windows-cross-compile \
+              --remote-download-toplevel \
+              -- \
+              test \
+              --skip_incompatible_explicit_targets \
+              --test_tag_filters=-argument-comment-lint \
+              --test_verbose_timeout_warnings \
+              --nocache_test_results \
+              --runs_per_test=1 \
+              --flaky_test_attempts=1 \
+              --test_env=CODEX_QUEUE_DIAGNOSTIC_NONCE=6c4e9a72 \
+              --build_metadata=COMMIT_SHA=${GITHUB_SHA} \
+              --build_metadata=TAG_queue_hook_diagnostic=6c4e9a72 \
+              --build_metadata=TAG_queue_pathext_arm="$arm" \
+              "$@" \
+              -- \
+              //codex-rs/ext/queue:queue-queue_service-test > "$raw" 2>&1; then
+              status=0
+            else
+              status=$?
+            fi
+            cat "$raw"
+            local raw_sha256
+            raw_sha256="$(sha256sum "$raw" | cut -d ' ' -f 1)"
+            printf 'QUEUE_PATHEXT_ARM_END arm=%s exit=%s raw_sha256=%s\n' "$arm" "$status" "$raw_sha256"
+            printf '%s\t%s\t%s\n' "$arm" "$status" "$raw_sha256" >> "$results"
+          }
+          # A preserves the existing test environment. B supplies only the
+          # repository's conservative extension default, never another interpreter.
+          # Both are predetermined whole-target invocations, not failure retries.
+          run_arm A
+          run_arm B '--test_env=PATHEXT=.COM;.EXE;.BAT;.CMD'
+          printf 'Queue PATHEXT comparison: arm, exit, private raw SHA256\n' >> "$GITHUB_STEP_SUMMARY"
+          cat "$results" >> "$GITHUB_STEP_SUMMARY"
+          # Preserve A's failure even if B passes. Each arm must have one result.
+          test "$(wc -l < "$results")" -eq 2
+          if awk -F '\t' '$2 != 0 { failed = 1 } END { exit failed }' "$results"; then
+            exit 0
+          fi
+          exit 1

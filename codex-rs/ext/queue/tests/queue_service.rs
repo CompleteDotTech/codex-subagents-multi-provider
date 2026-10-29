@@ -168,13 +168,13 @@ if payload["prompt"] == "blocked":
     );
     // Diagnostic branch only: the original interpreter/command and hook decision stay unchanged.
     let diagnostic =
-        cfg!(windows) && std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() == Ok("8d7b2c61");
+        cfg!(windows) && std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() == Ok("6c4e9a72");
     if diagnostic {
         script = script
             .replace("payload = json.load(sys.stdin)", concat!(r#"import hashlib
 
 def _queue_diag(phase):
-    print("QUEUE_HOOK_DIAG " + json.dumps({"nonce": "8d7b2c61", "phase": phase, "executable_path_sha256": hashlib.sha256(sys.executable.encode("utf-8", "surrogatepass")).hexdigest(), "version": list(sys.version_info[:3])}), file=sys.stderr, flush=True)
+    print("QUEUE_HOOK_DIAG " + json.dumps({"nonce": "6c4e9a72", "phase": phase, "executable_path_sha256": hashlib.sha256(sys.executable.encode("utf-8", "surrogatepass")).hexdigest(), "version": list(sys.version_info[:3])}), file=sys.stderr, flush=True)
 
 _queue_diag("entry")
 "#, "\npayload = json.load(sys.stdin)\n_queue_diag(\"decoded\")"))
@@ -213,7 +213,7 @@ impl QueueHookDiagnostic {
 
     fn observe(&self, event: &EventMsg) {
         if !cfg!(windows)
-            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("8d7b2c61")
+            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("6c4e9a72")
         {
             return;
         }
@@ -249,6 +249,14 @@ impl QueueHookDiagnostic {
             "script_has_space",
             "script_arg_quoted",
             "script_regular",
+            "path_present",
+            "pathext_present",
+            "pathext_empty",
+            "pathext_extension_count",
+            "pathext_has_exe",
+            "pathext_has_com",
+            "pathext_has_bat",
+            "pathext_has_cmd",
             "raw_os_error",
             "exit_code",
             "error_kind",
@@ -266,7 +274,7 @@ impl QueueHookDiagnostic {
             "python_micro",
         ];
         let labels = [
-            "8d7b2c61",
+            "6c4e9a72",
             "built",
             "spawned",
             "spawn_error",
@@ -309,7 +317,7 @@ impl Drop for QueueHookDiagnostic {
     fn drop(&mut self) {
         if self.passed
             || !cfg!(windows)
-            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("8d7b2c61")
+            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("6c4e9a72")
         {
             return;
         }
@@ -336,7 +344,7 @@ impl Drop for QueueHookDiagnostic {
             };
             eprintln!("QUEUE_HOOK_DIAGNOSTIC {record}");
         }
-        let path = self.home.join("queue_hook_diagnostic_8d7b2c61.jsonl");
+        let path = self.home.join("queue_hook_diagnostic_6c4e9a72.jsonl");
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             eprintln!("QUEUE_HOOK_DIAGNOSTIC {{\"kind\":\"records_absent\"}}");
             return;
@@ -349,7 +357,7 @@ impl Drop for QueueHookDiagnostic {
             for line in text.lines().take(32) {
                 // The runtime emits only this bounded typed schema, never arbitrary hook text.
                 if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-                    if record.get("nonce").and_then(serde_json::Value::as_str) == Some("8d7b2c61")
+                    if record.get("nonce").and_then(serde_json::Value::as_str) == Some("6c4e9a72")
                         && Self::safe_record(&record)
                     {
                         eprintln!("QUEUE_HOOK_DIAGNOSTIC {record}");
@@ -1204,7 +1212,7 @@ async fn queued_text_limit_is_enforced_across_all_input_items() -> anyhow::Resul
 async fn queued_text_limit_counts_characters_and_ignores_non_text_items() -> anyhow::Result<()> {
     let (queue, _home) = test_queue().await?;
     let service = QueuedItemService::new(queue, Weak::new(), Arc::new(NoopExtensionEventSink));
-    let mut input = structured_user_input(&"é".repeat(MAX_USER_INPUT_TEXT_CHARS));
+    let mut input = structured_user_input(&"ÃƒÂ©".repeat(MAX_USER_INPUT_TEXT_CHARS));
     if let TurnInput::UserInput { content, .. } = &mut input {
         content.push(UserInput::Mention {
             name: "Demo App".to_string(),
