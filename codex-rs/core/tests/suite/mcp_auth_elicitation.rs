@@ -4,7 +4,6 @@ use anyhow::Result;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol as app;
-use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_core::TurnInputSubmission;
 use codex_core::config::Constrained;
@@ -25,8 +24,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ElicitationAction;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathExt;
@@ -40,6 +37,7 @@ use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
+use futures::FutureExt as _;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -585,22 +583,8 @@ approvals_reviewer = "user"
         })
         .build_with_auto_env(&server)
         .await?;
-    let child = test
-        .thread_manager
-        .start_thread(StartThreadOptions {
-            session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id: test.session_configured.thread_id,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-            })),
-            environments: Some(vec![test.executor_environment().request()]),
-            ..StartThreadOptions::new(test.config.clone())
-        })
-        .await?
-        .thread;
-    wait_for_mcp_server(&child, CODEX_APPS_MCP_SERVER_NAME).await?;
+    let mut owned_child = None;
+    let outcome = std::panic::AssertUnwindSafe(async {
     responses::mount_sse_once(
         &server,
         responses::sse(vec![
@@ -615,24 +599,44 @@ approvals_reviewer = "user"
     )
     .await;
     let follow_up = responses::mount_sse_once(&server, responses::sse_completed("done")).await;
-    child
-        .start_or_steer_turn(
-            TurnInputRequest::user_input(vec![UserInput::Text {
-                text: "Use [$calendar](app://calendar) to create a calendar event.".into(),
-                text_elements: Vec::new(),
-            }])
-            .with_thread_settings(ThreadSettingsOverrides {
+    let child = test
+        .spawn_native_subagent(
+            &server,
+            "mcp_auth",
+            "Use [$calendar](app://calendar) to create a calendar event.",
+            ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::OnRequest),
                 permission_profile: Some(PermissionProfile::Disabled),
                 ..Default::default()
-            }),
+            },
         )
         .await?;
+    owned_child = Some(std::sync::Arc::clone(&child));
+    let mut startup_ready = false;
     let mut completed_status = None;
     let mut completed_result = None;
     let mut prompts = 0;
     loop {
         let event = wait_for_event(&child, |event| {
+            if let EventMsg::McpStartupComplete(summary) = event {
+                assert!(
+                    !summary
+                        .failed
+                        .iter()
+                        .any(|failure| failure.server == CODEX_APPS_MCP_SERVER_NAME)
+                );
+                assert!(
+                    !summary
+                        .cancelled
+                        .iter()
+                        .any(|name| name == CODEX_APPS_MCP_SERVER_NAME)
+                );
+                startup_ready = summary
+                    .ready
+                    .iter()
+                    .any(|name| name == CODEX_APPS_MCP_SERVER_NAME);
+                assert!(startup_ready, "child Apps MCP server must be ready");
+            }
             assert!(
                 !matches!(event, EventMsg::RequestUserInput(_)),
                 "subagents must not fall back to request_user_input"
@@ -683,6 +687,10 @@ approvals_reviewer = "user"
             })
             .await?;
     }
+    assert!(
+        startup_ready,
+        "actual native child emitted Apps MCP ready summary"
+    );
     let expects_prompt = !matches!(kind, SubagentRequestKind::LegacyToolApproval);
     assert_eq!(prompts, usize::from(expects_prompt));
     assert_eq!(
@@ -743,5 +751,65 @@ approvals_reviewer = "user"
     }
     child.shutdown_and_wait().await?;
     test.codex.shutdown_and_wait().await?;
-    Ok(())
+    Ok::<(), anyhow::Error>(())
+    }).catch_unwind().await;
+    // The exact newly built manager belongs only to this fixture. Retain handles
+    // before shutdown, including a child whose setup failed before returning it.
+    let mut owned_threads = vec![std::sync::Arc::clone(&test.codex)];
+    if let Some(child) = owned_child {
+        owned_threads.push(child);
+    }
+    let mut cleanup_errors = Vec::new();
+    for id in test.thread_manager.list_thread_ids().await {
+        match test.thread_manager.get_thread(id).await {
+            Ok(thread)
+                if !owned_threads
+                    .iter()
+                    .any(|owned| std::sync::Arc::ptr_eq(owned, &thread)) =>
+            {
+                owned_threads.push(thread);
+            }
+            Ok(_) => {}
+            Err(error) => cleanup_errors.push(format!("owned MCP fixture handle: {error}")),
+        }
+    }
+    let cleanup = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for thread in &owned_threads {
+            if let Err(error) = thread.shutdown_and_wait().await {
+                cleanup_errors.push(format!("owned MCP fixture shutdown: {error}"));
+            }
+            let (config, _) = thread.current_mcp_config_and_runtime_context().await;
+            if thread
+                .mcp_connection_statuses(&config)
+                .await
+                .values()
+                .any(|status| *status != codex_protocol::mcp::McpServerConnectionStatus::Cancelled)
+            {
+                cleanup_errors.push("owned MCP fixture client was not cancelled".to_string());
+            }
+        }
+    })
+    .await;
+    if cleanup.is_err() {
+        cleanup_errors
+            .push("owned MCP fixture cleanup deadline exceeded; ownership unresolved".into());
+    }
+    if !cleanup_errors.is_empty() {
+        eprintln!("MCP_INTEGRATION_CLEANUP_UNQUALIFIED: {cleanup_errors:?}");
+    }
+    match outcome {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(result) => {
+            let value = result?;
+            anyhow::ensure!(
+                cleanup_errors.is_empty(),
+                "MCP fixture cleanup failed: {cleanup_errors:?}"
+            );
+            eprintln!(
+                "MCP_INTEGRATION_OWNED_CLEANUP_COMPLETE threads={}",
+                owned_threads.len()
+            );
+            Ok(value)
+        }
+    }
 }

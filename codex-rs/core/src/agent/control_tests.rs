@@ -9038,3 +9038,5 @@ async fn fresh_revoked_running_caller_cannot_cross_final_admission(stage: u8) {
 }
 
 include!("control_lifecycle_tests.rs");
+
+include!("control_mcp_fixture_tests.rs");
