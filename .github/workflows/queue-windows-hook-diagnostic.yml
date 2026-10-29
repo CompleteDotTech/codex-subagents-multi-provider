@@ -65,6 +65,7 @@ jobs:
               --nocache_test_results \
               --runs_per_test=1 \
               --flaky_test_attempts=1 \
+              --test_arg=--show-output \
               --test_env=CODEX_QUEUE_DIAGNOSTIC_NONCE=6c4e9a72 \
               --build_metadata=COMMIT_SHA=${GITHUB_SHA} \
               --build_metadata=TAG_queue_hook_diagnostic=6c4e9a72 \

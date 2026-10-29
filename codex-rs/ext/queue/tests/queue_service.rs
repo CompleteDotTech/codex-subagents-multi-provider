@@ -315,12 +315,16 @@ impl QueueHookDiagnostic {
 
 impl Drop for QueueHookDiagnostic {
     fn drop(&mut self) {
-        if self.passed
-            || !cfg!(windows)
+        if !cfg!(windows)
             || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("6c4e9a72")
         {
             return;
         }
+        // Both comparison arms need the same bounded facts, including on pass.
+        eprintln!(
+            "QUEUE_HOOK_DIAGNOSTIC {{\"kind\":\"fixture_outcome\",\"passed\":{}}}",
+            self.passed
+        );
         let events = self
             .events
             .lock()
