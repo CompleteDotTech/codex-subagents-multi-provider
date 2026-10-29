@@ -226,7 +226,8 @@ def codex_rust_crate(
         unit_test_timeout = None,
         extra_binaries = [],
         extra_binaries_non_windows = [],
-        run_tests_with_wine_exec = False):
+        run_tests_with_wine_exec = False,
+        windows_integration_test_env = {}):
     """Defines a Rust crate with library, binaries, and tests wired for Bazel + Cargo parity.
 
     The macro mirrors Cargo conventions: it builds a library when `src/` exists,
@@ -290,6 +291,8 @@ def codex_rust_crate(
         run_tests_with_wine_exec: Boolean, defaults to False. Whether to emit a
             Wine-exec variant for each integration test. Variants inherit the
             native test's timeout, tags, and shard count.
+        windows_integration_test_env: Extra runtime environment for this crate's
+            Windows integration tests. Other platforms and unit tests are unchanged.
     """
     test_env = {
         # The launcher resolves an absolute workspace root at runtime so
@@ -533,6 +536,19 @@ def codex_rust_crate(
             "//conditions:default": cargo_env_runfiles | non_windows_cargo_env_runfiles,
         })
 
+    integration_test_wrapper_env = test_env
+    if windows_integration_test_env:
+        # Build both branches from raw dictionaries: integration_test_cargo_env
+        # may already be a select when non-Windows-only binaries are configured.
+        integration_test_cargo_env = select({
+            "@platforms//os:windows": cargo_env | windows_integration_test_env,
+            "//conditions:default": cargo_env | non_windows_cargo_env,
+        })
+        integration_test_wrapper_env = select({
+            "@platforms//os:windows": test_env | windows_integration_test_env,
+            "//conditions:default": test_env,
+        })
+
     wine_host_binaries = {
         env_var.removeprefix("CARGO_BIN_EXE_"): binary_label
         for binary_label, env_var in (cargo_env_runfiles | non_windows_cargo_env_runfiles).items()
@@ -610,7 +626,7 @@ def codex_rust_crate(
 
             workspace_root_test(
                 name = test_name,
-                env = test_env,
+                env = integration_test_wrapper_env,
                 # CARGO_BIN_EXE_* values are rlocation paths at analysis time.
                 # The launcher rewrites them to absolute paths at execution
                 # time so tests keep working after chdir_workspace_root and on
