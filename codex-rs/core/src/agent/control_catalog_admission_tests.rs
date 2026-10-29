@@ -280,7 +280,7 @@ stream_max_retries = 0
         }
         async fn prepare(&self, parent: &Arc<CodexThread>, target: bool) -> Result<Config, String> {
             let turn = parent.session.new_default_turn().await;
-            assert_eq!(
+            std::assert_eq!(
                 turn.multi_agent_version, self.version,
                 "actual configured native backend"
             );
@@ -392,15 +392,15 @@ stream_max_retries = 0
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
-            assert_eq!(entries.len(), 1, "one exact owned target catalog partition");
+            std::assert_eq!(entries.len(), 1, "one exact owned target catalog partition");
             let entry = &entries[0];
             assert!(entry.file_type().unwrap().is_file());
-            assert_eq!(entry.path().extension().unwrap(), "json");
+            std::assert_eq!(entry.path().extension().unwrap(), "json");
             let value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
             assert!(value.get("identity").is_some());
             std::fs::remove_file(entry.path()).unwrap();
-            assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
+            std::assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
         }
         async fn cleanup(&self) -> Result<(), String> {
             let threads = self.owned.lock().unwrap().clone();
@@ -479,18 +479,18 @@ stream_max_retries = 0
                 "real host policy is outside caller-writable roots and tmp allowances");
             let caller = fixture.start_prepared(&root,
                 fixture.prepare(&root, /*target*/ false).await.unwrap()).await.unwrap();
-            assert_eq!(fixture.gets().await, 0);
-            assert_eq!(fixture.auth_calls(), 0);
+            std::assert_eq!(fixture.gets().await, 0);
+            std::assert_eq!(fixture.auth_calls(), 0);
             let target = if resume {
                 let target = fixture.start_prepared(&caller,
                     fixture.prepare(&caller, /*target*/ true).await.unwrap()).await.unwrap();
-                assert_eq!(fixture.gets().await, 1, "supported target catalog really fetched");
+                std::assert_eq!(fixture.gets().await, 1, "supported target catalog really fetched");
                 assert!(fixture.auth_calls() > 0, "actual configured auth helper really executed");
                 assert!(target.config().await.model_catalog.is_none(), "dynamic target is not static");
                 let context = target.session.new_default_turn().await.to_turn_context_item();
                 assert!(target.session.persist_rollout_items(&[RolloutItem::TurnContext(context)]).await);
                 target.session.flush_rollout().await.unwrap();
-                assert_eq!(harness.manager.try_evict_v2_thread(Arc::clone(&target)).await.unwrap(),
+                std::assert_eq!(harness.manager.try_evict_v2_thread(Arc::clone(&target)).await.unwrap(),
                     ThreadEvictionOutcome::Evicted, "genuine completed owned eviction before private resume");
                 assert!(!target.is_running());
                 assert!(harness.manager.get_thread(target.session.thread_id).await.is_err());
@@ -539,9 +539,9 @@ stream_max_retries = 0
             };
             let owned_gate = gate_observation == (caller_id, TARGET.to_owned());
             assert!(owned_gate, "actual selected caller/provider reached the continuation");
-            assert_eq!(fixture.counts(), before_counts, "preparation gate precedes store effects");
-            assert_eq!(fixture.auth_calls(), before_auth, "no target auth before controlled continuation");
-            assert_eq!(fixture.gets().await, before_gets, "no target GET before controlled continuation");
+            std::assert_eq!(fixture.counts(), before_counts, "preparation gate precedes store effects");
+            std::assert_eq!(fixture.auth_calls(), before_auth, "no target auth before controlled continuation");
+            std::assert_eq!(fixture.gets().await, before_gets, "no target GET before controlled continuation");
             if change == 1 || change == 2 {
                 publish_native_startup_policy_change(&root, change).await;
             } else if change == 3 {
@@ -554,10 +554,10 @@ stream_max_retries = 0
             let file_policy_empty = root.config().await.config_layer_stack.effective_config()["agents"]
                 ["allowed_model_providers"].as_array().is_some_and(|list| list.is_empty());
             let root_removed = harness.manager.get_thread(root_id).await.is_err();
-            assert_eq!(publication_observed, change == 1 || change == 2);
-            assert_eq!(profile_changed, change == 1);
-            assert_eq!(file_policy_empty, change == 2);
-            assert_eq!(root_removed, change == 3);
+            std::assert_eq!(publication_observed, change == 1 || change == 2);
+            std::assert_eq!(profile_changed, change == 1);
+            std::assert_eq!(file_policy_empty, change == 2);
+            std::assert_eq!(root_removed, change == 3);
             let caller_after = crate::agent::child_provider_authorization::RetainedAgentAuthority::capture(
                 &caller.session, &caller.session_source).await;
             let caller_unchanged = caller.is_running()
@@ -641,11 +641,11 @@ stream_max_retries = 0
                 observed.auth_delta > 0,
                 "unchanged cold catalog uses actual configured helper"
             );
-            assert_eq!(
+            std::assert_eq!(
                 observed.get_delta, 1,
                 "unchanged cold catalog dispatches its real localhost GET"
             );
-            assert_eq!(
+            std::assert_eq!(
                 observed.store_delta,
                 if resume { (0, 1, 0) } else { (1, 0, 0) }
             );
@@ -655,8 +655,8 @@ stream_max_retries = 0
                 "completed root change denies native preparation specifically"
             );
             assert!(!observed.registered);
-            assert_eq!(observed.store_delta, (0, 0, 0));
-            assert_eq!(observed.prewarmed, 0);
+            std::assert_eq!(observed.store_delta, (0, 0, 0));
+            std::assert_eq!(observed.prewarmed, 0);
             assert!(observed.history_preserved);
             std::assert_eq!(
                 observed.auth_delta,
