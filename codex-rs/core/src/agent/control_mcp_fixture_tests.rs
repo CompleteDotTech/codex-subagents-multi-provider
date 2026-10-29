@@ -934,7 +934,7 @@ mod native_mcp_cache_tests {
             );
             Ok(bytes)
         }
-        fn stat(pid: u32) -> anyhow::Result<(u64, u32, u32)> {
+        fn stat(pid: u32) -> anyhow::Result<((u64, u32, u32), String)> {
             let path = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
             let bytes = small(&path)?;
             let text = std::str::from_utf8(&bytes)?;
@@ -945,7 +945,7 @@ mod native_mcp_cache_tests {
             let tail = text.rsplit_once(')').context("proc comm boundary")?.1;
             let fields = tail.split_whitespace().collect::<Vec<_>>();
             ensure!(
-                fields.len() >= 20 && !matches!(fields[0], "Z" | "X" | "x"),
+                fields.len() >= 20 && fields[0].len() == 1 && !matches!(fields[0], "Z" | "X" | "x"),
                 "MCP process is not live"
             );
             let birth = fields[19].parse::<u64>()?;
@@ -955,7 +955,7 @@ mod native_mcp_cache_tests {
                 birth > 0 && ppid > 0 && uid == unsafe { libc::geteuid() },
                 "invalid MCP birth/owner"
             );
-            Ok((birth, ppid, uid))
+            Ok(((birth, ppid, uid), fields[0].to_owned()))
         }
         pub(super) async fn publish(
             pid_text: &str,
@@ -973,7 +973,7 @@ mod native_mcp_cache_tests {
                 "unknown MCP role"
             );
             let root = Root::open()?;
-            let before = stat(pid)?;
+            let (before, state) = stat(pid)?;
             let exe_path = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
             let mut exe = File::open(&exe_path)?;
             let meta = exe.metadata()?;
@@ -999,7 +999,7 @@ mod native_mcp_cache_tests {
             ensure!(
                 file_identity(&exe.metadata()?) == identity
                     && std::fs::metadata(&exe_path).map(|m| file_identity(&m))? == identity
-                    && stat(pid)? == before,
+                    && stat(pid)?.0 == before,
                 "MCP process identity changed during hashing"
             );
             let boot = digest(small(Path::new("/proc/sys/kernel/random/boot_id"))?.trim_ascii());
@@ -1011,7 +1011,7 @@ mod native_mcp_cache_tests {
                     .as_bytes(),
             );
             let receipt = json!({"schema":1,"nonce":root.nonce.clone(),"kind":"stdio","role":role,"case_sha256":case.clone(),
-                "owner_pid":std::process::id(),"pid":pid,"starttime":before.0,"ppid":before.1,"uid":before.2,"boot_sha256":boot.clone(),
+                "platform":std::env::consts::OS,"state":state,"owner_pid":std::process::id(),"pid":pid,"starttime":before.0,"ppid":before.1,"uid":before.2,"boot_sha256":boot.clone(),
                 "exe":{"dev":identity.0,"ino":identity.1,"size":identity.2,"mtime_sec":identity.3,"mtime_nsec":identity.4,
                     "ctime_sec":identity.5,"ctime_nsec":identity.6,"sha256":exe_hash.clone(),"path_sha256":path_hash}});
             check_clock(deadline)?;
@@ -1039,7 +1039,7 @@ mod native_mcp_cache_tests {
                         "MCP custody ACK identity mismatch"
                     );
                     ensure!(
-                        stat(pid)? == before
+                        stat(pid)?.0 == before
                             && std::fs::metadata(&exe_path).map(|m| file_identity(&m))? == identity
                             && digest(
                                 small(Path::new("/proc/sys/kernel/random/boot_id"))?.trim_ascii()

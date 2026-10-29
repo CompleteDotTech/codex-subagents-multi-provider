@@ -92,15 +92,15 @@ def custody_ready():
             if text.split("(", 1)[0].strip() != str(pid):
                 raise RuntimeError("MCP custody PID mismatch")
             fields = text.rsplit(")", 1)[1].split()
-            if len(fields) < 20 or fields[0] in ("Z", "X", "x"):
+            if len(fields) < 20 or len(fields[0]) != 1 or fields[0] in ("Z", "X", "x"):
                 raise RuntimeError("MCP custody process not live")
             value = (int(fields[19]), int(fields[1]), os.stat("/proc/self").st_uid)
             if value[0] <= 0 or value[1] <= 0 or value[2] != os.geteuid():
                 raise RuntimeError("MCP custody birth/owner mismatch")
-            return value
+            return value, fields[0]
         def identity(info):
             return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-        before = birth()
+        before, state = birth()
         clock()
         exe = os.open("/proc/self/exe", os.O_RDONLY | os.O_CLOEXEC)
         try:
@@ -120,11 +120,11 @@ def custody_ready():
                     raise RuntimeError("MCP custody executable read bound")
                 digest.update(block)
             exe_hash = digest.hexdigest()
-            if identity(os.fstat(exe)) != original or identity(os.stat("/proc/self/exe")) != original or birth() != before:
+            if identity(os.fstat(exe)) != original or identity(os.stat("/proc/self/exe")) != original or birth()[0] != before:
                 raise RuntimeError("MCP custody identity changed while hashing")
             boot = hashlib.sha256(small("/proc/sys/kernel/random/boot_id").strip()).hexdigest()
             receipt = {"schema": 1, "nonce": nonce, "kind": "python", "role": "initialize",
-                       "case_sha256": case, "owner_pid": int(owner), "pid": pid,
+                       "case_sha256": case, "platform": sys.platform, "state": state, "owner_pid": int(owner), "pid": pid,
                        "starttime": before[0], "ppid": before[1], "uid": before[2], "boot_sha256": boot,
                        "exe": {"dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
                                "mtime_sec": info.st_mtime_ns // 1000000000, "mtime_nsec": info.st_mtime_ns % 1000000000,
@@ -173,7 +173,7 @@ def custody_ready():
                         raise RuntimeError("MCP custody ACK mismatch")
                 finally:
                     os.close(ack)
-                if birth() != before or identity(os.stat("/proc/self/exe")) != original or hashlib.sha256(small("/proc/sys/kernel/random/boot_id").strip()).hexdigest() != boot:
+                if birth()[0] != before or identity(os.stat("/proc/self/exe")) != original or hashlib.sha256(small("/proc/sys/kernel/random/boot_id").strip()).hexdigest() != boot:
                     raise RuntimeError("MCP custody process changed before ACK admission")
                 clock()
                 break
