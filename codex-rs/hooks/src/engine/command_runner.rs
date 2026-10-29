@@ -243,7 +243,7 @@ pub(crate) async fn run_command(
     command.current_dir(cwd);
     #[cfg(windows)]
     let mut queue_diagnostic =
-        QueueHookDiagnostic::selected(&runtime.shell, command_line, env, &command, started);
+        QueueHookDiagnostic::selected(&runtime.shell, command_line, &command, started);
 
     #[cfg(windows)]
     let (child, process_tree_job) = match JobObject::spawn_background(&mut command) {
@@ -377,20 +377,19 @@ impl QueueHookDiagnostic {
     fn selected(
         shell: &CommandShell,
         command_line: &str,
-        env: &HashMap<String, String>,
         command: &Command,
         started: Instant,
     ) -> Option<Self> {
         use std::os::windows::ffi::OsStrExt;
         static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("28a6d1e4")
-            || env.get("CODEX_QUEUE_HOOK_DIAG_NONCE").map(String::as_str) != Some("28a6d1e4")
-        {
+        if std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("8d7b2c61") {
             return None;
         }
-        let script = std::path::PathBuf::from(env.get("CODEX_QUEUE_HOOK_DIAG_SCRIPT")?);
-        let log = std::path::PathBuf::from(env.get("CODEX_QUEUE_HOOK_DIAG_LOG")?);
+        // hooks.json has no per-command env field. Recognize only this exact
+        // nonce-bound fixture command and script; leave command execution intact.
+        let script = std::path::PathBuf::from(command_line.strip_prefix("python3 ")?);
         let home = script.parent()?;
+        let log = home.join("queue_prompt_hook.log");
         if script.file_name()? != "queue_prompt_hook.py"
             || log != home.join("queue_prompt_hook.log")
             || command_line != format!("python3 {}", script.display())
@@ -410,7 +409,7 @@ impl QueueHookDiagnostic {
         }
         let normalized = source.replace(log_text, "<TEST_LOG>");
         if Self::digest(normalized.as_bytes())
-            != "e9a4daeacb568f3357da1eca872716ceb5db7aa12f28398ba91d8af8c35ae0c7"
+            != "0ed1acf40344f9128b8ce00f54cc87de715e89ebf3b1b8631e78188025423581"
         {
             return None;
         }
@@ -418,7 +417,7 @@ impl QueueHookDiagnostic {
             eprintln!("QUEUE_HOOK_DIAGNOSTIC launch_bound_exceeded");
             return None;
         }
-        let path = home.join("queue_hook_diagnostic_28a6d1e4.jsonl");
+        let path = home.join("queue_hook_diagnostic_8d7b2c61.jsonl");
         if std::fs::symlink_metadata(&path)
             .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
         {
@@ -484,7 +483,7 @@ impl QueueHookDiagnostic {
 
     fn record(&self, mut value: serde_json::Value) {
         use std::io::Write;
-        value["nonce"] = serde_json::json!("28a6d1e4");
+        value["nonce"] = serde_json::json!("8d7b2c61");
         value["elapsed_ms"] =
             serde_json::json!(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         let Ok(mut line) = serde_json::to_vec(&value) else {
@@ -557,7 +556,7 @@ impl QueueHookDiagnostic {
             let Ok(marker) = serde_json::from_str::<serde_json::Value>(json) else {
                 continue;
             };
-            if marker["nonce"].as_str() != Some("28a6d1e4") {
+            if marker["nonce"].as_str() != Some("8d7b2c61") {
                 continue;
             }
             match marker["phase"].as_str() {

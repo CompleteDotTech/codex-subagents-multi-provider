@@ -168,13 +168,13 @@ if payload["prompt"] == "blocked":
     );
     // Diagnostic branch only: the original interpreter/command and hook decision stay unchanged.
     let diagnostic =
-        cfg!(windows) && std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() == Ok("28a6d1e4");
+        cfg!(windows) && std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() == Ok("8d7b2c61");
     if diagnostic {
         script = script
             .replace("payload = json.load(sys.stdin)", concat!(r#"import hashlib
 
 def _queue_diag(phase):
-    print("QUEUE_HOOK_DIAG " + json.dumps({"nonce": "28a6d1e4", "phase": phase, "executable_path_sha256": hashlib.sha256(sys.executable.encode("utf-8", "surrogatepass")).hexdigest(), "version": list(sys.version_info[:3])}), file=sys.stderr, flush=True)
+    print("QUEUE_HOOK_DIAG " + json.dumps({"nonce": "8d7b2c61", "phase": phase, "executable_path_sha256": hashlib.sha256(sys.executable.encode("utf-8", "surrogatepass")).hexdigest(), "version": list(sys.version_info[:3])}), file=sys.stderr, flush=True)
 
 _queue_diag("entry")
 "#, "\npayload = json.load(sys.stdin)\n_queue_diag(\"decoded\")"))
@@ -182,7 +182,7 @@ _queue_diag("entry")
     }
     std::fs::write(&script_path, script)
         .unwrap_or_else(|error| panic!("write queue hook script: {error}"));
-    let mut hooks = serde_json::json!({
+    let hooks = serde_json::json!({
         "hooks": {
             "UserPromptSubmit": [{
                 "hooks": [{
@@ -192,13 +192,6 @@ _queue_diag("entry")
             }]
         }
     });
-    if diagnostic {
-        hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["env"] = serde_json::json!({
-            "CODEX_QUEUE_HOOK_DIAG_NONCE": "28a6d1e4",
-            "CODEX_QUEUE_HOOK_DIAG_SCRIPT": script_path,
-            "CODEX_QUEUE_HOOK_DIAG_LOG": log_path,
-        });
-    }
     std::fs::write(home.join("hooks.json"), hooks.to_string())
         .unwrap_or_else(|error| panic!("write queue hooks: {error}"));
 }
@@ -220,7 +213,7 @@ impl QueueHookDiagnostic {
 
     fn observe(&self, event: &EventMsg) {
         if !cfg!(windows)
-            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("28a6d1e4")
+            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("8d7b2c61")
         {
             return;
         }
@@ -273,7 +266,7 @@ impl QueueHookDiagnostic {
             "python_micro",
         ];
         let labels = [
-            "28a6d1e4",
+            "8d7b2c61",
             "built",
             "spawned",
             "spawn_error",
@@ -316,7 +309,7 @@ impl Drop for QueueHookDiagnostic {
     fn drop(&mut self) {
         if self.passed
             || !cfg!(windows)
-            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("28a6d1e4")
+            || std::env::var("CODEX_QUEUE_DIAGNOSTIC_NONCE").as_deref() != Ok("8d7b2c61")
         {
             return;
         }
@@ -343,7 +336,7 @@ impl Drop for QueueHookDiagnostic {
             };
             eprintln!("QUEUE_HOOK_DIAGNOSTIC {record}");
         }
-        let path = self.home.join("queue_hook_diagnostic_28a6d1e4.jsonl");
+        let path = self.home.join("queue_hook_diagnostic_8d7b2c61.jsonl");
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             eprintln!("QUEUE_HOOK_DIAGNOSTIC {{\"kind\":\"records_absent\"}}");
             return;
@@ -356,7 +349,7 @@ impl Drop for QueueHookDiagnostic {
             for line in text.lines().take(32) {
                 // The runtime emits only this bounded typed schema, never arbitrary hook text.
                 if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-                    if record.get("nonce").and_then(serde_json::Value::as_str) == Some("28a6d1e4")
+                    if record.get("nonce").and_then(serde_json::Value::as_str) == Some("8d7b2c61")
                         && Self::safe_record(&record)
                     {
                         eprintln!("QUEUE_HOOK_DIAGNOSTIC {record}");
