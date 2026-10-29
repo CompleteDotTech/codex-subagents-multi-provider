@@ -375,6 +375,68 @@ pub(crate) async fn prepare_agent_spawn_config(
     Ok(PreparedSpawnConfig { config, role_name })
 }
 
+#[cfg(test)]
+pub(crate) mod catalog_preparation_gate {
+    use codex_protocol::ThreadId;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use tokio::sync::oneshot;
+
+    struct Gate {
+        entered: oneshot::Sender<(ThreadId, String)>,
+        released: oneshot::Receiver<()>,
+    }
+    type Key = (ThreadId, String);
+    fn gates() -> &'static Mutex<HashMap<Key, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<Key, Gate>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    pub(crate) struct Owner {
+        key: Key,
+        pub(crate) entered: oneshot::Receiver<(ThreadId, String)>,
+        pub(crate) release: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            gates().lock().unwrap().remove(&self.key);
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+    pub(crate) fn arm(caller: ThreadId, provider: &str) -> Owner {
+        let key = (caller, provider.to_owned());
+        let (entered, observation) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        assert!(
+            gates()
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Gate { entered, released })
+                .is_none(),
+            "one actual preparation owns this test gate"
+        );
+        Owner {
+            key,
+            entered: observation,
+            release: Some(release),
+        }
+    }
+    pub(super) async fn wait(caller: ThreadId, provider: &str) {
+        let gate = gates()
+            .lock()
+            .unwrap()
+            .remove(&(caller, provider.to_owned()));
+        if let Some(gate) = gate {
+            let _ = gate.entered.send((caller, provider.to_owned()));
+            gate.released
+                .await
+                .expect("release owned catalog preparation continuation");
+        }
+    }
+}
+
 pub(crate) async fn prepare_resolved_child_models(
     session: &Session,
     config: &mut Config,
@@ -382,6 +444,8 @@ pub(crate) async fn prepare_resolved_child_models(
     requested_model: Option<&str>,
     requested_effort: Option<ReasoningEffort>,
 ) -> Result<SharedModelsManager, String> {
+    #[cfg(test)]
+    catalog_preparation_gate::wait(session.thread_id, &resolved.provider_id).await;
     let definition_changed = config.model_provider != resolved.provider;
     config.model_provider_id = resolved.provider_id.clone();
     config.model_provider = resolved.provider.clone();
