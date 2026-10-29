@@ -1,7 +1,6 @@
 //! MCP server elicitations preserve approval policy and signal abandonment before shutdown.
 
 use anyhow::Result;
-use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_protocol::approvals::ElicitationAction;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -9,8 +8,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
@@ -19,7 +16,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use core_test_support::wait_for_mcp_server;
+use futures::FutureExt as _;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -103,7 +100,6 @@ pub(super) async fn mcp_server_elicitation_scenario(
     request_kind: RequestKind,
 ) -> Result<Vec<ResponsesRequest>> {
     let server = responses::start_mock_server().await;
-    let test = test_codex().build_with_auto_env(&server).await?;
     let mut elicitation = json!({
         "mode": "form",
         "message": "Provide the requested input.",
@@ -134,57 +130,38 @@ pub(super) async fn mcp_server_elicitation_scenario(
             });
         }
     }
-    let mut config = test.config.clone();
-    config.approvals_reviewer = ApprovalsReviewer::User;
-    config.mcp_servers.set(serde_json::from_value(json!({
-        "elicitation": {
-            "command": if cfg!(windows) { "python" } else { "python3" },
-            "args": ["-u", "-c", SERVER, elicitation.to_string()],
-            "default_tools_approval_mode": "approve"
-        }
-    }))?)?;
     let full_access = matches!(caller, Caller::FullAccessSubagent);
     let expects_prompt = !full_access && !matches!(request_kind, RequestKind::StrictReview);
-    let session_source = if matches!(caller, Caller::Root) {
-        SessionSource::Exec
-    } else {
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: test.session_configured.thread_id,
-            depth: 1,
-            agent_path: None,
-            agent_nickname: None,
-            agent_role: None,
-        })
-    };
-    let thread = test
-        .thread_manager
-        .start_thread(StartThreadOptions {
-            session_source: Some(session_source),
-            environments: Some(vec![test.executor_environment().request()]),
-            ..StartThreadOptions::new(config)
-        })
-        .await?
-        .thread;
-    wait_for_mcp_server(&thread, "elicitation").await?;
-    let tool_call = responses::mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_function_call_with_namespace(
-                "input-call",
-                "mcp__elicitation",
-                "request_input",
-                "{}",
-            ),
-            responses::ev_completed("tool-response"),
-        ]),
-    )
-    .await;
-    let guardian = if matches!(request_kind, RequestKind::StrictReview) {
-        Some(
-            responses::mount_sse_once_match(
-                &server,
-                body_partial_json(json!({"client_metadata": {"x-openai-subagent": "guardian"}})),
-                responses::sse(vec![
+    let test = test_codex().with_config(move |config| {
+        config.approvals_reviewer = ApprovalsReviewer::User;
+        config.mcp_servers.set(serde_json::from_value(json!({
+            "elicitation": { "command": if cfg!(windows) { "python" } else { "python3" },
+                "args": ["-u", "-c", SERVER, elicitation.to_string()], "default_tools_approval_mode": "approve" }
+        })).expect("MCP fixture configuration")).expect("MCP fixture constraints");
+    }).build_with_auto_env(&server).await?;
+    let mut owned_child = None;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let tool_call = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_function_call_with_namespace(
+                    "input-call",
+                    "mcp__elicitation",
+                    "request_input",
+                    "{}",
+                ),
+                responses::ev_completed("tool-response"),
+            ]),
+        )
+        .await;
+        let guardian = if matches!(request_kind, RequestKind::StrictReview) {
+            Some(
+                responses::mount_sse_once_match(
+                    &server,
+                    body_partial_json(
+                        json!({"client_metadata": {"x-openai-subagent": "guardian"}}),
+                    ),
+                    responses::sse(vec![
                     responses::ev_assistant_message(
                         "review-result",
                         &json!({
@@ -195,136 +172,232 @@ pub(super) async fn mcp_server_elicitation_scenario(
                     ),
                     responses::ev_completed("guardian-review"),
                 ]),
+                )
+                .await,
             )
-            .await,
-        )
-    } else {
-        None
-    };
-    let follow_up = responses::mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_assistant_message("done-message", "done"),
-            responses::ev_completed("done-response"),
-        ]),
-    )
-    .await;
-    thread
-        .start_or_steer_turn(
-            TurnInputRequest::user_input(vec![UserInput::Text {
-                text: "Run the input tool.".into(),
-                text_elements: Vec::new(),
-            }])
-            .with_thread_settings(ThreadSettingsOverrides {
-                approval_policy: Some(if full_access {
-                    AskForApproval::Never
-                } else {
-                    AskForApproval::OnRequest
-                }),
-                permission_profile: Some(if full_access {
-                    PermissionProfile::Disabled
-                } else {
-                    PermissionProfile::read_only()
-                }),
-                ..Default::default()
-            }),
-        )
-        .await?;
-    let response_content = if matches!(request_kind, RequestKind::FormInput) {
-        json!({"answer": "continue"})
-    } else {
-        json!({})
-    };
-    let mut prompts = 0;
-    loop {
-        let event = wait_for_event(&thread, |event| {
-            matches!(
-                event,
-                EventMsg::ElicitationRequest(_) | EventMsg::TurnComplete(_)
-            )
-        })
-        .await;
-        let EventMsg::ElicitationRequest(request) = event else {
-            break;
+        } else {
+            None
         };
-        assert!(
-            expects_prompt,
-            "automatically handled elicitations must not prompt the user"
-        );
-        assert_eq!(prompts, 0, "one tool call must not prompt twice");
-        prompts += 1;
-        assert!(
-            follow_up.requests().is_empty(),
-            "the tool must wait for input"
-        );
-        if matches!(request_kind, RequestKind::ShutdownFormInput) {
-            thread.submit(Op::Shutdown).await?;
-            let EventMsg::ElicitationAbandoned(abandoned) = wait_for_event(&thread, |event| {
+        let follow_up = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_assistant_message("done-message", "done"),
+                responses::ev_completed("done-response"),
+            ]),
+        )
+        .await;
+        let settings = ThreadSettingsOverrides {
+            approval_policy: Some(if full_access {
+                AskForApproval::Never
+            } else {
+                AskForApproval::OnRequest
+            }),
+            permission_profile: Some(if full_access {
+                PermissionProfile::Disabled
+            } else {
+                PermissionProfile::read_only()
+            }),
+            ..Default::default()
+        };
+        let thread = if matches!(caller, Caller::Root) {
+            test.codex
+                .start_or_steer_turn(
+                    TurnInputRequest::user_input(vec![UserInput::Text {
+                        text: "Run the input tool.".into(),
+                        text_elements: Vec::new(),
+                    }])
+                    .with_thread_settings(settings),
+                )
+                .await?;
+            std::sync::Arc::clone(&test.codex)
+        } else {
+            test.spawn_native_subagent(&server, "mcp_elicitation", "Run the input tool.", settings)
+                .await?
+        };
+        if !std::sync::Arc::ptr_eq(&thread, &test.codex) {
+            owned_child = Some(std::sync::Arc::clone(&thread));
+        }
+        let mut startup_ready = false;
+        let response_content = if matches!(request_kind, RequestKind::FormInput) {
+            json!({"answer": "continue"})
+        } else {
+            json!({})
+        };
+        let mut prompts = 0;
+        loop {
+            let event = wait_for_event(&thread, |event| {
+                if let EventMsg::McpStartupComplete(summary) = event {
+                    assert!(
+                        !summary
+                            .failed
+                            .iter()
+                            .any(|failure| failure.server == "elicitation")
+                    );
+                    assert!(!summary.cancelled.iter().any(|name| name == "elicitation"));
+                    startup_ready = summary.ready.iter().any(|name| name == "elicitation");
+                    assert!(startup_ready, "elicitation MCP server must be ready");
+                }
                 matches!(
                     event,
-                    EventMsg::ElicitationAbandoned(_) | EventMsg::ShutdownComplete
+                    EventMsg::ElicitationRequest(_) | EventMsg::TurnComplete(_)
                 )
             })
-            .await
-            else {
-                panic!("abandonment must precede shutdown completion");
+            .await;
+            let EventMsg::ElicitationRequest(request) = event else {
+                break;
             };
-            assert_eq!(
-                abandoned,
-                codex_protocol::approvals::ElicitationAbandonedEvent {
-                    server_name: request.server_name,
-                    id: request.id,
-                }
+            assert!(
+                expects_prompt,
+                "automatically handled elicitations must not prompt the user"
             );
-            assert!(matches!(
-                wait_for_event(&thread, |event| {
+            assert_eq!(prompts, 0, "one tool call must not prompt twice");
+            prompts += 1;
+            assert!(
+                follow_up.requests().is_empty(),
+                "the tool must wait for input"
+            );
+            if matches!(request_kind, RequestKind::ShutdownFormInput) {
+                thread.submit(Op::Shutdown).await?;
+                let EventMsg::ElicitationAbandoned(abandoned) = wait_for_event(&thread, |event| {
                     matches!(
                         event,
                         EventMsg::ElicitationAbandoned(_) | EventMsg::ShutdownComplete
                     )
                 })
-                .await,
-                EventMsg::ShutdownComplete
-            ));
-            assert!(follow_up.requests().is_empty());
-            test.codex.shutdown_and_wait().await?;
-            return Ok(tool_call.requests());
+                .await
+                else {
+                    panic!("abandonment must precede shutdown completion");
+                };
+                assert_eq!(
+                    abandoned,
+                    codex_protocol::approvals::ElicitationAbandonedEvent {
+                        server_name: request.server_name,
+                        id: request.id,
+                    }
+                );
+                assert!(matches!(
+                    wait_for_event(&thread, |event| {
+                        matches!(
+                            event,
+                            EventMsg::ElicitationAbandoned(_) | EventMsg::ShutdownComplete
+                        )
+                    })
+                    .await,
+                    EventMsg::ShutdownComplete
+                ));
+                assert!(follow_up.requests().is_empty());
+                assert!(
+                    startup_ready,
+                    "actual elicitation server emitted ready summary"
+                );
+                if !std::sync::Arc::ptr_eq(&thread, &test.codex) {
+                    test.codex.shutdown_and_wait().await?;
+                }
+                return Ok(tool_call.requests());
+            }
+            thread
+                .submit(Op::ResolveElicitation {
+                    server_name: request.server_name,
+                    request_id: request.id,
+                    decision: ElicitationAction::Accept,
+                    content: Some(response_content.clone()),
+                    meta: None,
+                })
+                .await?;
         }
-        thread
-            .submit(Op::ResolveElicitation {
-                server_name: request.server_name,
-                request_id: request.id,
-                decision: ElicitationAction::Accept,
-                content: Some(response_content.clone()),
-                meta: None,
+        assert!(
+            startup_ready,
+            "actual elicitation server emitted ready summary"
+        );
+        assert_eq!(prompts, usize::from(expects_prompt));
+        let output = follow_up
+            .single_request()
+            .function_call_output("input-call");
+        let response: Value = serde_json::from_str(
+            output["output"][1]["text"]
+                .as_str()
+                .expect("MCP response must reach the model"),
+        )?;
+        let expected = if matches!(request_kind, RequestKind::StrictReview) {
+            json!({
+                "action": "accept", "content": {},
+                "_meta": {"approvals_reviewer": "auto_review"}
             })
-            .await?;
+        } else {
+            json!({"action": "accept", "content": response_content})
+        };
+        assert_eq!(response, expected);
+        let mut requests = tool_call.requests();
+        if let Some(guardian) = guardian {
+            assert!(guardian.single_request().body_contains_text("write_record"));
+            requests.extend(guardian.requests());
+        }
+        requests.extend(follow_up.requests());
+        thread.shutdown_and_wait().await?;
+        if !std::sync::Arc::ptr_eq(&thread, &test.codex) {
+            test.codex.shutdown_and_wait().await?;
+        }
+        Ok::<Vec<ResponsesRequest>, anyhow::Error>(requests)
+    })
+    .catch_unwind()
+    .await;
+    // The exact newly built manager belongs only to this fixture. Retain handles
+    // before shutdown, including a child whose setup failed before returning it.
+    let mut owned_threads = vec![std::sync::Arc::clone(&test.codex)];
+    if let Some(child) = owned_child {
+        owned_threads.push(child);
     }
-    assert_eq!(prompts, usize::from(expects_prompt));
-    let output = follow_up
-        .single_request()
-        .function_call_output("input-call");
-    let response: Value = serde_json::from_str(
-        output["output"][1]["text"]
-            .as_str()
-            .expect("MCP response must reach the model"),
-    )?;
-    let expected = if matches!(request_kind, RequestKind::StrictReview) {
-        json!({
-            "action": "accept", "content": {},
-            "_meta": {"approvals_reviewer": "auto_review"}
-        })
-    } else {
-        json!({"action": "accept", "content": response_content})
-    };
-    assert_eq!(response, expected);
-    let mut requests = tool_call.requests();
-    if let Some(guardian) = guardian {
-        assert!(guardian.single_request().body_contains_text("write_record"));
-        requests.extend(guardian.requests());
+    let mut cleanup_errors = Vec::new();
+    for id in test.thread_manager.list_thread_ids().await {
+        match test.thread_manager.get_thread(id).await {
+            Ok(thread)
+                if !owned_threads
+                    .iter()
+                    .any(|owned| std::sync::Arc::ptr_eq(owned, &thread)) =>
+            {
+                owned_threads.push(thread);
+            }
+            Ok(_) => {}
+            Err(error) => cleanup_errors.push(format!("owned MCP fixture handle: {error}")),
+        }
     }
-    requests.extend(follow_up.requests());
-    thread.shutdown_and_wait().await?;
-    test.codex.shutdown_and_wait().await?;
-    Ok(requests)
+    let cleanup = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for thread in &owned_threads {
+            if let Err(error) = thread.shutdown_and_wait().await {
+                cleanup_errors.push(format!("owned MCP fixture shutdown: {error}"));
+            }
+            let (config, _) = thread.current_mcp_config_and_runtime_context().await;
+            if thread
+                .mcp_connection_statuses(&config)
+                .await
+                .values()
+                .any(|status| *status != codex_protocol::mcp::McpServerConnectionStatus::Cancelled)
+            {
+                cleanup_errors.push("owned MCP fixture client was not cancelled".to_string());
+            }
+        }
+    })
+    .await;
+    if cleanup.is_err() {
+        cleanup_errors
+            .push("owned MCP fixture cleanup deadline exceeded; ownership unresolved".into());
+    }
+    if !cleanup_errors.is_empty() {
+        eprintln!("MCP_INTEGRATION_CLEANUP_UNQUALIFIED: {cleanup_errors:?}");
+    }
+    match outcome {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(result) => {
+            let value = result?;
+            anyhow::ensure!(
+                cleanup_errors.is_empty(),
+                "MCP fixture cleanup failed: {cleanup_errors:?}"
+            );
+            eprintln!(
+                "MCP_INTEGRATION_OWNED_CLEANUP_COMPLETE threads={}",
+                owned_threads.len()
+            );
+            Ok(value)
+        }
+    }
 }

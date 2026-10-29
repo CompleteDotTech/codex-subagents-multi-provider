@@ -1235,6 +1235,126 @@ impl TestCodex {
         }
     }
 
+    /// Drive the actual native tool boundary with the child's intended first task.
+    /// Parent-only responses never consume the test's child MCP response script.
+    pub async fn spawn_native_subagent(
+        &self,
+        server: &MockServer,
+        task_name: &str,
+        prompt: &str,
+        settings: ThreadSettingsOverrides,
+    ) -> Result<Arc<CodexThread>> {
+        let model = self
+            .codex
+            .thread_extension_data()
+            .get::<codex_protocol::openai_models::ModelInfo>()
+            .context("registered parent has actual selected model metadata")?;
+        let version = model.multi_agent_version.unwrap_or(
+            if self.config.features.enabled(Feature::MultiAgentV2) {
+                codex_protocol::protocol::MultiAgentVersion::V2
+            } else {
+                codex_protocol::protocol::MultiAgentVersion::V1
+            },
+        );
+        anyhow::ensure!(
+            version != codex_protocol::protocol::MultiAgentVersion::Disabled,
+            "parent model must support native children"
+        );
+        let (namespace, arguments) = if version == codex_protocol::protocol::MultiAgentVersion::V2 {
+            (
+                "collaboration",
+                serde_json::json!({"task_name":task_name,"message":prompt,"fork_turns":"none"}),
+            )
+        } else {
+            (
+                "multi_agent_v1",
+                serde_json::json!({"message":prompt,"fork_context":false}),
+            )
+        };
+        let parent_request =
+            |request: &wiremock::Request| !request.headers.contains_key("x-openai-subagent");
+        let before = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/responses") && parent_request(request))
+            .count();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path_regex(".*/responses$"))
+            .and(parent_request)
+            .respond_with(crate::responses::sse_response(crate::responses::sse(vec![
+                crate::responses::ev_response_created("native-mcp-parent-spawn"),
+                crate::responses::ev_function_call_with_namespace(
+                    "native-mcp-spawn",
+                    namespace,
+                    "spawn_agent",
+                    &arguments.to_string(),
+                ),
+                crate::responses::ev_completed("native-mcp-parent-spawn"),
+            ])))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path_regex(".*/responses$"))
+            .and(|request: &wiremock::Request| !request.headers.contains_key("x-openai-subagent"))
+            .respond_with(crate::responses::sse_response(
+                crate::responses::sse_completed("native-mcp-parent-done"),
+            ))
+            .with_priority(2)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(server)
+            .await;
+        let mut created = self.thread_manager.subscribe_thread_created();
+        self.codex
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: "Start the requested MCP fixture task in one native child.".into(),
+                    text_elements: Vec::new(),
+                }])
+                .with_thread_settings(settings),
+            )
+            .await?;
+        crate::wait_for_event(&self.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        let child_id = tokio::time::timeout(Duration::from_secs(10), created.recv()).await??;
+        let child = self.thread_manager.get_thread(child_id).await?;
+        anyhow::ensure!(
+            child
+                .config_snapshot()
+                .await
+                .session_source
+                .parent_thread_id()
+                == Some(self.session_configured.thread_id),
+            "native child must belong to actual registered parent"
+        );
+        anyhow::ensure!(
+            self.codex.multi_agent_version() == Some(version),
+            "actual native backend must match selected metadata"
+        );
+        let after = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.url.path().ends_with("/responses")
+                    && !request.headers.contains_key("x-openai-subagent")
+            })
+            .count();
+        anyhow::ensure!(
+            after == before + 2,
+            "native fixture owns exactly two parent setup requests"
+        );
+        Ok(child)
+    }
+
     pub fn cwd_path(&self) -> &Path {
         self.cwd.path()
     }
