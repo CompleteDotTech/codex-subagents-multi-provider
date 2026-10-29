@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
@@ -13,6 +14,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::SubAgentActivityItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::MultiAgentMessages;
 use codex_protocol::openai_models::MultiAgentRoleMessages;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -114,6 +116,18 @@ const FULL_HISTORY_PROACTIVE_PROMPT: &str = "switch to proactive delegation";
 const FULL_HISTORY_EXPLICIT_PROMPT: &str = "restore explicit-only delegation";
 const FULL_HISTORY_PROACTIVE_POLICY: &str = "Proactive multi-agent delegation is active.";
 const FULL_HISTORY_EXPLICIT_POLICY: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask";
+
+// This synthetic model is declared by the host fixture before native preparation.
+// Its absent default and empty presets retain the unknown-model effort scenarios
+// without treating fallback-discovered metadata as a child launch authority.
+fn notification_model_without_reasoning_default(model: &mut ModelInfo) {
+    assert_eq!(model.slug, "koffing");
+    assert!(!model.used_fallback_model_metadata);
+    model.default_reasoning_level = None;
+    model.supported_reasoning_levels.clear();
+    model.multi_agent_reasoning_effort = None;
+    model.comp_hash = None;
+}
 
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     decoded_body(req)
@@ -2358,6 +2372,7 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     };
     let mut builder = test_codex()
         .with_history_mode(history_mode)
+        .with_model_info_override("koffing", notification_model_without_reasoning_default)
         .with_model(parent_model)
         .with_config(move |config| {
             config.model_reasoning_effort = parent_reasoning_effort;
@@ -2380,6 +2395,25 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     let root_thread_id = test.session_configured.thread_id;
 
     test.submit_text_turn(TURN_1_PROMPT).await?;
+    let (spawn_output, spawn_success) = parent_request_log
+        .requests()
+        .into_iter()
+        .find_map(|request| request.function_call_output_content_and_success(SPAWN_CALL_ID))
+        .expect("parent request with native spawn result");
+    assert_eq!(
+        spawn_success,
+        Some(true),
+        "native spawn failed: {spawn_output:?}"
+    );
+    let spawn_output: Value = serde_json::from_str(
+        spawn_output
+            .as_deref()
+            .context("native spawn output text")?,
+    )?;
+    assert_eq!(spawn_output["task_name"], "/root/worker");
+    let registered = test.thread_manager.list_thread_ids().await;
+    assert_eq!(registered.len(), 2);
+    assert!(registered.contains(&root_thread_id));
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
     let rollout = codex_rollout::RolloutRecorder::get_rollout_history(
@@ -2574,6 +2608,138 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     Ok(())
 }
 
+#[tokio::test]
+async fn unpinned_unknown_model_cannot_start_native_child() -> Result<()> {
+    let server = start_mock_server().await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, TURN_1_PROMPT),
+        sse(vec![
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &json!({"task_name": "worker", "message": CHILD_PROMPT}).to_string(),
+            ),
+            ev_completed("unpinned-spawn-request"),
+        ]),
+    )
+    .await;
+    let rejected = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, SPAWN_CALL_ID),
+        sse(vec![ev_completed("unpinned-spawn-rejected")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model("koffing")
+        .with_history_mode(ThreadHistoryMode::Legacy)
+        .with_config(|config| {
+            let catalog = bundled_models_response().expect("bundled models should parse");
+            assert!(!catalog.models.iter().any(|model| model.slug == "koffing"));
+            config.model_catalog = Some(catalog);
+            for feature in [Feature::Collab, Feature::MultiAgentV2] {
+                config
+                    .features
+                    .enable(feature)
+                    .expect("enable native V2 tools");
+            }
+        })
+        .build(&server)
+        .await?;
+    let root_id = test.session_configured.thread_id;
+    let mut created = test.thread_manager.subscribe_thread_created();
+    test.submit_text_turn(TURN_1_PROMPT).await?;
+    let (output, success) = rejected
+        .requests()
+        .into_iter()
+        .find_map(|request| request.function_call_output_content_and_success(SPAWN_CALL_ID))
+        .expect("parent observes rejected native spawn");
+    assert_eq!(success, Some(false));
+    let output = output.context("native policy rejection text")?;
+    assert!(
+        output.contains("child_provider_policy_conflict"),
+        "{output}"
+    );
+    assert!(
+        output.contains("selected provider or pinned model authority changed or is unavailable"),
+        "{output}"
+    );
+    assert_eq!(test.thread_manager.list_thread_ids().await, vec![root_id]);
+    assert!(matches!(
+        created.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    // The ordinary root may still use its fallback model. A denied child launch
+    // must not revoke the root or turn that fallback into a child capability.
+    const CONTINUE: &str = "continue the root after the unpinned child denial";
+    let continued = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, CONTINUE),
+        sse(vec![ev_completed("unpinned-root-still-usable")]),
+    )
+    .await;
+    test.submit_text_turn(CONTINUE).await?;
+    assert!(continued.requests().iter().any(|request| {
+        request.body_json()["client_metadata"]["thread_id"] == root_id.to_string()
+    }));
+    assert_eq!(test.thread_manager.list_thread_ids().await, vec![root_id]);
+    assert!(matches!(
+        created.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    test.codex.ensure_rollout_materialized().await;
+    test.codex.flush_rollout().await?;
+    let rollout = codex_rollout::RolloutRecorder::get_rollout_history(
+        &test
+            .codex
+            .rollout_path()
+            .expect("negative-control root rollout"),
+    )
+    .await?;
+    assert!(!rollout.get_rollout_items().iter().any(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(completed)) => {
+            matches!(&completed.item, TurnItem::SubAgentActivity(activity)
+                if activity.kind == SubAgentActivityKind::Started)
+        }
+        RolloutItem::EventMsg(EventMsg::SubAgentActivity(activity)) => {
+            activity.kind == SubAgentActivityKind::Started
+        }
+        _ => false,
+    }));
+    test.codex.shutdown_and_wait().await?;
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording enabled");
+    let root_id = root_id.to_string();
+    let posts = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        posts.len(),
+        3,
+        "only the root request, rejection follow-up and continuation may reach the model"
+    );
+    assert!(
+        posts.iter().all(|request| {
+            request
+                .headers
+                .get("thread-id")
+                .and_then(|value| value.to_str().ok())
+                == Some(root_id.as_str())
+                && decoded_body(request)
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|body| body["client_metadata"]["thread_id"] == root_id)
+                && !request_has_input_type(request, "agent_message")
+        }),
+        "an unpinned child must not send model traffic"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum CompletionScenario {
     Completed,
@@ -2708,7 +2874,7 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     )
     .await;
     let test = test_codex()
-        .with_model("koffing")
+        .with_model_info_override("koffing", notification_model_without_reasoning_default)
         .with_config(|config| {
             config
                 .features
