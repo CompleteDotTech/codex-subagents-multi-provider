@@ -316,6 +316,133 @@ impl RetainedAgentAuthority {
     }
 }
 
+/// Original publication epochs, retained weakly to avoid Config/Session cycles.
+/// Locks are sorted and held only for synchronous policy -> signal -> registry
+/// -> binding admission decisions. Never acquire Session state under these locks.
+#[derive(Clone)]
+struct NativeChildPolicyFence {
+    owners: Vec<(Weak<CodexThread>, u64)>,
+    root: Weak<CodexThread>,
+    caller: Weak<CodexThread>,
+}
+
+impl NativeChildPolicyFence {
+    async fn capture(caller: &Arc<CodexThread>) -> Result<Self> {
+        let runtime = &caller.session.services.local_agent_runtime;
+        let mut owners = vec![Arc::clone(caller)];
+        let mut policy_root = Arc::clone(caller);
+        if let Some(origin) = runtime
+            .child_provider_origins
+            .verified(caller.session.thread_id)
+        {
+            let root = runtime
+                .upgrade()?
+                .get_thread(origin.root_thread_id())
+                .await?;
+            if root.session_source.parent_thread_id().is_some()
+                || root.session.session_id() != caller.session.session_id()
+                || !runtime.shares_registry_with(&root.session.services.local_agent_runtime)
+            {
+                return Err(invalid("native host policy owner changed"));
+            }
+            policy_root = Arc::clone(&root);
+            owners.push(root);
+        }
+        owners.sort_by_key(|owner| {
+            (
+                owner.session.thread_id.to_string(),
+                owner.session.native_registration_id,
+            )
+        });
+        owners.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let mut captured = Vec::new();
+        for owner in owners {
+            let revision = *owner
+                .session
+                .child_policy_revision
+                .lock()
+                .map_err(|_| invalid("native policy publication fence is unavailable"))?;
+            captured.push((Arc::downgrade(&owner), revision));
+        }
+        let fence = Self {
+            owners: captured,
+            root: Arc::downgrade(&policy_root),
+            caller: Arc::downgrade(caller),
+        };
+        fence.with_current(|| Ok(()))?;
+        Ok(fence)
+    }
+
+    fn with_signals<T>(&self, admit: impl FnOnce(&Session, bool) -> Result<T>) -> Result<T> {
+        let owners = self
+            .owners
+            .iter()
+            .map(|(owner, _)| {
+                owner
+                    .upgrade()
+                    .ok_or_else(|| invalid("native policy signal owner is unavailable"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let root = self
+            .root
+            .upgrade()
+            .ok_or_else(|| invalid("native host root is unavailable"))?;
+        let caller = self
+            .caller
+            .upgrade()
+            .ok_or_else(|| invalid("native caller is unavailable"))?;
+        let mut signals = Vec::new();
+        for owner in &owners {
+            signals.push(
+                owner
+                    .session
+                    .fresh_child_admission_live
+                    .lock()
+                    .map_err(|_| invalid("native policy owner signal is unavailable"))?,
+            );
+        }
+        let is_live = |thread: &Arc<CodexThread>| {
+            owners
+                .iter()
+                .zip(&signals)
+                .any(|(owner, signal)| Arc::ptr_eq(owner, thread) && **signal && owner.is_running())
+        };
+        if !Arc::ptr_eq(&root, &caller) && !is_live(&root) {
+            return Err(invalid("native host root stopped before startup admission"));
+        }
+        let result = admit(&root.session, is_live(&caller));
+        drop(signals);
+        result
+    }
+
+    fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let owners = self
+            .owners
+            .iter()
+            .map(|(owner, _)| {
+                owner
+                    .upgrade()
+                    .ok_or_else(|| invalid("native policy owner is unavailable"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut revisions = Vec::new();
+        for (owner, (_, expected)) in owners.iter().zip(&self.owners) {
+            let revision = owner
+                .session
+                .child_policy_revision
+                .lock()
+                .map_err(|_| invalid("native policy publication fence is unavailable"))?;
+            if *revision != *expected {
+                return Err(invalid("native policy changed before startup admission"));
+            }
+            revisions.push(revision);
+        }
+        let result = admit();
+        drop(revisions);
+        result
+    }
+}
+
 /// Fresh launch authority follows one actual caller allocation until final admission.
 /// Weak ownership avoids Config -> proof -> Session -> Config cycles.
 #[derive(Clone)]
@@ -323,6 +450,7 @@ pub(crate) struct FreshChildCaller {
     caller: Weak<CodexThread>,
     registration_id: Uuid,
     live: Arc<Mutex<bool>>,
+    policy: NativeChildPolicyFence,
 }
 
 impl FreshChildCaller {
@@ -343,6 +471,7 @@ impl FreshChildCaller {
             caller: Arc::downgrade(&caller),
             registration_id: authority.registration_id,
             live: Arc::clone(&session.fresh_child_admission_live),
+            policy: NativeChildPolicyFence::capture(&caller).await?,
         };
         fence.check_current()?;
         Ok(fence)
@@ -363,37 +492,27 @@ impl FreshChildCaller {
     }
 
     fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
-        let caller = self
-            .caller
-            .upgrade()
-            .ok_or_else(|| invalid("fresh child caller runtime is unavailable"))?;
-        // Revocation takes this same lock before stopping or removing this exact
-        // allocation. Keep it through the synchronous grant decision, never an await.
-        let live = self
-            .live
-            .lock()
-            .map_err(|_| invalid("fresh child caller admission state is unavailable"))?;
-        let runtime = &caller.session.services.local_agent_runtime;
-        if runtime.shutdown.is_cancelled() {
-            return Err(
-                CodexErr::InvalidRequest("agent runtime is shutting down".to_owned())
-                    .with_agent_context(AgentErrorContext::RuntimeShutdown),
-            );
-        }
-        if !*live
-            || !caller.is_running()
-            || !Arc::ptr_eq(&self.live, &caller.session.fresh_child_admission_live)
-        {
-            return Err(invalid(
-                "fresh child caller stopped or changed before startup admission",
-            ));
-        }
-        // Explicit close can revoke the registry while this signal is still
-        // live. Hold Current/epoch validation through the same synchronous
-        // decision, ordered signal -> registry -> managed binding.
-        let result = runtime.with_fresh_caller(&caller.session, self.registration_id, admit);
-        drop(live);
-        result
+        self.policy.with_current(|| {
+            self.policy.with_signals(|root, live| {
+                let caller = self
+                    .caller
+                    .upgrade()
+                    .ok_or_else(|| invalid("fresh child caller runtime is unavailable"))?;
+                let runtime = &caller.session.services.local_agent_runtime;
+                if runtime.shutdown.is_cancelled() {
+                    return Err(CodexErr::InvalidRequest(
+                        "agent runtime is shutting down".to_owned(),
+                    )
+                    .with_agent_context(AgentErrorContext::RuntimeShutdown));
+                }
+                if !live || !Arc::ptr_eq(&self.live, &caller.session.fresh_child_admission_live) {
+                    return Err(invalid(
+                        "fresh child caller stopped or changed before startup admission",
+                    ));
+                }
+                runtime.with_fresh_caller(root, &caller.session, self.registration_id, admit)
+            })
+        })
     }
 }
 
@@ -600,6 +719,7 @@ impl ChildLaunchPermit {
 /// Completed host residency eviction preserves this exact registration; shutdown
 /// and explicit close do not. Registry phase and epoch remain live until admit.
 struct ResumeChildCaller {
+    policy: NativeChildPolicyFence,
     caller: Arc<CodexThread>,
     epoch: Arc<RetainedAgentAuthority>,
 }
@@ -610,25 +730,18 @@ impl ResumeChildCaller {
     }
 
     fn with_current<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
-        let live = self
-            .caller
-            .session
-            .fresh_child_admission_live
-            .lock()
-            .map_err(|_| invalid("private resume caller admission state is unavailable"))?;
-        let runtime = &self.caller.session.services.local_agent_runtime;
-        if runtime.shutdown.is_cancelled() {
-            return Err(
-                CodexErr::InvalidRequest("agent runtime is shutting down".to_owned())
-                    .with_agent_context(AgentErrorContext::RuntimeShutdown),
-            );
-        }
-        // Signal -> registry -> binding. The registry holds its epoch/phase lock
-        // through admit; no map lock, async guard, or registry reentry is allowed.
-        let result =
-            runtime.with_resume_caller(&self.epoch, *live && self.caller.is_running(), admit);
-        drop(live);
-        result
+        self.policy.with_current(|| {
+            self.policy.with_signals(|root, live| {
+                let runtime = &self.caller.session.services.local_agent_runtime;
+                if runtime.shutdown.is_cancelled() {
+                    return Err(CodexErr::InvalidRequest(
+                        "agent runtime is shutting down".to_owned(),
+                    )
+                    .with_agent_context(AgentErrorContext::RuntimeShutdown));
+                }
+                runtime.with_native_resume_caller(root, &self.epoch, live, admit)
+            })
+        })
     }
 }
 
@@ -725,63 +838,70 @@ impl NativeChildAdmission {
         authority: Arc<RetainedAgentAuthority>,
         commit: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let (caller, epoch, allow_evicted) = if let Some(fence) = &self.caller_fence {
-            let caller = fence
-                .caller
-                .upgrade()
-                .ok_or_else(|| invalid("native startup caller is unavailable"))?;
-            let epoch = caller
-                .session
-                .services
-                .local_agent_runtime
-                .retained_authority(caller.session.thread_id)
-                .filter(|epoch| {
-                    epoch.registration_id() == fence.registration_id
-                        && epoch.matches_session(&caller.session)
-                })
-                .ok_or_else(|| invalid("native startup caller registration changed"))?;
-            (caller, epoch, false)
-        } else if let Some(fence) = &self.resume_caller {
-            (Arc::clone(&fence.caller), Arc::clone(&fence.epoch), true)
-        } else {
-            return Err(invalid("native startup has no caller continuation"));
-        };
-        let live = caller
-            .session
-            .fresh_child_admission_live
-            .lock()
-            .map_err(|_| invalid("native startup caller signal is unavailable"))?;
-        let runtime = &caller.session.services.local_agent_runtime;
-        if runtime.shutdown.is_cancelled() {
-            return Err(invalid("native runtime shut down during startup"));
-        }
-        runtime.commit_native_registration(
-            &epoch,
-            *live && caller.is_running(),
-            allow_evicted,
-            &self.teardown_revisions,
-            authority,
-            || {
-                let binding = self.binding.as_ref().map(|binding| binding.read());
-                if binding.as_ref().is_some_and(|guard| {
-                    guard.status != codex_config::CloudConfigBundleBindingStatus::Current
-                }) {
-                    return Err(invalid(
-                        "managed native child policy was revoked before registration",
-                    ));
+        let policy = self
+            .caller_fence
+            .as_ref()
+            .map(|caller| &caller.policy)
+            .or_else(|| self.resume_caller.as_ref().map(|caller| &caller.policy))
+            .ok_or_else(|| invalid("native startup has no policy continuation"))?;
+        policy.with_current(|| {
+            policy.with_signals(|root, live| {
+                let (caller, epoch, allow_evicted) = if let Some(fence) = &self.caller_fence {
+                    let caller = fence
+                        .caller
+                        .upgrade()
+                        .ok_or_else(|| invalid("native startup caller is unavailable"))?;
+                    let epoch = caller
+                        .session
+                        .services
+                        .local_agent_runtime
+                        .retained_authority(caller.session.thread_id)
+                        .filter(|epoch| {
+                            epoch.registration_id() == fence.registration_id
+                                && epoch.matches_session(&caller.session)
+                        })
+                        .ok_or_else(|| invalid("native startup caller registration changed"))?;
+                    (caller, epoch, false)
+                } else if let Some(fence) = &self.resume_caller {
+                    (Arc::clone(&fence.caller), Arc::clone(&fence.epoch), true)
+                } else {
+                    return Err(invalid("native startup has no caller continuation"));
+                };
+                let runtime = &caller.session.services.local_agent_runtime;
+                if runtime.shutdown.is_cancelled() {
+                    return Err(invalid("native runtime shut down during startup"));
                 }
-                let result = commit()?;
-                // The registry retains this guard through installation of the
-                // new epoch, not merely through the earlier status check.
-                Ok((result, binding))
-            },
-        )
+                runtime.commit_native_registration(
+                    root,
+                    &epoch,
+                    live,
+                    allow_evicted,
+                    &self.teardown_revisions,
+                    authority,
+                    || {
+                        let binding = self.binding.as_ref().map(|binding| binding.read());
+                        if binding.as_ref().is_some_and(|guard| {
+                            guard.status != codex_config::CloudConfigBundleBindingStatus::Current
+                        }) {
+                            return Err(invalid(
+                                "managed native child policy was revoked before registration",
+                            ));
+                        }
+                        let result = commit()?;
+                        // The registry retains this guard through installation of the
+                        // new epoch, not merely through the earlier status check.
+                        Ok((result, binding))
+                    },
+                )
+            })
+        })
     }
 }
 
 /// Non-cloneable one-operation authorization for a host-read saved runtime.
 /// The caller Arc exists only while this operation is in flight, never in the registry.
 pub(crate) struct ChildResumePermit {
+    policy: NativeChildPolicyFence,
     caller: Arc<CodexThread>,
     caller_epoch: Arc<RetainedAgentAuthority>,
     origins: Arc<ChildProviderOrigins>,
@@ -859,6 +979,7 @@ impl ChildResumePermit {
                 "resume caller is not the actual loaded host runtime",
             ));
         }
+        let native_policy_fence = NativeChildPolicyFence::capture(&caller).await?;
         let current =
             RetainedAgentAuthority::capture(&caller.session, &caller.session_source).await;
         if !current.same_registration(&caller_epoch)
@@ -1215,11 +1336,13 @@ impl ChildResumePermit {
             }
         }
         ResumeChildCaller {
+            policy: native_policy_fence.clone(),
             caller: Arc::clone(&caller),
             epoch: Arc::clone(&caller_epoch),
         }
         .check_current()?;
         Ok(Self {
+            policy: native_policy_fence,
             caller,
             caller_epoch,
             origins: Arc::clone(&runtime.child_provider_origins),
@@ -1275,6 +1398,7 @@ impl ChildResumePermit {
             ));
         }
         let caller_fence = ResumeChildCaller {
+            policy: self.policy,
             caller: Arc::clone(&self.caller),
             epoch: Arc::clone(&self.caller_epoch),
         };
