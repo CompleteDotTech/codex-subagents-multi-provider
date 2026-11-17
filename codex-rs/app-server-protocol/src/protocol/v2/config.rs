@@ -19,6 +19,7 @@ use codex_protocol::config_types::WebSearchToolConfig;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+pub use codex_utils_redacted_string::SerdeRedactedString;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -296,6 +297,8 @@ pub struct Config {
     pub forced_chatgpt_workspace_id: Option<ForcedChatgptWorkspaceIds>,
     pub forced_login_method: Option<ForcedLoginMethod>,
     pub web_search: Option<WebSearchMode>,
+    /// Effective tools.client_search_provider hint. Model-selected providers take precedence.
+    pub client_search_provider: Option<codex_protocol::openai_models::WebSearchProvider>,
     pub tools: Option<ToolsV2>,
     pub instructions: Option<String>,
     pub developer_instructions: Option<String>,
@@ -505,6 +508,7 @@ pub struct FeedbackRequirements {
 #[ts(export_to = "v2/")]
 pub struct OtelRequirements {
     pub tool_result: Option<OtelToolResultLogConfig>,
+    pub log_sse_deltas: Option<bool>,
     pub log_user_prompt: Option<bool>,
     pub log_agent_responses: Option<bool>,
     pub log_guardian_assessments: Option<bool>,
@@ -512,6 +516,8 @@ pub struct OtelRequirements {
     pub exporter: Option<OtelExporter>,
     pub trace_exporter: Option<OtelExporter>,
     pub metrics_exporter: Option<OtelExporter>,
+    pub span_attributes: Option<HashMap<String, String>>,
+    pub tracestate: Option<BTreeMap<String, BTreeMap<String, String>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -529,15 +535,19 @@ pub enum OtelExporter {
     Statsig,
     OtlpHttp {
         endpoint: String,
-        /// Exporter request headers.
-        headers: HashMap<String, String>,
+        /// Header names are retained; values are redacted by the server.
+        #[schemars(with = "HashMap<String, String>")]
+        #[ts(as = "HashMap<String, String>")]
+        headers: HashMap<String, SerdeRedactedString>,
         protocol: OtelHttpProtocol,
         tls: Option<OtelTlsConfig>,
     },
     OtlpGrpc {
         endpoint: String,
-        /// Exporter request headers.
-        headers: HashMap<String, String>,
+        /// Header names are retained; values are redacted by the server.
+        #[schemars(with = "HashMap<String, String>")]
+        #[ts(as = "HashMap<String, String>")]
+        headers: HashMap<String, SerdeRedactedString>,
         tls: Option<OtelTlsConfig>,
     },
 }

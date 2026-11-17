@@ -17,6 +17,8 @@ use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxManager;
+use codex_sandboxing::SandboxNetwork;
+use codex_sandboxing::SandboxSelection;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -86,7 +88,7 @@ impl ShellSnapshotSandbox {
             sandbox_exe: attempt.sandbox_exe.cloned(),
             use_legacy_landlock: attempt.use_legacy_landlock,
             windows_sandbox_level: attempt.windows_sandbox_level,
-            network: attempt.network_proxy(network).cloned(),
+            network: network.cloned(),
             environment_id: environment_id.to_string(),
             additional_permissions: additional_permissions.cloned(),
             network_denial_cancellation_token: attempt.network_denial_cancellation_token.clone(),
@@ -164,16 +166,21 @@ impl ShellSnapshotSandbox {
                     additional_permissions,
                 },
                 permissions: &self.permissions,
-                sandbox: self.sandbox,
-                enforce_managed_network: self.enforce_managed_network,
-                environment_id: Some(&self.environment_id),
-                network: self.network.as_ref(),
+                workspace_roots: None,
+                runtime_readable_paths: None,
+                selection: SandboxSelection::Explicit(self.sandbox),
+                network: SandboxNetwork::new(
+                    self.enforce_managed_network,
+                    self.network.as_ref(),
+                    Some(&self.environment_id),
+                ),
                 sandbox_policy_cwd: &self.sandbox_policy_cwd,
                 sandbox_exe: self.sandbox_exe.as_deref(),
                 use_legacy_landlock: self.use_legacy_landlock,
                 windows_sandbox_level: self.windows_sandbox_level,
             })
-            .context("failed to prepare shell snapshot sandbox")?;
+            .context("failed to prepare shell snapshot sandbox")?
+            .into_command_request()?;
         let workspace_roots = self
             .workspace_roots
             .iter()

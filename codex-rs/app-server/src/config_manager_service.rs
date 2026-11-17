@@ -1,6 +1,7 @@
 use crate::config_layer::config_layer_metadata_to_api;
 use crate::config_layer::config_layer_to_api;
 use crate::config_manager::ConfigManager;
+use crate::otel_config::redact_otel_exporter_headers;
 use codex_app_server_protocol::Config as ApiConfig;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigEdit as ApiConfigEdit;
@@ -24,6 +25,8 @@ use codex_config::is_structured_feature_path;
 use codex_config::merge_toml_values;
 use codex_config::shell_environment_filter_entry;
 use codex_config::validate_shell_environment_policy_filter_config;
+use codex_connectors::apps_config_from_layer_stack;
+use codex_connectors::apps_config_origins_from_layer_stack;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
@@ -46,8 +49,12 @@ use toml_edit::Item as TomlItem;
 
 #[path = "config_manager_service_credential_edits.rs"]
 mod credential_edits;
+#[path = "config_manager_service_model_providers.rs"]
+mod model_providers;
 #[path = "config_manager_service_provider_setup.rs"]
 mod provider_setup;
+#[path = "config_manager_service_provider_write.rs"]
+mod provider_write;
 
 use credential_edits::CredentialProviderEdits;
 
@@ -130,24 +137,28 @@ impl ConfigManager {
         &self,
         params: ConfigReadParams,
     ) -> Result<ConfigReadResponse, ConfigManagerError> {
-        let layers = match params.cwd.as_deref() {
-            Some(cwd) => {
-                let cwd = AbsolutePathBuf::try_from(PathBuf::from(cwd)).map_err(|err| {
+        let cwd = params
+            .cwd
+            .map(|cwd| {
+                AbsolutePathBuf::try_from(PathBuf::from(cwd)).map_err(|err| {
                     ConfigManagerError::io("failed to resolve config cwd to an absolute path", err)
-                })?;
-                self.load_config_layers(Some(cwd)).await.map_err(|err| {
-                    ConfigManagerError::io("failed to read configuration layers", err)
-                })?
-            }
-            None => self.load_thread_agnostic_config().await.map_err(|err| {
-                ConfigManagerError::io("failed to read configuration layers", err)
-            })?,
-        };
+                })
+            })
+            .transpose()?;
+        let layers = self
+            .load_config_layers(cwd)
+            .await
+            .map_err(|err| ConfigManagerError::io("failed to read configuration layers", err))?;
+        Self::config_read_response(&layers, params.include_layers)
+    }
 
-        let effective = layers.effective_config();
-        let mut effective_config_toml: ConfigToml = effective
-            .try_into()
+    pub(super) fn config_read_response(
+        layers: &ConfigLayerStack,
+        include_layers: bool,
+    ) -> Result<ConfigReadResponse, ConfigManagerError> {
+        let mut effective_config_toml = ConfigToml::try_from(layers.effective_config())
             .map_err(|err| ConfigManagerError::toml("invalid configuration", err))?;
+        effective_config_toml.apps = apps_config_from_layer_stack(layers);
         layers
             .requirements_toml()
             .apply_exact_to_config(&mut effective_config_toml);
@@ -155,8 +166,12 @@ impl ConfigManager {
 
         let json_value = serde_json::to_value(&effective_config_toml)
             .map_err(|err| ConfigManagerError::json("failed to serialize configuration", err))?;
-        let config: ApiConfig = serde_json::from_value(json_value)
+        let mut config: ApiConfig = serde_json::from_value(json_value)
             .map_err(|err| ConfigManagerError::json("failed to deserialize configuration", err))?;
+        config.client_search_provider = effective_config_toml
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.client_search_provider);
 
         let mut origins = layers.origins_with_path_filter(|segments| {
             layers
@@ -164,17 +179,19 @@ impl ConfigManager {
                 .exact_requirement_for_config_path(segments)
                 .is_none()
         });
+        origins.retain(|path, _| !path.starts_with("apps."));
+        origins.extend(apps_config_origins_from_layer_stack(layers));
         origins.retain(|_, metadata| {
             !matches!(&metadata.name, ConfigLayerSource::PackagedDefaults { .. })
         });
 
-        Ok(ConfigReadResponse {
+        let mut response = ConfigReadResponse {
             config,
             origins: origins
                 .into_iter()
                 .map(|(path, metadata)| (path, config_layer_metadata_to_api(metadata)))
                 .collect(),
-            layers: params.include_layers.then(|| {
+            layers: include_layers.then(|| {
                 layers
                     .all_layers_high_to_low()
                     .filter(|layer| {
@@ -183,7 +200,20 @@ impl ConfigManager {
                     .map(|layer| config_layer_to_api(layer.as_layer()))
                     .collect()
             }),
-        })
+        };
+
+        // Redact exporter credentials from both the effective config and any
+        // included config layers before returning the public API response.
+        if let Some(otel) = response.config.additional.get_mut("otel") {
+            redact_otel_exporter_headers(otel);
+        }
+        for layer in response.layers.iter_mut().flatten() {
+            if let Some(otel) = layer.config.get_mut("otel") {
+                redact_otel_exporter_headers(otel);
+            }
+        }
+
+        Ok(response)
     }
 
     pub(crate) async fn read_requirements(
@@ -322,13 +352,24 @@ impl ConfigManager {
             ));
         }
 
+        self.persist_user_edits(&layers, &user_layer, provided_path, edits)
+            .await
+    }
+
+    async fn persist_user_edits(
+        &self,
+        layers: &ConfigLayerStack,
+        user_layer: &ConfigLayerEntry,
+        provided_path: AbsolutePathBuf,
+        edits: Vec<(String, JsonValue, MergeStrategy)>,
+    ) -> Result<ConfigWriteResponse, ConfigManagerError> {
         let mut user_config = user_layer.config.clone();
         let mut credential_provider_edits = CredentialProviderEdits::new(&user_config);
         let mut parsed_segments = Vec::new();
         let mut config_edits = Vec::new();
 
         for (key_path, value, strategy) in edits.into_iter() {
-            let mut segments = writable_key_path(&layers, &key_path)?;
+            let mut segments = writable_key_path(layers, &key_path)?;
             if (value.is_null() || matches!(strategy, MergeStrategy::Upsert))
                 && let Some(pattern) = shell_environment_filter_entry(&user_config, &segments)
                     .map(|(pattern, _)| pattern.clone())
@@ -847,7 +888,7 @@ fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
 }
 
 fn validate_config(value: &TomlValue) -> anyhow::Result<()> {
-    let config: ConfigToml = value.clone().try_into()?;
+    let config = ConfigToml::try_from(value.clone())?;
     if config.approval_policy == Some(AskForApproval::UnlessTrusted) {
         anyhow::bail!(
             "approval_policy = \"untrusted\" is no longer supported; remove this setting"
@@ -952,12 +993,28 @@ fn compute_override_metadata(
     }
     let message = override_message(&overriding_layer.name);
 
+    // Redact the complete OTEL config before extracting the overridden path,
+    // which may point to an entire exporter or an individual credential.
+    let effective_value = if segments.first().is_some_and(|segment| segment == "otel") {
+        effective
+            .get("otel")
+            .and_then(|otel| serde_json::to_value(otel).ok())
+            .and_then(|mut otel| {
+                redact_otel_exporter_headers(&mut otel);
+                segments[1..]
+                    .iter()
+                    .try_fold(&otel, |value, segment| value.get(segment.as_str()))
+                    .cloned()
+            })
+    } else {
+        effective_value.and_then(|value| serde_json::to_value(value).ok())
+    }
+    .unwrap_or(JsonValue::Null);
+
     Some(OverriddenMetadata {
         message,
         overriding_layer: config_layer_metadata_to_api(overriding_layer),
-        effective_value: effective_value
-            .and_then(|value| serde_json::to_value(value).ok())
-            .unwrap_or(JsonValue::Null),
+        effective_value,
     })
 }
 

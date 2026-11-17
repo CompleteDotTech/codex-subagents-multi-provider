@@ -10,9 +10,6 @@
 //! Handoff projection preserves saved heartbeat instructions and the active turn's skills.
 
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
 
 use super::LocalAgentControl;
 use crate::codex_thread::GuardianRootMessage;
@@ -50,7 +47,10 @@ struct CapturedRootConversation {
 }
 
 impl RootConversationSource for CapturedRootConversation {
-    fn prepare(&self) -> codex_guardian_context::PreparedRootContext {
+    fn prepare(
+        &self,
+        budgeting: codex_guardian_context::ContextBudgeting,
+    ) -> codex_guardian_context::PreparedRootContext {
         let root_history = &self.history;
         // Join calls to host-confirmed outputs in this snapshot. Older outputs without
         // captured text cannot establish what was sent, including after a hook rewrite.
@@ -248,6 +248,7 @@ impl RootConversationSource for CapturedRootConversation {
         codex_guardian_context::prepare_root_context(
             &request_candidates,
             root_history.original_legacy_user_messages(),
+            budgeting,
         )
     }
 }
@@ -301,36 +302,18 @@ impl LocalAgentControl {
             history: root_history,
             handoff_boundaries,
         });
-        let prepared = request_candidates.prepare();
+        let prepared = request_candidates.prepare(codex_guardian_context::ContextBudgeting::Fixed);
         let root_evidence = root_thread
             .session
             .services
             .thread_extension_data
             .get_or_init(GuardianReviewEvidence::default);
-        let mut authorization_version = root_evidence.authorization_version(history.as_ref());
-        if prepared.missing_root_instructions {
-            authorization_version.retained_context_complete = false;
-        }
-        let mut review_context_revision = history.guardian_review_context_revision();
-        if let Some(selected) = &prepared.handoff_selection {
-            let mut revision = DefaultHasher::new();
-            review_context_revision.hash(&mut revision);
-            selected.hash(&mut revision);
-            review_context_revision = revision.finish();
-        }
-        let trusted_skill_paths = prepared
-            .latest_user_turn_id
-            .as_deref()
-            .map(|turn_id| root_evidence.trusted_skill_paths(turn_id))
-            .unwrap_or_default();
-        Some(GuardianRootSnapshot {
+        Some(root_evidence.root_snapshot(
             root_thread_id,
             history_reset_version,
-            authorization_version,
-            review_context_revision,
-            messages: prepared.messages,
-            trusted_skill_paths,
-            request_candidates: Some(request_candidates),
-        })
+            history.as_ref(),
+            prepared,
+            request_candidates,
+        ))
     }
 }

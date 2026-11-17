@@ -13,6 +13,7 @@ use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
 
 #[derive(Clone, PartialEq)]
 pub enum GuardianApprovalRequest {
@@ -37,6 +38,8 @@ pub enum GuardianApprovalRequest {
         approval_id: String,
         environment_id: String,
         process_id: i32,
+        /// Command used to launch the receiving terminal, not its current state.
+        original_command: String,
         input: String,
         cwd: PathUri,
         tty: bool,
@@ -72,6 +75,9 @@ pub enum GuardianApprovalRequest {
         tool_title: Option<String>,
         tool_description: Option<String>,
         annotations: Option<GuardianMcpAnnotations>,
+        /// Rules captured for an environment-owned call. Used for direct approval and
+        /// for a server's follow-up when its call ID matches that still-running call.
+        prompt_permissions: Option<(String, Arc<codex_file_system::FileSystemSandboxContext>)>,
     },
     RequestPermissions {
         id: String,

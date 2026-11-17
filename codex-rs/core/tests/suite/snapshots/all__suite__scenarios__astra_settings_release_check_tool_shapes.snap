@@ -16,15 +16,15 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=f2e4edd02b6f9300):
+        - namespace/functions; hash=81846de5bc4e7474
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=0271b89d55152d99
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -49,7 +49,7 @@ Settings:
     - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
     - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
 
-02:message/developer[2]:
+02:message/developer[3]:
     [01] <permissions instructions>
         Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`...ll commands are permitted. Network access is enabled. [hash=c134061cebb94a1b]
         Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.
@@ -70,6 +70,10 @@ Settings:
 
         Never use the `request_user_input` tool for permission requests or permission-related escalations.
         </collaboration_mode>
+    [03] <tools>
+        Deferred tool namespaces:
+        - mcp__rmcp: Use these tools to exercise the rmcp test server.
+        </tools>
 03:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 

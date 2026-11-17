@@ -1,3 +1,4 @@
+use codex_app_server_protocol::ModelProviderError;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_config::managed_config_bundle_loader;
 use codex_config::CloudConfigBundleLoader;
@@ -10,6 +11,7 @@ use codex_config::loader::load_managed_requirements_state;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::McpLaunchCwds;
 use codex_exec_server::LOCAL_FS;
 use codex_features::feature_for_key;
 use codex_login::AuthManager;
@@ -38,12 +40,6 @@ use tracing::warn;
 #[path = "application_network.rs"]
 pub(crate) mod application_network;
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "Your organization's required model provider settings changed. Restart Codex to apply them; this request was not sent"
-)]
-pub(crate) struct ModelProviderRequirementsChanged;
-
 /// Shared app-server entry point for loading effective Codex configuration.
 #[derive(Clone)]
 pub(crate) struct ConfigManager {
@@ -54,6 +50,7 @@ pub(crate) struct ConfigManager {
     strict_config: bool,
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
+    mcp_launch_cwds: Arc<McpLaunchCwds>,
     thread_config_loader: Arc<dyn ThreadConfigLoader>,
     network_policy: codex_http_client::NetworkPolicyController,
     local_network_policy: codex_http_client::NetworkPolicyController,
@@ -113,6 +110,7 @@ impl ConfigManager {
             strict_config,
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
+            mcp_launch_cwds: Arc::default(),
             thread_config_loader,
             network_policy,
             local_network_policy: Default::default(),
@@ -120,6 +118,11 @@ impl ConfigManager {
             network_policy_snapshot: Arc::default(),
             mcp_ema_cancellation: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_mcp_launch_cwds(mut self, cwds: McpLaunchCwds) -> Self {
+        self.mcp_launch_cwds = Arc::new(cwds);
+        self
     }
 
     pub(crate) fn codex_home(&self) -> &Path {
@@ -166,6 +169,10 @@ impl ConfigManager {
 
     pub(crate) fn user_config_path(&self) -> std::io::Result<AbsolutePathBuf> {
         self.loader_overrides.user_config_path(self.codex_home())
+    }
+
+    pub(crate) fn loader_overrides(&self) -> &LoaderOverrides {
+        &self.loader_overrides
     }
 
     pub(crate) fn current_cli_overrides(&self) -> Vec<(String, TomlValue)> {
@@ -284,7 +291,7 @@ impl ConfigManager {
         self.check_application_policy_load(&policy_load)?;
         self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
-        self.apply_arg0_paths(&mut config);
+        self.apply_process_settings(&mut config);
         config.config_layer_stack = config
             .config_layer_stack
             .with_mcp_ema_cancellation(mcp_ema_cancellation);
@@ -310,7 +317,7 @@ impl ConfigManager {
         .await?;
         self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
-        self.apply_arg0_paths(&mut config);
+        self.apply_process_settings(&mut config);
         config.config_layer_stack = config
             .config_layer_stack
             .with_mcp_ema_cancellation(mcp_ema_cancellation);
@@ -339,7 +346,7 @@ impl ConfigManager {
         .await?;
         self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
-        self.apply_arg0_paths(&mut config);
+        self.apply_process_settings(&mut config);
         config.config_layer_stack = config
             .config_layer_stack
             .with_mcp_ema_cancellation(mcp_ema_cancellation);
@@ -408,7 +415,12 @@ impl ConfigManager {
         if selection_changed || definition_changed {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                ModelProviderRequirementsChanged,
+                ModelProviderError::ModelProviderPolicyConflict {
+                    model_provider: current.model_provider_id.clone(),
+                    required_model_provider: requirements
+                        .model_provider
+                        .unwrap_or_else(|| current.model_provider_id.clone()),
+                },
             ));
         }
         Ok(())
@@ -474,7 +486,7 @@ impl ConfigManager {
             .await?;
         self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
-        self.apply_arg0_paths(&mut config);
+        self.apply_process_settings(&mut config);
         config.config_layer_stack = config
             .config_layer_stack
             .with_mcp_ema_cancellation(mcp_ema_cancellation);
@@ -506,6 +518,81 @@ impl ConfigManager {
             request_overrides,
             typesafe_overrides,
             cwd,
+        )
+        .await
+        .and_then(|config| {
+            config.validate_windows_mxc_requirement()?;
+            Ok(config)
+        })
+    }
+
+    /// Validates saved and requested providers before resume overrides or policy can replace them.
+    pub(crate) async fn load_for_resume(
+        &self,
+        saved_provider: Option<&str>,
+        request_overrides: Option<HashMap<String, serde_json::Value>>,
+        mut typesafe_overrides: ConfigOverrides,
+        cwd: Option<PathBuf>,
+    ) -> std::io::Result<Config> {
+        let requested_provider = typesafe_overrides.model_provider.clone().or_else(|| {
+            request_overrides
+                .as_ref()
+                .and_then(|values| values.get("model_provider"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        if let Some(saved) = saved_provider {
+            typesafe_overrides.model_provider = Some(saved.to_owned());
+        }
+        self.load_with_validation(
+            &self.current_cli_overrides(),
+            request_overrides,
+            typesafe_overrides,
+            cwd,
+            |config, _overrides, layers| {
+                let requested_provider = requested_provider
+                    .as_deref()
+                    .or(saved_provider)
+                    .or(config.model_provider.as_deref())
+                    .unwrap_or("openai");
+                // Validate the saved route even when a client sends a provider override.
+                for provider in [
+                    saved_provider.unwrap_or(requested_provider),
+                    requested_provider,
+                ] {
+                    if let Some(required) = layers.required_model_provider()
+                        && required != provider
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            ModelProviderError::ModelProviderPolicyConflict {
+                                model_provider: provider.to_owned(),
+                                required_model_provider: required.to_owned(),
+                            },
+                        ));
+                    }
+                    if !config.model_providers.contains_key(provider)
+                        && !built_in_model_providers(config.openai_base_url.clone())
+                            .contains_key(provider)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            ModelProviderError::ModelProviderNotConfigured {
+                                model_provider: provider.to_owned(),
+                            },
+                        ));
+                    }
+                }
+                if let Some(saved) = saved_provider
+                    && saved != requested_provider
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Cannot change this thread's model provider from `{saved}` to `{requested_provider}` on resume."),
+                    ));
+                }
+                Ok(())
+            },
         )
         .await
         .and_then(|config| {
@@ -561,8 +648,30 @@ impl ConfigManager {
         &self,
         cli_overrides: &[(String, TomlValue)],
         request_overrides: Option<HashMap<String, serde_json::Value>>,
+        typesafe_overrides: ConfigOverrides,
+        fallback_cwd: Option<PathBuf>,
+    ) -> std::io::Result<Config> {
+        self.load_with_validation(
+            cli_overrides,
+            request_overrides,
+            typesafe_overrides,
+            fallback_cwd,
+            |_, _, _| Ok(()),
+        )
+        .await
+    }
+
+    async fn load_with_validation(
+        &self,
+        cli_overrides: &[(String, TomlValue)],
+        request_overrides: Option<HashMap<String, serde_json::Value>>,
         mut typesafe_overrides: ConfigOverrides,
         fallback_cwd: Option<PathBuf>,
+        validate: impl FnOnce(
+            &codex_config::config_toml::ConfigToml,
+            &ConfigOverrides,
+            &ConfigLayerStack,
+        ) -> std::io::Result<()>,
     ) -> std::io::Result<Config> {
         let mcp_ema_cancellation = self.capture_mcp_ema_cancellation();
         let policy_load = self.refresh_application_network_policy().await?;
@@ -593,13 +702,13 @@ impl ConfigManager {
             .fallback_cwd(fallback_cwd)
             .cloud_config_bundle(policy_load.cloud_config.clone())
             .thread_config_loader(Arc::clone(&self.thread_config_loader))
-            .build()
+            .build_with_validation(validate)
             .await;
         let mut config = result?;
         self.check_application_policy_load(&policy_load)?;
         self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
-        self.apply_arg0_paths(&mut config);
+        self.apply_process_settings(&mut config);
         config.config_layer_stack = config
             .config_layer_stack
             .with_mcp_ema_cancellation(mcp_ema_cancellation);
@@ -624,7 +733,7 @@ impl ConfigManager {
             cwd,
             &self.current_cli_overrides(),
             codex_config::ConfigLoadOptions {
-                loader_overrides: self.loader_overrides.clone(),
+                loader_overrides: self.loader_overrides().clone(),
                 strict_config: self.strict_config,
                 cloud_config_bundle: policy_load.cloud_config.clone(),
             },
@@ -663,9 +772,10 @@ impl ConfigManager {
         );
     }
 
-    fn apply_arg0_paths(&self, config: &mut Config) {
+    fn apply_process_settings(&self, config: &mut Config) {
         config.codex_self_exe = self.arg0_paths.codex_self_exe.clone();
         config.codex_linux_sandbox_exe = self.arg0_paths.codex_linux_sandbox_exe.clone();
+        config.mcp_launch_cwds = Arc::clone(&self.mcp_launch_cwds);
     }
 
     #[cfg(test)]

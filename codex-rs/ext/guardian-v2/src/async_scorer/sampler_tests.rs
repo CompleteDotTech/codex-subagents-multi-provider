@@ -25,6 +25,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::turn_input::CyberAccessProgram;
+use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
 use core_test_support::responses;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_assistant_message;
@@ -70,7 +71,8 @@ impl LunaSampler {
             .into_iter()
             .map(codex_history::ResponseItemEnvelope::new)
             .collect();
-        let (input, input_tokens) = Self::prepare_input(&request, /*history*/ None, evidence);
+        let (input, input_tokens) =
+            Self::finish_input(&request, LunaSampler::prepare_setup(&request), evidence);
         let (ready, score) = tokio::sync::oneshot::channel();
         let sample = super::ConversationSample {
             input: crate::async_scorer::request::PreparedRequest {
@@ -241,6 +243,7 @@ pub(in crate::async_scorer) async fn proxy_websocket_servers_with_http(
 pub(in crate::async_scorer) fn sampler_config(base_url: String) -> LunaSamplerConfig {
     LunaSamplerConfig {
         api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
+        inherit_parent_cyber_access_program: true,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -305,6 +308,7 @@ fn assert_classifier_instructions(request: &serde_json::Value) {
 
 pub(in crate::async_scorer) fn sample_request(parent_turn_id: &str) -> LunaSamplingRequest {
     LunaSamplingRequest {
+        item_id_generator: uuid_v7_item_id_generator_for_test(),
         cyber_access_program: None,
         parent_response_id: None,
         instructions: classifier_instructions(),
@@ -656,6 +660,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
 
     let sampler = connect_sampler(LunaSamplerConfig {
         api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
+        inherit_parent_cyber_access_program: true,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -702,6 +707,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
 
     let first = sampler
         .sample(LunaSamplingRequest {
+            item_id_generator: uuid_v7_item_id_generator_for_test(),
             cyber_access_program: None,
             parent_response_id: None,
             instructions: classifier_instructions(),
@@ -748,6 +754,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
     sampler.prewarm().await;
     let second = sampler
         .sample(LunaSamplingRequest {
+            item_id_generator: uuid_v7_item_id_generator_for_test(),
             cyber_access_program: None,
             parent_response_id: None,
             instructions: classifier_instructions(),
@@ -836,6 +843,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
     );
     let sampler = connect_sampler(LunaSamplerConfig {
         api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::Disabled,
+        inherit_parent_cyber_access_program: true,
         workspace_routing: codex_model_provider::WorkspaceRoutingContext::new(
             "https://chatgpt.com/backend-api".into(),
         ),
@@ -855,9 +863,9 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
     .await?;
 
     let request = sample_request("turn-1");
-    let (input, input_tokens) = LunaSampler::prepare_input(
+    let (input, input_tokens) = LunaSampler::finish_input(
         &request,
-        /*history*/ None,
+        LunaSampler::prepare_setup(&request),
         request
             .input
             .iter()

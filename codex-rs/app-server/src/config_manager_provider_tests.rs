@@ -1,4 +1,4 @@
-//! Checks retained providers against managed policy without reloading session configuration.
+//! Checks retained providers against managed policy and the current provider selection.
 
 use super::*;
 use anyhow::Result;

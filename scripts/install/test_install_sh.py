@@ -135,6 +135,58 @@ class InstallShTest(unittest.TestCase):
             )
             self.assertTrue(os.access(host_path, os.X_OK))
 
+    def test_shell_lookup_after_adding_and_updating_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            for name in ["literal$HOME", r'quote" back\tslash and !tick`']:
+                install_dir = root / name
+                result, _ = run_installer_in(
+                    root,
+                    VERSION,
+                    install_dir=install_dir,
+                    metadata_json=metadata,
+                    archive_path=archive,
+                    checksum_path=checksum,
+                    force_macos=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+                env = {"HOME": str(root / "home"), "PATH": "/usr/bin:/bin"}
+                lookup = subprocess.check_output(
+                    ["/bin/sh", "-c", '. "$HOME/.profile" && command -v codex'],
+                    env=env,
+                    text=True,
+                )
+                self.assertEqual(lookup.rstrip("\n"), str(install_dir / "codex"))
+
+                instructions = result.stdout.split("Current terminal: ", 1)[1]
+                launched = subprocess.check_output(
+                    ["/bin/sh", "-c", instructions.splitlines()[0]], env=env, text=True
+                )
+                self.assertEqual(launched.strip(), f"codex-cli {VERSION}")
+
+    def test_noninteractive_install_warns_about_existing_npm_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            (root / "bin").mkdir()
+            write_executable(root / "bin" / "codex", "#!/usr/bin/env node\n")
+
+            result, _ = run_installer_in(
+                root,
+                VERSION,
+                metadata_json=metadata,
+                archive_path=archive,
+                checksum_path=checksum,
+                force_macos=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "Leaving the existing npm-managed Codex installed", result.stderr
+            )
+
     def test_releases_latest_installs_verified_package_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -995,6 +1047,8 @@ def run_installer_in(
     root: Path,
     release: str,
     *,
+    installer_path: Path = INSTALL_SCRIPT,
+    install_dir: Path | None = None,
     metadata_failure: bool = False,
     metadata_json: str | None = None,
     releases_metadata_json: str | None = None,
@@ -1141,7 +1195,7 @@ def run_installer_in(
     env.update(
         {
             "CODEX_HOME": str(root / "codex-home"),
-            "CODEX_INSTALL_DIR": str(root / "install-bin"),
+            "CODEX_INSTALL_DIR": str(install_dir or root / "install-bin"),
             "CODEX_NON_INTERACTIVE": "1",
             "CODEX_RELEASE": release,
             "CODEX_INSTALL_DAEMON_ONLY": "1" if daemon_only else "0",
@@ -1186,7 +1240,7 @@ def run_installer_in(
             "TRUE" if use_mirror else "false"
         )
     result = subprocess.run(
-        ["/bin/sh", str(INSTALL_SCRIPT)],
+        ["/bin/sh", str(installer_path)],
         capture_output=True,
         check=False,
         env=env,
@@ -1213,14 +1267,17 @@ def create_package_release(
     metadata_version: str = VERSION,
     binary_version: str = VERSION,
     target: str = "aarch64-apple-darwin",
+    include_exec_server: bool = False,
 ) -> tuple[Path, Path, str]:
     package_dir = root / "package"
     (package_dir / "bin").mkdir(parents=True)
     (package_dir / "codex-path").mkdir()
+    metadata = {"version": binary_version, "target": target, "entrypoint": "bin/codex"}
+    if include_exec_server:
+        metadata["execServer"] = "bin/codex-exec-server"
+        write_executable(package_dir / "bin/codex-exec-server", "#!/bin/sh\nexit 0\n")
     (package_dir / "codex-package.json").write_text(
-        json.dumps(
-            {"version": binary_version, "target": target, "entrypoint": "bin/codex"}
-        ),
+        json.dumps(metadata),
         encoding="utf-8",
     )
     write_executable(

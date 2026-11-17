@@ -92,9 +92,13 @@ to 4096 bytes; the helper removes them before native process creation. Use
   the proxy's additional private-network destination checks. Proxy domain rules
   still apply to proxied traffic; direct DNS remains denied. This default also
   applies to remote Windows executors and does not enable disabled networking.
-- Windows volume-root grants do not recurse. The adapter grants the root and
-  its immediate children; directories added or newly mounted during a running
-  command are not implicitly granted.
+- Read-only volume-root grants recurse without enumerating children. Writable
+  volume-root grants do not recurse, so the adapter grants the root and its
+  immediate children; new children added during a running command are not
+  implicitly writable.
+- Default read access excludes network shares unrelated to the policy or command
+  cwd. Explicit read/write grants remain supported. Unrelated shares are not
+  probed for object identity or enumerated for implicit reads.
 - The native API represents paths and environment values as Unicode strings.
   Non-Unicode values fail instead of undergoing lossy conversion.
 - An empty child environment still uses the Windows user-profile defaults.

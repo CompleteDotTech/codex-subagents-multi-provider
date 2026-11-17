@@ -121,7 +121,7 @@ fn agents_navigation_hint_snapshots() {
                     }
                     "agents_navigation_status" => {
                         composer.set_status_line_enabled(/*enabled*/ true);
-                        composer.set_status_line(Some(Line::from("model · project")));
+                        composer.set_status_line(Some(Line::from("model · project").into()));
                     }
                     _ => {}
                 }
@@ -131,7 +131,7 @@ fn agents_navigation_hint_snapshots() {
 }
 
 #[test]
-fn left_respects_editor_and_vim_history_remaps() {
+fn left_respects_editor_and_edit_history_remaps() {
     use codex_config::types::KeybindingSpec;
     use codex_config::types::KeybindingsSpec;
     use codex_config::types::TuiKeymap;

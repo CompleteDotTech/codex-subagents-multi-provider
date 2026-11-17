@@ -104,6 +104,7 @@ fn main() -> anyhow::Result<()> {
 
 fn build_trace_provider(endpoint: &str) -> anyhow::Result<OtelProvider> {
     OtelProvider::try_new(&OtelSettings {
+        headers_helper: None,
         http_client_factory: codex_http_client::HttpClientFactory::new(
             codex_http_client::OutboundProxyPolicy::ReqwestDefault,
         ),
@@ -120,7 +121,7 @@ fn build_trace_provider(endpoint: &str) -> anyhow::Result<OtelProvider> {
         },
         metrics_exporter: OtelExporter::None,
         runtime_metrics: false,
-        span_attributes: BTreeMap::new(),
+        span_attributes: HashMap::new(),
         tracestate: BTreeMap::new(),
     })
     .map_err(|error| anyhow::anyhow!("failed to build code-mode host OTEL provider: {error}"))?

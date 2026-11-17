@@ -3,6 +3,8 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
 use crate::session::Submission;
+use crate::session::submission::SubmissionOp;
+use codex_guardian_reviewer::GuardianReviewResponse;
 use codex_guardian_reviewer::ReviewerRequest;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::CodexHarnessMetadata;
@@ -46,6 +48,21 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
     )
     .unwrap();
     params.parent_session = Arc::clone(&parent);
+    let parent_uri = "wss://review-snapshot.chatgpt.com/backend-api/codex/responses"
+        .parse()
+        .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::SET_COOKIE,
+        http::HeaderValue::from_static("__oailb=original-parent; Path=/; Secure; Max-Age=3600"),
+    );
+    turn.extension_data.insert(super::super::ParentResponse {
+        id: "original-response".to_owned(),
+        routing_affinity: codex_http_client::ChatGptRoutingAffinity::from_response(
+            &parent_uri,
+            &headers,
+        ),
+    });
     params.parent_context = GuardianReviewContext::from(Arc::clone(&turn));
     let evidence: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "function_call_output", "call_id": "prior-inspection", "output": EVIDENCE
@@ -73,9 +90,14 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
             .node_repl_auto_review_required,
     )
     .with_node_repl_policy(&params.node_repl_policy);
+    let reviewer_session = Arc::clone(&reviewer.session);
     let manager = prewarm_test_session(&params, reviewer).await;
     // Capture the review context, then compact the parent before the reviewer builds its prompt.
     let prepared = setup::prepare_review(params).await.unwrap();
+    turn.extension_data.insert(super::super::ParentResponse {
+        id: "later-response".to_owned(),
+        routing_affinity: None,
+    });
     let checkpoint: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "compaction", "id": "cmp_new", "encrypted_content": "new-checkpoint"
     }))
@@ -86,6 +108,7 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
             vec![checkpoint.into()],
             turn.to_turn_context_item(),
             crate::context::world_state::WorldStateSnapshot::default(),
+            /*rejected_audio_file_ids*/ Default::default(),
             crate::compact::CompactedHistoryMetadata {
                 input_goal_ids: Default::default(),
                 message: String::new(),
@@ -99,8 +122,23 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
         .await;
     let ((outcome, _), submitted_text) = tokio::join!(manager.review(prepared), async {
         let submission = rx_sub.recv().await.unwrap();
+        let pending = reviewer_session
+            .services
+            .thread_extension_data
+            .get::<super::super::PendingReviewRouting>()
+            .unwrap();
+        let parent = pending.0.as_ref().unwrap();
+        assert_eq!(parent.id, "original-response");
+        assert_eq!(
+            parent
+                .routing_affinity
+                .as_ref()
+                .unwrap()
+                .cookie_header(&parent_uri),
+            Some(http::HeaderValue::from_static("__oailb=original-parent"))
+        );
         let id = submission.id;
-        let Op::TurnInput { request, reply, .. } = submission.op else {
+        let SubmissionOp::TurnInput { request, reply, .. } = submission.op else {
             panic!("expected reviewer prompt");
         };
         let codex_protocol::turn_input::TurnInput::UserInput { content, .. } = request.input else {
@@ -123,6 +161,14 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
             .unwrap();
         text
     });
+    assert!(
+        reviewer_session
+            .services
+            .thread_extension_data
+            .get::<super::super::PendingReviewRouting>()
+            .is_none()
+    );
+    assert!(!submitted_text.contains("__oailb"));
     assert!(matches!(
         outcome,
         GuardianReviewSessionOutcome::Completed(Ok(_))
@@ -136,7 +182,7 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
 async fn test_review_session() -> (
     GuardianReviewSession,
     async_channel::Sender<Event>,
-    async_channel::Receiver<Submission>,
+    async_channel::Receiver<Box<Submission>>,
 ) {
     let (session, _turn, _rx) = crate::session::tests::make_session_and_context_with_rx().await;
     let (tx_sub, rx_sub) = async_channel::bounded(4);
@@ -473,7 +519,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(mode: GuardianCon
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let mut history = ContextManager::new();
+    let mut history = ContextManager::default();
     history.replace_annotated(vec![ResponseItemEnvelope {
         item: item.clone(),
         metadata: Some(CodexHarnessMetadata {
@@ -483,7 +529,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(mode: GuardianCon
     }]);
     assert_eq!(
         policy
-            .parent_compaction(&history)
+            .parent_compaction(history.annotated_items())
             .expect("valid checkpoint"),
         Some(item)
     );
@@ -498,7 +544,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(mode: GuardianCon
         .into(),
     );
     history.replace_annotated(items);
-    let result = policy.parent_compaction(&history);
+    let result = policy.parent_compaction(history.annotated_items());
     if mode == GuardianContextMode::ThreadOwned {
         assert!(result.is_err());
     } else {
@@ -666,7 +712,7 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
     });
     let submission = rx_sub.recv().await.expect("guardian submission");
     let id = submission.id;
-    let Op::TurnInput { reply, .. } = submission.op else {
+    let SubmissionOp::TurnInput { reply, .. } = submission.op else {
         panic!("expected turn-input submission");
     };
     reply
@@ -692,7 +738,10 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
     let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
         panic!("expected submitted turn completion");
     };
-    assert_eq!(last_agent_message.as_deref(), Some("fresh"));
+    assert_eq!(
+        last_agent_message.as_ref().map(GuardianReviewResponse::raw),
+        Some("fresh")
+    );
     assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
     assert_eq!(disposition, SessionDisposition::Reusable);
 }
@@ -731,7 +780,7 @@ async fn run_review_removes_trunk_when_event_stream_is_broken() {
         tokio::spawn(async move { run_guardian_review_session(manager_for_review, params).await });
     let submission = rx_sub.recv().await.expect("guardian submission");
     let id = submission.id;
-    let Op::TurnInput { reply, .. } = submission.op else {
+    let SubmissionOp::TurnInput { reply, .. } = submission.op else {
         panic!("expected turn-input submission");
     };
     reply
@@ -761,6 +810,7 @@ async fn wait_for_guardian_review_ignores_prior_turn_errors() {
                 misalignment: None,
                 message: "stale guardian error".to_string(),
                 codex_error_info: None,
+                rejected_audio_file_ids: Vec::new(),
             }),
         })
         .await
@@ -793,7 +843,7 @@ async fn wait_for_guardian_review_ignores_prior_turn_errors() {
     let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
         panic!("expected current turn completion");
     };
-    assert_eq!(last_agent_message, None);
+    assert!(last_agent_message.is_none());
     assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
     assert_eq!(disposition, SessionDisposition::Reusable);
     assert!(turn_completed);
@@ -809,6 +859,7 @@ async fn wait_for_guardian_review_preserves_structured_session_error() {
                 misalignment: None,
                 message: "temporary failure".to_string(),
                 codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                rejected_audio_file_ids: Vec::new(),
             }),
         })
         .await
@@ -881,7 +932,10 @@ async fn wait_for_guardian_review_ignores_prior_turn_aborts() {
     let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
         panic!("expected current turn completion");
     };
-    assert_eq!(last_agent_message.as_deref(), Some("fresh"));
+    assert_eq!(
+        last_agent_message.as_ref().map(GuardianReviewResponse::raw),
+        Some("fresh")
+    );
     assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
     assert_eq!(disposition, SessionDisposition::Reusable);
     assert!(turn_completed);
@@ -897,7 +951,7 @@ async fn wait_for_guardian_review_timeout_drains_expected_turn_after_stale_termi
     let tx_interrupt_event = tx_event.clone();
     let interrupt_response = tokio::spawn(async move {
         let submission = rx_sub.recv().await.expect("interrupt submission");
-        assert!(matches!(submission.op, Op::Interrupt));
+        assert!(matches!(submission.op.as_protocol(), Some(Op::Interrupt)));
         tx_interrupt_event
             .send(turn_aborted_event("current-turn"))
             .await
@@ -938,7 +992,7 @@ async fn wait_for_guardian_review_cancel_drains_expected_turn_after_stale_termin
     let tx_interrupt_event = tx_event.clone();
     let interrupt_response = tokio::spawn(async move {
         let submission = rx_sub.recv().await.expect("interrupt submission");
-        assert!(matches!(submission.op, Op::Interrupt));
+        assert!(matches!(submission.op.as_protocol(), Some(Op::Interrupt)));
         tx_interrupt_event
             .send(turn_aborted_event("current-turn"))
             .await
@@ -1072,4 +1126,99 @@ async fn parent_checkpoint_recovery_stops_after_one_restart() {
     ));
     assert_eq!(observed_spawns.load(Ordering::SeqCst), 2);
     assert!(pool.trunk().await.is_none());
+}
+
+#[tokio::test]
+async fn compaction_and_review_submissions_share_execution_observer() {
+    let (review_session, events, submissions) = test_review_session().await;
+    let child_session = Arc::clone(&review_session.session);
+    let mut params = test_review_params().await;
+    let expected_country = codex_protocol::RequestCountry::UNKNOWN;
+    params.parent_context.request_country = expected_country.clone();
+    params
+        .spawn_config
+        .features
+        .enable(Feature::TokenBudget)
+        .unwrap();
+    params.spawn_config.model_auto_compact_token_limit = Some(0);
+    params.spawn_config.token_budget = None;
+    let turn = Arc::get_mut(&mut params.parent_context.turn).expect("unshared turn fixture");
+    turn.configured_token_budget = None;
+    turn.use_model_token_budget_defaults = false;
+    let execution = codex_direct_tool_timing::ReviewExecution::default();
+    execution.observe();
+    params.parent_context.review_execution = Some(execution.clone());
+    let review = tokio::spawn(async move {
+        run_review_on_session(
+            &review_session,
+            &params,
+            GuardianReviewSessionKind::TrunkReused,
+            codex_guardian_reviewer::ReviewDeadline::At(
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            ),
+        )
+        .await
+    });
+    let start = std::time::Instant::now();
+    for (index, (left, right)) in [(10, 30), (40, 70)].into_iter().enumerate() {
+        let submission = tokio::time::timeout(Duration::from_secs(10), submissions.recv())
+            .await
+            .expect("child submission deadline")
+            .expect("child submission");
+        if index == 0 {
+            assert!(matches!(submission.op.as_protocol(), Some(Op::Compact)));
+            assert_eq!(
+                child_session.thread_config_snapshot().await.request_country,
+                expected_country
+            );
+        } else {
+            let SubmissionOp::TurnInput { reply, .. } = submission.op else {
+                panic!("expected review input after compaction");
+            };
+            reply
+                .send(Ok(TurnInputSubmission::Started {
+                    root_turn_id: submission.id.clone(),
+                    turn_id: submission.id.clone(),
+                }))
+                .unwrap();
+        }
+        let pending = child_session
+            .services
+            .thread_extension_data
+            .remove::<crate::turn_timing::review_execution::PendingReviewExecution>();
+        let pending = pending.expect("instrumented child");
+        assert_eq!(pending.0, execution);
+        let child_start = start + Duration::from_millis(left);
+        pending.0.started(child_start);
+        pending
+            .0
+            .completed(child_start, start + Duration::from_millis(right));
+        events
+            .send(turn_complete_event(
+                &submission.id,
+                Some("complete"),
+                /*time_to_first_token_ms*/ None,
+            ))
+            .await
+            .unwrap();
+    }
+    let result = review.await.unwrap();
+    assert!(matches!(
+        result.outcome,
+        GuardianReviewSessionOutcome::Completed(Ok(_))
+    ));
+    assert!(
+        child_session
+            .services
+            .thread_extension_data
+            .get::<crate::turn_timing::review_execution::PendingReviewExecution>()
+            .is_none()
+    );
+    execution.seal();
+    let end = start + Duration::from_millis(100);
+    let totals = codex_utils_critical_path::CriticalPath::default()
+        .auto_review(start, end, vec![execution])
+        .durations(start, end);
+    assert_eq!(totals.auto_review, Duration::from_millis(100));
+    assert_eq!(totals.auto_review_overhead, Some(Duration::from_millis(50)));
 }

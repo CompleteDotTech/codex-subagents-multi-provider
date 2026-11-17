@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use codex_install_context::InstallContext;
 use codex_rollout::RolloutConfig;
-use codex_rollout::first_rollout_content_match_snippet;
+use codex_rollout::RolloutSnippetMatcher;
 use codex_rollout::parse_cursor;
 use codex_rollout::search_rollout_matches;
 use codex_utils_absolute_path::normalize_windows_device_path;
@@ -95,6 +95,7 @@ pub(super) async fn search_threads(
     let mut page_cursor = cursor;
     let scan_page_size = params.page_size.saturating_mul(8).clamp(256, 2048);
     let scan_params = ListThreadsParams {
+        included_thread_ids: None,
         page_size: scan_page_size,
         cursor: None,
         sort_key: params.sort_key,
@@ -106,7 +107,9 @@ pub(super) async fn search_threads(
         project_id: None,
         archived: params.archived,
         search_term: None,
-        relation_filter: None,
+        relation_filter: params
+            .include_attached_threads
+            .then_some(crate::ThreadRelationFilter::IncludeAttached),
         use_state_db_only: state_db.is_some(),
     };
     let mut remaining_rollouts = matching_rollouts
@@ -114,6 +117,7 @@ pub(super) async fn search_threads(
         .map(|(path, snippet)| (rollout_search_path(&path), snippet))
         .collect::<HashMap<_, _>>();
 
+    let mut snippet_matcher = RolloutSnippetMatcher::new(search_term);
     loop {
         let page = list_rollout_threads(
             state_db.clone(),
@@ -125,19 +129,44 @@ pub(super) async fn search_threads(
             sort_direction,
         )
         .await?;
+        let page = codex_rollout::ThreadsPage::from(page);
+        let page_thread_ids: Vec<_> = page
+            .items
+            .iter()
+            .filter_map(|item| item.thread_id)
+            .collect();
+        let mut original_paths = None;
         for item in page.items {
             let logical_path = rollout_search_path(item.path.as_path());
-            let Some(snippet) = (match remaining_rollouts.remove(logical_path.as_path()) {
-                Some(Some(snippet)) => Some(snippet),
-                Some(None) => first_rollout_content_match_snippet(item.path.as_path(), search_term)
+            let Some(mut snippet) = remaining_rollouts.remove(logical_path.as_path()) else {
+                continue;
+            };
+            if let Some(account) = &params.account {
+                let Some(thread_id) = item.thread_id else {
+                    continue;
+                };
+                if !account
+                    .includes(
+                        &store.config.codex_home,
+                        thread_id,
+                        Some(&item.path),
+                        &page_thread_ids,
+                        &mut original_paths,
+                    )
+                    .await
+                {
+                    continue;
+                }
+            }
+            if snippet.is_none() {
+                snippet = snippet_matcher
+                    .first_match(&item.path)
                     .await
                     .map_err(|err| ThreadStoreError::Internal {
                         message: format!("failed to read rollout search match: {err}"),
-                    })?,
-                None => None,
-            }) else {
-                continue;
-            };
+                    })?;
+            }
+            let Some(snippet) = snippet else { continue };
             matching_items.push(ThreadSearchItem { item, snippet });
             if matching_items.len() > params.page_size {
                 break;
@@ -155,9 +184,13 @@ pub(super) async fn search_threads(
     let more_matches_available = matching_items.len() > params.page_size;
     matching_items.truncate(params.page_size);
     let next_cursor = if more_matches_available {
-        matching_items
-            .last()
-            .and_then(|item| cursor_from_thread_search_item(item, params.sort_key))
+        matching_items.last().and_then(|item| {
+            if scan_params.use_state_db_only {
+                cursor_from_thread_search_item(item, params.sort_key)
+            } else {
+                item.item.filesystem_cursor(sort_key)
+            }
+        })
     } else {
         None
     }
@@ -233,11 +266,7 @@ fn cursor_from_thread_search_item(
             .or(item.item.created_at.as_deref())?,
         ThreadSortKey::SectionPosition => return None,
     };
-    match sort_key {
-        ThreadSortKey::RecencyAt => parse_cursor(&format!("{timestamp}|{}", item.item.thread_id?)),
-        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => parse_cursor(timestamp),
-        ThreadSortKey::SectionPosition => None,
-    }
+    parse_cursor(&format!("{timestamp}|{}", item.item.thread_id?))
 }
 
 async fn set_thread_search_result_names(
@@ -248,13 +277,7 @@ async fn set_thread_search_result_names(
         .iter()
         .map(|item| (item.thread.thread_id, item.thread.history_mode))
         .collect::<HashMap<_, _>>();
-    let names = resolve_thread_names(
-        store,
-        &thread_history_modes,
-        /*use_state_db_only*/ false,
-    )
-    .await
-    .unwrap_or_default();
+    let names = resolve_thread_names(store, &thread_history_modes).await;
     for item in items {
         if let Some(name) = names.get(&item.thread.thread_id).cloned() {
             set_thread_name(&mut item.thread, name);
